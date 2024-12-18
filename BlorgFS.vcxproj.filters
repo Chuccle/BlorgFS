@@ -1,0 +1,130 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hpp;hxx;hm;inl;inc;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="Driver Files">
+      <UniqueIdentifier>{8E41214B-6785-4CFE-B992-037D68949A14}</UniqueIdentifier>
+      <Extensions>inf;inv;inx;mof;mc;</Extensions>
+    </Filter>
+    <Filter Include="Source Files\Networking">
+      <UniqueIdentifier>{632289a7-93e1-4116-ac1f-d3eb624543bf}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\flatcc">
+      <UniqueIdentifier>{6b4c50a1-6927-41a3-917a-a96c15684fd5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\Networking">
+      <UniqueIdentifier>{fd3c864c-37af-4ca5-9e55-c725439ed24f}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\flatcc">
+      <UniqueIdentifier>{ae7be2cb-22b5-4cf0-8a5e-9375366c5c78}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Driver.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Create.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Close.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Read.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Write.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="FileInfo.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Ea.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="FlushBuffers.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="VolumeInfo.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DirCtrl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="FsCtrl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LockCtrl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Cleanup.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Security.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Structs.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DevIoCtrl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Shutdown.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Socket.c">
+      <Filter>Source Files\Networking</Filter>
+    </ClCompile>
+    <ClCompile Include="picohttpparser\picohttpparser.c">
+      <Filter>Source Files\Networking</Filter>
+    </ClCompile>
+    <ClCompile Include="Client.c">
+      <Filter>Source Files\Networking</Filter>
+    </ClCompile>
+    <ClCompile Include="flatcc\src\runtime\verifier.c">
+      <Filter>Source Files\flatcc</Filter>
+    </ClCompile>
+    <ClCompile Include="Util.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Structs.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="metadata_flatbuffer_reader.h">
+      <Filter>Header Files\flatcc</Filter>
+    </ClInclude>
+    <ClInclude Include="flatbuffers_common_reader.h">
+      <Filter>Header Files\flatcc</Filter>
+    </ClInclude>
+    <ClInclude Include="metadata_flatbuffer_verifier.h">
+      <Filter>Header Files\flatcc</Filter>
+    </ClInclude>
+    <ClInclude Include="Client.h">
+      <Filter>Header Files\Networking</Filter>
+    </ClInclude>
+    <ClInclude Include="Driver.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="picohttpparser\picohttpparser.h">
+      <Filter>Header Files\Networking</Filter>
+    </ClInclude>
+    <ClInclude Include="Socket.h">
+      <Filter>Header Files\Networking</Filter>
+    </ClInclude>
+    <ClInclude Include="Util.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
