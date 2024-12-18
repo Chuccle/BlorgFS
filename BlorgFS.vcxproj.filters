@@ -1,0 +1,138 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hpp;hxx;hm;inl;inc;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="Driver Files">
+      <UniqueIdentifier>{8E41214B-6785-4CFE-B992-037D68949A14}</UniqueIdentifier>
+      <Extensions>inf;inv;inx;mof;mc;</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="BlorgFS.inf">
+      <Filter>Driver Files</Filter>
+    </Inf>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Driver.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Create.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Close.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Read.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Write.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="QueryInfo.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SetInfo.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="QueryEa.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SetEa.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="FlushBuffers.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="QueryVolumeInfo.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SetVolumeInfo.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DirCtrl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="FsCtrl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="LockCtrl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Cleanup.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="QuerySecurity.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="SetSecurity.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Driver.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Create.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Cleanup.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Close.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DirCtrl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FlushBuffers.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FsCtrl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="LockCtrl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="QueryEa.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="QueryInfo.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="QuerySecurity.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="QueryVolumeInfo.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Read.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SetEa.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SetInfo.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SetSecurity.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SetVolumeInfo.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Write.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
