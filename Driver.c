@@ -2,110 +2,123 @@
 
 FAST_IO_DISPATCH BlorgFsFastDispatch;
 
+struct GLOBAL global;
+
 // {A6E07401-F24E-443E-A47C-D9BD219B9E68}
-static const GUID BLORGFS_DO_GUID = { 0xa6e07401, 0xf24e, 0x443e, { 0xa4, 0x7c, 0xd9, 0xbd, 0x21, 0x9b, 0x9e, 0x68 } };
+static const GUID BLORGFS_VDO_GUID = { 0xa6e07401, 0xf24e, 0x443e, { 0xa4, 0x7c, 0xd9, 0xbd, 0x21, 0x9b, 0x9e, 0x68 } };
 // {CC6E9F4D-1968-4D95-91AF-FFD72F35F6DA}
-static const GUID BLORGFS_VDO_GUID = { 0xcc6e9f4d, 0x1968, 0x4d95, { 0x91, 0xaf, 0xff, 0xd7, 0x2f, 0x35, 0xf6, 0xda } };
+static const GUID BLORGFS_DDO_GUID = { 0xcc6e9f4d, 0x1968, 0x4d95, { 0x91, 0xaf, 0xff, 0xd7, 0x2f, 0x35, 0xf6, 0xda } };
 
 
-NTSTATUS CreateBlorgVolume(PDRIVER_OBJECT pDriverObject)
+static NTSTATUS CreateBlorgDiskDevice(PDRIVER_OBJECT pDriverObject)
 {
-	BLORGFS_PRINT("Entering Volume Creation\n");
+	BLORGFS_PRINT("Entering Drive Creation\n");
 	KdBreakPoint();
-	UNICODE_STRING uniVDOString = RTL_CONSTANT_STRING(BLORGFS_VDO_STRING);
-	UNICODE_STRING uniSDDLString = RTL_CONSTANT_STRING(BLORGFS_VDO_DEVICE_SDDL_STRING);
+	UNICODE_STRING uniVDOString = RTL_CONSTANT_STRING(BLORGFS_DDO_STRING);
+	UNICODE_STRING uniSDDLString = RTL_CONSTANT_STRING(BLORGFS_DDO_DEVICE_SDDL_STRING);
 	UNICODE_STRING uniSymString = { 0 };
-	PDEVICE_OBJECT pVolumeDeviceObject = NULL;
+	PDEVICE_OBJECT pDiskDeviceObject = NULL;
 	WCHAR          wchBuffer[128] = { 0 };
 	NTSTATUS       result = STATUS_UNSUCCESSFUL;
 
-
 	result = WdmlibIoCreateDeviceSecure(pDriverObject,
-		sizeof(BLORGFS_DO_DEVICE_EXTENSION),
+		sizeof(BLORGFS_DDO_DEVICE_EXTENSION),
 		&uniVDOString,
 		FILE_DEVICE_DISK,
 		FILE_DEVICE_SECURE_OPEN,
 		FALSE,
 		&uniSDDLString,
-		&BLORGFS_VDO_GUID,
-		&pVolumeDeviceObject);
+		&BLORGFS_DDO_GUID,
+		&pDiskDeviceObject);
 
 	if (!NT_SUCCESS(result))
 	{
 		return result;
 	}
 
-	PBLORGFS_DO_DEVICE_EXTENSION pDevExt = pVolumeDeviceObject->DeviceExtension;
+	PBLORGFS_DDO_DEVICE_EXTENSION pDevExt = pDiskDeviceObject->DeviceExtension;
 
-	pDevExt->Identifier = BLORGFS_VDO_MAGIC;
+	pDevExt->hdr.Identifier = BLORGFS_DDO_MAGIC;
 
-	ClearFlag(pVolumeDeviceObject->Flags, DO_DEVICE_INITIALIZING);
+	global.pDiskDeviceObject = pDiskDeviceObject;
+
+	ClearFlag(global.pDiskDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
 	RtlInitEmptyUnicodeString(&uniSymString, wchBuffer, sizeof(wchBuffer));
 
 	result = RtlUnicodeStringPrintf(&uniSymString,
 		BLORGFS_DOS_DRIVELETTER_FORMAT_STRING,
-		'A');
+		'B');
 
 	IoCreateSymbolicLink(&uniSymString, &uniVDOString);
 
 	if (!NT_SUCCESS(result))
 	{
-		IoDeleteDevice(pVolumeDeviceObject);
+		IoDeleteDevice(global.pDiskDeviceObject);
+		global.pDiskDeviceObject = NULL;
 		return result;
 	}
 
-	return result;
-
+    return result;
 }
 
-NTSTATUS CreateBlorgFs(PDRIVER_OBJECT pDriverObject)
+static NTSTATUS CreateBlorgVolumeDevice(PDRIVER_OBJECT pDriverObject)
 {
     BLORGFS_PRINT("Entering Volume Creation\n");
     KdBreakPoint();
-    UNICODE_STRING uniVDOString = RTL_CONSTANT_STRING(BLORGFS_DO_STRING);
-    UNICODE_STRING uniSDDLString = RTL_CONSTANT_STRING(BLORGFS_DO_DEVICE_SDDL_STRING);
-    PDEVICE_OBJECT pFSDeviceObject = NULL;
+    UNICODE_STRING uniVDOString = RTL_CONSTANT_STRING(BLORGFS_VDO_STRING);
+    UNICODE_STRING uniSDDLString = RTL_CONSTANT_STRING(BLORGFS_VDO_DEVICE_SDDL_STRING);
+    PDEVICE_OBJECT pVolumeDeviceObject = NULL;
     NTSTATUS       result = STATUS_UNSUCCESSFUL;
 
-
     result = WdmlibIoCreateDeviceSecure(pDriverObject,
-                                        sizeof(BLORGFS_DO_DEVICE_EXTENSION), 
+                                        sizeof(BLORGFS_VDO_DEVICE_EXTENSION), 
                                         &uniVDOString,
                                         FILE_DEVICE_DISK_FILE_SYSTEM,
                                         FILE_DEVICE_SECURE_OPEN,
                                         FALSE,
                                         &uniSDDLString,
-                                        &BLORGFS_DO_GUID,
-                                        &pFSDeviceObject);
+                                        &BLORGFS_VDO_GUID,
+                                        &pVolumeDeviceObject);
 
     if (!NT_SUCCESS(result))
     {
         return result;
     }
 
-	PBLORGFS_DO_DEVICE_EXTENSION pDevExt = pFSDeviceObject->DeviceExtension;
+	PBLORGFS_VDO_DEVICE_EXTENSION pDevExt = pVolumeDeviceObject->DeviceExtension;
 
-	pDevExt->Identifier = BLORGFS_DO_MAGIC;
+	pDevExt->hdr.Identifier = BLORGFS_VDO_MAGIC;
 
-    IoRegisterFileSystem(pFSDeviceObject);
+	global.pVolumeDeviceObject = pVolumeDeviceObject;
+
+    IoRegisterFileSystem(global.pVolumeDeviceObject);
 
     return result;
-
 }
 
 VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
 {
-    IoUnregisterFileSystem(pDriverObject->DeviceObject);
-    IoDeleteDevice(pDriverObject->DeviceObject);
+	UNREFERENCED_PARAMETER(pDriverObject);
+    if (global.pVolumeDeviceObject)
+    {
+        IoUnregisterFileSystem(global.pVolumeDeviceObject);
+        IoDeleteDevice(global.pVolumeDeviceObject);
+    }
+
+    if (global.pDiskDeviceObject)
+    {
+        IoDeleteDevice(global.pDiskDeviceObject);
+    }
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegistryPath)
 {
-
     UNREFERENCED_PARAMETER(pRegistryPath);
    
     NTSTATUS  result = STATUS_SUCCESS;
+
+	global.pDriverObject = pDriverObject;
 
     pDriverObject->DriverUnload = DriverUnload;
     pDriverObject->MajorFunction[IRP_MJ_CREATE] = BlorgCreate;
@@ -128,14 +141,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegistryPath
 
 	KdBreakPoint();
     
-    result = CreateBlorgFs(pDriverObject);
+    result = CreateBlorgVolumeDevice(pDriverObject);
 
     if (!NT_SUCCESS(result))
     {
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
-	result = CreateBlorgVolume(pDriverObject);
+	result = CreateBlorgDiskDevice(pDriverObject);
 
 	if (!NT_SUCCESS(result))
 	{
