@@ -1,11 +1,8 @@
 #include "Driver.h"
 
-
-static inline void HandleUserFSRequest(ULONG ulFsCtrlCode, PDEVICE_OBJECT pDeviceObject, PIRP pIrp, PIO_STACK_LOCATION pIrpSp) 
+static inline void HandleUserFSRequest(ULONG ulFsCtrlCode, PIRP pIrp, PIO_STACK_LOCATION pIrpSp) 
 {
-
     UNREFERENCED_PARAMETER(pIrpSp);
-    UNREFERENCED_PARAMETER(pDeviceObject);
     
     switch (ulFsCtrlCode)
     {
@@ -17,13 +14,13 @@ static inline void HandleUserFSRequest(ULONG ulFsCtrlCode, PDEVICE_OBJECT pDevic
         }
         case FSCTL_GET_REPARSE_POINT:
         {
-            //pIrp->IoStatus.Status = FileSystemControlReparsePoint(pDeviceObject, pIrp, pIrpSp, FALSE);
+            // FileSystemControlReparsePoint(pDeviceObject, pIrp, pIrpSp, FALSE);
             break;
         }
         case FSCTL_SET_REPARSE_POINT:
         case FSCTL_DELETE_REPARSE_POINT:
         {
-           //pIrp->IoStatus.Status = FileSystemControlReparsePoint(pDeviceObject, pIrp, pIrpSp, TRUE);
+           // FileSystemControlReparsePoint(pDeviceObject, pIrp, pIrpSp, TRUE);
             break;
         }
         case FSCTL_REQUEST_OPLOCK_LEVEL_1:
@@ -36,74 +33,98 @@ static inline void HandleUserFSRequest(ULONG ulFsCtrlCode, PDEVICE_OBJECT pDevic
         case FSCTL_REQUEST_FILTER_OPLOCK:
         case FSCTL_REQUEST_OPLOCK:
         {
-            //pIrp->IoStatus.Status = FileSystemControlOplock(pDeviceObject, pIrp, pIrpSp);
+            // FileSystemControlOplock(pDeviceObject, pIrp, pIrpSp);
             break;
         }
         case FSCTL_QUERY_PERSISTENT_VOLUME_STATE:
         {
-           //pIrp->IoStatus.Status = FileSystemControlQueryPersistentVolumeState(pDeviceObject, pIrp, pIrpSp);
+           // FileSystemControlQueryPersistentVolumeState(pDeviceObject, pIrp, pIrpSp);
             break;
         }
         case FSCTL_FILESYSTEM_GET_STATISTICS:
         {
-            //pIrp->IoStatus.Status = FileSystemControlGetStatistics(pDeviceObject, pIrp, pIrpSp);
+            // FileSystemControlGetStatistics(pDeviceObject, pIrp, pIrpSp);
             break;
         }
         case FSCTL_GET_RETRIEVAL_POINTERS:
         {
-            //pIrp->IoStatus.Status = FileSystemControlGetRetrievalPointers(pDeviceObject, pIrp, pIrpSp);
+            // FileSystemControlGetRetrievalPointers(pDeviceObject, pIrp, pIrpSp);
             break;
         }
     }
 }
 
 
-NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+static NTSTATUS BlorgVolumeFileSystemControl(PIRP pIrp, PIO_STACK_LOCATION pIrpSp)
 {
-
-    UNREFERENCED_PARAMETER(pDeviceObject);
-    
-    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
 	PDEVICE_OBJECT pTargetDeviceObject = NULL;
+	NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (pIrpSp->MinorFunction) 
     {
         case IRP_MN_USER_FS_REQUEST:
         {
-            HandleUserFSRequest(pIrpSp->Parameters.FileSystemControl.FsControlCode, pDeviceObject, pIrp, pIrpSp);
+            HandleUserFSRequest(pIrpSp->Parameters.FileSystemControl.FsControlCode, pIrp, pIrpSp);
             break;
         }
         case IRP_MN_MOUNT_VOLUME:
         {
+            result = STATUS_UNRECOGNIZED_VOLUME;
 			pTargetDeviceObject = pIrpSp->Parameters.MountVolume.DeviceObject;
 			if (pTargetDeviceObject && GetDeviceExtensionMagic(pTargetDeviceObject) == BLORGFS_VDO_MAGIC)
 			{
 				KdBreakPoint();
-				pIrp->IoStatus.Status = STATUS_SUCCESS;
-			}
-            break;
-        }
-        case IRP_MN_VERIFY_VOLUME:
-        {
-            pIrp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
-            break;
-        }
-        case IRP_MN_LOAD_FILE_SYSTEM:
-        {
-            pIrp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
-            break;
-        }
-        case IRP_MN_KERNEL_CALL:
-        {
-            pIrp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
+                PVPB pVpb = pIrpSp->Parameters.MountVolume.Vpb;
+                KIRQL Irql;
+                /*
+                 * We will increment the VPB's ReferenceCount so that we can do a delayed delete
+                 * of the volume device later on.
+                 */
+                IoAcquireVpbSpinLock(&Irql);
+                pVpb->DeviceObject = global.pVolumeDeviceObject;
+                IoReleaseVpbSpinLock(Irql);
+
+                // Apparently this needs to be cleaned up by us
+                ObDereferenceObject(pTargetDeviceObject);
+
+				pIrp->IoStatus.Information = 0;
+                result = STATUS_SUCCESS;
+
+            }
             break;
         }
         default:
         {
-            pIrp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
+            result = STATUS_NOT_IMPLEMENTED;
             break;
         }
     }
+
+    return result;
+}
+
+NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+{
+    UNREFERENCED_PARAMETER(pDeviceObject);
+
+    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
+    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+
+    switch (GetDeviceExtensionMagic(pDeviceObject))
+    {
+        case BLORGFS_VDO_MAGIC:
+        {
+            result = BlorgVolumeFileSystemControl(pIrp, pIrpSp);
+            break;
+        }
+        case BLORGFS_DDO_MAGIC:
+        {
+            // result = BlorgDiskSetVolumeInformation(pIrp);
+            break;
+        }
+    }
+
+    pIrp->IoStatus.Status = result;
 
     IoCompleteRequest(pIrp, IO_NO_INCREMENT);
     return pIrp->IoStatus.Status;
