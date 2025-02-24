@@ -22,7 +22,6 @@ static NTSTATUS BlorgVolumeDirectoryControl(PIRP pIrp, PIO_STACK_LOCATION pIrpSp
         {
             result = STATUS_INVALID_DEVICE_REQUEST;
             pIrp->IoStatus.Information = 0;
-            break;
         }
     }
 

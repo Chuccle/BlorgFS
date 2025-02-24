@@ -96,7 +96,6 @@ static NTSTATUS BlorgVolumeFileSystemControl(PIRP pIrp, PIO_STACK_LOCATION pIrpS
         default:
         {
             result = STATUS_NOT_IMPLEMENTED;
-            break;
         }
     }
 
@@ -119,7 +118,6 @@ NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
         }
         case BLORGFS_DDO_MAGIC:
         {
-            KdBreakPoint();
             // result = BlorgDiskSetVolumeInformation(pIrp);
             break;
         }

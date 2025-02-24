@@ -2,43 +2,70 @@
 
 static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION pIrpSp)
 {
+	KdBreakPoint();
 	FS_INFORMATION_CLASS fsInformationClass = pIrpSp->Parameters.QueryVolume.FsInformationClass;
 	ULONG inputLength = pIrpSp->Parameters.QueryVolume.Length;
 	PVOID systemBuffer = pIrp->AssociatedIrp.SystemBuffer;
 	
-	NTSTATUS result = STATUS_SUCCESS;
+	NTSTATUS result = STATUS_INVALID_PARAMETER;
 	ULONG bytesWritten = 0;
 	
 	switch (fsInformationClass)
 	{
 		case FileFsVolumeInformation:
 		{
+			KdBreakPoint();
+			
 			PFILE_FS_VOLUME_INFORMATION pVolumeInfo = systemBuffer;
 			pVolumeInfo->VolumeCreationTime.QuadPart = 0;
 			pVolumeInfo->VolumeSerialNumber = 0x12345678;
-			pVolumeInfo->VolumeLabelLength = 0;
-			bytesWritten = 0;
+			pVolumeInfo->SupportsObjects = FALSE;
+
+			WCHAR volumeLabelBuffer[] = L"BLORGDRIVE";
+
+			ULONG stringBufferBytes = inputLength - FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
+
+			pVolumeInfo->VolumeLabelLength = sizeof(volumeLabelBuffer) - sizeof(WCHAR);
+
+			// Check if the buffer is large enough to hold the string
+			if (stringBufferBytes >= pVolumeInfo->VolumeLabelLength)
+			{
+				RtlCopyMemory(pVolumeInfo->VolumeLabel, volumeLabelBuffer, pVolumeInfo->VolumeLabelLength);
+			}
+			else
+			{
+				bytesWritten = 0;
+				result = STATUS_BUFFER_OVERFLOW;
+				break;
+			}
+			
+			bytesWritten = FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel) + pVolumeInfo->VolumeLabelLength;
 			result = STATUS_SUCCESS;
 			break;
 		}
 		case FileFsSizeInformation:
 		{
+			KdBreakPoint();
+			
 			PFILE_FS_SIZE_INFORMATION pSizeInfo = systemBuffer;
 			pSizeInfo->TotalAllocationUnits.QuadPart = 0;
 			pSizeInfo->AvailableAllocationUnits.QuadPart = 0;
 			pSizeInfo->SectorsPerAllocationUnit = 0;
 			pSizeInfo->BytesPerSector = 0;
-			bytesWritten = 0;
+			
+			bytesWritten = sizeof(FILE_FS_SIZE_INFORMATION);
 			result = STATUS_SUCCESS;
 			break;
 		}
 		case FileFsDeviceInformation:
 		{
+			KdBreakPoint();
+			
 			PFILE_FS_DEVICE_INFORMATION pDeviceInfo = systemBuffer;
 			pDeviceInfo->DeviceType = global.pDiskDeviceObject->DeviceType;
 			pDeviceInfo->Characteristics = global.pDiskDeviceObject->Characteristics;
 			
-			bytesWritten = 0;
+			bytesWritten = sizeof(FILE_FS_SIZE_INFORMATION);
 			result = STATUS_SUCCESS;
 			break;
 		}
@@ -55,12 +82,12 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION 
 			
 			WCHAR fileSystemNameBuffer[] = L"BLORGFS";
 
-			int stringBufferBytes = inputLength - FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
+			ULONG stringBufferBytes = inputLength - FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
 
 			pAttributeInfo->FileSystemNameLength = sizeof(fileSystemNameBuffer) - sizeof(WCHAR);
 
 			// Check if the buffer is large enough to hold the string
-			if (stringBufferBytes >= sizeof(fileSystemNameBuffer))
+			if (stringBufferBytes >= pAttributeInfo->FileSystemNameLength)
 			{
 				RtlCopyMemory(pAttributeInfo->FileSystemName, fileSystemNameBuffer, pAttributeInfo->FileSystemNameLength);
 			}
@@ -75,11 +102,48 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION 
 			result = STATUS_SUCCESS;
 			break;
 		}
+		case FileFsFullSizeInformation:
+		{
+			KdBreakPoint();
+
+			PFILE_FS_FULL_SIZE_INFORMATION pFullSizeInfo = systemBuffer;
+			pFullSizeInfo->TotalAllocationUnits.QuadPart = 0;
+			pFullSizeInfo->CallerAvailableAllocationUnits.QuadPart = 0;
+			pFullSizeInfo->ActualAvailableAllocationUnits.QuadPart = 0;
+			pFullSizeInfo->SectorsPerAllocationUnit = 0;
+			pFullSizeInfo->BytesPerSector = 0;
+
+			bytesWritten = sizeof(FILE_FS_FULL_SIZE_INFORMATION);
+			result = STATUS_SUCCESS;
+			break;
+		}
+		case FileFsFullSizeInformationEx:
+		{
+			KdBreakPoint();
+
+			PFILE_FS_FULL_SIZE_INFORMATION_EX pFullSizeInfoEx = systemBuffer;
+			pFullSizeInfoEx->ActualTotalAllocationUnits = 0;
+			pFullSizeInfoEx->ActualAvailableAllocationUnits = 0;
+			pFullSizeInfoEx->ActualPoolUnavailableAllocationUnits = 0;
+			pFullSizeInfoEx->CallerTotalAllocationUnits = 0;
+			pFullSizeInfoEx->CallerAvailableAllocationUnits = 0;
+			pFullSizeInfoEx->CallerPoolUnavailableAllocationUnits = 0;
+			pFullSizeInfoEx->UsedAllocationUnits = 0;
+			pFullSizeInfoEx->TotalReservedAllocationUnits = 0;
+			pFullSizeInfoEx->VolumeStorageReserveAllocationUnits = 0;
+			pFullSizeInfoEx->AvailableCommittedAllocationUnits = 0;
+			pFullSizeInfoEx->PoolAvailableAllocationUnits = 0;
+			pFullSizeInfoEx->SectorsPerAllocationUnit = 0;
+			pFullSizeInfoEx->BytesPerSector = 0;
+
+			bytesWritten = sizeof(FILE_FS_FULL_SIZE_INFORMATION_EX);
+			result = STATUS_SUCCESS;
+			break;
+		}
 		default:
 		{
-			bytesWritten = 0;
+			BLORGFS_PRINT("BlorgVolumeQueryVolumeInformation: FsInformationClass=%d\n", fsInformationClass);
 			result = STATUS_INVALID_PARAMETER;
-			break;
 		}
 	}
 
