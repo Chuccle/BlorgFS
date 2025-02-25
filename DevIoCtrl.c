@@ -1,6 +1,6 @@
 #include "Driver.h"
 
-NTSTATUS BlorgSetEa(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgDeviceControl(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
 {
     UNREFERENCED_PARAMETER(pDeviceObject);
 
@@ -11,12 +11,12 @@ NTSTATUS BlorgSetEa(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
     {
         case BLORGFS_VDO_MAGIC:
         {
-            // result = BlorgVolumeSetEa(pIrp, pIrpSp);
+            // result = BlorgVolumeDeviceControl(pIrpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskSetEa(pIrp);
+            // result = BlorgDiskDeviceControl(pIrp);
             break;
         }
     }

@@ -59,6 +59,8 @@ static NTSTATUS BlorgVolumeFileSystemControl(PIRP pIrp, PIO_STACK_LOCATION pIrpS
 {
 	PDEVICE_OBJECT pTargetDeviceObject = NULL;
 	NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+    KdBreakPoint();
+
 
     switch (pIrpSp->MinorFunction) 
     {
@@ -73,18 +75,16 @@ static NTSTATUS BlorgVolumeFileSystemControl(PIRP pIrp, PIO_STACK_LOCATION pIrpS
 			pTargetDeviceObject = pIrpSp->Parameters.MountVolume.DeviceObject;
 			if (pTargetDeviceObject && GetDeviceExtensionMagic(pTargetDeviceObject) == BLORGFS_DDO_MAGIC)
 			{
-                KdBreakPoint();
                 PVPB pVpb = pIrpSp->Parameters.MountVolume.Vpb;
                 KIRQL Irql;
-                /*
-                 * We will increment the VPB's ReferenceCount so that we can do a delayed delete
-                 * of the volume device later on.
-                 */
+
                 IoAcquireVpbSpinLock(&Irql);
                 pVpb->DeviceObject = global.pVolumeDeviceObject;
+				pVpb->VolumeLabelLength = 0;
+				SetFlag(pVpb->Flags, VPB_MOUNTED);
                 IoReleaseVpbSpinLock(Irql);
 
-                // Apparently this needs to be cleaned up by us
+				// Apparently this needs to be cleaned up by us
                 ObDereferenceObject(pTargetDeviceObject);
 
 				pIrp->IoStatus.Information = 0;

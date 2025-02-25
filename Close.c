@@ -8,10 +8,10 @@ static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION pIrpSp)
 
     PFILE_OBJECT pFileObject = pIrpSp->FileObject;
 
-	switch GetNodeType(pFileObject->FsContext)
+	switch GET_NODE_TYPE(pFileObject->FsContext)
 	{
 		case BLORGFS_ROOT_DIRECTORY_NODE_SIGNATURE:
-		{
+		{		
 			result = STATUS_SUCCESS;
 			break;
 		}
@@ -39,7 +39,6 @@ static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION pIrpSp)
 
     return result;
 }
-
 
 NTSTATUS BlorgClose(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
 {

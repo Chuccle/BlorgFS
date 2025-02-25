@@ -4,6 +4,8 @@
 #include <ntstrsafe.h>
 #include <wdmsec.h>
 
+#include "Structs.h"
+
 #define BLORGFS_VDO_STRING  L"\\Device\\BlorgFS"
 #define BLORGFS_VDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
 #define BLORGFS_VDO_MAGIC   0xDEAD5609
@@ -13,94 +15,7 @@
 #define BLORGFS_DDO_MAGIC  0xD4ADBAA5
 #define BLORGFS_DOS_DRIVELETTER_FORMAT_STRING L"\\DosDevices\\%C:"
 
-// 0x8000 - 0xBFFF  reserved for 3rd party file systems
-#define BLORGFS_FILE_NODE_SIGNATURE 0x8008
-#define BLORGFS_DIRECTORY_NODE_SIGNATURE 0xB00B
-#define BLORGFS_ROOT_DIRECTORY_NODE_SIGNATURE 0xBEEF
-#define BLORGFS_VOLUME_NODE_SIGNATURE 0xB055
-
-#define GetNodeType(Nodeptr) (*((USHORT*)(Nodeptr)))
-
-typedef struct _NON_PAGED_FCB 
-{
-    //
-    //  The following field contains a record of special pointers used by
-    //  MM and Cache to manipluate section objects.  Note that the values
-    //  are set outside of the file system.  However the file system on an
-    //  open/create will set the file object's SectionObject field to point
-    //  to this field
-    //
-
-    SECTION_OBJECT_POINTERS SectionObjectPointers;
-
-    FAST_MUTEX HeaderFastMutex;
-
-} NON_PAGED_FCB, * PNON_PAGED_FCB;
-
-typedef struct _FCB 
-{
-    FSRTL_ADVANCED_FCB_HEADER Header;
-    PNON_PAGED_FCB NonPaged;
-
-    PFILE_OBJECT FileObject;
-
-    LIST_ENTRY FcbLinks;
-    KGUARDED_MUTEX  Lock;
-
-    UNICODE_STRING  Name;
-
-    PDEVICE_OBJECT VolumeDeviceObject;
-
-    struct _DCB* ParentDcb;
-
-    LONG64 RefCount;
-
-    SHARE_ACCESS ShareAccess;
-
-} FCB, * PFCB;
-
-typedef struct _DCB
-{
-#pragma warning(suppress: 4201)
-    FCB  DUMMYSTRUCTNAME;
-    
-    LIST_ENTRY ListHead;
-    KGUARDED_MUTEX  ListLock;
-
-
-} DCB, * PDCB;
-
-typedef struct _BLORGFS_DEVICE_EXTENSION_HDR
-{
-    UINT64 Identifier;
-} BLORGFS_DEVICE_EXTENSION_HDR, * PBLORGFS_DEVICE_EXTENSION_HDR;
-
-typedef struct _BLORGFS_VDO_DEVICE_EXTENSION
-{
-    BLORGFS_DEVICE_EXTENSION_HDR Hdr;
-    PDCB RootDcb;
-} BLORGFS_VDO_DEVICE_EXTENSION, * PBLORGFS_VDO_DEVICE_EXTENSION;
-
-typedef struct _BLORGFS_DDO_DEVICE_EXTENSION
-{
-    BLORGFS_DEVICE_EXTENSION_HDR Hdr;
-    UNICODE_STRING SymLinkName;
-} BLORGFS_DDO_DEVICE_EXTENSION, * PBLORGFS_DDO_DEVICE_EXTENSION;
-
-static inline PBLORGFS_VDO_DEVICE_EXTENSION GetVolumeDeviceExtension(PDEVICE_OBJECT pDeviceObject)
-{
-    return pDeviceObject->DeviceExtension;
-}
-
-static inline PBLORGFS_DDO_DEVICE_EXTENSION GetDiskDeviceExtension(PDEVICE_OBJECT pDeviceObject)
-{
-    return pDeviceObject->DeviceExtension;
-}
-
-static inline ULONG64 GetDeviceExtensionMagic(PDEVICE_OBJECT pDeviceObject)
-{
-    return ((PBLORGFS_DEVICE_EXTENSION_HDR)pDeviceObject->DeviceExtension)->Identifier;
-}
+#ifdef DBG
 
 #define BLORGFS_PRINT(...)                                                     \
 do                                                                             \
@@ -111,26 +26,44 @@ do                                                                             \
 #define BLORGFS_VERIFY(expr) \
 do                           \
 {                            \
+    ASSERT(expr);            \
+} while (0)
+
+#else
+
+#define BLORGFS_PRINT(...) __noop
+
+
+#define BLORGFS_VERIFY(expr) \
+do                           \
+{                            \
     (void) (expr);           \
 } while (0)
 
-#include "Cleanup.h"
-#include "Close.h"
-#include "Create.h"
-#include "DirCtrl.h"
-#include "FlushBuffers.h"
-#include "FsCtrl.h"
-#include "LockCtrl.h"
-#include "QueryEa.h"
-#include "QueryInfo.h"
-#include "QuerySecurity.h"
-#include "QueryVolumeInfo.h"
-#include "Read.h"
-#include "SetEa.h"
-#include "SetInfo.h"
-#include "SetSecurity.h"
-#include "SetVolumeInfo.h"
-#include "Write.h"
+#endif
+
+_Dispatch_type_(IRP_MJ_CREATE)                   DRIVER_DISPATCH BlorgCreate;
+
+_Dispatch_type_(IRP_MJ_CLOSE)                    DRIVER_DISPATCH BlorgClose;
+_Dispatch_type_(IRP_MJ_READ)                     DRIVER_DISPATCH BlorgRead;
+_Dispatch_type_(IRP_MJ_WRITE)                    DRIVER_DISPATCH BlorgWrite;
+_Dispatch_type_(IRP_MJ_QUERY_INFORMATION)        DRIVER_DISPATCH BlorgQueryInformation;
+_Dispatch_type_(IRP_MJ_SET_INFORMATION)          DRIVER_DISPATCH BlorgSetInformation;
+_Dispatch_type_(IRP_MJ_QUERY_EA)                 DRIVER_DISPATCH BlorgQueryEa;
+_Dispatch_type_(IRP_MJ_SET_EA)                   DRIVER_DISPATCH BlorgSetEa;
+_Dispatch_type_(IRP_MJ_FLUSH_BUFFERS)            DRIVER_DISPATCH BlorgFlushBuffers;
+_Dispatch_type_(IRP_MJ_QUERY_VOLUME_INFORMATION) DRIVER_DISPATCH BlorgQueryVolumeInformation;
+_Dispatch_type_(IRP_MJ_SET_VOLUME_INFORMATION)   DRIVER_DISPATCH BlorgSetVolumeInformation;
+_Dispatch_type_(IRP_MJ_DIRECTORY_CONTROL)        DRIVER_DISPATCH BlorgDirectoryControl;
+_Dispatch_type_(IRP_MJ_FILE_SYSTEM_CONTROL)      DRIVER_DISPATCH BlorgFileSystemControl;
+_Dispatch_type_(IRP_MJ_DEVICE_CONTROL)           DRIVER_DISPATCH BlorgDeviceControl;
+
+_Dispatch_type_(IRP_MJ_SHUTDOWN)                 DRIVER_DISPATCH BlorgShutdown;
+_Dispatch_type_(IRP_MJ_LOCK_CONTROL)             DRIVER_DISPATCH BlorgLockControl;
+_Dispatch_type_(IRP_MJ_CLEANUP)                  DRIVER_DISPATCH BlorgCleanup;
+
+_Dispatch_type_(IRP_MJ_QUERY_SECURITY)           DRIVER_DISPATCH BlorgQuerySecurity;
+_Dispatch_type_(IRP_MJ_SET_SECURITY)             DRIVER_DISPATCH BlorgSetSecurity;
 
 extern struct GLOBAL 
 {

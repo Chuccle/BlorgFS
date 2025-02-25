@@ -9,7 +9,6 @@ static const GUID BLORGFS_VDO_GUID = { 0xa6e07401, 0xf24e, 0x443e, { 0xa4, 0x7c,
 // {CC6E9F4D-1968-4D95-91AF-FFD72F35F6DA}
 static const GUID BLORGFS_DDO_GUID = { 0xcc6e9f4d, 0x1968, 0x4d95, { 0x91, 0xaf, 0xff, 0xd7, 0x2f, 0x35, 0xf6, 0xda } };
 
-
 static NTSTATUS CreateBlorgDiskDevice(PDRIVER_OBJECT pDriverObject)
 {
 	BLORGFS_PRINT("Entering Drive Creation\n");
@@ -97,7 +96,7 @@ static NTSTATUS CreateBlorgVolumeDevice(PDRIVER_OBJECT pDriverObject)
     
     UNICODE_STRING rootDirectoryName = RTL_CONSTANT_STRING(L"\\");
 
-    result = BlorgDCBCreate(&pDevExt->RootDcb, NULL, BLORGFS_ROOT_DIRECTORY_NODE_SIGNATURE, &rootDirectoryName);
+    result = BlorgCreateDCB(&pDevExt->RootDcb, NULL, BLORGFS_ROOT_DIRECTORY_NODE_SIGNATURE, &rootDirectoryName);
     if (!NT_SUCCESS(result))
     {
         IoDeleteDevice(global.pVolumeDeviceObject);
@@ -150,7 +149,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegistryPath
     pDriverObject->MajorFunction[IRP_MJ_SET_VOLUME_INFORMATION] = BlorgSetVolumeInformation;
     pDriverObject->MajorFunction[IRP_MJ_DIRECTORY_CONTROL] = BlorgDirectoryControl;
     pDriverObject->MajorFunction[IRP_MJ_FILE_SYSTEM_CONTROL] = BlorgFileSystemControl;
-    //pDriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = 
+    pDriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = BlorgDeviceControl;
+    pDriverObject->MajorFunction[IRP_MJ_SHUTDOWN] = BlorgShutdown;
     pDriverObject->MajorFunction[IRP_MJ_LOCK_CONTROL] = BlorgLockControl;
     pDriverObject->MajorFunction[IRP_MJ_CLEANUP] = BlorgCleanup;
     pDriverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = BlorgQuerySecurity;

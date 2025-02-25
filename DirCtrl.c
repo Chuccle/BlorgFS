@@ -2,7 +2,8 @@
 
 static NTSTATUS BlorgVolumeDirectoryControl(PIRP pIrp, PIO_STACK_LOCATION pIrpSp)
 {
-	NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+    KdBreakPoint();
+    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (pIrpSp->MinorFunction)
     {

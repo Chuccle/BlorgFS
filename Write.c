@@ -2,6 +2,7 @@
 
 NTSTATUS BlorgWrite(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
 {
+    KdBreakPoint();
     UNREFERENCED_PARAMETER(pDeviceObject);
 
     // PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);

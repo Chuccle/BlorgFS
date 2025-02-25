@@ -88,6 +88,7 @@
     </DriverSign>
     <ClCompile>
       <SDLCheck>true</SDLCheck>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
     </ClCompile>
     <Link>
       <AdditionalDependencies>Wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -103,6 +104,7 @@
       <EnableFiberSafeOptimizations>true</EnableFiberSafeOptimizations>
       <OmitFramePointers>true</OmitFramePointers>
       <IntrinsicFunctions>true</IntrinsicFunctions>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
     </ClCompile>
     <Link>
       <AdditionalDependencies>Wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -115,41 +117,24 @@
     <ClCompile Include="Cleanup.c" />
     <ClCompile Include="Close.c" />
     <ClCompile Include="Create.c" />
+    <ClCompile Include="DevIoCtrl.c" />
     <ClCompile Include="DirCtrl.c" />
     <ClCompile Include="Driver.c" />
     <ClCompile Include="FlushBuffers.c" />
     <ClCompile Include="FsCtrl.c" />
+    <ClCompile Include="Shutdown.c" />
+    <ClCompile Include="Structs.c" />
     <ClCompile Include="LockCtrl.c" />
-    <ClCompile Include="QueryEa.c" />
-    <ClCompile Include="QueryInfo.c" />
-    <ClCompile Include="QuerySecurity.c" />
-    <ClCompile Include="QueryVolumeInfo.c" />
+    <ClCompile Include="Ea.c" />
+    <ClCompile Include="FileInfo.c" />
+    <ClCompile Include="Security.c" />
+    <ClCompile Include="VolumeInfo.c" />
     <ClCompile Include="Read.c" />
-    <ClCompile Include="SetEa.c" />
-    <ClCompile Include="SetInfo.c" />
-    <ClCompile Include="SetSecurity.c" />
-    <ClCompile Include="SetVolumeInfo.c" />
     <ClCompile Include="Write.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Cleanup.h" />
-    <ClInclude Include="Close.h" />
-    <ClInclude Include="Create.h" />
-    <ClInclude Include="DirCtrl.h" />
     <ClInclude Include="Driver.h" />
-    <ClInclude Include="FlushBuffers.h" />
-    <ClInclude Include="FsCtrl.h" />
-    <ClInclude Include="LockCtrl.h" />
-    <ClInclude Include="QueryEa.h" />
-    <ClInclude Include="QueryInfo.h" />
-    <ClInclude Include="QuerySecurity.h" />
-    <ClInclude Include="QueryVolumeInfo.h" />
-    <ClInclude Include="Read.h" />
-    <ClInclude Include="SetEa.h" />
-    <ClInclude Include="SetInfo.h" />
-    <ClInclude Include="SetSecurity.h" />
-    <ClInclude Include="SetVolumeInfo.h" />
-    <ClInclude Include="Write.h" />
+    <ClInclude Include="Structs.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

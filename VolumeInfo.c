@@ -15,7 +15,13 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION 
 		case FileFsVolumeInformation:
 		{
 			KdBreakPoint();
-			
+
+			if (inputLength < sizeof(FILE_FS_VOLUME_INFORMATION))
+			{
+				result = STATUS_BUFFER_TOO_SMALL;
+				break;
+			}
+
 			PFILE_FS_VOLUME_INFORMATION pVolumeInfo = systemBuffer;
 			pVolumeInfo->VolumeCreationTime.QuadPart = 0;
 			pVolumeInfo->VolumeSerialNumber = 0x12345678;
@@ -23,12 +29,10 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION 
 
 			WCHAR volumeLabelBuffer[] = L"BLORGDRIVE";
 
-			ULONG stringBufferBytes = inputLength - FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
-
 			pVolumeInfo->VolumeLabelLength = sizeof(volumeLabelBuffer) - sizeof(WCHAR);
 
 			// Check if the buffer is large enough to hold the string
-			if (stringBufferBytes >= pVolumeInfo->VolumeLabelLength)
+			if (inputLength - FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel) >= pVolumeInfo->VolumeLabelLength)
 			{
 				RtlCopyMemory(pVolumeInfo->VolumeLabel, volumeLabelBuffer, pVolumeInfo->VolumeLabelLength);
 			}
@@ -46,6 +50,12 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION 
 		case FileFsSizeInformation:
 		{
 			KdBreakPoint();
+
+			if (inputLength < sizeof(FILE_FS_SIZE_INFORMATION))
+			{
+				result = STATUS_BUFFER_TOO_SMALL;
+				break;
+			}
 			
 			PFILE_FS_SIZE_INFORMATION pSizeInfo = systemBuffer;
 			pSizeInfo->TotalAllocationUnits.QuadPart = 0;
@@ -60,18 +70,30 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION 
 		case FileFsDeviceInformation:
 		{
 			KdBreakPoint();
+
+			if (inputLength < sizeof(FILE_FS_DEVICE_INFORMATION))
+			{
+				result = STATUS_BUFFER_TOO_SMALL;
+				break;
+			}
 			
 			PFILE_FS_DEVICE_INFORMATION pDeviceInfo = systemBuffer;
 			pDeviceInfo->DeviceType = global.pDiskDeviceObject->DeviceType;
 			pDeviceInfo->Characteristics = global.pDiskDeviceObject->Characteristics;
 			
-			bytesWritten = sizeof(FILE_FS_SIZE_INFORMATION);
+			bytesWritten = sizeof(FILE_FS_DEVICE_INFORMATION);
 			result = STATUS_SUCCESS;
 			break;
 		}
 		case FileFsAttributeInformation:
 		{
 			KdBreakPoint();
+
+			if (inputLength < sizeof(FILE_FS_ATTRIBUTE_INFORMATION))
+			{
+				result = STATUS_BUFFER_TOO_SMALL;
+				break;
+			}
 
 			PFILE_FS_ATTRIBUTE_INFORMATION pAttributeInfo = systemBuffer;
 			pAttributeInfo->FileSystemAttributes = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK;
@@ -82,12 +104,10 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION 
 			
 			WCHAR fileSystemNameBuffer[] = L"BLORGFS";
 
-			ULONG stringBufferBytes = inputLength - FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
-
 			pAttributeInfo->FileSystemNameLength = sizeof(fileSystemNameBuffer) - sizeof(WCHAR);
 
 			// Check if the buffer is large enough to hold the string
-			if (stringBufferBytes >= pAttributeInfo->FileSystemNameLength)
+			if (inputLength - FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) >= pAttributeInfo->FileSystemNameLength)
 			{
 				RtlCopyMemory(pAttributeInfo->FileSystemName, fileSystemNameBuffer, pAttributeInfo->FileSystemNameLength);
 			}
@@ -106,6 +126,12 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION 
 		{
 			KdBreakPoint();
 
+			if (inputLength < sizeof(FILE_FS_FULL_SIZE_INFORMATION))
+			{
+				result = STATUS_BUFFER_TOO_SMALL;
+				break;
+			}
+
 			PFILE_FS_FULL_SIZE_INFORMATION pFullSizeInfo = systemBuffer;
 			pFullSizeInfo->TotalAllocationUnits.QuadPart = 0;
 			pFullSizeInfo->CallerAvailableAllocationUnits.QuadPart = 0;
@@ -120,6 +146,12 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP pIrp, PIO_STACK_LOCATION 
 		case FileFsFullSizeInformationEx:
 		{
 			KdBreakPoint();
+
+			if (inputLength < sizeof(FILE_FS_FULL_SIZE_INFORMATION_EX))
+			{
+				result = STATUS_BUFFER_TOO_SMALL;
+				break;
+			}
 
 			PFILE_FS_FULL_SIZE_INFORMATION_EX pFullSizeInfoEx = systemBuffer;
 			pFullSizeInfoEx->ActualTotalAllocationUnits = 0;
@@ -170,6 +202,33 @@ NTSTATUS BlorgQueryVolumeInformation(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
 			// result = BlorgDiskFlushBuffers(pIrp);
 			break;
 		}
+	}
+
+	pIrp->IoStatus.Status = result;
+
+	IoCompleteRequest(pIrp, IO_NO_INCREMENT);
+	return pIrp->IoStatus.Status;
+}
+
+NTSTATUS BlorgSetVolumeInformation(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+{
+	UNREFERENCED_PARAMETER(pDeviceObject);
+
+	// PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
+	NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+
+	switch (GetDeviceExtensionMagic(pDeviceObject))
+	{
+	case BLORGFS_VDO_MAGIC:
+	{
+		// result = BlorgVolumeSetVolumeInformation(pIrp, pIrpSp);
+		break;
+	}
+	case BLORGFS_DDO_MAGIC:
+	{
+		// result = BlorgDiskSetVolumeInformation(pIrp);
+		break;
+	}
 	}
 
 	pIrp->IoStatus.Status = result;

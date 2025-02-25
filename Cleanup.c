@@ -8,19 +8,13 @@ static NTSTATUS BlorgVolumeCleanup(PIO_STACK_LOCATION pIrpSp)
 
 	PFILE_OBJECT pFileObject = pIrpSp->FileObject;
 
-	switch GetNodeType(pFileObject->FsContext)
+	switch GET_NODE_TYPE(pFileObject->FsContext)
 	{
 		case BLORGFS_ROOT_DIRECTORY_NODE_SIGNATURE:
 		{
 			PDCB pRootDcb = pFileObject->FsContext;
 
-			KeAcquireGuardedMutex(&pRootDcb->Lock);
-
-			pRootDcb->RefCount -= 1;
-
-			ASSERT(pRootDcb->RefCount >= 1);
-
-			KeReleaseGuardedMutex(&pRootDcb->Lock);
+			InterlockedDecrement64(&pRootDcb->RefCount);
 
 			result = STATUS_SUCCESS;
 			break;
@@ -39,13 +33,7 @@ static NTSTATUS BlorgVolumeCleanup(PIO_STACK_LOCATION pIrpSp)
 		{
 			PDCB pRootDcb = pFileObject->FsContext;
 
-			KeAcquireGuardedMutex(&pRootDcb->Lock);
-
-			pRootDcb->RefCount -= 1;
-
-			ASSERT(pRootDcb->RefCount >= 1);
-
-			KeReleaseGuardedMutex(&pRootDcb->Lock);
+			InterlockedDecrement64(&pRootDcb->RefCount);
 
 			result = STATUS_SUCCESS;
 			break;

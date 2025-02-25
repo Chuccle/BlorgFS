@@ -1,6 +1,6 @@
 #include "Driver.h"
 
-NTSTATUS BlorgSetInformation(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgShutdown(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
 {
     UNREFERENCED_PARAMETER(pDeviceObject);
 
@@ -11,12 +11,12 @@ NTSTATUS BlorgSetInformation(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
     {
         case BLORGFS_VDO_MAGIC:
         {
-            // result = BlorgVolumeSetInformation(pIrp, pIrpSp);
+            // result = BlorgVolumeShutdown(pIrpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskSetInformation(pIrp);
+            // result = BlorgDiskShutdown(pIrp);
             break;
         }
     }

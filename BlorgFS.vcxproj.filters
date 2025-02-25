@@ -34,25 +34,16 @@
     <ClCompile Include="Write.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="QueryInfo.c">
+    <ClCompile Include="FileInfo.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="SetInfo.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="QueryEa.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="SetEa.c">
+    <ClCompile Include="Ea.c">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="FlushBuffers.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="QueryVolumeInfo.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="SetVolumeInfo.c">
+    <ClCompile Include="VolumeInfo.c">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="DirCtrl.c">
@@ -67,10 +58,16 @@
     <ClCompile Include="Cleanup.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="QuerySecurity.c">
+    <ClCompile Include="Security.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="SetSecurity.c">
+    <ClCompile Include="Structs.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DevIoCtrl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Shutdown.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -78,55 +75,7 @@
     <ClInclude Include="Driver.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="Create.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="Cleanup.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="Close.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="DirCtrl.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="FlushBuffers.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="FsCtrl.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="LockCtrl.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="QueryEa.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="QueryInfo.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="QuerySecurity.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="QueryVolumeInfo.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="Read.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="SetEa.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="SetInfo.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="SetSecurity.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="SetVolumeInfo.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="Write.h">
+    <ClInclude Include="Structs.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
