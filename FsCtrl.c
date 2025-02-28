@@ -1,15 +1,15 @@
 #include "Driver.h"
 
-static inline void HandleUserFSRequest(ULONG ulFsCtrlCode, PIRP pIrp, PIO_STACK_LOCATION pIrpSp) 
+static inline void HandleUserFSRequest(ULONG FsctlCode, PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
-    UNREFERENCED_PARAMETER(pIrpSp);
-    
-    switch (ulFsCtrlCode)
+    UNREFERENCED_PARAMETER(IrpSp);
+
+    switch (FsctlCode)
     {
         case FSCTL_IS_VOLUME_MOUNTED:
         {
-            pIrp->IoStatus.Information = 0;
-            pIrp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
+            Irp->IoStatus.Information = 0;
+            Irp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
             break;
         }
         case FSCTL_GET_REPARSE_POINT:
@@ -55,39 +55,51 @@ static inline void HandleUserFSRequest(ULONG ulFsCtrlCode, PIRP pIrp, PIO_STACK_
 }
 
 
-static NTSTATUS BlorgVolumeFileSystemControl(PIRP pIrp, PIO_STACK_LOCATION pIrpSp)
+static NTSTATUS BlorgVolumeFileSystemControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
-	PDEVICE_OBJECT pTargetDeviceObject = NULL;
-	NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
-    KdBreakPoint();
+    PDEVICE_OBJECT pTargetDeviceObject = NULL;
+    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
 
-    switch (pIrpSp->MinorFunction) 
+    switch (IrpSp->MinorFunction)
     {
         case IRP_MN_USER_FS_REQUEST:
         {
-            HandleUserFSRequest(pIrpSp->Parameters.FileSystemControl.FsControlCode, pIrp, pIrpSp);
+            HandleUserFSRequest(IrpSp->Parameters.FileSystemControl.FsControlCode, Irp, IrpSp);
             break;
         }
         case IRP_MN_MOUNT_VOLUME:
         {
             result = STATUS_UNRECOGNIZED_VOLUME;
-			pTargetDeviceObject = pIrpSp->Parameters.MountVolume.DeviceObject;
-			if (pTargetDeviceObject && GetDeviceExtensionMagic(pTargetDeviceObject) == BLORGFS_DDO_MAGIC)
-			{
-                PVPB pVpb = pIrpSp->Parameters.MountVolume.Vpb;
+            pTargetDeviceObject = IrpSp->Parameters.MountVolume.DeviceObject;
+
+            if (pTargetDeviceObject && GetDeviceExtensionMagic(pTargetDeviceObject) == BLORGFS_DDO_MAGIC)
+            {
+                KdBreakPoint();
+                PDEVICE_OBJECT pVolumeDeviceObject;
+                result = CreateBlorgVolumeDeviceObject(global.DriverObject, &pVolumeDeviceObject);
+
+                if (!NT_SUCCESS(result))
+                {
+                    return result;
+                }
+
+                ObReferenceObject(pVolumeDeviceObject);
+                GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject = pVolumeDeviceObject;
+
+                PVPB pVpb = IrpSp->Parameters.MountVolume.Vpb;
                 KIRQL Irql;
 
                 IoAcquireVpbSpinLock(&Irql);
-                pVpb->DeviceObject = global.pVolumeDeviceObject;
-				pVpb->VolumeLabelLength = 0;
-				SetFlag(pVpb->Flags, VPB_MOUNTED);
+                pVpb->DeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
+                pVpb->VolumeLabelLength = 0;
+                SetFlag(pVpb->Flags, VPB_MOUNTED);
                 IoReleaseVpbSpinLock(Irql);
 
-				// Apparently this needs to be cleaned up by us
+                // Apparently this needs to be cleaned up by us
                 ObDereferenceObject(pTargetDeviceObject);
 
-				pIrp->IoStatus.Information = 0;
+                Irp->IoStatus.Information = 0;
                 result = STATUS_SUCCESS;
 
             }
@@ -102,18 +114,17 @@ static NTSTATUS BlorgVolumeFileSystemControl(PIRP pIrp, PIO_STACK_LOCATION pIrpS
     return result;
 }
 
-NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(pDeviceObject);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
-    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
+    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(pDeviceObject))
+    switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            result = BlorgVolumeFileSystemControl(pIrp, pIrpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
@@ -121,10 +132,15 @@ NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
             // result = BlorgDiskSetVolumeInformation(pIrp);
             break;
         }
+        case BLORGFS_FSDO_MAGIC:
+        {
+            result = BlorgVolumeFileSystemControl(Irp, pIrpSp);
+            break;
+        }
     }
 
-    pIrp->IoStatus.Status = result;
+    Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return pIrp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Irp->IoStatus.Status;
 }

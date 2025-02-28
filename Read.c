@@ -1,28 +1,27 @@
 #include "Driver.h"
 
 
-static NTSTATUS BlorgVolumeRead(PIRP pIrp, PIO_STACK_LOCATION pIrpSp)
+static NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
-	UNREFERENCED_PARAMETER(pIrp);
-	UNREFERENCED_PARAMETER(pIrpSp);
-	KdBreakPoint();
+    UNREFERENCED_PARAMETER(Irp);
+    UNREFERENCED_PARAMETER(IrpSp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     return result;
 }
 
-NTSTATUS BlorgRead(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(pDeviceObject);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
-    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
+    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(pDeviceObject))
+    switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            result = BlorgVolumeRead(pIrp, pIrpSp);
+            result = BlorgVolumeRead(Irp, pIrpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
@@ -30,10 +29,14 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
             // result = BlorgDiskRead(pIrp);
             break;
         }
+        case BLORGFS_FSDO_MAGIC:
+        {
+            break;
+        }
     }
 
-    pIrp->IoStatus.Status = result;
+    Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return pIrp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Irp->IoStatus.Status;
 }

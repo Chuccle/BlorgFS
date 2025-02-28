@@ -1,66 +1,81 @@
 #include "Driver.h"
 
-NTSTATUS BlorgCreateFCB(FCB** ppFcb, PDCB parentDcb, CSHORT nodeType, PCUNICODE_STRING name)
+NTSTATUS BlorgCreateFCB(FCB** Fcb, PDCB ParentDcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVICE_OBJECT VolumeDeviceObject)
 {
-    *ppFcb = NULL;
+    *Fcb = NULL;
 
-    switch (nodeType)
+    PNON_PAGED_NODE pNonPaged = ExAllocateFromNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList);
+
+    if (!pNonPaged)
     {
-        case BLORGFS_DIRECTORY_NODE_SIGNATURE:
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+#pragma warning(suppress: 6386) // Prefast thinks this is an overrun?
+    RtlZeroMemory(pNonPaged, sizeof(NON_PAGED_NODE));
+
+    PFCB pFcb = ExAllocateFromPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList);
+
+    if (!pFcb)
+    {
+        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, pNonPaged);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(pFcb, sizeof(FCB));
+
+    if (Name)
+    {
+        PWCHAR nameBuffer = ExAllocatePoolZero(PagedPool, Name->Length, 'FCB');
+
+        if (!nameBuffer)
         {
-            return STATUS_INVALID_PARAMETER;
+            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, pFcb);
+            ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, pNonPaged);
+            return STATUS_INSUFFICIENT_RESOURCES;
         }
-        case BLORGFS_ROOT_DIRECTORY_NODE_SIGNATURE:
-        {
-            return STATUS_INVALID_PARAMETER;
-        }
-    }
 
-    PNON_PAGED_NODE pNonPaged = ExAllocatePoolZero(NonPagedPoolNx, sizeof(NON_PAGED_NODE), 'FCB');
-    if (NULL == pNonPaged)
-    {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+        RtlCopyMemory(nameBuffer, Name->Buffer, Name->Length);
 
-    PFCB pFcb = ExAllocatePoolZero(PagedPool, sizeof(FCB), 'FCB');
-    if (NULL == pFcb)
-    {
-        ExFreePool(pNonPaged);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    PWCHAR nameBuffer = ExAllocatePoolZero(PagedPool, name->Length, 'FCB');
-    if (NULL == nameBuffer)
-    {
-        ExFreePool(pFcb);
-        ExFreePool(pNonPaged);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    RtlCopyMemory(nameBuffer, name->Buffer, name->Length);
-
-    pFcb->Name.Buffer = nameBuffer;
-    pFcb->Name.Length = name->Length;
-    pFcb->Name.MaximumLength = name->Length;
-
-    pFcb->Header.AePushLock = FsRtlAllocateAePushLock(PagedPool, 'FCB');
-    if (NULL == pFcb->Header.AePushLock)
-    {
-        ExFreePool(pFcb->Name.Buffer);
-        ExFreePool(pFcb);
-        ExFreePool(pNonPaged);
-        return STATUS_INSUFFICIENT_RESOURCES;
+        pFcb->Name.Buffer = nameBuffer;
+        pFcb->Name.Length = Name->Length;
+        pFcb->Name.MaximumLength = Name->Length;
     }
 
     KeInitializeGuardedMutex(&pFcb->Lock);
-    ExInitializeResourceLite(&pNonPaged->HdrResource);
-    ExInitializeResourceLite(&pNonPaged->HdrPagingIoResource);
+
+    NTSTATUS result = ExInitializeResourceLite(&pNonPaged->HdrResource);
+
+    if (!NT_SUCCESS(result))
+    {
+        if (Name)
+        {
+            ExFreePool(pFcb->Name.Buffer);
+        }
+        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, pFcb);
+        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, pNonPaged);
+        return result;
+    }
+
+    result = ExInitializeResourceLite(&pNonPaged->HdrPagingIoResource);
+
+    if (!NT_SUCCESS(result))
+    {
+        ExDeleteResourceLite(&pNonPaged->HdrResource);
+        if (Name)
+        {
+            ExFreePool(pFcb->Name.Buffer);
+        }
+        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, pFcb);
+        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, pNonPaged);
+        return result;
+    }
+
     ExInitializeFastMutex(&pNonPaged->HdrFastMutex);
 
-#pragma warning(suppress: 4127)
-    FsRtlSetupAdvancedHeaderEx2(&pFcb->Header, &pNonPaged->HdrFastMutex, NULL, pFcb->Header.AePushLock);
+    FsRtlSetupAdvancedHeader(&pFcb->Header, &pNonPaged->HdrFastMutex);
 
-    pFcb->Header.NodeTypeCode = nodeType;
+    pFcb->Header.NodeTypeCode = NodeType;
     pFcb->Header.NodeByteSize = sizeof(FCB);
     pFcb->Header.IsFastIoPossible = FastIoIsQuestionable;
     pFcb->Header.ValidDataLength.QuadPart = MAXLONGLONG;
@@ -68,75 +83,81 @@ NTSTATUS BlorgCreateFCB(FCB** ppFcb, PDCB parentDcb, CSHORT nodeType, PCUNICODE_
     pFcb->Header.PagingIoResource = &pNonPaged->HdrPagingIoResource;
 
     pFcb->NonPaged = pNonPaged;
-    pFcb->VolumeDeviceObject = global.pVolumeDeviceObject;
-    pFcb->ParentDcb = parentDcb;
+    pFcb->VolumeDeviceObject = VolumeDeviceObject;
+    pFcb->ParentDcb = ParentDcb;
 
-    *ppFcb = pFcb;
+    *Fcb = pFcb;
 
     return STATUS_SUCCESS;
 }
 
-NTSTATUS BlorgCreateDCB(DCB** ppDcb, PDCB parentDcb, CSHORT nodeType, PCUNICODE_STRING name)
+NTSTATUS BlorgCreateDCB(DCB** Dcb, PDCB ParentDcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVICE_OBJECT VolumeDeviceObject)
 {
-    *ppDcb = NULL;
+    *Dcb = NULL;
 
-    switch (nodeType)
-    {
-        case BLORGFS_FILE_NODE_SIGNATURE:
-        {
-            return STATUS_INVALID_PARAMETER;
-        }
-        case BLORGFS_VOLUME_NODE_SIGNATURE:
-        {
-            return STATUS_INVALID_PARAMETER;
-        }
-    }
+    PNON_PAGED_NODE pNonPaged = ExAllocateFromNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList);
 
-    PNON_PAGED_NODE pNonPaged = ExAllocatePoolZero(NonPagedPoolNx, sizeof(NON_PAGED_NODE), 'DCB');
-    if (NULL == pNonPaged)
+    if (!pNonPaged)
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    PDCB pDcb = ExAllocatePoolZero(PagedPool, sizeof(DCB), 'DCB');
-    if (NULL == pDcb)
+#pragma warning(suppress: 6386) // Prefast thinks this is an overrun?
+    RtlZeroMemory(pNonPaged, sizeof(NON_PAGED_NODE));
+
+    PDCB pDcb = ExAllocateFromPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList);
+
+    if (!pDcb)
     {
-        ExFreePool(pNonPaged);
+        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, pNonPaged);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    PWCHAR nameBuffer = ExAllocatePoolZero(PagedPool, name->Length, 'DCB');
-    if (NULL == nameBuffer)
+    RtlZeroMemory(pDcb, sizeof(DCB));
+
+    PWCHAR nameBuffer = ExAllocatePoolUninitialized(PagedPool, Name->Length, 'DCB');
+
+    if (!nameBuffer)
     {
-        ExFreePool(pDcb);
-        ExFreePool(pNonPaged);
+        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, pDcb);
+        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, pNonPaged);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    RtlCopyMemory(nameBuffer, name->Buffer, name->Length);
+    RtlCopyMemory(nameBuffer, Name->Buffer, Name->Length);
 
     pDcb->Name.Buffer = nameBuffer;
-    pDcb->Name.Length = name->Length;
-    pDcb->Name.MaximumLength = name->Length;
-
-    pDcb->Header.AePushLock = FsRtlAllocateAePushLock(PagedPool, 'DCB');
-    if (NULL == pDcb->Header.AePushLock)
-    {
-        ExFreePool(pDcb->Name.Buffer);
-        ExFreePool(pDcb);
-        ExFreePool(pNonPaged);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    pDcb->Name.Length = Name->Length;
+    pDcb->Name.MaximumLength = Name->Length;
 
     KeInitializeGuardedMutex(&pDcb->Lock);
-    ExInitializeResourceLite(&pNonPaged->HdrResource);
-    ExInitializeResourceLite(&pNonPaged->HdrPagingIoResource);
+
+    NTSTATUS result = ExInitializeResourceLite(&pNonPaged->HdrResource);
+
+    if (!NT_SUCCESS(result))
+    {
+        ExFreePool(pDcb->Name.Buffer);
+        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, pDcb);
+        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, pNonPaged);
+        return result;
+    }
+
+    result = ExInitializeResourceLite(&pNonPaged->HdrPagingIoResource);
+
+    if (!NT_SUCCESS(result))
+    {
+        ExDeleteResourceLite(&pNonPaged->HdrResource);
+        ExFreePool(pDcb->Name.Buffer);
+        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, pDcb);
+        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, pNonPaged);
+        return result;
+    }
+
     ExInitializeFastMutex(&pNonPaged->HdrFastMutex);
 
-#pragma warning(suppress: 4127)
-    FsRtlSetupAdvancedHeaderEx2(&pDcb->Header, &pNonPaged->HdrFastMutex, NULL, pDcb->Header.AePushLock);
+    FsRtlSetupAdvancedHeader(&pDcb->Header, &pNonPaged->HdrFastMutex);
 
-    pDcb->Header.NodeTypeCode = nodeType;
+    pDcb->Header.NodeTypeCode = NodeType;
     pDcb->Header.NodeByteSize = sizeof(DCB);
     pDcb->Header.IsFastIoPossible = FastIoIsQuestionable;
     pDcb->Header.ValidDataLength.QuadPart = MAXLONGLONG;
@@ -144,43 +165,77 @@ NTSTATUS BlorgCreateDCB(DCB** ppDcb, PDCB parentDcb, CSHORT nodeType, PCUNICODE_
     pDcb->Header.PagingIoResource = &pNonPaged->HdrPagingIoResource;
 
     pDcb->NonPaged = pNonPaged;
-    pDcb->VolumeDeviceObject = global.pVolumeDeviceObject;
-    pDcb->ParentDcb = parentDcb;
+    pDcb->VolumeDeviceObject = VolumeDeviceObject;
+    pDcb->ParentDcb = ParentDcb;
 
-    *ppDcb = pDcb;
+    *Dcb = pDcb;
 
     return STATUS_SUCCESS;
 }
 
-#define DEALLOCATE_FILENODE_COMMON(node)                                  \
-do                                                                        \
-{                                                                         \
-    PCOMMON_CONTEXT pCommonContext = node;                                \
-    ExFreePool(pCommonContext->Name.Buffer);                              \
-                                                                          \
-    ExDeleteResourceLite(&pCommonContext->NonPaged->HdrPagingIoResource); \
-    ExDeleteResourceLite(&pCommonContext->NonPaged->HdrResource);         \
-    ExFreePool(pCommonContext->NonPaged);                                 \
-                                                                          \
-    FsRtlFreeAePushLock(pCommonContext->Header.AePushLock);               \
-                                                                          \
-    ExFreePool(pCommonContext);                                           \
+NTSTATUS BlorgCreateCCB(CCB** Ccb, PDEVICE_OBJECT VolumeDeviceObject)
+{
+    *Ccb = NULL;
+
+    PCCB pCcb = ExAllocateFromPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->CcbLookasideList);
+
+    if (!pCcb)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    pCcb->NodeTypeCode = BLORGFS_CCB_SIGNATURE;
+    pCcb->NodeByteSize = sizeof(CCB);
+    pCcb->SearchPattern.Buffer = NULL;
+
+    *Ccb = pCcb;
+
+    return STATUS_SUCCESS;
+}
+
+#define DEALLOCATE_COMMON(ctx)                                                                                                        \
+do                                                                                                                                    \
+{                                                                                                                                     \
+    PCOMMON_CONTEXT pCommonContext = ctx;                                                                                             \
+    ExFreePool(pCommonContext->Name.Buffer);                                                                                          \
+    ExDeleteResourceLite(&pCommonContext->NonPaged->HdrPagingIoResource);                                                             \
+    ExDeleteResourceLite(&pCommonContext->NonPaged->HdrResource);                                                                     \
+	PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;             \
+    ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(pVolumeDeviceObject)->NonPagedNodeLookasideList, pCommonContext->NonPaged); \
 } while(0)
 
-void BlorgFreeFileContext(PVOID pContext) 
+void BlorgFreeFileContext(PVOID Context)
 {
-    switch (GET_NODE_TYPE(pContext))
+    switch (GET_NODE_TYPE(Context))
     {
-        case BLORGFS_FILE_NODE_SIGNATURE:
+        case BLORGFS_VCB_SIGNATURE:
+        case BLORGFS_FCB_SIGNATURE:
         {
-            DEALLOCATE_FILENODE_COMMON(pContext);
+            DEALLOCATE_COMMON(Context);
+            PFCB pFcb = Context;
+            PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
+            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(pVolumeDeviceObject)->FcbLookasideList, pFcb);
             break;
         }
-        case BLORGFS_DIRECTORY_NODE_SIGNATURE:
-        case BLORGFS_VOLUME_NODE_SIGNATURE:
-        case BLORGFS_ROOT_DIRECTORY_NODE_SIGNATURE:
+        case BLORGFS_DCB_SIGNATURE:
+        case BLORGFS_ROOT_DCB_SIGNATURE:
         {
-            DEALLOCATE_FILENODE_COMMON(pContext);
+            DEALLOCATE_COMMON(Context);
+            PDCB pDcb = Context;
+            PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
+            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(pVolumeDeviceObject)->DcbLookasideList, pDcb);
+            break;
+        }
+        case BLORGFS_CCB_SIGNATURE:
+        {
+            PCCB pCcb = Context;
+            PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
+            if (pCcb->SearchPattern.Buffer)
+            {
+                ExFreePool(pCcb->SearchPattern.Buffer);
+                pCcb->SearchPattern.Buffer = NULL;
+            }
+            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(pVolumeDeviceObject)->CcbLookasideList, pCcb);
             break;
         }
     }

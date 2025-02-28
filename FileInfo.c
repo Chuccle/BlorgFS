@@ -1,13 +1,13 @@
 #include "Driver.h"
 
-static NTSTATUS BlorgVolumeQueryInformation(PIRP pIrp, PIO_STACK_LOCATION pIrpSp)
+static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     // Likely the key to GetVolumeInformation exceptions
-    FILE_INFORMATION_CLASS fileInfoClass = pIrpSp->Parameters.QueryFile.FileInformationClass;
-    ULONG inputLength = pIrpSp->Parameters.QueryFile.Length;
-    PVOID systemBuffer = pIrp->AssociatedIrp.SystemBuffer;
-    PFILE_OBJECT pFileObject = pIrpSp->FileObject;
-	
+    FILE_INFORMATION_CLASS fileInfoClass = IrpSp->Parameters.QueryFile.FileInformationClass;
+    ULONG inputLength = IrpSp->Parameters.QueryFile.Length;
+    PVOID systemBuffer = Irp->AssociatedIrp.SystemBuffer;
+    PFILE_OBJECT pFileObject = IrpSp->FileObject;
+
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
     ULONG bytesWritten = 0;
 
@@ -40,9 +40,9 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP pIrp, PIO_STACK_LOCATION pIrpSp
                 result = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
-            
+
             PFILE_NAME_INFORMATION NameInfo = systemBuffer;
-            
+
             PCOMMON_CONTEXT pCommonContext = pFileObject->FsContext;
 
             // Check if the buffer is large enough to hold the string
@@ -59,7 +59,7 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP pIrp, PIO_STACK_LOCATION pIrpSp
             }
 
             bytesWritten = FIELD_OFFSET(FILE_NAME_INFORMATION, FileName) + NameInfo->FileNameLength;
-            
+
             result = STATUS_SUCCESS;
             break;
         }
@@ -72,7 +72,7 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP pIrp, PIO_STACK_LOCATION pIrpSp
                 result = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
-            
+
             PFILE_BASIC_INFORMATION BasicInfo = systemBuffer;
 
             BasicInfo->CreationTime.QuadPart = 0;
@@ -87,13 +87,13 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP pIrp, PIO_STACK_LOCATION pIrpSp
         case FileStandardInformation:
         {
             KdBreakPoint();
-            
+
             if (inputLength < sizeof(FILE_STANDARD_INFORMATION))
             {
                 result = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
-            
+
             PFILE_STANDARD_INFORMATION StandardInfo = systemBuffer;
 
             StandardInfo->AllocationSize.QuadPart = 0;
@@ -115,7 +115,7 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP pIrp, PIO_STACK_LOCATION pIrpSp
                 result = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
-            
+
             PFILE_ATTRIBUTE_TAG_INFORMATION AttributeTagInfo = systemBuffer;
 
             AttributeTagInfo->FileAttributes = FILE_ATTRIBUTE_NORMAL;
@@ -127,15 +127,15 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP pIrp, PIO_STACK_LOCATION pIrpSp
         case FileAllInformation:
         {
             KdBreakPoint();
-            
+
             if (inputLength < sizeof(FILE_ALL_INFORMATION))
             {
                 result = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
-            
+
             //PFILE_ALL_INFORMATION AllInfo = (PFILE_ALL_INFORMATION)pIrp->AssociatedIrp.SystemBuffer;
-           
+
             result = STATUS_INVALID_DEVICE_REQUEST;
             bytesWritten = 0;
             break;
@@ -147,25 +147,25 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP pIrp, PIO_STACK_LOCATION pIrpSp
         }
     }
 
-    pIrp->IoStatus.Information = bytesWritten;
+    Irp->IoStatus.Information = bytesWritten;
 
     return result;
 }
 
 
 
-NTSTATUS BlorgQueryInformation(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgQueryInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(pDeviceObject);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
-    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
+    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(pDeviceObject))
+    switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            result = BlorgVolumeQueryInformation(pIrp, pIrpSp);
+            result = BlorgVolumeQueryInformation(Irp, pIrpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
@@ -173,39 +173,47 @@ NTSTATUS BlorgQueryInformation(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
             // result = BlorgDiskQueryInformation(pIrp);
             break;
         }
+        case BLORGFS_FSDO_MAGIC:
+        {
+            break;
+        }
     }
 
-    pIrp->IoStatus.Status = result;
+    Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return pIrp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Irp->IoStatus.Status;
 }
 
 
-NTSTATUS BlorgSetInformation(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgSetInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     KdBreakPoint();
-    UNREFERENCED_PARAMETER(pDeviceObject);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
     // PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(pDeviceObject))
+    switch (GetDeviceExtensionMagic(DeviceObject))
     {
-    case BLORGFS_VDO_MAGIC:
-    {
-        // result = BlorgVolumeSetInformation(pIrp, pIrpSp);
-        break;
-    }
-    case BLORGFS_DDO_MAGIC:
-    {
-        // result = BlorgDiskSetInformation(pIrp);
-        break;
-    }
+        case BLORGFS_VDO_MAGIC:
+        {
+            // result = BlorgVolumeSetInformation(pIrp, pIrpSp);
+            break;
+        }
+        case BLORGFS_DDO_MAGIC:
+        {
+            // result = BlorgDiskSetInformation(pIrp);
+            break;
+        }
+        case BLORGFS_FSDO_MAGIC:
+        {
+            break;
+        }
     }
 
-    pIrp->IoStatus.Status = result;
+    Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return pIrp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Irp->IoStatus.Status;
 }

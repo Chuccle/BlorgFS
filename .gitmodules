@@ -1,0 +1,9 @@
+[submodule "schemas"]
+	path = schemas
+	url = https://github.com/Chuccle/schemas.git
+[submodule "flatcc"]
+	path = flatcc
+	url = https://github.com/dvidelabs/flatcc.git
+[submodule "picohttpparser"]
+	path = picohttpparser
+	url = https://github.com/Chuccle/picohttpparser.git

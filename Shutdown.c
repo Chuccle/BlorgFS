@@ -1,13 +1,13 @@
 #include "Driver.h"
 
-NTSTATUS BlorgShutdown(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgShutdown(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(pDeviceObject);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
     // PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(pDeviceObject))
+    switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
@@ -19,10 +19,14 @@ NTSTATUS BlorgShutdown(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
             // result = BlorgDiskShutdown(pIrp);
             break;
         }
+        case BLORGFS_FSDO_MAGIC:
+        {
+            break;
+        }
     }
 
-    pIrp->IoStatus.Status = result;
+    Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return pIrp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Irp->IoStatus.Status;
 }

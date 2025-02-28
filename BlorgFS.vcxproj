@@ -71,10 +71,12 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <EnableInf2cat />
+    <RunCodeAnalysis>true</RunCodeAnalysis>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <EnableInf2cat />
+    <RunCodeAnalysis>true</RunCodeAnalysis>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
@@ -89,9 +91,13 @@
     <ClCompile>
       <SDLCheck>true</SDLCheck>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>$(ProjectDir)flatcc\include;$(ProjectDir);$(ProjectDir)picohttpparser;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <EnablePREfast>true</EnablePREfast>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Wdmsec.lib;Netio.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -105,9 +111,13 @@
       <OmitFramePointers>true</OmitFramePointers>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>$(ProjectDir)flatcc\include;$(ProjectDir);$(ProjectDir)picohttpparser;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <EnablePREfast>true</EnablePREfast>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Wdmsec.lib;Netio.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -115,13 +125,17 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Cleanup.c" />
+    <ClCompile Include="Client.c" />
     <ClCompile Include="Close.c" />
     <ClCompile Include="Create.c" />
     <ClCompile Include="DevIoCtrl.c" />
     <ClCompile Include="DirCtrl.c" />
     <ClCompile Include="Driver.c" />
+    <ClCompile Include="flatcc\src\runtime\verifier.c" />
     <ClCompile Include="FlushBuffers.c" />
     <ClCompile Include="FsCtrl.c" />
+    <ClCompile Include="Socket.c" />
+    <ClCompile Include="picohttpparser\picohttpparser.c" />
     <ClCompile Include="Shutdown.c" />
     <ClCompile Include="Structs.c" />
     <ClCompile Include="LockCtrl.c" />
@@ -133,7 +147,13 @@
     <ClCompile Include="Write.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Client.h" />
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="flatbuffers_common_reader.h" />
+    <ClInclude Include="Socket.h" />
+    <ClInclude Include="metadata_flatbuffer_reader.h" />
+    <ClInclude Include="metadata_flatbuffer_verifier.h" />
+    <ClInclude Include="picohttpparser\picohttpparser.h" />
     <ClInclude Include="Structs.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

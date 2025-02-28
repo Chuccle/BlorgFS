@@ -1,14 +1,13 @@
 #include "Driver.h"
 
-NTSTATUS BlorgQueryEa(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgQueryEa(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    KdBreakPoint();
-    UNREFERENCED_PARAMETER(pDeviceObject);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
     // PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(pDeviceObject))
+    switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
@@ -20,38 +19,46 @@ NTSTATUS BlorgQueryEa(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
             // result = BlorgDiskQueryEa(pIrp);
             break;
         }
+        case BLORGFS_FSDO_MAGIC:
+        {
+            break;
+        }
     }
 
-    pIrp->IoStatus.Status = result;
+    Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return pIrp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Irp->IoStatus.Status;
 }
 
-NTSTATUS BlorgSetEa(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgSetEa(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     KdBreakPoint();
-    UNREFERENCED_PARAMETER(pDeviceObject);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
     // PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(pDeviceObject))
+    switch (GetDeviceExtensionMagic(DeviceObject))
     {
-    case BLORGFS_VDO_MAGIC:
-    {
-        // result = BlorgVolumeSetEa(pIrp, pIrpSp);
-        break;
-    }
-    case BLORGFS_DDO_MAGIC:
-    {
-        // result = BlorgDiskSetEa(pIrp);
-        break;
-    }
+        case BLORGFS_VDO_MAGIC:
+        {
+            // result = BlorgVolumeSetEa(pIrp, pIrpSp);
+            break;
+        }
+        case BLORGFS_DDO_MAGIC:
+        {
+            // result = BlorgDiskSetEa(pIrp);
+            break;
+        }
+        case BLORGFS_FSDO_MAGIC:
+        {
+            break;
+        }
     }
 
-    pIrp->IoStatus.Status = result;
+    Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return pIrp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Irp->IoStatus.Status;
 }

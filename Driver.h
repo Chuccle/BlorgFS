@@ -3,12 +3,18 @@
 #include <ntifs.h>
 #include <ntstrsafe.h>
 #include <wdmsec.h>
+#include <wsk.h>
 
+#include "Client.h"
 #include "Structs.h"
 
-#define BLORGFS_VDO_STRING  L"\\Device\\BlorgFS"
+#define BLORGFS_FSDO_STRING  L"\\BlorgFS"
+#define BLORGFS_FSDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
+#define BLORGFS_FSDO_MAGIC   0xDEAD00D
+
+#define BLORGFS_VDO_STRING  L"\\Device\\BlorgVolume"
 #define BLORGFS_VDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
-#define BLORGFS_VDO_MAGIC   0xDEAD5609
+#define BLORGFS_VDO_MAGIC   0xD3ADBEAF
 
 #define BLORGFS_DDO_STRING  L"\\Device\\BlorgDrive"
 #define BLORGFS_DDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
@@ -31,7 +37,7 @@ do                           \
 
 #else
 
-#define BLORGFS_PRINT(...) __noop
+#define BLORGFS_PRINT(...)
 
 #define BLORGFS_VERIFY(expr) \
 do                           \
@@ -64,9 +70,12 @@ _Dispatch_type_(IRP_MJ_CLEANUP)                  DRIVER_DISPATCH BlorgCleanup;
 _Dispatch_type_(IRP_MJ_QUERY_SECURITY)           DRIVER_DISPATCH BlorgQuerySecurity;
 _Dispatch_type_(IRP_MJ_SET_SECURITY)             DRIVER_DISPATCH BlorgSetSecurity;
 
-extern struct GLOBAL 
+NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject);
+
+extern struct GLOBAL
 {
-	PDRIVER_OBJECT pDriverObject;
-	PDEVICE_OBJECT pVolumeDeviceObject;
-	PDEVICE_OBJECT pDiskDeviceObject;
+    PDRIVER_OBJECT DriverObject;
+    PDEVICE_OBJECT FileSystemDeviceObject;
+    PDEVICE_OBJECT DiskDeviceObject;
+    PADDRINFOEXW   RemoteAddressInfo;
 } global;

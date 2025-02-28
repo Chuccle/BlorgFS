@@ -1,53 +1,81 @@
 #include "Driver.h"
 
-static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION pIrpSp)
+static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp)
 {
-	KdBreakPoint();
-
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    PFILE_OBJECT pFileObject = pIrpSp->FileObject;
+    PFILE_OBJECT pFileObject = IrpSp->FileObject;
 
-	switch GET_NODE_TYPE(pFileObject->FsContext)
-	{
-		case BLORGFS_ROOT_DIRECTORY_NODE_SIGNATURE:
-		{		
-			result = STATUS_SUCCESS;
-			break;
-		}
-		case BLORGFS_DIRECTORY_NODE_SIGNATURE:
-		{
-			result = STATUS_INVALID_DEVICE_REQUEST;
-			break;
-		}
-		case BLORGFS_FILE_NODE_SIGNATURE:
-		{
-			result = STATUS_INVALID_DEVICE_REQUEST;
-			break;
-		}
-		case BLORGFS_VOLUME_NODE_SIGNATURE:
-		{
-			result = STATUS_SUCCESS;
-			break;
-		}
-		default:
-		{
-			result = STATUS_INVALID_DEVICE_REQUEST;
-			BLORGFS_PRINT("BlorgVolumeCleanup: Unknown FCB type\n");
-		}
-	}
+    switch GET_NODE_TYPE(pFileObject->FsContext)
+    {
+        case BLORGFS_ROOT_DCB_SIGNATURE:
+        {
+            result = STATUS_SUCCESS;
+
+            PDCB pDcb = pFileObject->FsContext;
+
+            InterlockedDecrement64(&pDcb->RefCount);
+
+            BlorgFreeFileContext(pFileObject->FsContext2);
+
+            break;
+        }
+        case BLORGFS_DCB_SIGNATURE:
+        {
+            result = STATUS_INVALID_DEVICE_REQUEST;
+
+            BlorgFreeFileContext(pFileObject->FsContext2);
+
+            PDCB pDcb = pFileObject->FsContext;
+
+            if (InterlockedDecrement64(&pDcb->RefCount) == 0)
+            {
+                BlorgFreeFileContext(pDcb);
+            }
+
+            break;
+        }
+        case BLORGFS_FCB_SIGNATURE:
+        {
+            result = STATUS_INVALID_DEVICE_REQUEST;
+
+            PDCB pFcb = pFileObject->FsContext;
+
+            if (InterlockedDecrement64(&pFcb->RefCount) == 0)
+            {
+                BlorgFreeFileContext(pFcb);
+            }
+
+            break;
+        }
+        case BLORGFS_VCB_SIGNATURE:
+        {
+            result = STATUS_SUCCESS;
+
+            PDCB pVcb = pFileObject->FsContext;
+
+            InterlockedDecrement64(&pVcb->RefCount);
+
+            break;
+        }
+        default:
+        {
+            BLORGFS_PRINT("BlorgVolumeCleanup: Unknown FCB type\n");
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+    }
 
     return result;
 }
 
-NTSTATUS BlorgClose(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+NTSTATUS BlorgClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(pDeviceObject);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
-    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
+    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(pDeviceObject))
+    switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
@@ -59,10 +87,14 @@ NTSTATUS BlorgClose(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
             // result = BlorgDiskClose(pIrp);
             break;
         }
+        case BLORGFS_FSDO_MAGIC:
+        {
+            break;
+        }
     }
 
-    pIrp->IoStatus.Status = result;
+    Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return pIrp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Irp->IoStatus.Status;
 }

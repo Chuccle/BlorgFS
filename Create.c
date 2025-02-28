@@ -1,152 +1,143 @@
 #include "Driver.h"
 
-static NTSTATUS BlorgVolumeOpen(PIRP pIrp, PFILE_OBJECT pFileObject, UCHAR createDisposition, USHORT shareAccess, PACCESS_MASK pDesiredAccess)
+static NTSTATUS BlorgVolumeOpen(PIRP Irp, PFILE_OBJECT FileObject, UCHAR CreateDisposition, USHORT ShareAccess, PACCESS_MASK DesiredAccess)
 {
-    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
-
-    if (*pDesiredAccess == 0)
+    if (0 == *DesiredAccess)
     {
-        result = STATUS_INVALID_PARAMETER;
-        goto exit;
+        return STATUS_INVALID_PARAMETER;
     }
 
-    if (shareAccess == 0)
+    if (0 == ShareAccess)
     {
-        result = STATUS_INVALID_PARAMETER;
-        goto exit;
+        return STATUS_INVALID_PARAMETER;
     }
-    
-    if ((createDisposition != FILE_OPEN) &&
-        (createDisposition != FILE_OPEN_IF)) 
+
+    if ((CreateDisposition != FILE_OPEN) &&
+        (CreateDisposition != FILE_OPEN_IF))
     {
-        result = STATUS_ACCESS_DENIED;
-		goto exit;
+        return STATUS_ACCESS_DENIED;
     }
 
     //
     // Only allow the volume to be opened for read access.
     //
 
-    if (FlagOn(*pDesiredAccess, ~FILE_GENERIC_READ))
+    if (FlagOn(*DesiredAccess, ~FILE_GENERIC_READ))
     {
-        result = STATUS_ACCESS_DENIED;
-        goto exit;
+        return STATUS_ACCESS_DENIED;
     }
 
-    PDCB pRootDcb = GetVolumeDeviceExtension(global.pVolumeDeviceObject)->RootDcb;
+    PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
 
-    if (InterlockedIncrement64(&pRootDcb->RefCount) == 1)
+    PVCB pVcb = GetVolumeDeviceExtension(pVolumeDeviceObject)->Vcb;
+
+    if (InterlockedIncrement64(&pVcb->RefCount) == 1)
     {
-        IoSetShareAccess(*pDesiredAccess, shareAccess, pFileObject, &pRootDcb->ShareAccess);
+        IoSetShareAccess(*DesiredAccess, ShareAccess, FileObject, &pVcb->ShareAccess);
     }
     else
     {
-        result = IoCheckShareAccess(*pDesiredAccess, shareAccess, pFileObject, &pRootDcb->ShareAccess, TRUE);
+        NTSTATUS result = IoCheckShareAccess(*DesiredAccess, ShareAccess, FileObject, &pVcb->ShareAccess, TRUE);
+
         if (!NT_SUCCESS(result))
         {
-            InterlockedDecrement64(&pRootDcb->RefCount);
-            goto exit;
+            InterlockedDecrement64(&pVcb->RefCount);
+            return result;
         }
     }
-    
-    pFileObject->SectionObjectPointer = &pRootDcb->NonPaged->SectionObjectPointers;
-	pFileObject->Vpb = global.pDiskDeviceObject->Vpb;
-	pFileObject->FsContext = pRootDcb;
-	pFileObject->FsContext2 = NULL;
-	
-	result = STATUS_SUCCESS;
-	pIrp->IoStatus.Information = FILE_OPENED;
 
-exit:
+#pragma warning(suppress: 28175) // We are a filesystem. We are allowed to fiddle with VPB.
+    FileObject->Vpb = global.DiskDeviceObject->Vpb;
+    FileObject->FsContext = pVcb;
+    FileObject->FsContext2 = NULL;
+    Irp->IoStatus.Information = FILE_OPENED;
 
-    return result;
+    return STATUS_SUCCESS;
 }
 
-static NTSTATUS BlorgRootDirectoryOpen(PIRP pIrp, PFILE_OBJECT pFileObject, UCHAR createDisposition, PACCESS_MASK pDesiredAccess, USHORT shareAccess)
+static NTSTATUS BlorgRootDirectoryOpen(PIRP Irp, PFILE_OBJECT FileObject, UCHAR CreateDisposition, PACCESS_MASK DesiredAccess, USHORT ShareAccess)
 {
-    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
-
-    if (*pDesiredAccess == 0)
+    if (0 == *DesiredAccess)
     {
-        result = STATUS_INVALID_PARAMETER;
-        goto exit;
+        return STATUS_INVALID_PARAMETER;
     }
 
-    if (shareAccess == 0)
+    if (0 == ShareAccess)
     {
-        result = STATUS_INVALID_PARAMETER;
-        goto exit;
+        return STATUS_INVALID_PARAMETER;
     }
 
-    if ((createDisposition != FILE_OPEN) &&
-        (createDisposition != FILE_OPEN_IF))
+    if ((FILE_OPEN != CreateDisposition) &&
+        (FILE_OPEN_IF != CreateDisposition))
     {
-        result = STATUS_ACCESS_DENIED;
-        goto exit;
+        return STATUS_ACCESS_DENIED;
     }
 
     //
     // Only allow the root directory to be opened for read access.
     //
 
-    if (FlagOn(*pDesiredAccess, ~FILE_GENERIC_READ))
+    if (FlagOn(*DesiredAccess, ~FILE_GENERIC_READ))
     {
-        result = STATUS_ACCESS_DENIED;
-        goto exit;
+        return STATUS_ACCESS_DENIED;
     }
 
-    PDCB pRootDcb = GetVolumeDeviceExtension(global.pVolumeDeviceObject)->RootDcb;
+    PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
+
+    PDCB pRootDcb = GetVolumeDeviceExtension(pVolumeDeviceObject)->RootDcb;
+
+    PCCB pCcb;
+
+    NTSTATUS result = BlorgCreateCCB(&pCcb, pVolumeDeviceObject);
+
+    if (!NT_SUCCESS(result))
+    {
+        return result;
+    }
 
     if (InterlockedIncrement64(&pRootDcb->RefCount) == 1)
     {
-        IoSetShareAccess(*pDesiredAccess, shareAccess, pFileObject, &pRootDcb->ShareAccess);
+        IoSetShareAccess(*DesiredAccess, ShareAccess, FileObject, &pRootDcb->ShareAccess);
     }
     else
     {
-        result = IoCheckShareAccess(*pDesiredAccess, shareAccess, pFileObject, &pRootDcb->ShareAccess, TRUE);
+        result = IoCheckShareAccess(*DesiredAccess, ShareAccess, FileObject, &pRootDcb->ShareAccess, TRUE);
+
         if (!NT_SUCCESS(result))
         {
             InterlockedDecrement64(&pRootDcb->RefCount);
-            goto exit;
+            BlorgFreeFileContext(pCcb);
+            return result;
         }
     }
 
-    pFileObject->SectionObjectPointer = &pRootDcb->NonPaged->SectionObjectPointers;
-    pFileObject->Vpb = global.pDiskDeviceObject->Vpb;
-    pFileObject->FsContext = pRootDcb;
-    pFileObject->FsContext2 = NULL;
+#pragma warning(suppress: 28175) // We are a filesystem. We are allowed to fiddle with VPB.
+    FileObject->Vpb = global.DiskDeviceObject->Vpb;
+    FileObject->FsContext = pRootDcb;
+    FileObject->FsContext2 = pCcb;
+    Irp->IoStatus.Information = FILE_OPENED;
 
-	result = STATUS_SUCCESS;
-    pIrp->IoStatus.Information = FILE_OPENED;
-
-exit:
-
-    return result;
+    return STATUS_SUCCESS;
 }
 
-static NTSTATUS BlorgVolumeCreate(PIRP pIrp, PIO_STACK_LOCATION pIrpSp)
+static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     // handle the volume object's create request
-    KdBreakPoint();
-    PFILE_OBJECT pFileObject = pIrpSp->FileObject;
+    PFILE_OBJECT pFileObject = IrpSp->FileObject;
     PFILE_OBJECT pRelatedFileObject = pFileObject->RelatedFileObject;
     UNICODE_STRING fileName = pFileObject->FileName;
 
-
-    ULONG options = pIrpSp->Parameters.Create.Options;
-    USHORT shareAccess = pIrpSp->Parameters.Create.ShareAccess;
+    ULONG options = IrpSp->Parameters.Create.Options;
+    USHORT shareAccess = IrpSp->Parameters.Create.ShareAccess;
     UCHAR createDisposition = (options >> 24) & 0x000000ff;
-    PACCESS_MASK pDesiredAccess = &pIrpSp->Parameters.Create.SecurityContext->DesiredAccess;
-
-    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+    PACCESS_MASK pDesiredAccess = &IrpSp->Parameters.Create.SecurityContext->DesiredAccess;
 
     if (!pRelatedFileObject)
     {
         // open the volume object
         if (0 == fileName.Length)
         {
-            result = BlorgVolumeOpen(pIrp, pFileObject, createDisposition, shareAccess, pDesiredAccess);
-            goto exit;
+            return BlorgVolumeOpen(Irp, pFileObject, createDisposition, shareAccess, pDesiredAccess);
         }
 
         // open the root directory
@@ -154,50 +145,59 @@ static NTSTATUS BlorgVolumeCreate(PIRP pIrp, PIO_STACK_LOCATION pIrpSp)
         {
             if (BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE))
             {
-                result = STATUS_FILE_IS_A_DIRECTORY;
-                goto exit;
+                return STATUS_FILE_IS_A_DIRECTORY;
+
             }
 
-            result = BlorgRootDirectoryOpen(pIrp, pFileObject, createDisposition, pDesiredAccess, shareAccess);
-            goto exit;
+            return BlorgRootDirectoryOpen(Irp, pFileObject, createDisposition, pDesiredAccess, shareAccess);
         }
     }
 
-exit:
-
-    return result;
+    return STATUS_INVALID_DEVICE_REQUEST;
 }
 
-static NTSTATUS BlorgDiskCreate(PIRP pIrp)
+static NTSTATUS BlorgDiskCreate(PIRP Irp)
 {
-	// handle the disk object's create request
-    pIrp->IoStatus.Information = FILE_OPENED;
+    // handle the disk object's create request
+    Irp->IoStatus.Information = FILE_OPENED;
     return STATUS_SUCCESS;
 }
 
-NTSTATUS BlorgCreate(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
+static NTSTATUS BlorgFileSystemCreate(PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(pDeviceObject);
+    // handle the FileSystem object's create request
+    Irp->IoStatus.Information = FILE_OPENED;
+    return STATUS_SUCCESS;
+}
 
-    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(pIrp);
-	NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
 
-    switch (GetDeviceExtensionMagic(pDeviceObject))
+    PIO_STACK_LOCATION pIrpSp = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+
+    switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            result = BlorgVolumeCreate(pIrp, pIrpSp);
+            result = BlorgVolumeCreate(Irp, pIrpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
-			result = BlorgDiskCreate(pIrp);
+            result = BlorgDiskCreate(Irp);
+            break;
+        }
+        case BLORGFS_FSDO_MAGIC:
+        {
+            result = BlorgFileSystemCreate(Irp);
             break;
         }
     }
 
-    pIrp->IoStatus.Status = result;
+    Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-    return pIrp->IoStatus.Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Irp->IoStatus.Status;
 }
