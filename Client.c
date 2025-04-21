@@ -11,6 +11,32 @@
 
 #include "picohttpparser.h"
 
+#define N_DIGITS_INT_MAX_INTERNAL(N) \
+    ((N) < 10 ? 1 : \
+     (N) < 100 ? 2 : \
+     (N) < 1000 ? 3 : \
+     (N) < 10000 ? 4 : \
+     (N) < 100000 ? 5 : \
+     (N) < 1000000 ? 6 : \
+     (N) < 10000000 ? 7 : \
+     (N) < 100000000 ? 8 : \
+     (N) < 1000000000 ? 9 : \
+     (N) < 10000000000ULL ? 10 : \
+     (N) < 100000000000ULL ? 11 : \
+     (N) < 1000000000000ULL ? 12 : \
+     (N) < 10000000000000ULL ? 13 : \
+     (N) < 100000000000000ULL ? 14 : \
+     (N) < 1000000000000000ULL ? 15 : \
+     (N) < 10000000000000000ULL ? 16 : \
+     (N) < 100000000000000000ULL ? 17 : \
+     (N) < 1000000000000000000ULL ? 18 : \
+     19) // For ULLONG_MAX, which is at least 2^64-1, requiring 20 digits.
+          // This macro can be extended if needed, but 19 covers up to 10^19-1.
+
+// consider intsafe here when relying on the content length. 
+// process flatbuffers inside a system thread.
+// we should probably move all of this to a user mode service with inverted call model.
+
 typedef struct _HTTP_BUFFER_INFO
 {
     const struct phr_header* Headers;
@@ -19,9 +45,6 @@ typedef struct _HTTP_BUFFER_INFO
     SIZE_T BodyBufferSize;
 } HTTP_BUFFER_INFO, * PHTTP_BUFFER_INFO;
 
-//
-// Convert a string to a size with bounds checking
-//
 static NTSTATUS StrToSize(const char* AsciiBuffer, SIZE_T Length, PSIZE_T Result)
 {
     if (!AsciiBuffer || !Result || 0 == Length)
@@ -53,9 +76,6 @@ static NTSTATUS StrToSize(const char* AsciiBuffer, SIZE_T Length, PSIZE_T Result
     return STATUS_SUCCESS;
 }
 
-//
-// Helper function to extract content length from headers
-//
 static NTSTATUS GetContentLengthFromHeaders(const struct phr_header* Headers, SIZE_T HeaderCount, PSIZE_T ContentLength)
 {
     ANSI_STRING contentLengthBuffer = RTL_CONSTANT_STRING("content-length");
@@ -197,11 +217,11 @@ static NTSTATUS ProcessEntries(BlorgMetaFlat_DirectoryEntriesMetadata_table_t en
 
     outDirInfo->Entries = entries;
     outDirInfo->EntryCount = entryCount;
-    
+
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS DeserializeFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTORY_INFO SubDirInfo, PDIRECTORY_INFO FileDirInfo)
+static NTSTATUS DeserializeDirectoryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTORY_INFO SubDirInfo, PDIRECTORY_INFO FileDirInfo)
 {
     if (!HttpInfo->Headers || !HttpInfo->BodyBuffer || 0 == HttpInfo->BodyBufferSize)
     {
@@ -210,9 +230,9 @@ static NTSTATUS DeserializeFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTO
     }
 
     SIZE_T contentLength;
-    
+
     NTSTATUS result = GetContentLengthFromHeaders(HttpInfo->Headers, HttpInfo->HeaderCount, &contentLength);
-    
+
     if (!NT_SUCCESS(result))
     {
         BLORGFS_PRINT("DeserializeFlatBuffer() - Failed to parse headers to get content length\n");
@@ -227,9 +247,9 @@ static NTSTATUS DeserializeFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTO
 
     PCHAR alignedBuffer;
     BOOLEAN bufferAllocated;
-    
+
     result = AlignBuffer(HttpInfo->BodyBuffer, HttpInfo->BodyBufferSize, contentLength, &alignedBuffer, &bufferAllocated);
-    
+
     if (!NT_SUCCESS(result))
     {
         BLORGFS_PRINT("DeserializeFlatBuffer() - buffer alignment failure\n");
@@ -239,14 +259,14 @@ static NTSTATUS DeserializeFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTO
     int verifyCode = BlorgMetaFlat_Directory_verify_as_root(alignedBuffer, contentLength);
 
     if (flatcc_verify_ok != verifyCode)
-    {        
+    {
         if (bufferAllocated)
         {
             ExFreePool(alignedBuffer);
         }
 
         BLORGFS_PRINT("DeserializeFlatBuffer() - %s\n", flatcc_verify_error_string(verifyCode));
-        
+
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -278,7 +298,7 @@ static NTSTATUS DeserializeFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTO
     if (0 < fileCount)
     {
         BlorgMetaFlat_DirectoryEntriesMetadata_table_t files = BlorgMetaFlat_Directory_files(directory);
-        
+
         if (!files)
         {
             BLORGFS_PRINT("DeserializeFlatBuffer() - files vector suggested but not valid\n");
@@ -290,7 +310,7 @@ static NTSTATUS DeserializeFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTO
         }
 
         result = ProcessEntries(files, fileCount, FileDirInfo);
-        
+
         if (!NT_SUCCESS(result))
         {
             BLORGFS_PRINT("DeserializeFlatBuffer() - error processing files\n");
@@ -305,7 +325,7 @@ static NTSTATUS DeserializeFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTO
     if (0 < directoryCount)
     {
         BlorgMetaFlat_DirectoryEntriesMetadata_table_t subDirs = BlorgMetaFlat_Directory_directories(directory);
-        
+
         if (!subDirs)
         {
             BLORGFS_PRINT("DeserializeFlatBuffer() - directories vector suggested but not valid\n");
@@ -318,7 +338,7 @@ static NTSTATUS DeserializeFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTO
         }
 
         result = ProcessEntries(subDirs, directoryCount, SubDirInfo);
-        
+
         if (!NT_SUCCESS(result))
         {
             BLORGFS_PRINT("DeserializeFlatBuffer() - error processing directories\n");
@@ -339,43 +359,131 @@ static NTSTATUS DeserializeFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTO
     return STATUS_SUCCESS;
 }
 
-#define HEX_TO_CHAR(x) ((WCHAR)((x) < 10 ? (x) + '0' : (x) - 10 + 'A'))
+static NTSTATUS DeserializeDirectoryEntryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTORY_ENTRY DirEntryInfo, PBOOLEAN IsDir)
+{
+    if (!HttpInfo->Headers || !HttpInfo->BodyBuffer || 0 == HttpInfo->BodyBufferSize)
+    {
+        BLORGFS_PRINT("DeserializeDirectoryEntryInfoFlatBuffer() - params are weird\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    SIZE_T contentLength;
+
+    NTSTATUS result = GetContentLengthFromHeaders(HttpInfo->Headers, HttpInfo->HeaderCount, &contentLength);
+
+    if (!NT_SUCCESS(result))
+    {
+        BLORGFS_PRINT("DeserializeDirectoryEntryInfoFlatBuffer() - Failed to parse headers to get content length\n");
+        return result;
+    }
+
+    if (HttpInfo->BodyBufferSize < contentLength)
+    {
+        BLORGFS_PRINT("DeserializeDirectoryEntryInfoFlatBuffer() - buffer to small for needed payload\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    PCHAR alignedBuffer;
+    BOOLEAN bufferAllocated;
+
+    result = AlignBuffer(HttpInfo->BodyBuffer, HttpInfo->BodyBufferSize, contentLength, &alignedBuffer, &bufferAllocated);
+
+    if (!NT_SUCCESS(result))
+    {
+        BLORGFS_PRINT("DeserializeDirectoryEntryInfoFlatBuffer() - buffer alignment failure\n");
+        return result;
+    }
+
+    int verifyCode = BlorgMetaFlat_DirectoryEntryMetadata_verify_as_root(alignedBuffer, contentLength);
+
+    if (flatcc_verify_ok != verifyCode)
+    {
+        if (bufferAllocated)
+        {
+            ExFreePool(alignedBuffer);
+        }
+
+        BLORGFS_PRINT("DeserializeDirectoryEntryInfoFlatBuffer() - %s\n", flatcc_verify_error_string(verifyCode));
+
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    BlorgMetaFlat_DirectoryEntryMetadata_table_t dirEntMeta = BlorgMetaFlat_DirectoryEntryMetadata_as_root(alignedBuffer);
+
+    if (!dirEntMeta)
+    {
+        if (bufferAllocated)
+        {
+            ExFreePool(alignedBuffer);
+        }
+
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    DirEntryInfo->Size = BlorgMetaFlat_DirectoryEntryMetadata_size(dirEntMeta);
+    DirEntryInfo->CreationTime = BlorgMetaFlat_DirectoryEntryMetadata_created(dirEntMeta);
+    DirEntryInfo->LastAccessedTime = BlorgMetaFlat_DirectoryEntryMetadata_accessed(dirEntMeta);
+    DirEntryInfo->LastModifiedTime = BlorgMetaFlat_DirectoryEntryMetadata_modified(dirEntMeta);
+
+    *IsDir = BlorgMetaFlat_DirectoryEntryMetadata_directory(dirEntMeta);
+
+    if (bufferAllocated)
+    {
+        ExFreePool(alignedBuffer);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+#define HEX_TO_CHAR(x) ((x) < 10 ? '0' + (x) : 'A' + (x) - 10)
+
+static BOOLEAN IsCharacterSafeForUrl(UCHAR c)
+{
+    // RFC 3986 unreserved characters: ALPHA / DIGIT / "-" / "." / "_" / "~"
+
+    if ((c >= 'A' && c <= 'Z') ||    // Uppercase letters
+        (c >= 'a' && c <= 'z') ||    // Lowercase letters  
+        (c >= '0' && c <= '9') ||    // Digits
+        c == '-' ||                   // Hyphen
+        c == '.' ||                   // Period
+        c == '_' ||                   // Underscore
+        c == '~')                     // Tilde
+    {
+        return TRUE;
+    }
+
+    return FALSE;
+}
 
 static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STRING OutputString, BOOLEAN AllocateDestination)
 {
-    NTSTATUS status = STATUS_SUCCESS;
+    UTF8_STRING utf8String;
+
+    NTSTATUS status = RtlUnicodeStringToUTF8String(&utf8String, InputString, TRUE);
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    PUCHAR utf8Buffer = (PUCHAR)utf8String.Buffer;
+    ULONG utf8Length = utf8String.Length;
     SIZE_T estimatedLength = 0;
-    ULONG i, j;
-    WCHAR* inputBuffer = InputString->Buffer;
-    ULONG inputLength = InputString->Length / sizeof(WCHAR);
 
     // First pass: calculate the estimated length of the encoded string
-    for (i = 0; i < inputLength; i++)
+    for (ULONG i = 0; i < utf8Length; i++)
     {
-        WCHAR c = inputBuffer[i];
-        if (c >= 128 ||
-            c <= 32 ||  // Encode control characters
-            c == '+' ||
-            c == '&' ||
-            c == '=' ||
-            c == '%' ||
-            c == '?' ||
-            c == '/' ||
-            c == ':' ||
-            c == ';' ||
-            c == '#' ||
-            c == ',' ||
-            c == '$')
-        {
-            estimatedLength += 3; // Percent-encoded characters need 3 chars
-        }
-        else
+        UCHAR c = utf8Buffer[i];
+
+        if (IsCharacterSafeForUrl(c))
         {
             estimatedLength++;
         }
+        else
+        {
+            estimatedLength += 3; // Percent-encoded characters need 3 chars (%XX)
+        }
     }
 
-    // Allocate output buffer if needed
     if (AllocateDestination)
     {
         OutputString->Buffer = (PWCHAR)ExAllocatePoolUninitialized(
@@ -384,8 +492,9 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
             'URLE'
         );
 
-        if (OutputString->Buffer == NULL)
+        if (NULL == OutputString->Buffer)
         {
+            RtlFreeUTF8String(&utf8String);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -393,40 +502,18 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
     }
     else if (OutputString->MaximumLength < estimatedLength * sizeof(WCHAR))
     {
+        RtlFreeUTF8String(&utf8String);
         return STATUS_BUFFER_TOO_SMALL;
     }
 
     // Second pass: perform actual URL encoding
-    j = 0;
-    for (i = 0; i < inputLength; i++)
-    {
-        WCHAR c = inputBuffer[i];
-        if (c >= 128 ||
-            c <= 32 ||
-            c == '+' ||
-            c == '&' ||
-            c == '=' ||
-            c == '%' ||
-            c == '?' ||
-            c == '/' ||
-            c == ':' ||
-            c == ';' ||
-            c == '#' ||
-            c == ',' ||
-            c == '$')
-        {
-            if (j + 3 > OutputString->MaximumLength / sizeof(WCHAR))
-            {
-                status = STATUS_BUFFER_OVERFLOW;
-                break;
-            }
+    ULONG j = 0;
 
-            // Percent-encode the character
-            OutputString->Buffer[j++] = '%';
-            OutputString->Buffer[j++] = HEX_TO_CHAR((c >> 4) & 0xF);
-            OutputString->Buffer[j++] = HEX_TO_CHAR(c & 0xF);
-        }
-        else
+    for (ULONG i = 0; i < utf8Length; i++)
+    {
+        UCHAR c = utf8Buffer[i];
+
+        if (IsCharacterSafeForUrl(c))
         {
             if (j + 1 > OutputString->MaximumLength / sizeof(WCHAR))
             {
@@ -434,12 +521,25 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
                 break;
             }
 
-            // Regular character, copy as-is
-            OutputString->Buffer[j++] = c;
+            OutputString->Buffer[j++] = (WCHAR)c;
+        }
+        else
+        {
+            if (j + 3 > OutputString->MaximumLength / sizeof(WCHAR))
+            {
+                status = STATUS_BUFFER_OVERFLOW;
+                break;
+            }
+
+            OutputString->Buffer[j++] = L'%';
+            OutputString->Buffer[j++] = (WCHAR)HEX_TO_CHAR((c >> 4) & 0xF);
+            OutputString->Buffer[j++] = (WCHAR)HEX_TO_CHAR(c & 0xF);
         }
     }
 
     OutputString->Length = (USHORT)(j * sizeof(WCHAR));
+
+    RtlFreeUTF8String(&utf8String);
 
     return status;
 }
@@ -535,7 +635,7 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDir
 
     ULONG totalBytesWritten = 0;
     ULONG bytesWritten = 0;
-    
+
     do
     {
         if (totalBytesWritten >= receiveBufferSize)
@@ -549,6 +649,15 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDir
 
             int bytesProcessed = phr_parse_response(receiveBuffer, totalBytesWritten, &minor_version, &status, &msg, &msg_len, headers, &num_headers, 0);
 
+            if (bytesProcessed < 0)
+            {
+                BLORGFS_PRINT("GetHttpDirectoryInfo() - Failed to parse HTTP response\n");
+                CloseWskSocket(socket);
+                ExFreePool(receiveBuffer);
+                ExFreePool(sendBuffer);
+                return STATUS_INVALID_PARAMETER;
+            }
+
             SIZE_T contentLength;
             result = GetContentLengthFromHeaders(headers, num_headers, &contentLength);
 
@@ -561,19 +670,19 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDir
                 return result;
             }
 
-           PCHAR newReceiveBuffer = ReallocateBufferUninitialized(receiveBuffer, receiveBufferSize, PagedPool, (bytesProcessed + contentLength), 'BHDI');
+            PCHAR newReceiveBuffer = ReallocateBufferUninitialized(receiveBuffer, receiveBufferSize, PagedPool, (bytesProcessed + contentLength), 'BHDI');
 
-           if (newReceiveBuffer == receiveBuffer)
-           {
-               BLORGFS_PRINT("GetHttpDirectoryInfo() - Failed to allocate new receive buffer\n");
-               CloseWskSocket(socket);
-               ExFreePool(receiveBuffer);
-               ExFreePool(sendBuffer);
-               return STATUS_INSUFFICIENT_RESOURCES;
-           }
+            if (newReceiveBuffer == receiveBuffer)
+            {
+                BLORGFS_PRINT("GetHttpDirectoryInfo() - Failed to allocate new receive buffer\n");
+                CloseWskSocket(socket);
+                ExFreePool(receiveBuffer);
+                ExFreePool(sendBuffer);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
 
-           receiveBufferSize = bytesProcessed + (ULONG)contentLength;
-           receiveBuffer = newReceiveBuffer;
+            receiveBufferSize = bytesProcessed + (ULONG)contentLength;
+            receiveBuffer = newReceiveBuffer;
         }
 
         result = SendRecvWsk(socket, receiveBuffer + totalBytesWritten, receiveBufferSize - totalBytesWritten, &bytesWritten, 0, FALSE);
@@ -590,7 +699,7 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDir
         totalBytesWritten += bytesWritten;
     }
     while (0 < bytesWritten);
-    
+
     int minor_version;
     int status;
     const char* msg;
@@ -617,7 +726,7 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDir
         .HeaderCount = num_headers
     };
 
-    result = DeserializeFlatBuffer(&httpInfo, SubDirInfo, FileDirInfo);
+    result = DeserializeDirectoryInfoFlatBuffer(&httpInfo, SubDirInfo, FileDirInfo);
 
     if (!NT_SUCCESS(result))
     {
@@ -660,28 +769,25 @@ void FreeHttpDirectoryInfo(PDIRECTORY_INFO SubDirInfo, PDIRECTORY_INFO FileDirIn
     }
 }
 
-NTSTATUS FindHttpFile(const PUNICODE_STRING Path, PBOOLEAN Directory, PBOOLEAN Found)
+NTSTATUS GetHttpFileInformation(const PUNICODE_STRING Path, PDIRECTORY_ENTRY DirectoryEntryInfo, PBOOLEAN isDir)
 {
-    *Found = FALSE;
-    *Directory = FALSE;
-
     if (!Path || 0 == Path->Length || !Path->Buffer)
     {
-        BLORGFS_PRINT("FindHttpFile() - Invalid path parameter\n");
+        BLORGFS_PRINT("GetHttpFileInformation() - Invalid path parameter\n");
         return STATUS_INVALID_PARAMETER;
     }
 
     UNICODE_STRING encodedPath;
-    NTSTATUS result =  UrlEncodeUnicodeString(Path, &encodedPath, TRUE);
+    NTSTATUS result = UrlEncodeUnicodeString(Path, &encodedPath, TRUE);
 
     if (!NT_SUCCESS(result))
     {
-        BLORGFS_PRINT("FindHttpFile() - No encoded buffer\n");
+        BLORGFS_PRINT("GetHttpFileInformation() - No encoded buffer\n");
         return result;
     }
 
     char sendBufferFormat[] =
-        "GET /find_path?path=%wZ HTTP/1.1\r\n"
+        "GET /get_dir_entry_info?path=%wZ HTTP/1.1\r\n"
         "Host: blorgfs-server.blorg.lan\r\n"
         "Connection: close\r\n"
         "\r\n";
@@ -699,7 +805,7 @@ NTSTATUS FindHttpFile(const PUNICODE_STRING Path, PBOOLEAN Directory, PBOOLEAN F
 
     if (!NT_SUCCESS(result))
     {
-        BLORGFS_PRINT("FindHttpFile() - No send buffer alloc\n");
+        BLORGFS_PRINT("GetHttpFileInformation() - No send buffer alloc\n");
         ExFreePool(sendBuffer);
         ExFreePool(encodedPath.Buffer);
         return result;
@@ -707,12 +813,205 @@ NTSTATUS FindHttpFile(const PUNICODE_STRING Path, PBOOLEAN Directory, PBOOLEAN F
 
     ExFreePool(encodedPath.Buffer);
 
-    ULONG receiveBufferSize = 256;
+    ULONG receiveBufferSize = PAGE_SIZE;
     char* receiveBuffer = ExAllocatePoolUninitialized(PagedPool, receiveBufferSize, 'TEST');
 
     if (!receiveBuffer)
     {
-        BLORGFS_PRINT("FindHttpFile() - No receive buffer alloc\n");
+        BLORGFS_PRINT("GetHttpFileInformation() - No receive buffer alloc\n");
+        ExFreePool(sendBuffer);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    PKSOCKET socket;
+    result = CreateWskSocket(&socket, SOCK_STREAM, IPPROTO_TCP, 0, global.RemoteAddressInfo->ai_addr);
+
+    if (!NT_SUCCESS(result))
+    {
+        BLORGFS_PRINT("GetHttpFileInformation() - Failed to create socket\n");
+        ExFreePool(receiveBuffer);
+        ExFreePool(sendBuffer);
+        return result;
+    }
+
+    result = SendRecvWsk(socket, sendBuffer, (ULONG)strlen(sendBuffer), NULL, 0, TRUE);
+
+    if (!NT_SUCCESS(result))
+    {
+        BLORGFS_PRINT("GetHttpFileInformation() - Failed to send\n");
+        CloseWskSocket(socket);
+        ExFreePool(receiveBuffer);
+        ExFreePool(sendBuffer);
+        return result;
+    }
+
+    ULONG totalBytesWritten = 0;
+    ULONG bytesWritten = 0;
+
+    do
+    {
+        if (totalBytesWritten >= receiveBufferSize)
+        {
+            int minor_version;
+            int status;
+            const char* msg;
+            SIZE_T msg_len;
+            struct phr_header headers[4];
+            SIZE_T num_headers = sizeof(headers) / sizeof(headers[0]);
+
+            int bytesProcessed = phr_parse_response(receiveBuffer, totalBytesWritten, &minor_version, &status, &msg, &msg_len, headers, &num_headers, 0);
+
+            if (bytesProcessed < 0)
+            {
+                BLORGFS_PRINT("GetHttpFileInformation() - Failed to parse HTTP response\n");
+                CloseWskSocket(socket);
+                ExFreePool(receiveBuffer);
+                ExFreePool(sendBuffer);
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            SIZE_T contentLength;
+            result = GetContentLengthFromHeaders(headers, num_headers, &contentLength);
+
+            if (!NT_SUCCESS(result))
+            {
+                BLORGFS_PRINT("GetHttpFileInformation() - Failed to parse content length header\n");
+                CloseWskSocket(socket);
+                ExFreePool(receiveBuffer);
+                ExFreePool(sendBuffer);
+                return result;
+            }
+
+            PCHAR newReceiveBuffer = ReallocateBufferUninitialized(receiveBuffer, receiveBufferSize, PagedPool, (bytesProcessed + contentLength), 'BHDI');
+
+            if (newReceiveBuffer == receiveBuffer)
+            {
+                BLORGFS_PRINT("GetHttpFileInformation() - Failed to allocate new receive buffer\n");
+                CloseWskSocket(socket);
+                ExFreePool(receiveBuffer);
+                ExFreePool(sendBuffer);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+
+            receiveBufferSize = bytesProcessed + (ULONG)contentLength;
+            receiveBuffer = newReceiveBuffer;
+        }
+
+        result = SendRecvWsk(socket, receiveBuffer + totalBytesWritten, receiveBufferSize - totalBytesWritten, &bytesWritten, 0, FALSE);
+
+        if (!NT_SUCCESS(result))
+        {
+            BLORGFS_PRINT("GetHttpFileInformation() - Failed to receive\n");
+            CloseWskSocket(socket);
+            ExFreePool(receiveBuffer);
+            ExFreePool(sendBuffer);
+            return result;
+        }
+
+        totalBytesWritten += bytesWritten;
+    }
+    while (0 < bytesWritten);
+
+    int minor_version;
+    int status;
+    const char* msg;
+    SIZE_T msg_len;
+    struct phr_header headers[4];
+    SIZE_T num_headers = sizeof(headers) / sizeof(headers[0]);
+
+    int bytesProcessed = phr_parse_response(receiveBuffer, totalBytesWritten, &minor_version, &status, &msg, &msg_len, headers, &num_headers, 0);
+
+    if (0 > bytesProcessed || 200 != status)
+    {
+        ASSERT(0 <= bytesProcessed);
+
+        BLORGFS_PRINT("phr_parse_response() - Failed to parse\n");
+        CloseWskSocket(socket);
+        ExFreePool(receiveBuffer);
+        ExFreePool(sendBuffer);
+
+        return (404 == status) ? STATUS_NOT_FOUND : STATUS_INVALID_PARAMETER;
+    }
+
+    HTTP_BUFFER_INFO httpInfo =
+    {
+        .BodyBuffer = (receiveBuffer + bytesProcessed),
+        .BodyBufferSize = ((SIZE_T)receiveBufferSize - bytesProcessed),
+        .Headers = headers,
+        .HeaderCount = num_headers
+    };
+
+    result = DeserializeDirectoryEntryInfoFlatBuffer(&httpInfo, DirectoryEntryInfo, isDir);
+
+    if (!NT_SUCCESS(result))
+    {
+        BLORGFS_PRINT("DeserializeFlatBuffer() - Failed to deserialise\n");
+        CloseWskSocket(socket);
+        ExFreePool(receiveBuffer);
+        ExFreePool(sendBuffer);
+        return result;
+    }
+
+    result = CloseWskSocket(socket);
+    ExFreePool(receiveBuffer);
+    ExFreePool(sendBuffer);
+
+    return result;
+}
+
+NTSTATUS GetHttpFile(const PUNICODE_STRING Path, SIZE_T StartOffset, SIZE_T Length, PHTTP_FILE_BUFFER OutputBuffer)
+{
+    if (!Path || 0 == Path->Length || !Path->Buffer)
+    {
+        BLORGFS_PRINT("GetHttpFile() - Invalid path parameter\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    UNICODE_STRING encodedPath;
+    NTSTATUS result = UrlEncodeUnicodeString(Path, &encodedPath, TRUE);
+
+    if (!NT_SUCCESS(result))
+    {
+        BLORGFS_PRINT("GetHttpFile() - No encoded buffer\n");
+        return result;
+    }
+
+    char sendBufferFormat[] =
+        "GET /get_file?path=%wZ HTTP/1.1\r\n"
+        "Host: blorgfs-server.blorg.lan\r\n"
+        "Connection: close\r\n"
+        "Range: bytes=%zu-%zu\r\n"
+        "\r\n";
+
+    const int ULLONG_MAX_DIGITS = 20;
+
+    ULONG sendBufferSize = sizeof(sendBufferFormat) + encodedPath.Length + (ULLONG_MAX_DIGITS * 2);
+    char* sendBuffer = ExAllocatePoolZero(PagedPool, sendBufferSize, 'BOOB');
+
+    if (!sendBuffer)
+    {
+        ExFreePool(encodedPath.Buffer);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    result = RtlStringCbPrintfA(sendBuffer, sendBufferSize, sendBufferFormat, &encodedPath, StartOffset, Length);
+
+    if (!NT_SUCCESS(result))
+    {
+        BLORGFS_PRINT("GetHttpFile() - No send buffer alloc\n");
+        ExFreePool(sendBuffer);
+        ExFreePool(encodedPath.Buffer);
+        return result;
+    }
+
+    ExFreePool(encodedPath.Buffer);
+
+    ULONG receiveBufferSize = PAGE_SIZE;
+    char* receiveBuffer = ExAllocatePoolUninitialized(PagedPool, receiveBufferSize, 'TEST');
+
+    if (!receiveBuffer)
+    {
+        BLORGFS_PRINT("GetHttpFile() - No receive buffer alloc\n");
         ExFreePool(sendBuffer);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -732,24 +1031,80 @@ NTSTATUS FindHttpFile(const PUNICODE_STRING Path, PBOOLEAN Directory, PBOOLEAN F
 
     if (!NT_SUCCESS(result))
     {
-        BLORGFS_PRINT("FindHttpFile() - Failed to send\n");
+        BLORGFS_PRINT("GetHttpFile() - Failed to send\n");
         CloseWskSocket(socket);
         ExFreePool(receiveBuffer);
         ExFreePool(sendBuffer);
         return result;
     }
 
-    ULONG bytesWritten;
-    result = SendRecvWsk(socket, receiveBuffer, receiveBufferSize, &bytesWritten, 0, FALSE);
+    ULONG totalBytesWritten = 0;
+    ULONG bytesWritten = 0;
+    SIZE_T contentLength = 0;
 
-    if (!NT_SUCCESS(result))
+    do
     {
-        BLORGFS_PRINT("FindHttpFile() - Failed to receive\n");
-        CloseWskSocket(socket);
-        ExFreePool(receiveBuffer);
-        ExFreePool(sendBuffer);
-        return result;
+        if (totalBytesWritten >= receiveBufferSize)
+        {
+            int minor_version;
+            int status;
+            const char* msg;
+            SIZE_T msg_len;
+            struct phr_header headers[4];
+            SIZE_T num_headers = sizeof(headers) / sizeof(headers[0]);
+
+            int bytesProcessed = phr_parse_response(receiveBuffer, totalBytesWritten, &minor_version, &status, &msg, &msg_len, headers, &num_headers, 0);
+
+            if (bytesProcessed < 0)
+            {
+                BLORGFS_PRINT("GetHttpFile() - Failed to parse HTTP response\n");
+                CloseWskSocket(socket);
+                ExFreePool(receiveBuffer);
+                ExFreePool(sendBuffer);
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            result = GetContentLengthFromHeaders(headers, num_headers, &contentLength);
+
+            if (!NT_SUCCESS(result))
+            {
+                BLORGFS_PRINT("GetHttpFile() - Failed to parse content length header\n");
+                CloseWskSocket(socket);
+                ExFreePool(receiveBuffer);
+                ExFreePool(sendBuffer);
+                return result;
+            }
+
+            PCHAR newReceiveBuffer = ReallocateBufferUninitialized(receiveBuffer, receiveBufferSize, PagedPool, (bytesProcessed + contentLength), 'BHDI');
+
+            if (newReceiveBuffer == receiveBuffer)
+            {
+                BLORGFS_PRINT("GetHttpFile() - Failed to allocate new receive buffer\n");
+                CloseWskSocket(socket);
+                ExFreePool(receiveBuffer);
+                ExFreePool(sendBuffer);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+
+            receiveBufferSize = bytesProcessed + (ULONG)contentLength;
+            receiveBuffer = newReceiveBuffer;
+        }
+
+        result = SendRecvWsk(socket, receiveBuffer + totalBytesWritten, receiveBufferSize - totalBytesWritten, &bytesWritten, 0, FALSE);
+
+        if (!NT_SUCCESS(result))
+        {
+            BLORGFS_PRINT("GetHttpFile() - Failed to receive\n");
+            CloseWskSocket(socket);
+            ExFreePool(receiveBuffer);
+            ExFreePool(sendBuffer);
+            return result;
+        }
+
+        totalBytesWritten += bytesWritten;
+
     }
+    while (0 < bytesWritten);
 
     int minor_version;
     int status;
@@ -758,9 +1113,9 @@ NTSTATUS FindHttpFile(const PUNICODE_STRING Path, PBOOLEAN Directory, PBOOLEAN F
     struct phr_header headers[4];
     SIZE_T num_headers = sizeof(headers) / sizeof(headers[0]);
 
-    int bytesProcessed = phr_parse_response(receiveBuffer, bytesWritten, &minor_version, &status, &msg, &msg_len, headers, &num_headers, 0);
+    int bytesProcessed = phr_parse_response(receiveBuffer, totalBytesWritten, &minor_version, &status, &msg, &msg_len, headers, &num_headers, 0);
 
-    if (0 > bytesProcessed)
+    if (0 > bytesProcessed || 200 != status)
     {
         BLORGFS_PRINT("phr_parse_response() - Failed to parse\n");
         CloseWskSocket(socket);
@@ -769,20 +1124,19 @@ NTSTATUS FindHttpFile(const PUNICODE_STRING Path, PBOOLEAN Directory, PBOOLEAN F
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (302 == status)
-    {
-        *Found = TRUE;
-        if ('1' == (receiveBuffer + bytesProcessed)[0])
-        {
-            *Directory = TRUE;
-        }
-    }
-
     result = CloseWskSocket(socket);
-    ExFreePool(receiveBuffer);
     ExFreePool(sendBuffer);
 
+    OutputBuffer->BodyBuffer = (receiveBuffer + bytesProcessed);
+    OutputBuffer->BodyBufferSize = contentLength;
+    OutputBuffer->BaseAddress = receiveBuffer;
+
     return result;
+}
+
+void FreeHttpFile(PHTTP_FILE_BUFFER FileBuffer)
+{
+    ExFreePool(FileBuffer->BaseAddress);
 }
 
 NTSTATUS GetHttpAddrInfo(PUNICODE_STRING NodeName, PUNICODE_STRING ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo)

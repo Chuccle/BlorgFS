@@ -1,6 +1,6 @@
 #include "Driver.h"
 
-NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVICE_OBJECT VolumeDeviceObject)
+NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, PCUNICODE_STRING Name, const PDEVICE_OBJECT VolumeDeviceObject, ULONGLONG Size)
 {
     *Fcb = NULL;
 
@@ -79,6 +79,7 @@ NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVI
 
     fcb->Header.NodeTypeCode = NodeType;
     fcb->Header.NodeByteSize = sizeof(FCB);
+    fcb->Header.FileSize.QuadPart = fcb->Header.AllocationSize.QuadPart = fcb->Header.ValidDataLength.QuadPart = Size;
     fcb->Header.IsFastIoPossible = FastIoIsQuestionable;
     fcb->Header.ValidDataLength.QuadPart = MAXLONGLONG;
     fcb->Header.Resource = &nonPaged->HdrResource;
@@ -92,7 +93,7 @@ NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVI
     return STATUS_SUCCESS;
 }
 
-NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVICE_OBJECT VolumeDeviceObject)
+NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, PCUNICODE_STRING Name, const PDEVICE_OBJECT VolumeDeviceObject)
 {
     *Dcb = NULL;
 
@@ -132,14 +133,14 @@ NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVI
     dcb->FullPath.Buffer = nameBuffer;
     dcb->FullPath.Length = Name->Length;
     dcb->FullPath.MaximumLength = Name->Length;
-    
+
     NTSTATUS result = ExInitializeResourceLite(&nonPaged->HdrResource);
 
     if (!NT_SUCCESS(result))
     {
         if (dcb->FullPath.Buffer)
         {
-           ExFreePool(dcb->FullPath.Buffer);
+            ExFreePool(dcb->FullPath.Buffer);
         }
         ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
         ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
@@ -179,7 +180,7 @@ NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVI
     return STATUS_SUCCESS;
 }
 
-NTSTATUS BlorgCreateCCB(CCB** Ccb, PDEVICE_OBJECT VolumeDeviceObject)
+inline NTSTATUS BlorgCreateCCB(CCB** Ccb, const PDEVICE_OBJECT VolumeDeviceObject)
 {
     *Ccb = NULL;
 
@@ -207,12 +208,11 @@ do                                                                              
     PCOMMON_CONTEXT commonContext = ctx;                                                                                             \
     ExDeleteResourceLite(&commonContext->NonPaged->HdrPagingIoResource);                                                             \
     ExDeleteResourceLite(&commonContext->NonPaged->HdrResource);                                                                     \
-	PDEVICE_OBJECT volumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;             \
-    ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(volumeDeviceObject)->NonPagedNodeLookasideList, commonContext->NonPaged);  \
+    ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, commonContext->NonPaged);  \
 }                                                                                                                                    \
 while(0)
 
-void BlorgFreeFileContext(PVOID Context)
+void BlorgFreeFileContext(PVOID Context, PDEVICE_OBJECT VolumeDeviceObject)
 {
     switch (GET_NODE_TYPE(Context))
     {
@@ -221,9 +221,8 @@ void BlorgFreeFileContext(PVOID Context)
             DEALLOCATE_COMMON(Context);
             PFCB fcb = Context;
             ExFreePool(fcb->FullPath.Buffer);
-            PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
             RemoveEntryList(&(fcb->Links));
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(pVolumeDeviceObject)->FcbLookasideList, fcb);
+            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
             break;
         }
         case BLORGFS_DCB_SIGNATURE:
@@ -231,17 +230,15 @@ void BlorgFreeFileContext(PVOID Context)
             DEALLOCATE_COMMON(Context);
             PDCB dcb = Context;
             ExFreePool(dcb->FullPath.Buffer);
-            PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
             RemoveEntryList(&(dcb->Links));
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(pVolumeDeviceObject)->DcbLookasideList, dcb);
+            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
             break;
         }
         case BLORGFS_VCB_SIGNATURE:
         {
             DEALLOCATE_COMMON(Context);
             PVCB vcb = Context;
-            PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(pVolumeDeviceObject)->FcbLookasideList, vcb);
+            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, vcb);
             break;
         }
         case BLORGFS_ROOT_DCB_SIGNATURE:
@@ -249,33 +246,76 @@ void BlorgFreeFileContext(PVOID Context)
             DEALLOCATE_COMMON(Context);
             PDCB dcb = Context;
             ExFreePool(dcb->FullPath.Buffer);
-            PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(pVolumeDeviceObject)->DcbLookasideList, dcb);
+            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
             break;
         }
         case BLORGFS_CCB_SIGNATURE:
         {
             PCCB ccb = Context;
-            PDEVICE_OBJECT pVolumeDeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
             if (ccb->SearchPattern.Buffer)
             {
                 RtlFreeUnicodeString(&ccb->SearchPattern);
                 RtlZeroMemory(&ccb->SearchPattern, sizeof(UNICODE_STRING));
             }
             FreeHttpDirectoryInfo(&ccb->SubDirectories, &ccb->Files);
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(pVolumeDeviceObject)->CcbLookasideList, ccb);
+            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->CcbLookasideList, ccb);
             break;
         }
     }
 }
 
-/**
- * GetLastComponent - Extracts the last component of a given path
- *
- * @param Path - Full path to extract from
- *
- * @return UNICODE_STRING - The last component of the path (filename or last directory)
- */
+PIRP_CONTEXT BlorgCreateIrpContext(PIRP Irp, BOOLEAN Wait)
+{
+    BLORGFS_PRINT("BlorgCreateIrpContext\n");
+
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+
+    PIRP_CONTEXT irpContext = ExAllocateFromNPagedLookasideList(&global.IrpContextLookasideList);
+
+    if (!irpContext)
+    {
+        BLORGFS_PRINT("BlorgCreateIrpContext: Failed to allocate irp context from lookaside list\n");
+        return NULL;
+    }
+
+    ULONG irpContextSize = sizeof(IRP_CONTEXT) + IoSizeofWorkItem();
+
+    RtlZeroMemory(irpContext, irpContextSize);
+
+    irpContext->NodeTypeCode = BLORGFS_IRP_CONTEXT_SIGNATURE;
+    irpContext->NodeByteSize = irpContextSize;
+
+    irpContext->OriginatingIrp = Irp;
+
+    irpContext->MajorFunction = irpSp->MajorFunction;
+    irpContext->MinorFunction = irpSp->MinorFunction;
+
+    if (Wait)
+    {
+        SetFlag(irpContext->Flags, IRP_CONTEXT_FLAG_WAIT);
+    }
+
+    //
+    //  Set the recursive file system call parameter.  We set it true if
+    //  the TopLevelIrp field in the thread local storage is not the current
+    //  irp, otherwise we leave it as FALSE.
+    //
+
+    if (IoGetTopLevelIrp() != Irp)
+    {
+        SetFlag(irpContext->Flags, IRP_CONTEXT_FLAG_RECURSIVE_CALL);
+    }
+
+    BLORGFS_PRINT("BlorgCreateIrpContext -> %p\n", irpContext);
+
+    return irpContext;
+}
+
+inline void BlorgFreeIrpContext(PIRP_CONTEXT IrpContext)
+{
+    ExFreeToNPagedLookasideList(&global.IrpContextLookasideList, IrpContext);
+}
+
 static UNICODE_STRING GetLastComponent(PCUNICODE_STRING Path)
 {
     UNICODE_STRING lastComponent = { 0 };
@@ -320,15 +360,7 @@ static UNICODE_STRING GetLastComponent(PCUNICODE_STRING Path)
     return lastComponent;
 }
 
-/**
- * ArePathComponentsEqual - Case-insensitive comparison of path components
- *
- * @param Component1 - First component to compare
- * @param Component2 - Second component to compare
- *
- * @return BOOLEAN - TRUE if equal, FALSE otherwise
- */
-static BOOLEAN ArePathComponentsEqual(PCUNICODE_STRING Component1, PCUNICODE_STRING Component2)
+inline static BOOLEAN ArePathComponentsEqual(PCUNICODE_STRING Component1, PCUNICODE_STRING Component2)
 {
     // Quick length check
     if (Component1->Length != Component2->Length)
@@ -340,7 +372,7 @@ static BOOLEAN ArePathComponentsEqual(PCUNICODE_STRING Component1, PCUNICODE_STR
     return RtlEqualUnicodeString(Component1, Component2, TRUE);
 }
 
-PCOMMON_CONTEXT SearchByName(PDCB Dcb, PCUNICODE_STRING Name)
+inline static PCOMMON_CONTEXT SearchByName(PDCB Dcb, PCUNICODE_STRING Name)
 {
     PCOMMON_CONTEXT child = NULL;
     UNICODE_STRING lastComponent;
@@ -351,24 +383,24 @@ PCOMMON_CONTEXT SearchByName(PDCB Dcb, PCUNICODE_STRING Name)
     {
         child = CONTAINING_RECORD(entry, COMMON_CONTEXT, Links);
         lastComponent = GetLastComponent(&child->FullPath);
-        
+
         if (ArePathComponentsEqual(Name, &lastComponent))
         {
             return child;
         }
     }
 
-     return NULL;
+    return NULL;
 }
 
-PCOMMON_CONTEXT SearchByPath(PDCB RootDcb, PCUNICODE_STRING Path)
+PCOMMON_CONTEXT SearchByPath(const PDCB RootDcb, PCUNICODE_STRING Path)
 {
     PDCB currentDcb = RootDcb;
     UNICODE_STRING remainingPath = *Path;
     UNICODE_STRING component, nextRemainingPart, lastComponent;
     PCOMMON_CONTEXT child = NULL;
     PCOMMON_CONTEXT matchingChild = NULL;
-    
+
     while (0 < remainingPath.Length)
     {
         FsRtlDissectName(remainingPath, &component, &nextRemainingPart);
@@ -393,11 +425,11 @@ PCOMMON_CONTEXT SearchByPath(PDCB RootDcb, PCUNICODE_STRING Path)
         {
             return NULL;
         }
-        
+
         // If it's not a directory this is our guy
         if (BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(matchingChild))
         {
-           return (nextRemainingPart.Length == 0) ? matchingChild : NULL;
+            return (nextRemainingPart.Length == 0) ? matchingChild : NULL;
         }
 
         currentDcb = (PDCB)child;
@@ -407,7 +439,7 @@ PCOMMON_CONTEXT SearchByPath(PDCB RootDcb, PCUNICODE_STRING Path)
     return (PCOMMON_CONTEXT)currentDcb;
 }
 
-NTSTATUS InsertByPath(PDCB RootDcb, PCUNICODE_STRING Path, BOOLEAN Directory, PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out)
+NTSTATUS InsertByPath(const PDCB RootDcb, PCUNICODE_STRING Path, const PDIRECTORY_ENTRY DirEntryInfo, BOOLEAN Directory, const PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out)
 {
     *Out = NULL;
     UNICODE_STRING remainingPath = *Path;
@@ -437,12 +469,16 @@ NTSTATUS InsertByPath(PDCB RootDcb, PCUNICODE_STRING Path, BOOLEAN Directory, PD
                     // Last component is a file, create FCB
                     PFCB newFcb;
 
-                    status = BlorgCreateFCB(&newFcb, BLORGFS_FCB_SIGNATURE, Path, VolumeDeviceObject);
+                    status = BlorgCreateFCB(&newFcb, BLORGFS_FCB_SIGNATURE, Path, VolumeDeviceObject, DirEntryInfo->Size);
 
                     if (!NT_SUCCESS(status))
                     {
                         return status;
                     }
+
+                    newFcb->LastAccessedTime = DirEntryInfo->LastAccessedTime;
+                    newFcb->LastModifiedTime = DirEntryInfo->LastModifiedTime;
+                    newFcb->CreationTime = DirEntryInfo->CreationTime;
 
                     newFcb->ParentDcb = currentDcb;
                     InsertTailList(&currentDcb->ChildrenList, &newFcb->Links);
@@ -477,9 +513,9 @@ NTSTATUS InsertByPath(PDCB RootDcb, PCUNICODE_STRING Path, BOOLEAN Directory, PD
                     .MaximumLength = partialPath.Length,
                     .Buffer = Path->Buffer
                 };
-                
+
                 status = BlorgCreateDCB(&newDcb, BLORGFS_DCB_SIGNATURE, &partialPath, VolumeDeviceObject);
-                
+
                 if (!NT_SUCCESS(status))
                 {
                     return status;

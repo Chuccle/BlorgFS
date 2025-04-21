@@ -1,8 +1,6 @@
 #pragma once
 
-NTSTATUS MapUserBuffer(PIRP Irp, PVOID* Address);
-
-FORCEINLINE
+inline
 __drv_allocatesMem(Mem)
 _When_((PoolType& PagedPool) != 0, _IRQL_requires_max_(APC_LEVEL))
 _When_((PoolType& PagedPool) == 0, _IRQL_requires_max_(DISPATCH_LEVEL))
@@ -40,7 +38,7 @@ _When_((PoolType& NonPagedPoolMustSucceed) != 0,
     return newBuffer;
 }
 
-FORCEINLINE
+inline
 __drv_allocatesMem(Mem)
 _When_((PoolType& PagedPool) != 0, _IRQL_requires_max_(APC_LEVEL))
 _When_((PoolType& PagedPool) == 0, _IRQL_requires_max_(DISPATCH_LEVEL))
@@ -76,4 +74,130 @@ _When_((PoolType& NonPagedPoolMustSucceed) != 0,
     ExFreePool(OldBuffer);
 
     return newBuffer;
+}
+
+inline void LockUserBuffer(IN OUT PIRP Irp, IN LOCK_OPERATION Operation, IN ULONG BufferLength)
+{
+    if (!Irp->MdlAddress)
+    {
+        PMDL mdl = IoAllocateMdl(Irp->UserBuffer, BufferLength, FALSE, FALSE, Irp);
+
+        if (mdl)
+        {
+           //
+           // Now probe the buffer described by the Irp.  If we get an exception,
+           // deallocate the Mdl and return the appropriate "expected" status.
+           //
+
+            __try
+            {
+                MmProbeAndLockPages(mdl,
+                    Irp->RequestorMode,
+                    Operation);
+
+            } 
+            __except(EXCEPTION_EXECUTE_HANDLER)
+            {
+                IoFreeMdl(mdl);
+                Irp->MdlAddress = NULL;
+            }
+        }
+    }
+}
+
+inline void CompleteRequest(
+    IN PIRP_CONTEXT IrpContext OPTIONAL,
+    IN PIRP Irp OPTIONAL,
+    IN NTSTATUS Status
+)
+
+/*++
+
+Routine Description:
+
+    This routine completes a Irp
+
+Arguments:
+
+    Irp - Supplies the Irp being processed
+
+    Status - Supplies the status to complete the Irp with
+
+Return Value:
+
+    None.
+
+--*/
+
+{
+    //
+    //  Delete the Irp context before completing the IRP so if
+    //  we run into some of the asserts, we can still backtrack
+    //  through the IRP.
+    //
+
+    if (IrpContext)
+    {
+        BlorgFreeIrpContext(IrpContext);
+    }
+
+    //
+    //  If we have an Irp then complete the irp.
+    //
+
+    if (Irp)
+    {
+        //
+        //  We got an error, so zero out the information field before
+        //  completing the request if this was an input operation.
+        //  Otherwise IopCompleteRequest will try to copy to the user's buffer.
+        //
+
+        if (NT_ERROR(Status) &&
+            FlagOn(Irp->Flags, IRP_INPUT_OPERATION))
+        {
+            Irp->IoStatus.Information = 0;
+        }
+
+        Irp->IoStatus.Status = Status;
+
+        IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+    }
+}
+
+inline BOOLEAN IsIrpTopLevel(
+    IN PIRP Irp
+)
+
+/*++
+
+Routine Description:
+
+    This routine detects if an Irp is the Top level requestor, ie. if it os OK
+    to do a verify or pop-up now.  If TRUE is returned, then no file system
+    resources are held above us.
+
+Arguments:
+
+    Irp - Supplies the Irp being processed
+
+    Status - Supplies the status to complete the Irp with
+
+Return Value:
+
+    None.
+
+--*/
+
+{
+    if (!IoGetTopLevelIrp())
+    {
+        IoSetTopLevelIrp(Irp);
+
+        return TRUE;
+    }
+    else
+    {
+        return FALSE;
+    }
 }

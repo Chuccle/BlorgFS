@@ -94,7 +94,10 @@
     <ClCompile Include="flatcc\src\runtime\verifier.c">
       <Filter>Source Files\flatcc</Filter>
     </ClCompile>
-    <ClCompile Include="Util.c">
+    <ClCompile Include="CacheManager.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WorkQueue.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -124,6 +127,12 @@
       <Filter>Header Files\Networking</Filter>
     </ClInclude>
     <ClInclude Include="Util.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="CacheManager.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="WorkQueue.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

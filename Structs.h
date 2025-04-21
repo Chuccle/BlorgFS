@@ -55,6 +55,7 @@ CHECK_PADDING_END(DIRECTORY_INFO, EntryCount);
 #define BLORGFS_ROOT_DCB_SIGNATURE 0xBEEF
 #define BLORGFS_VCB_SIGNATURE 0xB055
 #define BLORGFS_CCB_SIGNATURE 0xBE55
+#define BLORGFS_IRP_CONTEXT_SIGNATURE   0xBF00
 
 #define GET_NODE_TYPE(Nodeptr) (*((USHORT*)(Nodeptr)))
 
@@ -95,6 +96,12 @@ typedef struct _COMMON_CONTEXT
 
     LONG CacheAcquired;
 
+    ULONG64 CreationTime;
+    
+    ULONG64 LastAccessedTime;
+    
+    ULONG64 LastModifiedTime;
+
     // Interlocked
     LONG64 RefCount;
 } COMMON_CONTEXT, * PCOMMON_CONTEXT;
@@ -106,7 +113,10 @@ CHECK_PADDING_BETWEEN(COMMON_CONTEXT, FullPath, VolumeDeviceObject);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, VolumeDeviceObject, ParentDcb);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ParentDcb, ShareAccess);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ShareAccess, CacheAcquired);
-CHECK_PADDING_BETWEEN(COMMON_CONTEXT, CacheAcquired, RefCount);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, CacheAcquired, CreationTime);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, CreationTime, LastAccessedTime);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, LastAccessedTime, LastModifiedTime);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, LastModifiedTime, RefCount);
 CHECK_PADDING_END(COMMON_CONTEXT, RefCount);
 
 typedef struct _FCB
@@ -114,6 +124,7 @@ typedef struct _FCB
 #pragma warning(suppress: 4201)
     COMMON_CONTEXT  DUMMYSTRUCTNAME;
     FILE_LOCK       FileLock;
+    PVOID           LazyWriteThread;
 } FCB, * PFCB;
 
 CHECK_PADDING_BETWEEN(FCB, Header, NonPaged);
@@ -123,9 +134,13 @@ CHECK_PADDING_BETWEEN(FCB, FullPath, VolumeDeviceObject);
 CHECK_PADDING_BETWEEN(FCB, VolumeDeviceObject, ParentDcb);
 CHECK_PADDING_BETWEEN(FCB, ParentDcb, ShareAccess);
 CHECK_PADDING_BETWEEN(FCB, ShareAccess, CacheAcquired);
-CHECK_PADDING_BETWEEN(FCB, CacheAcquired, RefCount);
+CHECK_PADDING_BETWEEN(FCB, CacheAcquired, CreationTime);
+CHECK_PADDING_BETWEEN(FCB, CreationTime, LastAccessedTime);
+CHECK_PADDING_BETWEEN(FCB, LastAccessedTime, LastModifiedTime);
+CHECK_PADDING_BETWEEN(FCB, LastModifiedTime, RefCount);
 CHECK_PADDING_BETWEEN(FCB, RefCount, FileLock);
-CHECK_PADDING_END(FCB, FileLock);
+CHECK_PADDING_BETWEEN(FCB, FileLock, LazyWriteThread);
+CHECK_PADDING_END(FCB, LazyWriteThread);
 
 typedef struct _DCB
 {
@@ -141,14 +156,17 @@ CHECK_PADDING_BETWEEN(DCB, FullPath, VolumeDeviceObject);
 CHECK_PADDING_BETWEEN(DCB, VolumeDeviceObject, ParentDcb);
 CHECK_PADDING_BETWEEN(DCB, ParentDcb, ShareAccess);
 CHECK_PADDING_BETWEEN(DCB, ShareAccess, CacheAcquired);
-CHECK_PADDING_BETWEEN(DCB, CacheAcquired, RefCount);
+CHECK_PADDING_BETWEEN(DCB, CacheAcquired, CreationTime);
+CHECK_PADDING_BETWEEN(DCB, CreationTime, LastAccessedTime);
+CHECK_PADDING_BETWEEN(DCB, LastAccessedTime, LastModifiedTime);
+CHECK_PADDING_BETWEEN(DCB, LastModifiedTime, RefCount);
 CHECK_PADDING_BETWEEN(DCB, RefCount, ChildrenList);
 CHECK_PADDING_END(DCB, ChildrenList);
 
 typedef struct _CCB
 {
-    ULONG NodeTypeCode: 16;
-    ULONG NodeByteSize: 16;
+    ULONG NodeTypeCode;
+    ULONG NodeByteSize;
     ULONGLONG Flags;
     UINT64 CurrentIndex;
     UNICODE_STRING SearchPattern;
@@ -169,14 +187,58 @@ CHECK_PADDING_END(CCB, Files);
 typedef FCB VCB;
 typedef PFCB PVCB;
 
-NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVICE_OBJECT VolumeDeviceObject);
-NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, PCUNICODE_STRING Name, PDEVICE_OBJECT VolumeDeviceObject);
-NTSTATUS BlorgCreateCCB(CCB** Ccb, PDEVICE_OBJECT VolumeDeviceObject);
-void BlorgFreeFileContext(PVOID FileNode);
+NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, PCUNICODE_STRING Name, const PDEVICE_OBJECT VolumeDeviceObject, ULONGLONG Size);
+NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, PCUNICODE_STRING Name, const PDEVICE_OBJECT VolumeDeviceObject);
+extern inline NTSTATUS BlorgCreateCCB(CCB** Ccb, const PDEVICE_OBJECT VolumeDeviceObject);
+void BlorgFreeFileContext(PVOID Context, const PDEVICE_OBJECT VolumeDeviceObject);
 
-PCOMMON_CONTEXT SearchByPath(PDCB RootDcb, PCUNICODE_STRING Path);
-PCOMMON_CONTEXT SearchByName(PDCB ParentDcb, PCUNICODE_STRING Name);
-NTSTATUS InsertByPath(PDCB RootDcb, PCUNICODE_STRING Path, BOOLEAN Directory, PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out);
+PCOMMON_CONTEXT SearchByPath(const PDCB RootDcb, PCUNICODE_STRING Path);
+NTSTATUS InsertByPath(const PDCB RootDcb, PCUNICODE_STRING Path, const PDIRECTORY_ENTRY DirEntryInfo, BOOLEAN Directory, const PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out);
+
+typedef struct _IRP_CONTEXT
+{
+    ULONG NodeTypeCode;
+    ULONG NodeByteSize;
+    ULONGLONG Flags;
+    PIRP OriginatingIrp;
+    ULONG MajorFunction;
+    ULONG MinorFunction;
+    LIST_ENTRY ListEntry;
+    CHAR WorkQueueItem[]; // opaque structure;
+} IRP_CONTEXT, * PIRP_CONTEXT;
+
+CHECK_PADDING_BETWEEN(IRP_CONTEXT, NodeTypeCode, NodeByteSize);
+CHECK_PADDING_BETWEEN(IRP_CONTEXT, NodeByteSize, Flags);
+CHECK_PADDING_BETWEEN(IRP_CONTEXT, Flags, OriginatingIrp);
+CHECK_PADDING_BETWEEN(IRP_CONTEXT, OriginatingIrp, MajorFunction);
+CHECK_PADDING_BETWEEN(IRP_CONTEXT, MajorFunction, MinorFunction);
+CHECK_PADDING_BETWEEN(IRP_CONTEXT, MinorFunction, ListEntry);
+CHECK_PADDING_BETWEEN(IRP_CONTEXT, ListEntry, WorkQueueItem);
+CHECK_PADDING_END(IRP_CONTEXT, WorkQueueItem);
+
+#define IRP_CONTEXT_FLAG_DISABLE_DIRTY              0x00000001
+#define IRP_CONTEXT_FLAG_WAIT                       0x00000002
+#define IRP_CONTEXT_FLAG_WRITE_THROUGH              0x00000004
+#define IRP_CONTEXT_FLAG_DISABLE_WRITE_THROUGH      0x00000008
+#define IRP_CONTEXT_FLAG_RECURSIVE_CALL             0x00000010
+#define IRP_CONTEXT_FLAG_DISABLE_POPUPS             0x00000020
+#define IRP_CONTEXT_FLAG_DEFERRED_WRITE             0x00000040
+#define IRP_CONTEXT_FLAG_VERIFY_READ                0x00000080
+#define IRP_CONTEXT_STACK_IO_CONTEXT                0x00000100
+#define IRP_CONTEXT_FLAG_IN_FSP                     0x00000200
+#define IRP_CONTEXT_FLAG_USER_IO                    0x00000400       // for performance counters
+#define IRP_CONTEXT_FLAG_DISABLE_RAISE              0x00000800
+#define IRP_CONTEXT_FLAG_OVERRIDE_VERIFY            0x00001000
+#define IRP_CONTEXT_FLAG_CLEANUP_BREAKING_OPLOCK    0x00002000
+
+#if (NTDDI_VERSION >= NTDDI_WINTHRESHOLD)
+#define IRP_CONTEXT_FLAG_SWAPPED_STACK              0x00100000
+#endif
+
+#define IRP_CONTEXT_FLAG_PARENT_BY_CHILD            0x80000000
+
+PIRP_CONTEXT BlorgCreateIrpContext(PIRP Irp, BOOLEAN Wait);
+extern inline void BlorgFreeIrpContext(PIRP_CONTEXT IrpContext);
 
 /////////////////////////////////////////////
 ///////DEVICE EXTENSION SECTION//////////////
@@ -198,6 +260,10 @@ typedef struct _BLORGFS_VDO_DEVICE_EXTENSION
     PAGED_LOOKASIDE_LIST FcbLookasideList;
     PAGED_LOOKASIDE_LIST DcbLookasideList;
     PAGED_LOOKASIDE_LIST CcbLookasideList;
+    ULONG PostedRequestCount;
+    ULONG OverflowQueueCount;
+    LIST_ENTRY OverflowQueue;
+    KSPIN_LOCK OverflowQueueSpinLock;
 } BLORGFS_VDO_DEVICE_EXTENSION, * PBLORGFS_VDO_DEVICE_EXTENSION;
 
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, Hdr, Vcb);
@@ -206,7 +272,11 @@ CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, RootDcb, NonPagedNodeLookasi
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, NonPagedNodeLookasideList, FcbLookasideList);
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, FcbLookasideList, DcbLookasideList);
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, DcbLookasideList, CcbLookasideList);
-CHECK_PADDING_END(BLORGFS_VDO_DEVICE_EXTENSION, CcbLookasideList);
+CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, CcbLookasideList, PostedRequestCount);
+CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, PostedRequestCount, OverflowQueueCount);
+CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, OverflowQueueCount, OverflowQueue);
+CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, OverflowQueue, OverflowQueueSpinLock);
+CHECK_PADDING_END(BLORGFS_VDO_DEVICE_EXTENSION, OverflowQueueSpinLock);
 
 typedef struct _BLORGFS_DDO_DEVICE_EXTENSION
 {

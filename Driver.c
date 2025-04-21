@@ -1,6 +1,6 @@
 #include "Driver.h"
 
-FAST_IO_DISPATCH BlorgFsFastDispatch;
+FAST_IO_DISPATCH  BlorgFsFastDispatch;
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD     DriverUnload;
 
@@ -106,9 +106,11 @@ NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
 
     PBLORGFS_VDO_DEVICE_EXTENSION devExt = volumeDeviceObject->DeviceExtension;
 
+    RtlZeroMemory(devExt, sizeof(BLORGFS_VDO_DEVICE_EXTENSION));
+
     devExt->Hdr.Identifier = BLORGFS_VDO_MAGIC;
 
-    ExInitializeNPagedLookasideList(&devExt->NonPagedNodeLookasideList, NULL, NULL, 0, sizeof(NON_PAGED_NODE), 'NPN', 0);
+    ExInitializeNPagedLookasideList(&devExt->NonPagedNodeLookasideList, NULL, NULL, POOL_NX_ALLOCATION, sizeof(NON_PAGED_NODE), 'NPN', 0);
     ExInitializePagedLookasideList(&devExt->FcbLookasideList, NULL, NULL, 0, sizeof(FCB), 'FCB', 0);
     ExInitializePagedLookasideList(&devExt->DcbLookasideList, NULL, NULL, 0, sizeof(DCB), 'DCB', 0);
     ExInitializePagedLookasideList(&devExt->CcbLookasideList, NULL, NULL, 0, sizeof(CCB), 'CCB', 0);
@@ -127,11 +129,11 @@ NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
         return result;
     }
 
-    result = BlorgCreateFCB(&devExt->Vcb, BLORGFS_VCB_SIGNATURE, NULL, volumeDeviceObject);
+    result = BlorgCreateFCB(&devExt->Vcb, BLORGFS_VCB_SIGNATURE, NULL, volumeDeviceObject, 0);
 
     if (!NT_SUCCESS(result))
     {
-        BlorgFreeFileContext(devExt->RootDcb);
+        BlorgFreeFileContext(devExt->RootDcb, volumeDeviceObject);
         ExDeleteNPagedLookasideList(&devExt->NonPagedNodeLookasideList);
         ExDeletePagedLookasideList(&devExt->FcbLookasideList);
         ExDeletePagedLookasideList(&devExt->DcbLookasideList);
@@ -139,6 +141,10 @@ NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
         IoDeleteDevice(volumeDeviceObject);
         return result;
     }
+
+    InitializeListHead(&devExt->OverflowQueue);
+
+    KeInitializeSpinLock(&devExt->OverflowQueueSpinLock);
 
     ClearFlag(volumeDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
@@ -151,8 +157,8 @@ static void DeleteBlorgVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
     if (VolumeDeviceObject)
     {
         PBLORGFS_VDO_DEVICE_EXTENSION pDevExt = GetVolumeDeviceExtension(VolumeDeviceObject);
-        BlorgFreeFileContext(pDevExt->Vcb);
-        BlorgFreeFileContext(pDevExt->RootDcb);
+        BlorgFreeFileContext(pDevExt->Vcb, VolumeDeviceObject);
+        BlorgFreeFileContext(pDevExt->RootDcb, VolumeDeviceObject);
         ExDeleteNPagedLookasideList(&pDevExt->NonPagedNodeLookasideList);
         ExDeletePagedLookasideList(&pDevExt->FcbLookasideList);
         ExDeletePagedLookasideList(&pDevExt->DcbLookasideList);
@@ -226,6 +232,8 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
     DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
     global.DiskDeviceObject = NULL;
 
+    ExDeleteNPagedLookasideList(&global.IrpContextLookasideList);
+
     FreeHttpAddrInfo(global.RemoteAddressInfo);
 
     CleanupHttpClient();
@@ -234,8 +242,6 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     UNREFERENCED_PARAMETER(RegistryPath);
-
-    NTSTATUS  result = STATUS_SUCCESS;
 
     global.DriverObject = DriverObject;
 
@@ -260,8 +266,24 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DriverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = BlorgQuerySecurity;
     DriverObject->MajorFunction[IRP_MJ_SET_SECURITY] = BlorgSetSecurity;
 
+#pragma warning(suppress: 28175) // "We are a filesystem. Touching FastIoDispatch is allowed"
+    DriverObject->FastIoDispatch = &BlorgFsFastDispatch;
+
+    RtlZeroMemory(&BlorgFsFastDispatch, sizeof(FAST_IO_DISPATCH));
+
+    global.CacheManagerCallbacks.AcquireForLazyWrite = BlorgAcquireNodeForLazyWrite;
+    global.CacheManagerCallbacks.ReleaseFromLazyWrite = BlorgReleaseNodeFromLazyWrite;
+    global.CacheManagerCallbacks.AcquireForReadAhead = BlorgAcquireNodeForReadAhead;
+    global.CacheManagerCallbacks.ReleaseFromReadAhead = BlorgReleaseNodeFromReadAhead;
+
+    BlorgFsFastDispatch.SizeOfFastIoDispatch = sizeof(FAST_IO_DISPATCH);
+    BlorgFsFastDispatch.FastIoCheckIfPossible = FastIoCheckIfPossible;
+    BlorgFsFastDispatch.FastIoRead = FsRtlCopyRead;
+    BlorgFsFastDispatch.MdlRead = FsRtlMdlReadDev;
+    BlorgFsFastDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;
+    
     PDEVICE_OBJECT fileSystemDeviceObject;
-    result = CreateBlorgFileSystemDeviceObject(DriverObject, &fileSystemDeviceObject);
+    NTSTATUS result = CreateBlorgFileSystemDeviceObject(DriverObject, &fileSystemDeviceObject);
 
     if (!NT_SUCCESS(result))
     {
@@ -285,10 +307,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     ObReferenceObject(diskDeviceObject);
     global.DiskDeviceObject = diskDeviceObject;
 
+    ExInitializeNPagedLookasideList(&global.IrpContextLookasideList, NULL, NULL, POOL_NX_ALLOCATION, sizeof(IRP_CONTEXT) + IoSizeofWorkItem(), 'ICTX', 0);
+
     result = InitialiseHttpClient();
 
     if (!NT_SUCCESS(result))
     {
+        ExDeleteNPagedLookasideList(&global.IrpContextLookasideList);
         ObDereferenceObject(global.FileSystemDeviceObject);
         DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
@@ -307,6 +332,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     if (!NT_SUCCESS(result))
     {
         CleanupHttpClient();
+        ExDeleteNPagedLookasideList(&global.IrpContextLookasideList);
         ObDereferenceObject(global.FileSystemDeviceObject);
         DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
