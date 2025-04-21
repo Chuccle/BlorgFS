@@ -8,7 +8,6 @@ static inline void HandleUserFSRequest(ULONG FsctlCode, PIRP Irp, PIO_STACK_LOCA
     {
         case FSCTL_IS_VOLUME_MOUNTED:
         {
-            Irp->IoStatus.Information = 0;
             Irp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
             break;
         }

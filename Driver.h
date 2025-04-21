@@ -5,9 +5,12 @@
 #include <wdmsec.h>
 #include <wsk.h>
 
-#include "Util.h"
+
 #include "Structs.h"
+#include "Util.h"
 #include "Client.h"
+#include "CacheManager.h"
+#include "WorkQueue.h"
 
 #define BLORGFS_FSDO_STRING  L"\\BlorgFS"
 #define BLORGFS_FSDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
@@ -67,4 +70,7 @@ extern struct GLOBAL
     PDEVICE_OBJECT FileSystemDeviceObject;
     PDEVICE_OBJECT DiskDeviceObject;
     PADDRINFOEXW   RemoteAddressInfo;
+    CACHE_MANAGER_CALLBACKS CacheManagerCallbacks;
+    PVOID LazyWriteThread;
+    NPAGED_LOOKASIDE_LIST IrpContextLookasideList;
 } global;

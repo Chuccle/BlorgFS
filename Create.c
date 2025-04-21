@@ -21,12 +21,13 @@ static NTSTATUS BlorgOpenExistingFcbShared(PIRP Irp, PFILE_OBJECT FileObject, PA
     FileObject->Vpb = global.DiskDeviceObject->Vpb;
     FileObject->FsContext = Fcb;
     FileObject->FsContext2 = NULL;
+    FileObject->SectionObjectPointer = &Fcb->NonPaged->SectionObjectPointers;
     Irp->IoStatus.Information = FILE_OPENED;
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS BlorgOpenExistingDcbShared(PIRP Irp, PFILE_OBJECT FileObject, PACCESS_MASK DesiredAccess, USHORT ShareAccess, PDCB Dcb, PDEVICE_OBJECT VolumeDeviceObject)
+static NTSTATUS BlorgOpenExistingDcbShared(PIRP Irp, PFILE_OBJECT FileObject, PACCESS_MASK DesiredAccess, USHORT ShareAccess, PDCB Dcb, const PDEVICE_OBJECT VolumeDeviceObject)
 {
     PCCB pCcb;
 
@@ -48,7 +49,7 @@ static NTSTATUS BlorgOpenExistingDcbShared(PIRP Irp, PFILE_OBJECT FileObject, PA
         if (!NT_SUCCESS(result))
         {
             InterlockedDecrement64(&Dcb->RefCount);
-            BlorgFreeFileContext(pCcb);
+            BlorgFreeFileContext(pCcb, VolumeDeviceObject);
             return result;
         }
     }
@@ -84,6 +85,7 @@ static NTSTATUS BlorgOpenExistingFcbExclusive(PIRP Irp, PFILE_OBJECT FileObject,
     FileObject->Vpb = global.DiskDeviceObject->Vpb;
     FileObject->FsContext = Fcb;
     FileObject->FsContext2 = NULL;
+    FileObject->SectionObjectPointer = &Fcb->NonPaged->SectionObjectPointers;
     Irp->IoStatus.Information = FILE_OPENED;
 
     return STATUS_SUCCESS;
@@ -110,7 +112,7 @@ static NTSTATUS BlorgOpenExistingDcbExclusive(PIRP Irp, PFILE_OBJECT FileObject,
 
         if (!NT_SUCCESS(result))
         {
-            BlorgFreeFileContext(pCcb);
+            BlorgFreeFileContext(pCcb, VolumeDeviceObject);
             return result;
         }
     }
@@ -128,18 +130,23 @@ static NTSTATUS BlorgOpenExistingDcbExclusive(PIRP Irp, PFILE_OBJECT FileObject,
 
 static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
 {
-    // handle the volume object's create request
+    struct OwnedString
+    {
+        BOOLEAN IsAllocated;
+        UNICODE_STRING String;
+    };
+
     PFILE_OBJECT fileObject = IrpSp->FileObject;
     PFILE_OBJECT relatedFileObject = fileObject->RelatedFileObject;
 
-    UNICODE_STRING filePath = fileObject->FileName;
+    struct OwnedString filePath = { 0 };
+    PDCB parentDcb = GetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb;
     ULONG options = IrpSp->Parameters.Create.Options;
     USHORT shareAccess = IrpSp->Parameters.Create.ShareAccess;
     UCHAR createDisposition = (options >> 24) & 0x000000ff;
     PACCESS_MASK desiredAccess = &IrpSp->Parameters.Create.SecurityContext->DesiredAccess;
 
-    if ((FILE_OPEN != createDisposition) &&
-        (FILE_OPEN_IF != createDisposition))
+    if (FILE_OPEN != createDisposition)
     {
         return STATUS_ACCESS_DENIED;
     }
@@ -149,11 +156,6 @@ static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OB
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (0 == shareAccess)
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-    
     //
     // Only allow to be opened for read or execute access.
     //
@@ -165,42 +167,105 @@ static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OB
 
     if (!relatedFileObject)
     {
-        // open the volume object
-        if (0 == filePath.Length)
+        //
+        // Open the volume object
+        //
+
+        if (0 == fileObject->FileName.Length)
         {
             return BlorgOpenExistingFcbShared(Irp, fileObject, desiredAccess, shareAccess, GetVolumeDeviceExtension(VolumeDeviceObject)->Vcb);
         }
-
-        // open the root directory
-        if (sizeof(WCHAR) == filePath.Length && L'\\' == filePath.Buffer[0])
-        {
-            if (BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE))
-            {
-                return STATUS_INVALID_PARAMETER;
-            }
-
-            return BlorgOpenExistingDcbShared(Irp, fileObject, desiredAccess, shareAccess, GetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb, VolumeDeviceObject);
-        }
+        
+        filePath.String = fileObject->FileName;
     }
     else
     {
-        KdBreakPoint();
+        //
+        //  A relative open must be via a relative path.
+        //
+
+        if ((0 < fileObject->FileName.Length) &&
+            (L'\\' == fileObject->FileName.Buffer[0]))
+        {
+            return STATUS_OBJECT_NAME_INVALID;
+        }
+        
+        //
+        // Validate the related file object is a DCB
+        //
+        
+        if ((BLORGFS_DCB_SIGNATURE != GET_NODE_TYPE(relatedFileObject->FsContext)) 
+            || (BLORGFS_ROOT_DCB_SIGNATURE != GET_NODE_TYPE(relatedFileObject->FsContext)))
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        parentDcb = relatedFileObject->FsContext;
+
+        //
+        //  Common path + path separator + remaining path
+        //
+        
+        USHORT length = relatedFileObject->FileName.Length + sizeof(WCHAR) + fileObject->FileName.Length;
+
+        if (0 < length)
+        { 
+            filePath.String.Buffer = ExAllocatePoolUninitialized(PagedPool, length, 'CRET');
+
+            if (!filePath.String.Buffer)
+            {
+                return STATUS_NO_MEMORY;
+            }
+
+            filePath.IsAllocated = TRUE;
+
+            RtlCopyMemory(filePath.String.Buffer, relatedFileObject->FileName.Buffer, relatedFileObject->FileName.Length);
+            filePath.String.Buffer[relatedFileObject->FileName.Length / sizeof(WCHAR)] = L'\\';
+            RtlCopyMemory(filePath.String.Buffer + relatedFileObject->FileName.Length, fileObject->FileName.Buffer, fileObject->FileName.Length);
+
+            filePath.String.Length = length;
+            filePath.String.MaximumLength = length;
+        }
     }
 
-    if (((sizeof(WCHAR) * 2) <= filePath.Length) &&
-       (L'\\' == filePath.Buffer[(filePath.Length / sizeof(WCHAR)) - 1])) 
+    if (((sizeof(WCHAR) * 2) <= filePath.String.Length) &&
+        (L'\\' == filePath.String.Buffer[(filePath.String.Length / sizeof(WCHAR)) - 1]))
     {
-        filePath.Length -= sizeof(WCHAR);
+        filePath.String.Length -= sizeof(WCHAR);
     }
     
-    BLORGFS_PRINT(" ->NormalisedFileName             = %wZ\n", &filePath);
+    //
+    // Open the root directory
+    //
+    
+    if (sizeof(WCHAR) == filePath.String.Length && L'\\' == filePath.String.Buffer[0])
+    {
+        if (BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE))
+        {
+            if(filePath.IsAllocated)
+            {
+                ExFreePool(filePath.String.Buffer);
+            }
+            
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        if (filePath.IsAllocated)
+        {
+            ExFreePool(filePath.String.Buffer);
+        }
+        
+        return BlorgOpenExistingDcbShared(Irp, fileObject, desiredAccess, shareAccess, parentDcb, VolumeDeviceObject);
+    }
+
+    BLORGFS_PRINT(" ->NormalisedFileName             = %wZ\n", &filePath.String);
 
     PVCB vcb = GetVolumeDeviceExtension(VolumeDeviceObject)->Vcb;
 
     // lookup the in memory FCBs to see if we already have this file open
     ExAcquireResourceSharedLite(vcb->Header.Resource, TRUE);
 
-    PCOMMON_CONTEXT desiredNode = SearchByPath(GetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb, &filePath);
+    PCOMMON_CONTEXT desiredNode = SearchByPath(parentDcb, &filePath.String);
 
     if (desiredNode)
     {
@@ -211,17 +276,37 @@ static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OB
                 if (BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE))
                 {
                     ExReleaseResourceLite(vcb->Header.Resource);
+
+                    if (filePath.IsAllocated)
+                    {
+                        ExFreePool(filePath.String.Buffer);
+                    }
+
                     return STATUS_FILE_IS_A_DIRECTORY;
                 }
 
                 NTSTATUS result = BlorgOpenExistingDcbShared(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
+                
                 ExReleaseResourceLite(vcb->Header.Resource);
+
+                if (filePath.IsAllocated)
+                {
+                    ExFreePool(filePath.String.Buffer);
+                }
+                
                 return result;
             }
             case BLORGFS_FCB_SIGNATURE:
             {
                 NTSTATUS result = BlorgOpenExistingFcbShared(Irp, fileObject, desiredAccess, shareAccess, (PFCB)desiredNode);
+                
                 ExReleaseResourceLite(vcb->Header.Resource);
+
+                if (filePath.IsAllocated)
+                {
+                    ExFreePool(filePath.String.Buffer);
+                }
+                
                 return result;
             }
         }
@@ -230,32 +315,43 @@ static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OB
     ExReleaseResourceLite(vcb->Header.Resource);
 
     // Verify that this actually exists on the remote store
-    BOOLEAN found;
-    BOOLEAN directory;
+    BOOLEAN isDir;
+    DIRECTORY_ENTRY dirEntInfo;
 
-    NTSTATUS result = FindHttpFile(&filePath, &directory, &found);
+    NTSTATUS result = GetHttpFileInformation(&filePath.String, &dirEntInfo, &isDir);
 
     if (!NT_SUCCESS(result))
     {
+        if (filePath.IsAllocated)
+        {
+            ExFreePool(filePath.String.Buffer);
+        }
+        
+        if (result == STATUS_NOT_FOUND)
+        {
+           // Irp->IoStatus.Information = FILE_DOES_NOT_EXIST;
+        }
+        
         return result;
     }
 
-    if (!found)
+    if (isDir && BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE))
     {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    }
+        if (filePath.IsAllocated)
+        {
+            ExFreePool(filePath.String.Buffer);
+        }
 
-    if (directory && BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE))
-    {
+        // Irp->IoStatus.Information = FILE_DOES_NOT_EXIST;
         return STATUS_FILE_IS_A_DIRECTORY;
     }
-    
+
     // slow case, we're missing DCBs in memory which represent each component of the path
     // we need to create them and insert them into the tree
     ExAcquireResourceExclusiveLite(vcb->Header.Resource, TRUE);
 
     // Recheck at this point as A lot of uOps have transpired since we were last sync'd 
-    desiredNode = SearchByPath(GetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb, &filePath);
+    desiredNode = SearchByPath(parentDcb, &filePath.String);
 
     if (desiredNode)
     {
@@ -266,27 +362,55 @@ static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OB
                 if (BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE))
                 {
                     ExReleaseResourceLite(vcb->Header.Resource);
+                    
+                    if (filePath.IsAllocated)
+                    {
+                        ExFreePool(filePath.String.Buffer);
+                    }
+                    
+                    // Irp->IoStatus.Information = FILE_DOES_NOT_EXIST;
                     return STATUS_FILE_IS_A_DIRECTORY;
                 }
 
                 result = BlorgOpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
+                
                 ExReleaseResourceLite(vcb->Header.Resource);
+                
+                if (filePath.IsAllocated)
+                {
+                    ExFreePool(filePath.String.Buffer);
+                }
+                
                 return result;
             }
             case BLORGFS_FCB_SIGNATURE:
             {
                 result = BlorgOpenExistingFcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PFCB)desiredNode);
+                
                 ExReleaseResourceLite(vcb->Header.Resource);
+
+                if (filePath.IsAllocated)
+                {
+                    ExFreePool(filePath.String.Buffer);
+                }
+                
                 return result;
             }
         }
     }
-  
-    result = InsertByPath(GetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb, &filePath, !BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE), VolumeDeviceObject, &desiredNode);
+
+    // insert by path should ensure the fcb is not already in the tree
+    result = InsertByPath(parentDcb, &filePath.String, &dirEntInfo, isDir, VolumeDeviceObject, &desiredNode);
 
     if (!NT_SUCCESS(result))
     {
         ExReleaseResourceLite(vcb->Header.Resource);
+
+        if (filePath.IsAllocated)
+        {
+            ExFreePool(filePath.String.Buffer);
+        }
+        
         return result;
     }
 
@@ -297,20 +421,40 @@ static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OB
             case BLORGFS_DCB_SIGNATURE:
             {
                 result = BlorgOpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
+                
                 ExReleaseResourceLite(vcb->Header.Resource);
+
+                if (filePath.IsAllocated)
+                {
+                    ExFreePool(filePath.String.Buffer);
+                }
+                
                 return result;
             }
             case BLORGFS_FCB_SIGNATURE:
             {
                 result = BlorgOpenExistingFcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PFCB)desiredNode);
+                
                 ExReleaseResourceLite(vcb->Header.Resource);
+
+                if (filePath.IsAllocated)
+                {
+                    ExFreePool(filePath.String.Buffer);
+                }
+                
                 return result;
             }
         }
     }
-    
+
     ExReleaseResourceLite(vcb->Header.Resource);
 
+    if (filePath.IsAllocated)
+    {
+        ExFreePool(filePath.String.Buffer);
+    }
+    
+    // We should never reach here.
     KdBreakPoint();
     return STATUS_INVALID_DEVICE_REQUEST;
 }
@@ -335,7 +479,7 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
-    
+
     FsRtlEnterFileSystem();
     switch (GetDeviceExtensionMagic(DeviceObject))
     {
@@ -356,7 +500,7 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
     }
     FsRtlExitFileSystem();
-    
+
     Irp->IoStatus.Status = result;
 
     IoCompleteRequest(Irp, IO_NO_INCREMENT);

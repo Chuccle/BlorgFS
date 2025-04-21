@@ -277,7 +277,7 @@ NTSTATUS SendRecvWsk(PKSOCKET Socket, PVOID Buffer, ULONG Length, PULONG BytesWr
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         IoFreeMdl(wskBuffer.Mdl);
-        return STATUS_ACCESS_VIOLATION;
+        return GetExceptionCode();
     }
 
     ReuseSocketContext(&Socket->SocketContext);

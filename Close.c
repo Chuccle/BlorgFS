@@ -9,7 +9,7 @@ static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Volume
     {
         case BLORGFS_ROOT_DCB_SIGNATURE:
         {
-            BlorgFreeFileContext(fileObject->FsContext2);
+            BlorgFreeFileContext(fileObject->FsContext2, VolumeDeviceObject);
             PDCB dcb = fileObject->FsContext;
             InterlockedDecrement64(&dcb->RefCount);
 
@@ -17,7 +17,7 @@ static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Volume
         }
         case BLORGFS_DCB_SIGNATURE:
         {
-            BlorgFreeFileContext(fileObject->FsContext2);
+            BlorgFreeFileContext(fileObject->FsContext2, VolumeDeviceObject);
             PDCB dcb = fileObject->FsContext;
             ExAcquireResourceExclusiveLite(vcb->Header.Resource, TRUE);
             dcb->RefCount--;
@@ -56,7 +56,7 @@ static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Volume
     {
         PDCB parentDcb = node->ParentDcb;
 
-        BlorgFreeFileContext(node);
+        BlorgFreeFileContext(node, VolumeDeviceObject);
 
         while ((BLORGFS_DCB_SIGNATURE == GET_NODE_TYPE(parentDcb)) &&
                (IsListEmpty(&parentDcb->ChildrenList)) &&
@@ -65,7 +65,7 @@ static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Volume
             PDCB currentDcb = parentDcb;
             parentDcb = currentDcb->ParentDcb;
 
-            BlorgFreeFileContext(currentDcb);
+            BlorgFreeFileContext(currentDcb, VolumeDeviceObject);
         }
     }
 

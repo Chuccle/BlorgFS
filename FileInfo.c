@@ -69,9 +69,11 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             PFILE_BASIC_INFORMATION basicInfo = systemBuffer;
 
-            basicInfo->CreationTime.QuadPart = 0;
-            basicInfo->LastAccessTime.QuadPart = 0;
-            basicInfo->LastWriteTime.QuadPart = 0;
+            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
+
+            basicInfo->CreationTime.QuadPart = commonContext->CreationTime;
+            basicInfo->LastAccessTime.QuadPart = commonContext->LastAccessedTime;
+            basicInfo->LastWriteTime.QuadPart = commonContext->LastModifiedTime;
             basicInfo->FileAttributes = FILE_ATTRIBUTE_NORMAL;
 
             result = STATUS_SUCCESS;
@@ -88,11 +90,13 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             PFILE_STANDARD_INFORMATION standardInfo = systemBuffer;
 
-            standardInfo->AllocationSize.QuadPart = 0;
-            standardInfo->EndOfFile.QuadPart = 0;
+            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
+
+            standardInfo->AllocationSize.QuadPart = commonContext->Header.AllocationSize.QuadPart;
+            standardInfo->EndOfFile.QuadPart = commonContext->Header.AllocationSize.QuadPart;
             standardInfo->NumberOfLinks = 0;
             standardInfo->DeletePending = FALSE;
-            standardInfo->Directory = FALSE;
+            standardInfo->Directory = (GET_NODE_TYPE(commonContext) == BLORGFS_DCB_SIGNATURE);
 
             result = STATUS_SUCCESS;
             bytesWritten = sizeof(FILE_STANDARD_INFORMATION);
@@ -122,7 +126,7 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 break;
             }
 
-            //PFILE_ALL_INFORMATION allInfo = (PFILE_ALL_INFORMATION)pIrp->AssociatedIrp.SystemBuffer;
+            //PFILE_ALL_INFORMATION allInfo = (PFILE_ALL_INFORMATION)Irp->AssociatedIrp.SystemBuffer;
 
             result = STATUS_INVALID_DEVICE_REQUEST;
             bytesWritten = 0;

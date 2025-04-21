@@ -39,6 +39,7 @@
     <DriverType>WDM</DriverType>
     <_NT_TARGET_VERSION>0xA000010</_NT_TARGET_VERSION>
     <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
+    <Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
@@ -95,8 +96,10 @@
       <SDLCheck>true</SDLCheck>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <AdditionalIncludeDirectories>$(ProjectDir)flatcc\include;$(ProjectDir);$(ProjectDir)picohttpparser;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;__SSE4_2__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <EnablePREfast>true</EnablePREfast>
+      <ConformanceMode>true</ConformanceMode>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <AdditionalDependencies>Wdmsec.lib;Netio.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -110,13 +113,13 @@
     <ClCompile>
       <SDLCheck>true</SDLCheck>
       <WholeProgramOptimization>true</WholeProgramOptimization>
-      <EnableFiberSafeOptimizations>true</EnableFiberSafeOptimizations>
-      <OmitFramePointers>true</OmitFramePointers>
-      <IntrinsicFunctions>true</IntrinsicFunctions>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <AdditionalIncludeDirectories>$(ProjectDir)flatcc\include;$(ProjectDir);$(ProjectDir)picohttpparser;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;__SSE4_2__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <EnablePREfast>true</EnablePREfast>
+      <ConformanceMode>true</ConformanceMode>
+      <WarningLevel>Level4</WarningLevel>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <AdditionalDependencies>Wdmsec.lib;Netio.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -127,6 +130,7 @@
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="CacheManager.c" />
     <ClCompile Include="Cleanup.c" />
     <ClCompile Include="Client.c" />
     <ClCompile Include="Close.c" />
@@ -145,12 +149,13 @@
     <ClCompile Include="Ea.c" />
     <ClCompile Include="FileInfo.c" />
     <ClCompile Include="Security.c" />
-    <ClCompile Include="Util.c" />
     <ClCompile Include="VolumeInfo.c" />
     <ClCompile Include="Read.c" />
+    <ClCompile Include="WorkQueue.c" />
     <ClCompile Include="Write.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="CacheManager.h" />
     <ClInclude Include="Client.h" />
     <ClInclude Include="Driver.h" />
     <ClInclude Include="flatbuffers_common_reader.h" />
@@ -160,6 +165,7 @@
     <ClInclude Include="picohttpparser\picohttpparser.h" />
     <ClInclude Include="Structs.h" />
     <ClInclude Include="Util.h" />
+    <ClInclude Include="WorkQueue.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
