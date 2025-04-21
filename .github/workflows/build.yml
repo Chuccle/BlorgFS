@@ -1,0 +1,98 @@
+name: Build BlorgFS
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  SOLUTION_NAME: BlorgFS.sln
+  ChocolateyUseWindowsCompression: 'true'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        config: [Release, Debug]
+        platform: [x64]
+    name: Build ${{ matrix.config }} ${{ matrix.platform }}
+
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
+
+    - name: Checkout repository and submodules
+      uses: actions/checkout@v4
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+        submodules: recursive
+
+    - name: Get flatcc commit hash
+      id: flatcc_hash
+      shell: pwsh
+      run: |
+        cd flatcc
+        $hash = git rev-parse HEAD
+        Write-Host "FlatCC Hash: $hash"
+        echo "flatcc_hash=$hash" >> $env:GITHUB_OUTPUT
+        cd ..
+
+    - name: Cache Flatcc build
+      id: cache_flatcc
+      uses: actions/cache@v4
+      with:
+        path: |
+          flatcc/bin/Release
+          flatcc/build/MSVC
+        key: ${{ runner.os }}-flatcc-${{ steps.flatcc_hash.outputs.flatcc_hash }}
+
+    - name: Install build tools
+      if: steps.cache_flatcc.outputs.cache-hit != 'true'
+      run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+
+    - name: Build flatcc compiler
+      if: steps.cache_flatcc.outputs.cache-hit != 'true'
+      shell: cmd # Use cmd shell as cmake commands often assume it on Windows
+      run: |
+          cd flatcc
+          mkdir build\MSVC
+          cd build\MSVC
+          REM Add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to handle old cmake_minimum_required in flatcc
+          cmake -G "Visual Studio 17 2022" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..\..
+          cmake --build . --config Release
+          cd ..\..\..
+
+    - name: Create generated flatbuffer files
+      shell: cmd # Use cmd shell as flatcc.exe is a windows executable
+      run: flatcc\bin\Release\flatcc.exe -rv --common_reader schemas\metadata_flatbuffer.fbs
+
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ./packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+
+    - name: Setup Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Obtain WDK from Nuget
+      run: nuget restore ${{ env.SOLUTION_NAME }} -PackagesDirectory ".\packages"
+
+    - name: Build driver
+      run: msbuild ${{ env.SOLUTION_NAME }} /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /bl # /bl creates msbuild.binlog
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: BlorgFS-${{ matrix.config }}-${{ matrix.platform }}
+        path: |
+          ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/BlorgFS.*
+          ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/*.inf
+          ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/*.cat
+          ${{ github.workspace }}/msbuild.binlog # Upload the build log
+        if-no-files-found: warn
