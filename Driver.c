@@ -267,7 +267,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DriverObject->MajorFunction[IRP_MJ_SET_SECURITY] = BlorgSetSecurity;
 
 #pragma warning(suppress: 28175) // "We are a filesystem. Touching FastIoDispatch is allowed"
-    DriverObject->FastIoDispatch = &BlorgFsFastDispatch;
+    // DriverObject->FastIoDispatch = &BlorgFsFastDispatch;
 
     RtlZeroMemory(&BlorgFsFastDispatch, sizeof(FAST_IO_DISPATCH));
 

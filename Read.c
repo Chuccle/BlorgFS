@@ -321,7 +321,7 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    //PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     BOOLEAN topLevel = IsIrpTopLevel(Irp);
@@ -331,12 +331,13 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     {
         case BLORGFS_VDO_MAGIC:
         {
-            PIRP_CONTEXT irpContext = BlorgCreateIrpContext(Irp, IoIsOperationSynchronous(Irp));
-            result = BlorgVolumeRead(Irp, irpSp, irpContext);
-            if (STATUS_PENDING != result || STATUS_CANCELLED != result)
-            {
-                CompleteRequest(irpContext, Irp, result);
-            }
+            //PIRP_CONTEXT irpContext = BlorgCreateIrpContext(Irp, IoIsOperationSynchronous(Irp));
+            //result = BlorgVolumeRead(Irp, irpSp, irpContext);
+            //if (STATUS_PENDING != result || STATUS_CANCELLED != result)
+            //{
+            //    CompleteRequest(irpContext, Irp, result);
+            //}
+            CompleteRequest(NULL, Irp, result);
             break;
         }
         case BLORGFS_DDO_MAGIC:
