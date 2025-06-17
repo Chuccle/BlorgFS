@@ -1,0 +1,170 @@
+name: "CodeQL Advanced"
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  schedule:
+    - cron: '41 23 * * 6'
+
+env:
+  SOLUTION_NAME: BlorgFS.sln
+  ChocolateyUseWindowsCompression: 'true'
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ (matrix.language == 'c-cpp' && 'windows-latest') || ((matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest') }}
+    timeout-minutes: 60
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - language: actions
+          build-mode: none
+        - language: c-cpp
+          build-mode: manual
+          config: Release
+          platform: x64
+    
+    steps:
+    - name: Detect if Dependabot
+      if: matrix.language == 'c-cpp'
+      id: is_dependabot
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ (matrix.language == 'c-cpp' && steps.is_dependabot.outputs.is_dependabot == 'true') && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT || github.token }}
+        submodules: ${{ matrix.language == 'c-cpp' && 'recursive' || false }}
+
+    - name: Get flatcc commit hash
+      if: matrix.language == 'c-cpp'
+      id: flatcc_hash
+      shell: pwsh
+      run: |
+        if (Test-Path "flatcc") {
+          cd flatcc
+          $hash = git rev-parse HEAD
+          Write-Host "FlatCC Hash: $hash"
+          echo "flatcc_hash=$hash" >> $env:GITHUB_OUTPUT
+          cd ..
+        } else {
+          Write-Host "FlatCC directory not found"
+          echo "flatcc_hash=none" >> $env:GITHUB_OUTPUT
+        }
+
+    - name: Cache Flatcc build
+      if: matrix.language == 'c-cpp' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      id: cache_flatcc
+      uses: actions/cache@v4
+      with:
+        path: |
+          flatcc/bin/Release
+          flatcc/build/MSVC
+        key: ${{ runner.os }}-flatcc-${{ steps.flatcc_hash.outputs.flatcc_hash }}
+        restore-keys: |
+          ${{ runner.os }}-flatcc-
+
+    - name: Install build tools
+      if: matrix.language == 'c-cpp' && steps.cache_flatcc.outputs.cache-hit != 'true' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      run: |
+        choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+        refreshenv
+
+    - name: Build flatcc compiler
+      if: matrix.language == 'c-cpp' && steps.cache_flatcc.outputs.cache-hit != 'true' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      shell: cmd
+      run: |
+        cd flatcc
+        if not exist "build\MSVC" mkdir build\MSVC
+        cd build\MSVC
+        cmake -G "Visual Studio 17 2022" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..\..
+        cmake --build . --config Release
+        cd ..\..\..
+
+    - name: Create generated flatbuffer files
+      if: matrix.language == 'c-cpp' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      shell: cmd
+      run: |
+        if exist "flatcc\bin\Release\flatcc.exe" (
+          if exist "schemas\metadata_flatbuffer.fbs" (
+            flatcc\bin\Release\flatcc.exe -rv --common_reader schemas\metadata_flatbuffer.fbs
+          ) else (
+            echo "Schema file not found, skipping flatbuffer generation"
+          )
+        ) else (
+          echo "FlatCC compiler not found, skipping flatbuffer generation"
+        )
+
+    - name: Cache NuGet packages
+      if: matrix.language == 'c-cpp'
+      uses: actions/cache@v4
+      with:
+        path: ./packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+
+    - name: Setup Developer Command Prompt
+      if: matrix.language == 'c-cpp'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ matrix.platform }}
+
+    - name: Obtain WDK from Nuget
+      if: matrix.language == 'c-cpp'
+      run: |
+        echo "Restoring NuGet packages..."
+        nuget restore ${{ env.SOLUTION_NAME }} -PackagesDirectory ".\packages"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "NuGet restore failed"
+          exit 1
+        }
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+        packs: ${{ matrix.language == 'c-cpp' && 'microsoft/windows-drivers' || '' }}
+        queries: ${{ matrix.language == 'c-cpp' && '+security-extended,security-and-quality' || '+security-extended,security-and-quality' }}
+        config: |
+          paths-ignore:
+            - 'flatcc/build/**'
+            - 'packages/**'
+            - '**/*.generated.*'
+
+    - name: Build driver for CodeQL analysis
+      if: matrix.language == 'c-cpp'
+      run: |
+        echo "Building solution: ${{ env.SOLUTION_NAME }}"
+        msbuild ${{ env.SOLUTION_NAME }} /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /m /verbosity:minimal
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Build failed"
+          exit 1
+        }
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{matrix.language}}"
+        upload: true
+
+    - name: Upload CodeQL SARIF (backup)
+      if: failure() && matrix.language == 'c-cpp'
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-sarif-${{ matrix.language }}
+        path: |
+          ${{ runner.temp }}/codeql_databases/
+          sarif-results/${{matrix.language}}.sarif
+        retention-days: 7
