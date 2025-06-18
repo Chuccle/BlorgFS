@@ -47,7 +47,7 @@ Return Value:
     //  for all the other pre-acquire routines as well.
     //
 
-    if (!ExAcquireResourceSharedLite(((PCOMMON_CONTEXT)Context)->Header.PagingIoResource, Wait))
+    if (!ExAcquireResourceSharedLite(((PFCB)Context)->Header.PagingIoResource, Wait))
     {
         return FALSE;
     }
@@ -337,5 +337,4 @@ Return Value:
     //
        
    return FALSE;
-  
 }

@@ -61,7 +61,7 @@ static BOOLEAN MatchPattern(PUNICODE_STRING EntryName, PUNICODE_STRING SearchPat
     return match;
 }
 
-NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CONTEXT IrpContext)
+NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
@@ -117,10 +117,10 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CO
 
             if (initialQuery || restartScan)
             {
-                if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT)))
+                if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_WAIT)))
                 {
                     BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                    return FsdPostRequest(IrpContext, Irp, IrpSp);
+                    return FsdPostRequest(Irp, IrpSp);
                 }
 
                 //
@@ -137,10 +137,10 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CO
             }
             else
             {
-                if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT)))
+                if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_WAIT)))
                 {
                     BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                    return FsdPostRequest(IrpContext, Irp, IrpSp);
+                    return FsdPostRequest(Irp, IrpSp);
                 }
             }
 
@@ -275,8 +275,8 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CO
                                     dirInfo->LastWriteTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastModifiedTime;
                                     dirInfo->ChangeTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastModifiedTime;
                                     dirInfo->EndOfFile.QuadPart = ccb->SubDirectories.Entries[entryIndex].Size;
-                                    dirInfo->AllocationSize.QuadPart = 4096;
-                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY;
+                                    dirInfo->AllocationSize.QuadPart = ccb->SubDirectories.Entries[entryIndex].Size;
+                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
                                     dirInfo->FileId.QuadPart = 0;
                                 }
                                 else
@@ -286,8 +286,8 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CO
                                     dirInfo->LastWriteTime.QuadPart = ccb->Files.Entries[entryIndex].LastModifiedTime;
                                     dirInfo->ChangeTime.QuadPart = ccb->Files.Entries[entryIndex].LastModifiedTime;
                                     dirInfo->EndOfFile.QuadPart = ccb->Files.Entries[entryIndex].Size;
-                                    dirInfo->AllocationSize.QuadPart = 4096;
-                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_READONLY;
+                                    dirInfo->AllocationSize.QuadPart = ccb->Files.Entries[entryIndex].Size;
+                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_NORMAL;
                                     dirInfo->FileId.QuadPart = 0;
                                 }
 
@@ -379,8 +379,8 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CO
                                     dirInfo->LastWriteTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastModifiedTime;
                                     dirInfo->ChangeTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastModifiedTime;
                                     dirInfo->EndOfFile.QuadPart = ccb->SubDirectories.Entries[entryIndex].Size;
-                                    dirInfo->AllocationSize.QuadPart = 4096;
-                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY;
+                                    dirInfo->AllocationSize.QuadPart = ccb->SubDirectories.Entries[entryIndex].Size;
+                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
                                 }
                                 else
                                 {
@@ -389,8 +389,8 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CO
                                     dirInfo->LastWriteTime.QuadPart = ccb->Files.Entries[entryIndex].LastModifiedTime;
                                     dirInfo->ChangeTime.QuadPart = ccb->Files.Entries[entryIndex].LastModifiedTime;
                                     dirInfo->EndOfFile.QuadPart = ccb->Files.Entries[entryIndex].Size;
-                                    dirInfo->AllocationSize.QuadPart = 4096;
-                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_READONLY;
+                                    dirInfo->AllocationSize.QuadPart = ccb->Files.Entries[entryIndex].Size;
+                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_NORMAL;
                                 }
 
                                 dirInfo->FileNameLength = entryName->Length;
@@ -504,23 +504,24 @@ NTSTATUS BlorgDirectoryControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     {
         case BLORGFS_VDO_MAGIC:
         {
-            PIRP_CONTEXT irpContext = BlorgCreateIrpContext(Irp, IoIsOperationSynchronous(Irp));
-            result = BlorgVolumeDirectoryControl(Irp, irpSp, irpContext);
+            BlorgSetupIrpContext(Irp, IoIsOperationSynchronous(Irp));
+
+            result = BlorgVolumeDirectoryControl(Irp, irpSp);
             if (STATUS_PENDING != result)
             {
-                CompleteRequest(irpContext, Irp, result, IO_DISK_INCREMENT);
+                CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
             // result = BlorgDiskDirectoryControl(pIrp);
-            CompleteRequest(NULL, Irp, result, IO_DISK_INCREMENT);
+            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
         case BLORGFS_FSDO_MAGIC:
         {
-            CompleteRequest(NULL, Irp, result, IO_DISK_INCREMENT);
+            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
     }
