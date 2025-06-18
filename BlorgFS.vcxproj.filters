@@ -97,7 +97,7 @@
     <ClCompile Include="CacheManager.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="WorkQueue.c">
+    <ClCompile Include="FspWorkQueue.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -132,7 +132,7 @@
     <ClInclude Include="CacheManager.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="WorkQueue.h">
+    <ClInclude Include="FspWorkQueue.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

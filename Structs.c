@@ -264,58 +264,6 @@ void BlorgFreeFileContext(PVOID Context, PDEVICE_OBJECT VolumeDeviceObject)
     }
 }
 
-PIRP_CONTEXT BlorgCreateIrpContext(PIRP Irp, BOOLEAN Wait)
-{
-    BLORGFS_PRINT("BlorgCreateIrpContext\n");
-
-    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
-
-    PIRP_CONTEXT irpContext = ExAllocateFromNPagedLookasideList(&global.IrpContextLookasideList);
-
-    if (!irpContext)
-    {
-        BLORGFS_PRINT("BlorgCreateIrpContext: Failed to allocate irp context from lookaside list\n");
-        return NULL;
-    }
-
-    ULONG irpContextSize = sizeof(IRP_CONTEXT);
-
-    RtlZeroMemory(irpContext, irpContextSize);
-
-    irpContext->NodeTypeCode = BLORGFS_IRP_CONTEXT_SIGNATURE;
-    irpContext->NodeByteSize = irpContextSize;
-
-    irpContext->OriginatingIrp = Irp;
-
-    irpContext->MajorFunction = irpSp->MajorFunction;
-    irpContext->MinorFunction = irpSp->MinorFunction;
-
-    if (Wait)
-    {
-        SetFlag(irpContext->Flags, IRP_CONTEXT_FLAG_WAIT);
-    }
-
-    //
-    //  Set the recursive file system call parameter.  We set it true if
-    //  the TopLevelIrp field in the thread local storage is not the current
-    //  irp, otherwise we leave it as FALSE.
-    //
-
-    if (IoGetTopLevelIrp() != Irp)
-    {
-        SetFlag(irpContext->Flags, IRP_CONTEXT_FLAG_RECURSIVE_CALL);
-    }
-
-    BLORGFS_PRINT("BlorgCreateIrpContext -> %p\n", irpContext);
-
-    return irpContext;
-}
-
-inline void BlorgFreeIrpContext(PIRP_CONTEXT IrpContext)
-{
-    ExFreeToNPagedLookasideList(&global.IrpContextLookasideList, IrpContext);
-}
-
 static UNICODE_STRING GetLastComponent(PCUNICODE_STRING Path)
 {
     UNICODE_STRING lastComponent = { 0 };

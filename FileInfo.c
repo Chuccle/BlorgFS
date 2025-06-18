@@ -2,7 +2,7 @@
 
 static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
-    // Likely the key to GetVolumeInformation exceptions
+    // GetVolumeInformation crashes without this being implemented, come on Windows!
     FILE_INFORMATION_CLASS fileInfoClass = IrpSp->Parameters.QueryFile.FileInformationClass;
     ULONG inputLength = IrpSp->Parameters.QueryFile.Length;
     PVOID systemBuffer = Irp->AssociatedIrp.SystemBuffer;
@@ -29,8 +29,10 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             bytesWritten = sizeof(FILE_POSITION_INFORMATION);
             break;
         }
+        case FileNormalizedNameInformation:
         case FileNameInformation:
         {
+            // REVIEW!!!!
             if (inputLength < sizeof(FILE_NAME_INFORMATION))
             {
                 result = STATUS_BUFFER_TOO_SMALL;
@@ -74,7 +76,8 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             basicInfo->CreationTime.QuadPart = commonContext->CreationTime;
             basicInfo->LastAccessTime.QuadPart = commonContext->LastAccessedTime;
             basicInfo->LastWriteTime.QuadPart = commonContext->LastModifiedTime;
-            basicInfo->FileAttributes = FILE_ATTRIBUTE_NORMAL;
+            basicInfo->ChangeTime.QuadPart = commonContext->LastModifiedTime;
+            basicInfo->FileAttributes = (GET_NODE_TYPE(commonContext) == BLORGFS_FCB_SIGNATURE) ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_DIRECTORY;
 
             result = STATUS_SUCCESS;
             bytesWritten = sizeof(FILE_BASIC_INFORMATION);
@@ -92,8 +95,8 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             PCOMMON_CONTEXT commonContext = fileObject->FsContext;
 
-            standardInfo->AllocationSize.QuadPart = commonContext->Header.AllocationSize.QuadPart;
-            standardInfo->EndOfFile.QuadPart = commonContext->Header.AllocationSize.QuadPart;
+            standardInfo->AllocationSize = commonContext->Header.AllocationSize;
+            standardInfo->EndOfFile = commonContext->Header.AllocationSize;
             standardInfo->NumberOfLinks = 0;
             standardInfo->DeletePending = FALSE;
             standardInfo->Directory = (GET_NODE_TYPE(commonContext) == BLORGFS_DCB_SIGNATURE);
@@ -112,8 +115,34 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             PFILE_ATTRIBUTE_TAG_INFORMATION attributeTagInfo = systemBuffer;
 
-            attributeTagInfo->FileAttributes = FILE_ATTRIBUTE_NORMAL;
+            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
 
+            attributeTagInfo->FileAttributes = (GET_NODE_TYPE(commonContext) == BLORGFS_FCB_SIGNATURE) ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_DIRECTORY;
+
+            result = STATUS_SUCCESS;
+            bytesWritten = sizeof(FILE_ATTRIBUTE_TAG_INFORMATION);
+            break;
+        }
+        case FileNetworkOpenInformation:
+        {
+            if (inputLength < sizeof(FILE_NETWORK_OPEN_INFORMATION))
+            {
+                result = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            PFILE_NETWORK_OPEN_INFORMATION networkOpenInfo = systemBuffer;
+
+            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
+
+            networkOpenInfo->AllocationSize = commonContext->Header.AllocationSize;
+            networkOpenInfo->EndOfFile = commonContext->Header.AllocationSize;
+            networkOpenInfo->CreationTime.QuadPart = commonContext->CreationTime;
+            networkOpenInfo->LastAccessTime.QuadPart = commonContext->LastAccessedTime;
+            networkOpenInfo->LastWriteTime.QuadPart = commonContext->LastModifiedTime;
+            networkOpenInfo->ChangeTime.QuadPart = commonContext->LastModifiedTime;
+            networkOpenInfo->FileAttributes = (GET_NODE_TYPE(commonContext) == BLORGFS_FCB_SIGNATURE) ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_DIRECTORY;
+            
             result = STATUS_SUCCESS;
             bytesWritten = sizeof(FILE_ATTRIBUTE_TAG_INFORMATION);
             break;
@@ -143,8 +172,6 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
     return result;
 }
-
-
 
 NTSTATUS BlorgQueryInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
