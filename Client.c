@@ -601,7 +601,7 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDir
 
     ExFreePool(encodedPath.Buffer);
 
-    ULONG receiveBufferSize = 0x4000;
+    ULONG receiveBufferSize = PAGE_SIZE * 4;
     char* receiveBuffer = ExAllocatePoolUninitialized(PagedPool, receiveBufferSize, 'TEST');
 
     if (!receiveBuffer)
@@ -1008,7 +1008,7 @@ NTSTATUS GetHttpFile(const PUNICODE_STRING Path, SIZE_T StartOffset, SIZE_T Leng
 
     ExFreePool(encodedPath.Buffer);
 
-    ULONG receiveBufferSize = PAGE_SIZE;
+    ULONG receiveBufferSize = PAGE_SIZE * 64; //256 KB
     char* receiveBuffer = ExAllocatePoolUninitialized(PagedPool, receiveBufferSize, 'TEST');
 
     if (!receiveBuffer)

@@ -57,7 +57,6 @@ CHECK_PADDING_END(DIRECTORY_INFO, EntryCount);
 #define BLORGFS_ROOT_DCB_SIGNATURE 0xBEEF
 #define BLORGFS_VCB_SIGNATURE 0xB055
 #define BLORGFS_CCB_SIGNATURE 0xBE55
-#define BLORGFS_IRP_CONTEXT_SIGNATURE   0xBF00
 
 #define GET_NODE_TYPE(Nodeptr) (*((USHORT*)(Nodeptr)))
 
@@ -197,23 +196,6 @@ void BlorgFreeFileContext(PVOID Context, const PDEVICE_OBJECT VolumeDeviceObject
 PCOMMON_CONTEXT SearchByPath(const PDCB RootDcb, PCUNICODE_STRING Path);
 NTSTATUS InsertByPath(const PDCB RootDcb, PCUNICODE_STRING Path, const PDIRECTORY_ENTRY DirEntryInfo, BOOLEAN Directory, const PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out);
 
-typedef struct _IRP_CONTEXT
-{
-    ULONG NodeTypeCode;
-    ULONG NodeByteSize;
-    ULONGLONG Flags;
-    PIRP OriginatingIrp;
-    ULONG MajorFunction;
-    ULONG MinorFunction;
-} IRP_CONTEXT, * PIRP_CONTEXT;
-
-CHECK_PADDING_BETWEEN(IRP_CONTEXT, NodeTypeCode, NodeByteSize);
-CHECK_PADDING_BETWEEN(IRP_CONTEXT, NodeByteSize, Flags);
-CHECK_PADDING_BETWEEN(IRP_CONTEXT, Flags, OriginatingIrp);
-CHECK_PADDING_BETWEEN(IRP_CONTEXT, OriginatingIrp, MajorFunction);
-CHECK_PADDING_BETWEEN(IRP_CONTEXT, MajorFunction, MinorFunction);
-CHECK_PADDING_END(IRP_CONTEXT, MinorFunction);
-
 #define IRP_CONTEXT_FLAG_DISABLE_DIRTY              0x00000001
 #define IRP_CONTEXT_FLAG_WAIT                       0x00000002
 #define IRP_CONTEXT_FLAG_WRITE_THROUGH              0x00000004
@@ -235,8 +217,30 @@ CHECK_PADDING_END(IRP_CONTEXT, MinorFunction);
 
 #define IRP_CONTEXT_FLAG_PARENT_BY_CHILD            0x80000000
 
-PIRP_CONTEXT BlorgCreateIrpContext(PIRP Irp, BOOLEAN Wait);
-extern inline void BlorgFreeIrpContext(PIRP_CONTEXT IrpContext);
+inline void BlorgSetupIrpContext(PIRP Irp, BOOLEAN Wait)
+{
+    ULONG_PTR flags = (ULONG_PTR)Irp->Tail.Overlay.DriverContext[0];
+
+    NT_ASSERT(0 == flags);
+
+    if (Wait)
+    {
+        SetFlag(flags, IRP_CONTEXT_FLAG_WAIT);
+    }
+
+    //
+    //  Set the recursive file system call parameter.  We set it true if
+    //  the TopLevelIrp field in the thread local storage is not the current
+    //  irp, otherwise we leave it as FALSE.
+    //
+
+    if (IoGetTopLevelIrp() != Irp)
+    {
+        SetFlag(flags, IRP_CONTEXT_FLAG_RECURSIVE_CALL);
+    }
+
+    Irp->Tail.Overlay.DriverContext[0] = (PVOID)flags;
+}
 
 /////////////////////////////////////////////
 ///////DEVICE EXTENSION SECTION//////////////

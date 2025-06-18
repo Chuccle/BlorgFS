@@ -1,6 +1,6 @@
 #include "Driver.h"
 
-NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CONTEXT IrpContext)
+NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
@@ -60,7 +60,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CONTEXT IrpCon
     {
         result = FsRtlCheckOplock(&fcb->Header.Oplock,
             Irp,
-            IrpContext,
+            NULL,
             OplockComplete,
             PrePostIrp);
 
@@ -244,13 +244,13 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CONTEXT IrpCon
                 if (!CcCopyReadEx(IrpSp->FileObject,
                     &startingByte,
                     realLength,
-                    BooleanFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT),
+                    BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_WAIT),
                     systemBuffer,
                     &Irp->IoStatus,
                     Irp->Tail.Overlay.Thread))
                 {
                     BLORGFS_PRINT("Cached Read could not wait\n");
-                    return FsdPostRequest(IrpContext, Irp, IrpSp);
+                    return FsdPostRequest(Irp, IrpSp);
                 }
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
@@ -331,23 +331,23 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     {
         case BLORGFS_VDO_MAGIC:
         {
-            PIRP_CONTEXT irpContext = BlorgCreateIrpContext(Irp, IoIsOperationSynchronous(Irp));
-            result = BlorgVolumeRead(Irp, irpSp, irpContext);
+            BlorgSetupIrpContext(Irp, IoIsOperationSynchronous(Irp));
+            result = BlorgVolumeRead(Irp, irpSp);
             if (STATUS_PENDING != result)
             {
-                CompleteRequest(irpContext, Irp, result, IO_DISK_INCREMENT);
+                CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
             // result = BlorgDiskRead(pIrp);
-            CompleteRequest(NULL, Irp, result, IO_DISK_INCREMENT);
+            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
         case BLORGFS_FSDO_MAGIC:
         {
-            CompleteRequest(NULL, Irp, result, IO_DISK_INCREMENT);
+            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
     }

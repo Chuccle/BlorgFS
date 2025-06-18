@@ -243,8 +243,6 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
     DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
     global.DiskDeviceObject = NULL;
 
-    ExDeleteNPagedLookasideList(&global.IrpContextLookasideList);
-
     FreeHttpAddrInfo(global.RemoteAddressInfo);
 
     CleanupHttpClient();
@@ -282,8 +280,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     RtlZeroMemory(&BlorgFsFastDispatch, sizeof(FAST_IO_DISPATCH));
 
-    global.CacheManagerCallbacks.AcquireForLazyWrite = BlorgAcquireNodeForLazyWrite;
-    global.CacheManagerCallbacks.ReleaseFromLazyWrite = BlorgReleaseNodeFromLazyWrite;
     global.CacheManagerCallbacks.AcquireForReadAhead = BlorgAcquireNodeForReadAhead;
     global.CacheManagerCallbacks.ReleaseFromReadAhead = BlorgReleaseNodeFromReadAhead;
 
@@ -318,13 +314,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     ObReferenceObject(diskDeviceObject);
     global.DiskDeviceObject = diskDeviceObject;
 
-    ExInitializeNPagedLookasideList(&global.IrpContextLookasideList, NULL, NULL, POOL_NX_ALLOCATION, sizeof(IRP_CONTEXT), 'ICTX', 0);
-
     result = InitialiseHttpClient();
 
     if (!NT_SUCCESS(result))
     {
-        ExDeleteNPagedLookasideList(&global.IrpContextLookasideList);
         ObDereferenceObject(global.FileSystemDeviceObject);
         DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
@@ -343,7 +336,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     if (!NT_SUCCESS(result))
     {
         CleanupHttpClient();
-        ExDeleteNPagedLookasideList(&global.IrpContextLookasideList);
         ObDereferenceObject(global.FileSystemDeviceObject);
         DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
