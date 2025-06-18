@@ -106,7 +106,6 @@ inline void LockUserBuffer(IN OUT PIRP Irp, IN LOCK_OPERATION Operation, IN ULON
 }
 
 inline void CompleteRequest(
-    IN PIRP_CONTEXT IrpContext OPTIONAL,
     IN PIRP Irp OPTIONAL,
     IN NTSTATUS Status,
     IN CCHAR PriorityBoost
@@ -131,17 +130,6 @@ Return Value:
 --*/
 
 {
-    //
-    //  Delete the Irp context before completing the IRP so if
-    //  we run into some of the asserts, we can still backtrack
-    //  through the IRP.
-    //
-
-    if (IrpContext)
-    {
-        BlorgFreeIrpContext(IrpContext);
-    }
-
     //
     //  If we have an Irp then complete the irp.
     //

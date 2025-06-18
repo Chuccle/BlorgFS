@@ -151,7 +151,7 @@
     <ClCompile Include="Security.c" />
     <ClCompile Include="VolumeInfo.c" />
     <ClCompile Include="Read.c" />
-    <ClCompile Include="WorkQueue.c" />
+    <ClCompile Include="FspWorkQueue.c" />
     <ClCompile Include="Write.c" />
   </ItemGroup>
   <ItemGroup>
@@ -165,7 +165,7 @@
     <ClInclude Include="picohttpparser\picohttpparser.h" />
     <ClInclude Include="Structs.h" />
     <ClInclude Include="Util.h" />
-    <ClInclude Include="WorkQueue.h" />
+    <ClInclude Include="FspWorkQueue.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
