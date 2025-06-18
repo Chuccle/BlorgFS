@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ master ]
 
+permissions:
+  contents: read
+  packages: read
+  actions: read
+
 env:
   SOLUTION_NAME: BlorgFS.sln
   ChocolateyUseWindowsCompression: 'true'
