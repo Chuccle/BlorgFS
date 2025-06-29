@@ -96,7 +96,7 @@
       <SDLCheck>true</SDLCheck>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <AdditionalIncludeDirectories>$(ProjectDir)flatcc\include;$(ProjectDir);$(ProjectDir)picohttpparser;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;__SSE4_2__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;__SSE4_2__;POOL_ZERO_DOWN_LEVEL_SUPPORT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <EnablePREfast>true</EnablePREfast>
       <ConformanceMode>true</ConformanceMode>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -115,7 +115,7 @@
       <WholeProgramOptimization>true</WholeProgramOptimization>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <AdditionalIncludeDirectories>$(ProjectDir)flatcc\include;$(ProjectDir);$(ProjectDir)picohttpparser;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;__SSE4_2__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>PORTABLE_HAS_INCLUDE_STDALIGN=0;__SSE4_2__;POOL_ZERO_DOWN_LEVEL_SUPPORT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <EnablePREfast>true</EnablePREfast>
       <ConformanceMode>true</ConformanceMode>
       <WarningLevel>Level4</WarningLevel>

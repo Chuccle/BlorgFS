@@ -6,6 +6,6 @@ void PrePostIrp(IN PVOID Context, IN PIRP Irp);
 
 void OplockComplete(PVOID Context, PIRP Irp);
 
-NTSTATUS InitializeWorkQueue(void);
+NTSTATUS CreateWorkQueue(void);
 
-void DeinitializeWorkQueue(void);
+void DestroyWorkQueue(void);
