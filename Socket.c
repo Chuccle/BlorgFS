@@ -25,7 +25,7 @@ NTSTATUS SocketContextCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp, P
         return STATUS_INVALID_PARAMETER;
     }
 
-    KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
+    KeSetEvent((PKEVENT)Context, EVENT_INCREMENT, FALSE);
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
 

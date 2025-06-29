@@ -64,7 +64,16 @@ static NTSTATUS CreateBlorgDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE
         return result;
     }
 
-    IoCreateSymbolicLink(&devExt->SymLinkName, &vdoString);
+    result = IoCreateSymbolicLink(&devExt->SymLinkName, &vdoString);
+
+    if (!NT_SUCCESS(result))
+    {
+        ExFreePool(GetDiskDeviceExtension(diskDeviceObject)->SymLinkName.Buffer);
+        IoDeleteDevice(diskDeviceObject);
+        return result;
+    }
+
+    ClearFlag(diskDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
     *DiskDeviceObject = diskDeviceObject;
 
@@ -142,7 +151,7 @@ NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
         return result;
     }
 
-    result = InitializeWorkQueue();
+    result = CreateWorkQueue();
 
     if (!NT_SUCCESS(result))
     {
@@ -167,7 +176,7 @@ static void DeleteBlorgVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
     if (VolumeDeviceObject)
     {
         PBLORGFS_VDO_DEVICE_EXTENSION pDevExt = GetVolumeDeviceExtension(VolumeDeviceObject);
-        DeinitializeWorkQueue();
+        DestroyWorkQueue();
         BlorgFreeFileContext(pDevExt->Vcb, VolumeDeviceObject);
         BlorgFreeFileContext(pDevExt->RootDcb, VolumeDeviceObject);
         ExDeleteNPagedLookasideList(&pDevExt->NonPagedNodeLookasideList);
@@ -208,6 +217,8 @@ static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, P
     devExt->Hdr.Identifier = BLORGFS_FSDO_MAGIC;
 
     IoRegisterFileSystem(fileSystemDeviceObject);
+
+    ClearFlag(fileSystemDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
     *FileSystemDeviceObject = fileSystemDeviceObject;
 
@@ -251,6 +262,8 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     UNREFERENCED_PARAMETER(RegistryPath);
+
+    ExInitializeDriverRuntime(0);
 
     global.DriverObject = DriverObject;
 

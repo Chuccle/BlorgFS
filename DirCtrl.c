@@ -255,7 +255,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                             if (MatchPattern(entryName, &ccb->SearchPattern, ccb->Flags))
                             {
-                                ULONG entrySize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName[0]) + entryName->Length;
+                                ULONG entrySize = UFIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName[0]) + entryName->Length;
 
                                 if (remainingLength < entrySize)
                                 {
@@ -359,7 +359,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                             if (MatchPattern(entryName, &ccb->SearchPattern, ccb->Flags))
                             {
-                                ULONG entrySize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName[0]) + entryName->Length;
+                                ULONG entrySize = UFIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName[0]) + entryName->Length;
 
                                 if (remainingLength < entrySize)
                                 {

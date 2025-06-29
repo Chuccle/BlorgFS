@@ -9,14 +9,14 @@ volatile BOOLEAN g_FspThreadsActive;
 KEVENT g_FspTerminationEvent;
 HANDLE g_FspThreadHandle[FSP_THREAD_COUNT];
 IO_CSQ g_FspCsq;
-KSEMAPHORE g_FspWorkSemaphore;
-KSPIN_LOCK g_FspOverflowQueueSpinLock;
-LIST_ENTRY g_FspOverflowQueue;
+KEVENT g_FspWorkEvent;
+KSPIN_LOCK g_FspIrpQueueSpinLock;
+LIST_ENTRY g_FspIrpQueue;
 
 VOID FspCsqInsertIrp(IO_CSQ* Csq, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Csq);
-    InsertTailList(&g_FspOverflowQueue, &Irp->Tail.Overlay.ListEntry);
+    InsertTailList(&g_FspIrpQueue, &Irp->Tail.Overlay.ListEntry);
 }
 
 VOID FspCsqRemoveIrp(IO_CSQ* Csq, PIRP Irp)
@@ -35,14 +35,14 @@ PIRP FspCsqPeekNextIrp(IO_CSQ* Csq, PIRP Irp, PVOID PeekContext)
     // If Irp is NULL, we start from the head. Otherwise, we start from the given IRP.
     if (!Irp)
     {
-        nextEntry = g_FspOverflowQueue.Flink;
+        nextEntry = g_FspIrpQueue.Flink;
     }
     else
     {
         nextEntry = Irp->Tail.Overlay.ListEntry.Flink;
     }
 
-    if (nextEntry != &g_FspOverflowQueue)
+    if (nextEntry != &g_FspIrpQueue)
     {
         return CONTAINING_RECORD(nextEntry, IRP, Tail.Overlay.ListEntry);
     }
@@ -56,14 +56,14 @@ _IRQL_raises_(DISPATCH_LEVEL)
 VOID FspCsqAcquireLock(IO_CSQ* Csq, _At_(*Irql, _IRQL_saves_) PKIRQL Irql)
 {
     UNREFERENCED_PARAMETER(Csq);
-    KeAcquireSpinLock(&g_FspOverflowQueueSpinLock, Irql);
+    KeAcquireSpinLock(&g_FspIrpQueueSpinLock, Irql);
 }
 
 _IRQL_requires_(DISPATCH_LEVEL)
 VOID FspCsqReleaseLock(IO_CSQ* Csq, _IRQL_restores_ KIRQL Irql)
 {
     UNREFERENCED_PARAMETER(Csq);
-    KeReleaseSpinLock(&g_FspOverflowQueueSpinLock, Irql);
+    KeReleaseSpinLock(&g_FspIrpQueueSpinLock, Irql);
 }
 
 VOID FspCsqCompleteCanceledIrp(IO_CSQ* Csq, PIRP Irp)
@@ -96,7 +96,6 @@ Return Value:
 
 {
     UNREFERENCED_PARAMETER(StartContext);
-    BOOLEAN active = TRUE;
 
     //
     //  Now case on the function code.  For each major function code,
@@ -108,10 +107,10 @@ Return Value:
     //  satisfied right away and then read can be done.
     //
 
-    while (active)
+    while (TRUE)
     {
 
-        PVOID waitObjectArray[2] = { &g_FspWorkSemaphore, &g_FspTerminationEvent };
+        PVOID waitObjectArray[2] = { &g_FspWorkEvent, &g_FspTerminationEvent };
 
         if (STATUS_WAIT_1 == KeWaitForMultipleObjects(2,
             waitObjectArray,
@@ -122,7 +121,7 @@ Return Value:
             NULL,
             NULL))
         {
-            active = FALSE;
+            break;
         }
 
         PIRP irp = IoCsqRemoveNextIrp(&g_FspCsq, NULL);
@@ -216,7 +215,7 @@ static void AddToWorkqueue(
         //
         
         IoCsqInsertIrp(&g_FspCsq, Irp, NULL);
-        KeReleaseSemaphore(&g_FspWorkSemaphore, IO_NO_INCREMENT, 1, FALSE);
+        KeSetEvent(&g_FspWorkEvent, EVENT_INCREMENT, FALSE);
     }
 }
 
@@ -344,14 +343,14 @@ void OplockComplete(PVOID Context, PIRP Irp)
     }
 }
 
-NTSTATUS InitializeWorkQueue(void)
+NTSTATUS CreateWorkQueue(void)
 {
     g_FspThreadsActive = TRUE;
 
-    KeInitializeSpinLock(&g_FspOverflowQueueSpinLock);
-    InitializeListHead(&g_FspOverflowQueue);
+    KeInitializeSpinLock(&g_FspIrpQueueSpinLock);
+    InitializeListHead(&g_FspIrpQueue);
 
-    KeInitializeSemaphore(&g_FspWorkSemaphore, 0, FSP_THREAD_COUNT);
+    KeInitializeEvent(&g_FspWorkEvent, SynchronizationEvent, FALSE);
     KeInitializeEvent(&g_FspTerminationEvent, NotificationEvent, FALSE);
 
     NTSTATUS result = IoCsqInitialize(&g_FspCsq,
@@ -370,10 +369,8 @@ NTSTATUS InitializeWorkQueue(void)
     return result;
 }
 
-void DeinitializeWorkQueue(void)
+void DestroyWorkQueue(void)
 {
-
-#pragma message("Potential race condition in the window before this flag is set to false but maybe IRP didn't get added to queue in time before the flush, probs gonna make a atomic reference count")
     g_FspThreadsActive = FALSE;
 
     PVOID* waitObjectArray = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(PKTHREAD) * FSP_THREAD_COUNT, 'abw');
@@ -416,7 +413,7 @@ void DeinitializeWorkQueue(void)
     }
 
     KeEnterCriticalRegion();
-    KeSetEvent(&g_FspTerminationEvent, IO_NO_INCREMENT, TRUE);
+    KeSetEvent(&g_FspTerminationEvent, EVENT_INCREMENT, TRUE);
     KeWaitForMultipleObjects(FSP_THREAD_COUNT, waitObjectArray, WaitAll, Executive, KernelMode, FALSE, NULL, waitBlockArray);
     KeLeaveCriticalRegion();
 
@@ -426,5 +423,13 @@ void DeinitializeWorkQueue(void)
     for (int i = 0; i < FSP_THREAD_COUNT; ++i)
     {
         ZwClose(g_FspThreadHandle[i]);
+    }
+
+    PIRP irp = IoCsqRemoveNextIrp(&g_FspCsq, NULL);
+
+    while (irp)
+    {
+        CompleteRequest(irp, STATUS_CANCELLED, IO_NO_INCREMENT);
+        irp = IoCsqRemoveNextIrp(&g_FspCsq, NULL);
     }
 }

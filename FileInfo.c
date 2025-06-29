@@ -44,7 +44,7 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             PCOMMON_CONTEXT commonContext = fileObject->FsContext;
 
             // Check if the buffer is large enough to hold the string
-            if (inputLength - FIELD_OFFSET(FILE_NAME_INFORMATION, FileName) >= commonContext->FullPath.Length)
+            if (inputLength - UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) >= commonContext->FullPath.Length)
             {
                 nameInfo->FileNameLength = commonContext->FullPath.Length;
                 RtlCopyMemory(nameInfo->FileName, commonContext->FullPath.Buffer, nameInfo->FileNameLength);
@@ -56,7 +56,7 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 break;
             }
 
-            bytesWritten = FIELD_OFFSET(FILE_NAME_INFORMATION, FileName) + nameInfo->FileNameLength;
+            bytesWritten = UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) + nameInfo->FileNameLength;
 
             result = STATUS_SUCCESS;
             break;
