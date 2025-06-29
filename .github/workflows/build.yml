@@ -27,6 +27,7 @@ jobs:
     steps:
     - name: Detect if Dependabot
       id: is_dependabot
+      shell: pwsh
       run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
 
     - name: Checkout repository and submodules
@@ -56,6 +57,7 @@ jobs:
 
     - name: Install build tools
       if: steps.cache_flatcc.outputs.cache-hit != 'true'
+      shell: pwsh
       run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
 
     - name: Build flatcc compiler
