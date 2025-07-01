@@ -5,15 +5,6 @@ static_assert(FSP_THREAD_COUNT <= MAXIMUM_WAIT_OBJECTS, "System threads cannot e
 NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CONTEXT IrpContext);
 NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp, PIRP_CONTEXT IrpContext);
 
-IO_CSQ_INSERT_IRP CsqInsertIrp;
-IO_CSQ_REMOVE_IRP CsqRemoveIrp;
-IO_CSQ_PEEK_NEXT_IRP CsqPeekNextIrp;
-IO_CSQ_ACQUIRE_LOCK CsqAcquireLock;
-IO_CSQ_RELEASE_LOCK CsqReleaseLock;
-IO_CSQ_COMPLETE_CANCELED_IRP CsqCompleteCanceledIrp;
-
-KSTART_ROUTINE KstartRoutine;
-
 volatile BOOLEAN g_FspThreadsActive;
 KEVENT g_FspTerminationEvent;
 HANDLE g_FspThreadHandle[FSP_THREAD_COUNT];
@@ -61,13 +52,15 @@ PIRP CsqPeekNextIrp(IO_CSQ* Csq, PIRP Irp, PVOID PeekContext)
     }
 }
 
-VOID CsqAcquireLock(IO_CSQ* Csq, PKIRQL Irql)
+_IRQL_raises_(DISPATCH_LEVEL)
+VOID CsqAcquireLock(IO_CSQ* Csq, _At_(*Irql, _IRQL_saves_) PKIRQL Irql)
 {
     UNREFERENCED_PARAMETER(Csq);
     KeAcquireSpinLock(&g_OverflowQueueSpinLock, Irql);
 }
 
-VOID CsqReleaseLock(IO_CSQ* Csq, KIRQL Irql)
+_IRQL_requires_(DISPATCH_LEVEL)
+VOID CsqReleaseLock(IO_CSQ* Csq, _IRQL_restores_ KIRQL Irql)
 {
     UNREFERENCED_PARAMETER(Csq);
     KeReleaseSpinLock(&g_OverflowQueueSpinLock, Irql);
