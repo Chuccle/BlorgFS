@@ -13,10 +13,12 @@
 #include "Client.h"
 #include "CacheManager.h"
 #include "FspWorkQueue.h"
+#include "InvertedWorkQueue.h"
 
 #define BLORGFS_FSDO_STRING  L"\\BlorgFS"
 #define BLORGFS_FSDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
 #define BLORGFS_FSDO_MAGIC   0xDEAD00D
+#define BLORGFS_FSDO_SYMLINK_STRING L"\\??\\BlorgFS"
 
 #define BLORGFS_VDO_STRING  L"\\Device\\BlorgVolume"
 #define BLORGFS_VDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
