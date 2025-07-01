@@ -1,8 +1,10 @@
 #include "Driver.h"
+#include <BlorgFSCTL.h>
 
-static inline void HandleUserFSRequest(ULONG FsctlCode, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+static inline NTSTATUS HandleUserFSRequest(ULONG FsctlCode, PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     UNREFERENCED_PARAMETER(IrpSp);
+    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (FsctlCode)
     {
@@ -50,7 +52,28 @@ static inline void HandleUserFSRequest(ULONG FsctlCode, PIRP Irp, PIO_STACK_LOCA
             // FileSystemControlGetRetrievalPointers(pDeviceObject, pIrp, pIrpSp);
             break;
         }
+        case FSCTL_BLORGFS_INVERTED_CALL:
+        {
+            if (IrpSp->Parameters.FileSystemControl.OutputBufferLength < UFIELD_OFFSET(BLORGFS_INVERTED_CALL, Payload.ResponseBuffer))
+            {
+               result = STATUS_BUFFER_TOO_SMALL;
+               break;
+            }
+
+            ProcessControlResponse(Irp, IrpSp->Parameters.FileSystemControl.OutputBufferLength - UFIELD_OFFSET(BLORGFS_INVERTED_CALL, Payload.ResponseBuffer));
+
+            result = ProcessControlRequest(Irp);
+
+            if (result != STATUS_PENDING)
+            {
+                CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            }
+
+            break;
+        }
     }
+
+    return result;
 }
 
 static NTSTATUS BlorgVolumeFileSystemControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
@@ -63,7 +86,7 @@ static NTSTATUS BlorgVolumeFileSystemControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
     {
         case IRP_MN_USER_FS_REQUEST:
         {
-            HandleUserFSRequest(IrpSp->Parameters.FileSystemControl.FsControlCode, Irp, IrpSp);
+            result = HandleUserFSRequest(IrpSp->Parameters.FileSystemControl.FsControlCode, Irp, IrpSp);
             break;
         }
         case IRP_MN_MOUNT_VOLUME:

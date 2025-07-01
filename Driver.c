@@ -216,6 +216,14 @@ static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, P
 
     devExt->Hdr.Identifier = BLORGFS_FSDO_MAGIC;
 
+    result = InitializeInvertedCallHandler();
+
+    if (!NT_SUCCESS(result))
+    {
+        IoDeleteDevice(fileSystemDeviceObject);
+        return result;
+    }
+
     IoRegisterFileSystem(fileSystemDeviceObject);
 
     ClearFlag(fileSystemDeviceObject->Flags, DO_DEVICE_INITIALIZING);
