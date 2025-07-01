@@ -141,6 +141,7 @@
     <ClCompile Include="flatcc\src\runtime\verifier.c" />
     <ClCompile Include="FlushBuffers.c" />
     <ClCompile Include="FsCtrl.c" />
+    <ClCompile Include="InvertedCallWorkQueue.c" />
     <ClCompile Include="Socket.c" />
     <ClCompile Include="picohttpparser\picohttpparser.c" />
     <ClCompile Include="Shutdown.c" />
@@ -155,10 +156,12 @@
     <ClCompile Include="Write.c" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="BlorgFSCTL.h" />
     <ClInclude Include="CacheManager.h" />
     <ClInclude Include="Client.h" />
     <ClInclude Include="Driver.h" />
     <ClInclude Include="flatbuffers_common_reader.h" />
+    <ClInclude Include="InvertedWorkQueue.h" />
     <ClInclude Include="Socket.h" />
     <ClInclude Include="metadata_flatbuffer_reader.h" />
     <ClInclude Include="metadata_flatbuffer_verifier.h" />
