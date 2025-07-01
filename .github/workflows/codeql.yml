@@ -97,7 +97,8 @@ jobs:
       run: |
         if exist "flatcc\bin\Release\flatcc.exe" (
           if exist "schemas\metadata_flatbuffer.fbs" (
-            flatcc\bin\Release\flatcc.exe -rv --common_reader schemas\metadata_flatbuffer.fbs
+            mkdir generated
+            flatcc\bin\Release\flatcc.exe -rv --common_reader -o generated schemas\metadata_flatbuffer.fbs
           ) else (
             echo "Schema file not found, skipping flatbuffer generation"
           )
@@ -163,6 +164,9 @@ jobs:
           -flatcc/**
           -packages/**
           -**/*.generated.*
+          -picohttpparser/**
+          -schemas/**
+          -generated/**
         input:  sarif-results/cpp.sarif
         output: sarif-results/cpp.sarif
 

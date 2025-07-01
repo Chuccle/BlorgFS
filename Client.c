@@ -5,8 +5,8 @@
 
 #pragma warning(push)
 #pragma warning(disable: 28110) // We don't use floating point numbers in our schema so no need to mess about with saving CPU state.
-#include "metadata_flatbuffer_reader.h"
-#include "metadata_flatbuffer_verifier.h"
+#include "generated/metadata_flatbuffer_reader.h"
+#include "generated/metadata_flatbuffer_verifier.h"
 #pragma warning(pop)
 
 #include "picohttpparser.h"
