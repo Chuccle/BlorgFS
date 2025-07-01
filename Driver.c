@@ -194,6 +194,7 @@ static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, P
 
     UNICODE_STRING fsdoString = RTL_CONSTANT_STRING(BLORGFS_FSDO_STRING);
     UNICODE_STRING sddlString = RTL_CONSTANT_STRING(BLORGFS_FSDO_DEVICE_SDDL_STRING);
+    UNICODE_STRING fsdoSymlinkString = RTL_CONSTANT_STRING(BLORGFS_FSDO_SYMLINK_STRING);
     PDEVICE_OBJECT fileSystemDeviceObject = NULL;
     NTSTATUS       result = STATUS_UNSUCCESSFUL;
 
@@ -216,7 +217,23 @@ static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, P
 
     devExt->Hdr.Identifier = BLORGFS_FSDO_MAGIC;
 
+    result = InitializeInvertedCallHandler();
+
+    if (!NT_SUCCESS(result))
+    {
+        IoDeleteDevice(fileSystemDeviceObject);
+        return result;
+    }
+
     IoRegisterFileSystem(fileSystemDeviceObject);
+
+    result = IoCreateSymbolicLink(&fsdoSymlinkString, &fsdoString);
+
+    if (!NT_SUCCESS(result))
+    {
+        IoDeleteDevice(fileSystemDeviceObject);
+        return result;
+    }
 
     ClearFlag(fileSystemDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
@@ -236,8 +253,11 @@ static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObj
             ObDereferenceObject(volumeDeviceObject);
             DeleteBlorgVolumeDeviceObject(volumeDeviceObject);
         }
+        
+        UNICODE_STRING fsdoSymlinkString = RTL_CONSTANT_STRING(BLORGFS_FSDO_SYMLINK_STRING);
 
         IoUnregisterFileSystem(FileSystemDeviceObject);
+        IoDeleteSymbolicLink(&fsdoSymlinkString);
         IoDeleteDevice(FileSystemDeviceObject);
     }
 }
