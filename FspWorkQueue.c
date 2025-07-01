@@ -2,6 +2,7 @@
 
 static_assert(FSP_THREAD_COUNT <= MAXIMUM_WAIT_OBJECTS, "System threads cannot exceed MAXIMUM_WAIT_OBJECTS");
 
+NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject);
 NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp);
 
@@ -160,6 +161,11 @@ Return Value:
 
             switch (irpSp->MajorFunction)
             {
+                case IRP_MJ_CREATE:
+                {
+                    result = BlorgVolumeCreate(irp, irpSp, irpSp->DeviceObject);
+                    break;
+                }
                 case IRP_MJ_READ:
                 {
                     result = BlorgVolumeRead(irp, irpSp);

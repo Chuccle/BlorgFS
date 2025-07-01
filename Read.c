@@ -136,6 +136,12 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         //  Do the read here
         //
 
+        if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+        {
+            BLORGFS_PRINT("BlorgVolumeRead: Enqueue to Fsp\n");
+            return FsdPostRequest(Irp, IrpSp);
+        }
+
         HTTP_FILE_BUFFER fileBuffer;
 
         result = GetHttpFile(&fcb->FullPath, startingByte.QuadPart, realLength, &fileBuffer);
