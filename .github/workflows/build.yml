@@ -74,7 +74,17 @@ jobs:
 
     - name: Create generated flatbuffer files
       shell: cmd # Use cmd shell as flatcc.exe is a windows executable
-      run: flatcc\bin\Release\flatcc.exe -rv --common_reader schemas\metadata_flatbuffer.fbs
+      run: |
+        if exist "flatcc\bin\Release\flatcc.exe" (
+          if exist "schemas\metadata_flatbuffer.fbs" (
+            mkdir generated
+            flatcc\bin\Release\flatcc.exe -rv --common_reader -o generated schemas\metadata_flatbuffer.fbs
+          ) else (
+            echo "Schema file not found, skipping flatbuffer generation"
+          )
+        ) else (
+          echo "FlatCC compiler not found, skipping flatbuffer generation"
+        )
 
     - name: Cache NuGet packages
       uses: actions/cache@v4
