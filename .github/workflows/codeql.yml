@@ -131,13 +131,23 @@ jobs:
           exit 1
         }
 
-    - name: Initialize CodeQL
+    - name: Initialize CodeQL (C/C++)
+      if: matrix.language == 'c-cpp'
       uses: github/codeql-action/init@v3
       with:
         languages: ${{ matrix.language }}
         build-mode: ${{ matrix.build-mode }}
-        packs: ${{ matrix.language == 'c-cpp' && 'microsoft/windows-drivers' || '' }}
-        queries: ${{ matrix.language == 'c-cpp' && '+security-extended,security-and-quality' || '+security-extended,security-and-quality' }}
+        packs: microsoft/windows-drivers@1.1.0
+        queries: security-extended,security-and-quality
+
+
+    - name: Initialize CodeQL (Actions)
+      if: matrix.language == 'actions'
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+        queries: security-extended,security-and-quality
 
     - name: Build driver for CodeQL analysis
       if: matrix.language == 'c-cpp'
