@@ -128,7 +128,7 @@ static NTSTATUS BlorgOpenExistingDcbExclusive(PIRP Irp, PFILE_OBJECT FileObject,
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
+NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
 {
     struct OwnedString
     {
@@ -323,9 +323,15 @@ static NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OB
     ExReleaseResourceLite(vcb->Header.Resource);
 
     // Verify that this actually exists on the remote store
+    if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+    {
+        BLORGFS_PRINT("BlorgVolumeCreate: Enqueue to Fsp\n");
+        return FsdPostRequest(Irp, IrpSp);
+    }
+    
     BOOLEAN isDir;
     DIRECTORY_ENTRY dirEntInfo;
-
+    
     NTSTATUS result = GetHttpFileInformation(&filePath.String, &dirEntInfo, &isDir);
 
     if (!NT_SUCCESS(result))
@@ -511,7 +517,10 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         {
             BlorgSetupIrpContext(Irp, TRUE);
             result = BlorgVolumeCreate(Irp, irpSp, DeviceObject);
-            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            if (STATUS_PENDING != result)
+            {
+                CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            }
             break;
         }
         case BLORGFS_DDO_MAGIC:

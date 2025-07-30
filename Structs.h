@@ -21,7 +21,7 @@ static_assert(sizeof(STRUCT_NAME) == offsetof(STRUCT_NAME, LAST_FIELD) + sizeof(
 
 #endif
 
-#define FSP_THREAD_COUNT 4
+#define FSP_THREAD_COUNT 32
 
 /////////////////////////////////////////////
 ///////FILE CONTEXT SECTION//////////////////

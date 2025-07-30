@@ -152,6 +152,13 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                 if (initialQuery || restartScan)
                 {
+                    if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+                    {
+                        BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
+                        ExReleaseResourceLite(dcb->Header.Resource);
+                        return FsdPostRequest(Irp, IrpSp);
+                    }
+
                     RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
 
                     if (ccb->SearchPattern.Buffer)
@@ -189,6 +196,13 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             {
                 if (initialQuery || restartScan)
                 {
+                    if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+                    {
+                        BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
+                        ExReleaseResourceLite(dcb->Header.Resource);
+                        return FsdPostRequest(Irp, IrpSp);
+                    }
+
                     RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
 
                     if (ccb->SearchPattern.Buffer)
