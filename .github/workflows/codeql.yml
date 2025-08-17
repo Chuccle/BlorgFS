@@ -47,6 +47,30 @@ jobs:
         token: ${{ (matrix.language == 'c-cpp' && steps.is_dependabot.outputs.is_dependabot == 'true') && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT || github.token }}
         submodules: ${{ matrix.language == 'c-cpp' && 'recursive' || false }}
 
+    - name: Get flatbuffers commit hash
+      if: matrix.language == 'c-cpp'
+      id: flatbuffers_hash
+      shell: pwsh
+      run: |
+        if (Test-Path "BlorgService/flatbuffers") {
+          cd BlorgService/flatbuffers
+          $hash = git rev-parse HEAD
+          Write-Host "FlatBuffers Hash: $hash"
+          echo "flatbuffers_hash=$hash" >> $env:GITHUB_OUTPUT
+        } else {
+          Write-Host "FlatBuffers directory not found"
+          echo "flatbuffers_hash=none" >> $env:GITHUB_OUTPUT
+        }
+
+    - name: Cache FlatBuffers build
+      if: matrix.language == 'c-cpp' && steps.flatbuffers_hash.outputs.flatbuffers_hash != 'none'
+      id: cache_flatbuffers
+      uses: actions/cache@v4
+      with:
+        path: BlorgService/flatbuffers/Release
+        key: ${{ runner.os }}-flatbuffers-${{ steps.flatbuffers_hash.outputs.flatbuffers_hash }}
+        restore-keys: ${{ runner.os }}-flatbuffers-
+
     - name: Get flatcc commit hash
       if: matrix.language == 'c-cpp'
       id: flatcc_hash
@@ -57,7 +81,6 @@ jobs:
           $hash = git rev-parse HEAD
           Write-Host "FlatCC Hash: $hash"
           echo "flatcc_hash=$hash" >> $env:GITHUB_OUTPUT
-          cd ..
         } else {
           Write-Host "FlatCC directory not found"
           echo "flatcc_hash=none" >> $env:GITHUB_OUTPUT
@@ -68,42 +91,61 @@ jobs:
       id: cache_flatcc
       uses: actions/cache@v4
       with:
-        path: |
-          flatcc/bin/Release
-          flatcc/build/MSVC
+        path: flatcc/bin/Release
         key: ${{ runner.os }}-flatcc-${{ steps.flatcc_hash.outputs.flatcc_hash }}
-        restore-keys: |
-          ${{ runner.os }}-flatcc-
+        restore-keys: ${{ runner.os }}-flatcc-
 
     - name: Install build tools
-      if: matrix.language == 'c-cpp' && steps.cache_flatcc.outputs.cache-hit != 'true' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      if: matrix.language == 'c-cpp' && ((steps.cache_flatcc.outputs.cache-hit != 'true' && steps.flatcc_hash.outputs.flatcc_hash != 'none') || (steps.cache_flatbuffers.outputs.cache-hit != 'true' && steps.flatbuffers_hash.outputs.flatbuffers_hash != 'none'))
       shell: pwsh
       run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+
+    - name: Build FlatBuffers compiler
+      if: matrix.language == 'c-cpp' && steps.cache_flatbuffers.outputs.cache-hit != 'true' && steps.flatbuffers_hash.outputs.flatbuffers_hash != 'none'
+      shell: cmd
+      run: |
+        cd BlorgService\flatbuffers
+        cmake -G "Visual Studio 17 2022"
+        cmake --build . --config Release
 
     - name: Build flatcc compiler
       if: matrix.language == 'c-cpp' && steps.cache_flatcc.outputs.cache-hit != 'true' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
       shell: cmd
       run: |
         cd flatcc
-        if not exist "build\MSVC" mkdir build\MSVC
-        cd build\MSVC
-        cmake -G "Visual Studio 17 2022" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..\..
+        cmake -G "Visual Studio 17 2022" -DCMAKE_POLICY_VERSION_MINIMUM=3.5
         cmake --build . --config Release
-        cd ..\..\..
 
-    - name: Create generated flatbuffer files
+    - name: Create generated C++ flatbuffer files
+      if: matrix.language == 'c-cpp' && steps.flatbuffers_hash.outputs.flatbuffers_hash != 'none'
+      shell: cmd
+      run: |
+        if exist "BlorgService\flatbuffers\Release\flatc.exe" (
+          if exist "schemas\metadata_flatbuffer.fbs" (
+            if not exist "BlorgService\generated" mkdir BlorgService\generated
+            BlorgService\flatbuffers\Release\flatc.exe --cpp -o BlorgService\generated schemas\metadata_flatbuffer.fbs
+            echo "Generated C++ FlatBuffer files"
+          ) else (
+            echo "Schema file not found, skipping C++ flatbuffer generation"
+          )
+        ) else (
+          echo "FlatBuffers C++ compiler not found, skipping C++ generation"
+        )
+
+    - name: Create generated C flatbuffer files
       if: matrix.language == 'c-cpp' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
       shell: cmd
       run: |
         if exist "flatcc\bin\Release\flatcc.exe" (
           if exist "schemas\metadata_flatbuffer.fbs" (
-            mkdir generated
+            if not exist "generated" mkdir generated
             flatcc\bin\Release\flatcc.exe -rv --common_reader -o generated schemas\metadata_flatbuffer.fbs
+            echo "Generated C FlatBuffer files"
           ) else (
-            echo "Schema file not found, skipping flatbuffer generation"
+            echo "Schema file not found, skipping C flatbuffer generation"
           )
         ) else (
-          echo "FlatCC compiler not found, skipping flatbuffer generation"
+          echo "FlatCC compiler not found, skipping C generation"
         )
 
     - name: Cache NuGet packages
@@ -112,8 +154,7 @@ jobs:
       with:
         path: ./packages
         key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config') }}
-        restore-keys: |
-          ${{ runner.os }}-nuget-
+        restore-keys: ${{ runner.os }}-nuget-
 
     - name: Setup Developer Command Prompt
       if: matrix.language == 'c-cpp'
@@ -139,7 +180,6 @@ jobs:
         build-mode: ${{ matrix.build-mode }}
         packs: microsoft/windows-drivers@1.1.0
         queries: security-extended,security-and-quality
-
 
     - name: Initialize CodeQL (Actions)
       if: matrix.language == 'actions'
@@ -177,6 +217,8 @@ jobs:
           -picohttpparser/**
           -schemas/**
           -generated/**
+          -BlorgService/flatbuffers/**
+          -BlorgService/generated/**
         input:  sarif-results/cpp.sarif
         output: sarif-results/cpp.sarif
 
