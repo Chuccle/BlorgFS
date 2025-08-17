@@ -257,7 +257,7 @@ void BlorgFreeFileContext(PVOID Context, PDEVICE_OBJECT VolumeDeviceObject)
                 RtlFreeUnicodeString(&ccb->SearchPattern);
                 RtlZeroMemory(&ccb->SearchPattern, sizeof(UNICODE_STRING));
             }
-            FreeHttpDirectoryInfo(&ccb->SubDirectories, &ccb->Files);
+            FreeHttpDirectoryInfo(ccb->Entries);
             ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->CcbLookasideList, ccb);
             break;
         }
@@ -389,7 +389,7 @@ PCOMMON_CONTEXT SearchByPath(const PDCB ParentDcb, PCUNICODE_STRING Path)
     return (PCOMMON_CONTEXT)currentDcb;
 }
 
-NTSTATUS InsertByPath(const PDCB ParentDcb, PCUNICODE_STRING Path, const PDIRECTORY_ENTRY DirEntryInfo, BOOLEAN Directory, const PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out)
+NTSTATUS InsertByPath(const PDCB ParentDcb, PCUNICODE_STRING Path, const PDIRECTORY_ENTRY_METADATA DirEntryInfo, const PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out)
 {
     *Out = NULL;
     UNICODE_STRING remainingPath = *Path;
@@ -414,7 +414,7 @@ NTSTATUS InsertByPath(const PDCB ParentDcb, PCUNICODE_STRING Path, const PDIRECT
 
             if (isLastComponent)
             {
-                if (!Directory)
+                if (!DirEntryInfo->IsDirectory)
                 {
                     // Last component is a file, create FCB
                     PFCB newFcb;
