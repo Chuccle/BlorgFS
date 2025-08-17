@@ -36,54 +36,93 @@ jobs:
         token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
         submodules: recursive
 
+    - name: Get flatbuffers commit hash
+      id: flatbuffers_hash
+      shell: pwsh
+      run: |
+        cd BlorgService/flatbuffers
+        $hash = git rev-parse HEAD
+        Write-Host "FlatBuffers Hash: $hash"
+        echo "flatbuffers_hash=$hash" >> $env:GITHUB_OUTPUT
+
+    - name: Cache FlatBuffers build
+      id: cache_flatbuffers
+      uses: actions/cache@v4
+      with:
+        path: BlorgService/flatbuffers/Release
+        key: ${{ runner.os }}-flatbuffers-${{ steps.flatbuffers_hash.outputs.flatbuffers_hash }}
+
+    - name: Install build tools
+      if: steps.cache_flatbuffers.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+
+    - name: Build FlatBuffers compiler
+      if: steps.cache_flatbuffers.outputs.cache-hit != 'true'
+      shell: cmd
+      run: |
+          cd BlorgService\flatbuffers
+          cmake -G "Visual Studio 17 2022"
+          cmake --build . --config Release
+
+    - name: Create generated C++ flatbuffer files
+      shell: cmd
+      run: |
+        if exist "BlorgService\flatbuffers\Release\flatc.exe" (
+          if exist "schemas\metadata_flatbuffer.fbs" (
+            mkdir BlorgService\generated
+            BlorgService\flatbuffers\Release\flatc.exe --cpp -o BlorgService\generated schemas\metadata_flatbuffer.fbs
+            echo "Generated C++ FlatBuffer files"
+          ) else (
+            echo "Schema file not found at schemas\metadata_flatbuffer.fbs"
+            dir schemas\
+          )
+        ) else (
+          echo "FlatBuffers compiler not found"
+        )
+
     - name: Get flatcc commit hash
       id: flatcc_hash
       shell: pwsh
       run: |
-        cd flatcc
-        $hash = git rev-parse HEAD
-        Write-Host "FlatCC Hash: $hash"
-        echo "flatcc_hash=$hash" >> $env:GITHUB_OUTPUT
-        cd ..
+        if (Test-Path "flatcc") {
+          cd flatcc
+          $hash = git rev-parse HEAD
+          Write-Host "FlatCC Hash: $hash"
+          echo "flatcc_hash=$hash" >> $env:GITHUB_OUTPUT
+        } else {
+          echo "flatcc_hash=none" >> $env:GITHUB_OUTPUT
+        }
 
     - name: Cache Flatcc build
       id: cache_flatcc
+      if: steps.flatcc_hash.outputs.flatcc_hash != 'none'
       uses: actions/cache@v4
       with:
-        path: |
-          flatcc/bin/Release
-          flatcc/build/MSVC
+        path: flatcc/bin/Release
         key: ${{ runner.os }}-flatcc-${{ steps.flatcc_hash.outputs.flatcc_hash }}
 
-    - name: Install build tools
-      if: steps.cache_flatcc.outputs.cache-hit != 'true'
-      shell: pwsh
-      run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
-
     - name: Build flatcc compiler
-      if: steps.cache_flatcc.outputs.cache-hit != 'true'
-      shell: cmd # Use cmd shell as cmake commands often assume it on Windows
+      if: steps.flatcc_hash.outputs.flatcc_hash != 'none' && steps.cache_flatcc.outputs.cache-hit != 'true'
+      shell: cmd
       run: |
           cd flatcc
-          mkdir build\MSVC
-          cd build\MSVC
-          REM Add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to handle old cmake_minimum_required in flatcc
-          cmake -G "Visual Studio 17 2022" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..\..
+          cmake -G "Visual Studio 17 2022" -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build . --config Release
-          cd ..\..\..
 
-    - name: Create generated flatbuffer files
-      shell: cmd # Use cmd shell as flatcc.exe is a windows executable
+    - name: Create generated C flatbuffer files
+      if: steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      shell: cmd
       run: |
         if exist "flatcc\bin\Release\flatcc.exe" (
           if exist "schemas\metadata_flatbuffer.fbs" (
             mkdir generated
             flatcc\bin\Release\flatcc.exe -rv --common_reader -o generated schemas\metadata_flatbuffer.fbs
           ) else (
-            echo "Schema file not found, skipping flatbuffer generation"
+            echo "Schema file not found, skipping C flatbuffer generation"
           )
         ) else (
-          echo "FlatCC compiler not found, skipping flatbuffer generation"
+          echo "FlatCC compiler not found, skipping C flatbuffer generation"
         )
 
     - name: Cache NuGet packages
@@ -91,8 +130,7 @@ jobs:
       with:
         path: ./packages
         key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config') }}
-        restore-keys: |
-          ${{ runner.os }}-nuget-
+        restore-keys: ${{ runner.os }}-nuget-
 
     - name: Setup Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
