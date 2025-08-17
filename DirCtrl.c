@@ -152,6 +152,13 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                 if (initialQuery || restartScan)
                 {
+                    if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+                    {
+                        BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
+                        ExReleaseResourceLite(dcb->Header.Resource);
+                        return FsdPostRequest(Irp, IrpSp);
+                    }
+
                     RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
 
                     if (ccb->SearchPattern.Buffer)
@@ -172,9 +179,9 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                         SetFlag(ccb->Flags, CCB_FLAG_MATCH_ALL);
                     }
 
-                    FreeHttpDirectoryInfo(&ccb->SubDirectories, &ccb->Files);
+                    FreeHttpDirectoryInfo(ccb->Entries);
 
-                    result = GetHttpDirectoryInfo(&dcb->FullPath, &ccb->SubDirectories, &ccb->Files);
+                    result = GetHttpDirectoryInfo(&dcb->FullPath, &ccb->Entries);
 
                     if (!NT_SUCCESS(result))
                     {
@@ -189,6 +196,13 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             {
                 if (initialQuery || restartScan)
                 {
+                    if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+                    {
+                        BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
+                        ExReleaseResourceLite(dcb->Header.Resource);
+                        return FsdPostRequest(Irp, IrpSp);
+                    }
+
                     RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
 
                     if (ccb->SearchPattern.Buffer)
@@ -199,9 +213,9 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                     SetFlag(ccb->Flags, CCB_FLAG_MATCH_ALL);
 
-                    FreeHttpDirectoryInfo(&ccb->SubDirectories, &ccb->Files);
+                    FreeHttpDirectoryInfo(ccb->Entries);
 
-                    result = GetHttpDirectoryInfo(&dcb->FullPath, &ccb->SubDirectories, &ccb->Files);
+                    result = GetHttpDirectoryInfo(&dcb->FullPath, &ccb->Entries);
 
                     if (!NT_SUCCESS(result))
                     {
@@ -220,7 +234,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             BOOLEAN updateCcb = FALSE;
             ULONG index = (indexSpecified) ? IrpSp->Parameters.QueryDirectory.FileIndex : (ULONG)ccb->CurrentIndex;
 
-            ULONG totalEntries = (ULONG)(ccb->SubDirectories.EntryCount + ccb->Files.EntryCount);
+            ULONG totalEntries = (ULONG)(ccb->Entries->FileCount + ccb->Entries->SubDirCount);
 
             __try
             {
@@ -228,9 +242,9 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 {
                     case FileIdBothDirectoryInformation:
                     {
-
-#pragma message ("doesn't sit right fastfat doesn't probe here in a synchronous request i wonder if i can create POC attack")
-                        PFILE_ID_BOTH_DIR_INFORMATION dirInfo = (!Irp->MdlAddress) ? Irp->UserBuffer : MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
+                        PFILE_ID_BOTH_DIR_INFORMATION dirInfo = (!Irp->MdlAddress) ?
+                            Irp->UserBuffer :
+                            MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
 
                         if (!dirInfo)
                         {
@@ -247,15 +261,52 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                         while (index < totalEntries && moreEntries)
                         {
-                            BOOLEAN isDirectory = index < ccb->SubDirectories.EntryCount;
-                            ULONG entryIndex = isDirectory ? index : index - (ULONG)ccb->SubDirectories.EntryCount;
-                            PUNICODE_STRING entryName = isDirectory ?
-                                &ccb->SubDirectories.Entries[entryIndex].Name :
-                                &ccb->Files.Entries[entryIndex].Name;
+                            BOOLEAN isDirectory = index >= ccb->Entries->FileCount;
+                            UNICODE_STRING uniName;
+                            LARGE_INTEGER creationTime, lastAccessTime, lastWriteTime;
+                            LARGE_INTEGER fileSize = { 0 };
+                            ULONG fileAttributes;
 
-                            if (MatchPattern(entryName, &ccb->SearchPattern, ccb->Flags))
+                            // Get entry metadata based on type
+                            if (isDirectory)
                             {
-                                ULONG entrySize = UFIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName[0]) + entryName->Length;
+                                ULONG entryIndex = index - (ULONG)ccb->Entries->FileCount;
+
+                                PDIRECTORY_SUBDIR_METADATA subDirEntry = GetSubDirEntry(ccb->Entries, entryIndex);
+
+                                if (!subDirEntry)
+                                {
+                                    break;
+                                }
+
+                                RtlInitUnicodeString(&uniName, subDirEntry->Name);
+                                creationTime.QuadPart = subDirEntry->CreationTime;
+                                lastAccessTime.QuadPart = subDirEntry->LastAccessedTime;
+                                lastWriteTime.QuadPart = subDirEntry->LastModifiedTime;
+                                fileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+                                // fileSize remains 0 for directories
+                            }
+                            else
+                            {
+                                PDIRECTORY_FILE_METADATA fileEntry = GetFileEntry(ccb->Entries, index);
+
+                                if (!fileEntry)
+                                {
+                                    break;
+                                }
+
+                                RtlInitUnicodeString(&uniName, fileEntry->Name);
+                                creationTime.QuadPart = fileEntry->CreationTime;
+                                lastAccessTime.QuadPart = fileEntry->LastAccessedTime;
+                                lastWriteTime.QuadPart = fileEntry->LastModifiedTime;
+                                fileSize.QuadPart = fileEntry->Size;
+                                fileAttributes = FILE_ATTRIBUTE_NORMAL;
+                            }
+
+                            // Check if entry matches search pattern
+                            if (MatchPattern(&uniName, &ccb->SearchPattern, ccb->Flags))
+                            {
+                                ULONG entrySize = UFIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName[0]) + uniName.Length;
 
                                 if (remainingLength < entrySize)
                                 {
@@ -263,40 +314,27 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                                     break;
                                 }
 
-                                // Fill in entry information
+                                // Populate directory information structure
                                 RtlZeroMemory(dirInfo, entrySize);
                                 dirInfo->NextEntryOffset = (returnSingleEntry || (index == totalEntries - 1)) ? 0 : entrySize;
                                 dirInfo->FileIndex = index;
 
-                                if (isDirectory)
-                                {
-                                    dirInfo->CreationTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].CreationTime;
-                                    dirInfo->LastAccessTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastAccessedTime;
-                                    dirInfo->LastWriteTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastModifiedTime;
-                                    dirInfo->ChangeTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastModifiedTime;
-                                    dirInfo->EndOfFile.QuadPart = ccb->SubDirectories.Entries[entryIndex].Size;
-                                    dirInfo->AllocationSize.QuadPart = ccb->SubDirectories.Entries[entryIndex].Size;
-                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-                                    dirInfo->FileId.QuadPart = 0;
-                                }
-                                else
-                                {
-                                    dirInfo->CreationTime.QuadPart = ccb->Files.Entries[entryIndex].CreationTime;
-                                    dirInfo->LastAccessTime.QuadPart = ccb->Files.Entries[entryIndex].LastAccessedTime;
-                                    dirInfo->LastWriteTime.QuadPart = ccb->Files.Entries[entryIndex].LastModifiedTime;
-                                    dirInfo->ChangeTime.QuadPart = ccb->Files.Entries[entryIndex].LastModifiedTime;
-                                    dirInfo->EndOfFile.QuadPart = ccb->Files.Entries[entryIndex].Size;
-                                    dirInfo->AllocationSize.QuadPart = ccb->Files.Entries[entryIndex].Size;
-                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_NORMAL;
-                                    dirInfo->FileId.QuadPart = 0;
-                                }
+                                dirInfo->CreationTime = creationTime;
+                                dirInfo->LastAccessTime = lastAccessTime;
+                                dirInfo->LastWriteTime = lastWriteTime;
+                                dirInfo->ChangeTime = lastWriteTime;  // Using LastWriteTime for ChangeTime
+                                dirInfo->EndOfFile = fileSize;
+                                dirInfo->AllocationSize = fileSize;
+                                dirInfo->FileAttributes = fileAttributes;
+                                dirInfo->FileId.QuadPart = 0;
 
-                                dirInfo->FileNameLength = entryName->Length;
+                                dirInfo->FileNameLength = uniName.Length;
                                 dirInfo->EaSize = 0;
                                 dirInfo->ShortNameLength = 0;
 
-                                RtlCopyMemory(dirInfo->FileName, entryName->Buffer, entryName->Length);
+                                RtlCopyMemory(dirInfo->FileName, uniName.Buffer, uniName.Length);
 
+                                // Update pointers and counters
                                 prevDirInfo = dirInfo;
                                 dirInfo = (PFILE_ID_BOTH_DIR_INFORMATION)((PUCHAR)dirInfo + entrySize);
                                 remainingLength -= entrySize;
@@ -304,18 +342,13 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                                 bytesWritten += entrySize;
                                 foundEntry = TRUE;
 
-                                index++;
-
                                 if (returnSingleEntry)
                                 {
                                     break;
                                 }
                             }
-                            else
-                            {
-                                index++;
-                            }
 
+                            index++;
                             updateCcb = TRUE;
                         }
 
@@ -351,15 +384,52 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                         while (index < totalEntries && moreEntries)
                         {
-                            BOOLEAN isDirectory = index < ccb->SubDirectories.EntryCount;
-                            ULONG entryIndex = isDirectory ? index : index - (ULONG)ccb->SubDirectories.EntryCount;
-                            PUNICODE_STRING entryName = isDirectory ?
-                                &ccb->SubDirectories.Entries[entryIndex].Name :
-                                &ccb->Files.Entries[entryIndex].Name;
+                            BOOLEAN isDirectory = index >= ccb->Entries->FileCount;
+                            UNICODE_STRING uniName;
+                            LARGE_INTEGER creationTime, lastAccessTime, lastWriteTime;
+                            LARGE_INTEGER fileSize = { 0 };
+                            ULONG fileAttributes;
 
-                            if (MatchPattern(entryName, &ccb->SearchPattern, ccb->Flags))
+                            // Get entry metadata based on type
+                            if (isDirectory)
                             {
-                                ULONG entrySize = UFIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName[0]) + entryName->Length;
+                                ULONG entryIndex = index - (ULONG)ccb->Entries->FileCount;
+                                
+                                PDIRECTORY_SUBDIR_METADATA subDirEntry = GetSubDirEntry(ccb->Entries, entryIndex);
+                                
+                                if (!subDirEntry)
+                                {
+                                    break;
+                                }
+
+                                RtlInitUnicodeString(&uniName, subDirEntry->Name);
+                                creationTime.QuadPart = subDirEntry->CreationTime;
+                                lastAccessTime.QuadPart = subDirEntry->LastAccessedTime;
+                                lastWriteTime.QuadPart = subDirEntry->LastModifiedTime;
+                                fileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+                                // fileSize remains 0 for directories
+                            }
+                            else
+                            {
+                                PDIRECTORY_FILE_METADATA fileEntry = GetFileEntry(ccb->Entries, index);
+                                
+                                if (!fileEntry)
+                                {
+                                    break;
+                                }
+
+                                RtlInitUnicodeString(&uniName, fileEntry->Name);
+                                creationTime.QuadPart = fileEntry->CreationTime;
+                                lastAccessTime.QuadPart = fileEntry->LastAccessedTime;
+                                lastWriteTime.QuadPart = fileEntry->LastModifiedTime;
+                                fileSize.QuadPart = fileEntry->Size;
+                                fileAttributes = FILE_ATTRIBUTE_NORMAL;
+                            }
+
+                            // Check if entry matches search pattern
+                            if (MatchPattern(&uniName, &ccb->SearchPattern, ccb->Flags))
+                            {
+                                ULONG entrySize = UFIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName[0]) + uniName.Length;
 
                                 if (remainingLength < entrySize)
                                 {
@@ -367,37 +437,25 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                                     break;
                                 }
 
-                                // Fill in entry information
+                                // Populate directory information structure
                                 RtlZeroMemory(dirInfo, entrySize);
                                 dirInfo->NextEntryOffset = (returnSingleEntry || (index == totalEntries - 1)) ? 0 : entrySize;
                                 dirInfo->FileIndex = index;
 
-                                if (isDirectory)
-                                {
-                                    dirInfo->CreationTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].CreationTime;
-                                    dirInfo->LastAccessTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastAccessedTime;
-                                    dirInfo->LastWriteTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastModifiedTime;
-                                    dirInfo->ChangeTime.QuadPart = ccb->SubDirectories.Entries[entryIndex].LastModifiedTime;
-                                    dirInfo->EndOfFile.QuadPart = ccb->SubDirectories.Entries[entryIndex].Size;
-                                    dirInfo->AllocationSize.QuadPart = ccb->SubDirectories.Entries[entryIndex].Size;
-                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-                                }
-                                else
-                                {
-                                    dirInfo->CreationTime.QuadPart = ccb->Files.Entries[entryIndex].CreationTime;
-                                    dirInfo->LastAccessTime.QuadPart = ccb->Files.Entries[entryIndex].LastAccessedTime;
-                                    dirInfo->LastWriteTime.QuadPart = ccb->Files.Entries[entryIndex].LastModifiedTime;
-                                    dirInfo->ChangeTime.QuadPart = ccb->Files.Entries[entryIndex].LastModifiedTime;
-                                    dirInfo->EndOfFile.QuadPart = ccb->Files.Entries[entryIndex].Size;
-                                    dirInfo->AllocationSize.QuadPart = ccb->Files.Entries[entryIndex].Size;
-                                    dirInfo->FileAttributes = FILE_ATTRIBUTE_NORMAL;
-                                }
+                                dirInfo->CreationTime = creationTime;
+                                dirInfo->LastAccessTime = lastAccessTime;
+                                dirInfo->LastWriteTime = lastWriteTime;
+                                dirInfo->ChangeTime = lastWriteTime;  // Using LastWriteTime for ChangeTime
+                                dirInfo->EndOfFile = fileSize;
+                                dirInfo->AllocationSize = fileSize;
+                                dirInfo->FileAttributes = fileAttributes;
 
-                                dirInfo->FileNameLength = entryName->Length;
+                                dirInfo->FileNameLength = uniName.Length;
                                 dirInfo->EaSize = 0;
 
-                                RtlCopyMemory(dirInfo->FileName, entryName->Buffer, entryName->Length);
+                                RtlCopyMemory(dirInfo->FileName, uniName.Buffer, uniName.Length);
 
+                                // Update pointers and counters
                                 prevDirInfo = dirInfo;
                                 dirInfo = (PFILE_FULL_DIR_INFORMATION)((PUCHAR)dirInfo + entrySize);
                                 remainingLength -= entrySize;
@@ -405,18 +463,13 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                                 bytesWritten += entrySize;
                                 foundEntry = TRUE;
 
-                                index++;
-
                                 if (returnSingleEntry)
                                 {
                                     break;
                                 }
                             }
-                            else
-                            {
-                                index++;
-                            }
 
+                            index++;
                             updateCcb = TRUE;
                         }
 

@@ -5,7 +5,7 @@
 #include <wdmsec.h>
 #include <wsk.h>
 
-
+#include "BlorgFSCTL.h"
 #include "Structs.h"
 #include "Util.h"
 #include "Client.h"

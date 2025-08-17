@@ -21,35 +21,11 @@ static_assert(sizeof(STRUCT_NAME) == offsetof(STRUCT_NAME, LAST_FIELD) + sizeof(
 
 #endif
 
-#define FSP_THREAD_COUNT 4
+#define FSP_THREAD_COUNT 32
 
 /////////////////////////////////////////////
 ///////FILE CONTEXT SECTION//////////////////
 /////////////////////////////////////////////
-
-typedef struct _DIRECTORY_ENTRY
-{
-    UNICODE_STRING Name;
-    ULONG64 Size;
-    ULONG64 CreationTime;
-    ULONG64 LastAccessedTime;
-    ULONG64 LastModifiedTime;
-} DIRECTORY_ENTRY, * PDIRECTORY_ENTRY;
-
-CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY, Name, Size);
-CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY, Size, CreationTime);
-CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY, CreationTime, LastAccessedTime);
-CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY, LastAccessedTime, LastModifiedTime);
-CHECK_PADDING_END(DIRECTORY_ENTRY, LastModifiedTime);
-
-typedef struct _DIRECTORY_INFO
-{
-    DIRECTORY_ENTRY* Entries;
-    SIZE_T EntryCount;
-} DIRECTORY_INFO, * PDIRECTORY_INFO;
-
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, Entries, EntryCount);
-CHECK_PADDING_END(DIRECTORY_INFO, EntryCount);
 
 // 0x8000 - 0xBFFF  reserved for 3rd party file systems
 #define BLORGFS_FCB_SIGNATURE 0x8008
@@ -171,8 +147,7 @@ typedef struct _CCB
     ULONGLONG Flags;
     UINT64 CurrentIndex;
     UNICODE_STRING SearchPattern;
-    DIRECTORY_INFO SubDirectories;
-    DIRECTORY_INFO Files;
+    PDIRECTORY_INFO Entries;
 } CCB, * PCCB;
 
 #define CCB_FLAG_MATCH_ALL 0x0001
@@ -181,9 +156,8 @@ CHECK_PADDING_BETWEEN(CCB, NodeTypeCode, NodeByteSize);
 CHECK_PADDING_BETWEEN(CCB, NodeByteSize, Flags);
 CHECK_PADDING_BETWEEN(CCB, Flags, CurrentIndex);
 CHECK_PADDING_BETWEEN(CCB, CurrentIndex, SearchPattern);
-CHECK_PADDING_BETWEEN(CCB, SearchPattern, SubDirectories);
-CHECK_PADDING_BETWEEN(CCB, SubDirectories, Files);
-CHECK_PADDING_END(CCB, Files);
+CHECK_PADDING_BETWEEN(CCB, SearchPattern, Entries);
+CHECK_PADDING_END(CCB, Entries);
 
 typedef FCB VCB;
 typedef PFCB PVCB;
@@ -194,7 +168,7 @@ extern inline NTSTATUS BlorgCreateCCB(CCB** Ccb, const PDEVICE_OBJECT VolumeDevi
 void BlorgFreeFileContext(PVOID Context, const PDEVICE_OBJECT VolumeDeviceObject);
 
 PCOMMON_CONTEXT SearchByPath(const PDCB RootDcb, PCUNICODE_STRING Path);
-NTSTATUS InsertByPath(const PDCB RootDcb, PCUNICODE_STRING Path, const PDIRECTORY_ENTRY DirEntryInfo, BOOLEAN Directory, const PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out);
+NTSTATUS InsertByPath(const PDCB RootDcb, PCUNICODE_STRING Path, const PDIRECTORY_ENTRY_METADATA DirEntryInfo, const PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out);
 
 #define IRP_CONTEXT_FLAG_DISABLE_DIRTY              0x00000001
 #define IRP_CONTEXT_FLAG_WAIT                       0x00000002
@@ -256,20 +230,20 @@ CHECK_PADDING_END(BLORGFS_DEVICE_EXTENSION_HDR, Identifier);
 typedef struct BLORGFS_VDO_DEVICE_EXTENSION
 {
     BLORGFS_DEVICE_EXTENSION_HDR Hdr;
-    PDCB RootDcb;
     NPAGED_LOOKASIDE_LIST NonPagedNodeLookasideList;
     PAGED_LOOKASIDE_LIST FcbLookasideList;
     PAGED_LOOKASIDE_LIST DcbLookasideList;
     PAGED_LOOKASIDE_LIST CcbLookasideList;
+    PDCB RootDcb;
     PVCB Vcb;
 } BLORGFS_VDO_DEVICE_EXTENSION, * PBLORGFS_VDO_DEVICE_EXTENSION;
 
-CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, Hdr, RootDcb);
-CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, RootDcb, NonPagedNodeLookasideList);
+CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, Hdr, NonPagedNodeLookasideList);
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, NonPagedNodeLookasideList, FcbLookasideList);
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, FcbLookasideList, DcbLookasideList);
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, DcbLookasideList, CcbLookasideList);
-CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, CcbLookasideList, Vcb);
+CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, CcbLookasideList, RootDcb);
+CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, RootDcb, Vcb);
 CHECK_PADDING_END(BLORGFS_VDO_DEVICE_EXTENSION, Vcb);
 
 typedef struct _BLORGFS_DDO_DEVICE_EXTENSION

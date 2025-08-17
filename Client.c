@@ -139,89 +139,156 @@ static NTSTATUS AlignBuffer(char* OriginalBuffer, SIZE_T BufferSize, SIZE_T Cont
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS ProcessEntries(BlorgMetaFlat_DirectoryEntriesMetadata_table_t entriesMetadata, uint64_t entryCount, PDIRECTORY_INFO outDirInfo)
+static NTSTATUS ProcessEntries(BlorgMetaFlat_Directory_table_t entriesMetadata, PDIRECTORY_INFO* OutDirInfo)
 {
-    if (!entriesMetadata || !outDirInfo)
+    if (!entriesMetadata || !OutDirInfo)
     {
         BLORGFS_PRINT("ProcessEntries() - invalid arguments\n");
         return STATUS_INVALID_PARAMETER;
     }
 
-    PDIRECTORY_ENTRY entries = ExAllocatePoolZero(PagedPool, entryCount * sizeof(DIRECTORY_ENTRY), 'DBLR');
+    size_t headerSize = sizeof(DIRECTORY_INFO);
+    
+    BlorgMetaFlat_FileEntryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(entriesMetadata);
+    SIZE_T subdirCount = (flatSubdirEntries) ? BlorgMetaFlat_SubdirectoryMetadata_vec_len(flatSubdirEntries) : 0;
 
-    if (!entries)
+    BlorgMetaFlat_FileEntryMetadata_vec_t flatFileEntries = BlorgMetaFlat_Directory_files(entriesMetadata);
+    SIZE_T filesCount = (flatFileEntries) ? BlorgMetaFlat_FileEntryMetadata_vec_len(flatFileEntries) : 0;
+    
+    SIZE_T filesEntryArraySize = filesCount * sizeof(DIRECTORY_FILE_METADATA);
+    SIZE_T subDirArraySize = subdirCount * sizeof(DIRECTORY_SUBDIR_METADATA);
+
+    PDIRECTORY_INFO dirInfo = ExAllocatePoolZero(PagedPool, headerSize + filesEntryArraySize + subDirArraySize, 'DBLR');
+
+    if (!dirInfo)
     {
         BLORGFS_PRINT("ProcessEntries() - failed entries alloc\n");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    flatbuffers_string_vec_t name_vector = BlorgMetaFlat_DirectoryEntriesMetadata_name(entriesMetadata);
-    flatbuffers_uint64_vec_t size_vector = BlorgMetaFlat_DirectoryEntriesMetadata_size(entriesMetadata);
-    flatbuffers_uint64_vec_t last_created_vector = BlorgMetaFlat_DirectoryEntriesMetadata_created(entriesMetadata);
-    flatbuffers_uint64_vec_t last_accessed_vector = BlorgMetaFlat_DirectoryEntriesMetadata_accessed(entriesMetadata);
-    flatbuffers_uint64_vec_t last_modified_vector = BlorgMetaFlat_DirectoryEntriesMetadata_modified(entriesMetadata);
+    dirInfo->FilesOffset = headerSize;
+    dirInfo->SubDirsOffset = headerSize + filesEntryArraySize;
+    dirInfo->FileCount = filesCount;
+    dirInfo->SubDirCount = subdirCount;
 
-    if (entryCount != flatbuffers_string_vec_len(name_vector) ||
-        entryCount != flatbuffers_uint64_vec_len(size_vector) ||
-        entryCount != flatbuffers_uint64_vec_len(last_created_vector) ||
-        entryCount != flatbuffers_uint64_vec_len(last_accessed_vector) ||
-        entryCount != flatbuffers_uint64_vec_len(last_modified_vector))
+    // base of the file entries
+    PDIRECTORY_FILE_METADATA fileEntries = GetFileEntry(dirInfo, 0);
+
+    for (size_t i = 0; i < filesCount; ++i)
     {
-        BLORGFS_PRINT("ProcessEntries() - vector length to entry count mismatch\n");
-        ExFreePool(entries);
-        return STATUS_INVALID_PARAMETER;
-    }
+        BlorgMetaFlat_FileEntryMetadata_table_t flatFileEntry = BlorgMetaFlat_FileEntryMetadata_vec_at(flatFileEntries, i);
 
-    for (size_t i = 0; i < entryCount; ++i)
-    {
-        flatbuffers_string_t name = flatbuffers_string_vec_at(name_vector, i);
-        uint64_t size = flatbuffers_uint64_vec_at(size_vector, i);
-        uint64_t created = flatbuffers_uint64_vec_at(last_created_vector, i);
-        uint64_t accessed = flatbuffers_uint64_vec_at(last_accessed_vector, i);
-        uint64_t modified = flatbuffers_uint64_vec_at(last_modified_vector, i);
-
-        if (0 == flatbuffers_string_len(name))
+        if (!flatFileEntry)
         {
-            BLORGFS_PRINT("ProcessEntries() - string entry length is 0\n");
-            for (size_t j = 0; j < i; j++)
-            {
-                RtlFreeUnicodeString(&(entries[j].Name));
-            }
-            ExFreePool(entries);
+            BLORGFS_PRINT("ProcessEntries() - failed\n");
+            ExFreePool(dirInfo);
             return STATUS_INVALID_PARAMETER;
         }
+
+        flatbuffers_string_t name = BlorgMetaFlat_FileEntryMetadata_name(flatFileEntry);
+
+        if (!name || flatbuffers_string_len(name) == 0)
+        { 
+            BLORGFS_PRINT("ProcessEntries() - failed\n");
+            ExFreePool(dirInfo);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        uint64_t size = BlorgMetaFlat_FileEntryMetadata_size(flatFileEntry);
+        uint64_t created = BlorgMetaFlat_FileEntryMetadata_created(flatFileEntry);
+        uint64_t accessed = BlorgMetaFlat_FileEntryMetadata_accessed(flatFileEntry);
+        uint64_t modified = BlorgMetaFlat_FileEntryMetadata_modified(flatFileEntry);
 
         // Convert char* to UNICODE_STRING
         UTF8_STRING utf8name;
         RtlInitUTF8String(&utf8name, name);
 
-        NTSTATUS status = RtlUTF8StringToUnicodeString(&(entries[i].Name), &utf8name, TRUE);
+        UNICODE_STRING uniName;
+        
+        NTSTATUS status = RtlUTF8StringToUnicodeString(&uniName, &utf8name, TRUE);
         if (!NT_SUCCESS(status))
         {
-            BLORGFS_PRINT("ProcessEntries() - failed RtlAnsiStringToUnicodeString\n");
-            for (size_t j = 0; j < i; j++)
-            {
-                RtlFreeUnicodeString(&(entries[j].Name));
-            }
-            ExFreePool(entries);
+            BLORGFS_PRINT("ProcessEntries() - failed\n");
+            RtlFreeUnicodeString(&uniName);
+            ExFreePool(dirInfo);
             return status;
         }
 
-        entries[i].Size = size;
-        entries[i].CreationTime = created;
-        entries[i].LastAccessedTime = accessed;
-        entries[i].LastModifiedTime = modified;
+        memcpy(fileEntries[i].Name, uniName.Buffer, uniName.Length);
+        fileEntries[i].NameLength = uniName.Length / sizeof(WCHAR);
+
+        RtlFreeUnicodeString(&uniName);
+
+        fileEntries[i].Size = size;
+        fileEntries[i].CreationTime = created;
+        fileEntries[i].LastAccessedTime = accessed;
+        fileEntries[i].LastModifiedTime = modified;
 
         BLORGFS_PRINT("name=%s -- size=%llu -- created=%llu -- accessed=%llu -- modified=%llu\n", name, size, created, accessed, modified);
     }
 
-    outDirInfo->Entries = entries;
-    outDirInfo->EntryCount = entryCount;
+     // base of the subdirectory entries
+    PDIRECTORY_SUBDIR_METADATA subdirEntries = GetSubDirEntry(dirInfo, 0);
+
+    for (size_t i = 0; i < subdirCount; ++i)
+    {
+
+        BlorgMetaFlat_SubdirectoryMetadata_table_t flatSubdirEntry = BlorgMetaFlat_SubdirectoryMetadata_vec_at(flatSubdirEntries, i);
+
+        if (!flatSubdirEntry)
+        {
+            BLORGFS_PRINT("ProcessEntries() - failed\n");
+            ExFreePool(dirInfo);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        flatbuffers_string_t name = BlorgMetaFlat_SubdirectoryMetadata_name(flatSubdirEntry);
+
+        if (!name || flatbuffers_string_len(name) == 0)
+        {
+            BLORGFS_PRINT("ProcessEntries() - failed\n");
+            ExFreePool(dirInfo);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        uint64_t created = BlorgMetaFlat_SubdirectoryMetadata_created(flatSubdirEntry);
+        uint64_t accessed = BlorgMetaFlat_SubdirectoryMetadata_accessed(flatSubdirEntry);
+        uint64_t modified = BlorgMetaFlat_SubdirectoryMetadata_modified(flatSubdirEntry);
+
+        // Convert char* to UNICODE_STRING
+        UTF8_STRING utf8name;
+        RtlInitUTF8String(&utf8name, name);
+
+        UNICODE_STRING uniName;
+
+        NTSTATUS status = RtlUTF8StringToUnicodeString(&uniName, &utf8name, TRUE);
+        
+        if (!NT_SUCCESS(status))
+        {
+            BLORGFS_PRINT("ProcessEntries() - failed RtlAnsiStringToUnicodeString\n");
+            RtlFreeUnicodeString(&uniName);
+            ExFreePool(dirInfo);
+            return status;
+        }
+
+        memcpy(subdirEntries[i].Name, uniName.Buffer, uniName.Length);
+        subdirEntries[i].NameLength = uniName.Length / sizeof(WCHAR);
+
+        RtlFreeUnicodeString(&uniName);
+
+        subdirEntries[i].CreationTime = created;
+        subdirEntries[i].LastAccessedTime = accessed;
+        subdirEntries[i].LastModifiedTime = modified;
+
+        BLORGFS_PRINT("name=%s -- created=%llu -- accessed=%llu -- modified=%llu\n", name, created, accessed, modified);
+    }
+
+    *OutDirInfo = dirInfo;
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS DeserializeDirectoryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTORY_INFO SubDirInfo, PDIRECTORY_INFO FileDirInfo)
+static NTSTATUS DeserializeDirectoryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTORY_INFO* OutDirInfo)
 {
     if (!HttpInfo->Headers || !HttpInfo->BodyBuffer || 0 == HttpInfo->BodyBufferSize)
     {
@@ -282,75 +349,18 @@ static NTSTATUS DeserializeDirectoryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpI
         return STATUS_INVALID_PARAMETER;
     }
 
-    uint64_t fileCount = BlorgMetaFlat_Directory_file_count(directory);
-    uint64_t directoryCount = BlorgMetaFlat_Directory_directory_count(directory);
+    result = ProcessEntries(directory, OutDirInfo);
 
-    if (0 == (fileCount + directoryCount))
+    if (!NT_SUCCESS(result))
     {
+        BLORGFS_PRINT("DeserializeFlatBuffer() - error processing files\n");
         if (bufferAllocated)
         {
             ExFreePool(alignedBuffer);
         }
-        // empty dir can be considered valid
-        return STATUS_SUCCESS;
+        return result;
     }
-
-    if (0 < fileCount)
-    {
-        BlorgMetaFlat_DirectoryEntriesMetadata_table_t files = BlorgMetaFlat_Directory_files(directory);
-
-        if (!files)
-        {
-            BLORGFS_PRINT("DeserializeFlatBuffer() - files vector suggested but not valid\n");
-            if (bufferAllocated)
-            {
-                ExFreePool(alignedBuffer);
-            }
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        result = ProcessEntries(files, fileCount, FileDirInfo);
-
-        if (!NT_SUCCESS(result))
-        {
-            BLORGFS_PRINT("DeserializeFlatBuffer() - error processing files\n");
-            if (bufferAllocated)
-            {
-                ExFreePool(alignedBuffer);
-            }
-            return result;
-        }
-    }
-
-    if (0 < directoryCount)
-    {
-        BlorgMetaFlat_DirectoryEntriesMetadata_table_t subDirs = BlorgMetaFlat_Directory_directories(directory);
-
-        if (!subDirs)
-        {
-            BLORGFS_PRINT("DeserializeFlatBuffer() - directories vector suggested but not valid\n");
-            FreeHttpDirectoryInfo(NULL, FileDirInfo);
-            if (bufferAllocated)
-            {
-                ExFreePool(alignedBuffer);
-            }
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        result = ProcessEntries(subDirs, directoryCount, SubDirInfo);
-
-        if (!NT_SUCCESS(result))
-        {
-            BLORGFS_PRINT("DeserializeFlatBuffer() - error processing directories\n");
-            FreeHttpDirectoryInfo(NULL, FileDirInfo);
-            if (bufferAllocated)
-            {
-                ExFreePool(alignedBuffer);
-            }
-            return result;
-        }
-    }
-
+   
     if (bufferAllocated)
     {
         ExFreePool(alignedBuffer);
@@ -359,7 +369,7 @@ static NTSTATUS DeserializeDirectoryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpI
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS DeserializeDirectoryEntryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTORY_ENTRY DirEntryInfo, PBOOLEAN IsDir)
+static NTSTATUS DeserializeDirectoryEntryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTORY_ENTRY_METADATA DirEntryInfo)
 {
     if (!HttpInfo->Headers || !HttpInfo->BodyBuffer || 0 == HttpInfo->BodyBufferSize)
     {
@@ -424,8 +434,7 @@ static NTSTATUS DeserializeDirectoryEntryInfoFlatBuffer(const PHTTP_BUFFER_INFO 
     DirEntryInfo->CreationTime = BlorgMetaFlat_DirectoryEntryMetadata_created(dirEntMeta);
     DirEntryInfo->LastAccessedTime = BlorgMetaFlat_DirectoryEntryMetadata_accessed(dirEntMeta);
     DirEntryInfo->LastModifiedTime = BlorgMetaFlat_DirectoryEntryMetadata_modified(dirEntMeta);
-
-    *IsDir = BlorgMetaFlat_DirectoryEntryMetadata_directory(dirEntMeta);
+    DirEntryInfo->IsDirectory = BlorgMetaFlat_DirectoryEntryMetadata_directory(dirEntMeta);
 
     if (bufferAllocated)
     {
@@ -544,7 +553,7 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
     return status;
 }
 
-NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDirInfo, PDIRECTORY_INFO FileDirInfo)
+NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO* OutDirInfo)
 {
     if (!Path || 0 == Path->Length || !Path->Buffer)
     {
@@ -552,16 +561,10 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDir
         return STATUS_INVALID_PARAMETER;
     }
 
-    if (!SubDirInfo || !FileDirInfo)
+    if (!OutDirInfo)
     {
         return STATUS_INVALID_PARAMETER;
     }
-
-    SubDirInfo->Entries = NULL;
-    SubDirInfo->EntryCount = 0;
-
-    FileDirInfo->Entries = NULL;
-    FileDirInfo->EntryCount = 0;
 
     UNICODE_STRING encodedPath;
     NTSTATUS result = UrlEncodeUnicodeString(Path, &encodedPath, TRUE);
@@ -726,7 +729,7 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDir
         .HeaderCount = num_headers
     };
 
-    result = DeserializeDirectoryInfoFlatBuffer(&httpInfo, SubDirInfo, FileDirInfo);
+    result = DeserializeDirectoryInfoFlatBuffer(&httpInfo, OutDirInfo);
 
     if (!NT_SUCCESS(result))
     {
@@ -744,32 +747,15 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO SubDir
     return result;
 }
 
-void FreeHttpDirectoryInfo(PDIRECTORY_INFO SubDirInfo, PDIRECTORY_INFO FileDirInfo)
+void FreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
 {
-    if (SubDirInfo && SubDirInfo->Entries)
+    if (DirInfo)
     {
-        for (SIZE_T i = 0; i < SubDirInfo->EntryCount; i++)
-        {
-            RtlFreeUnicodeString(&(SubDirInfo->Entries[i].Name));
-        }
-        ExFreePool(SubDirInfo->Entries);
-
-        RtlZeroMemory(SubDirInfo, sizeof(DIRECTORY_INFO));
-    }
-
-    if (FileDirInfo && FileDirInfo->Entries)
-    {
-        for (SIZE_T i = 0; i < FileDirInfo->EntryCount; i++)
-        {
-            RtlFreeUnicodeString(&(FileDirInfo->Entries[i].Name));
-        }
-        ExFreePool(FileDirInfo->Entries);
-
-        RtlZeroMemory(FileDirInfo, sizeof(DIRECTORY_INFO));
+        ExFreePool(DirInfo);
     }
 }
 
-NTSTATUS GetHttpFileInformation(const PUNICODE_STRING Path, PDIRECTORY_ENTRY DirectoryEntryInfo, PBOOLEAN isDir)
+NTSTATUS GetHttpFileInformation(const PUNICODE_STRING Path, PDIRECTORY_ENTRY_METADATA DirectoryEntryInfo)
 {
     if (!Path || 0 == Path->Length || !Path->Buffer)
     {
@@ -941,7 +927,7 @@ NTSTATUS GetHttpFileInformation(const PUNICODE_STRING Path, PDIRECTORY_ENTRY Dir
         .HeaderCount = num_headers
     };
 
-    result = DeserializeDirectoryEntryInfoFlatBuffer(&httpInfo, DirectoryEntryInfo, isDir);
+    result = DeserializeDirectoryEntryInfoFlatBuffer(&httpInfo, DirectoryEntryInfo);
 
     if (!NT_SUCCESS(result))
     {
