@@ -3,6 +3,9 @@
 #define INVERTED_CALL_TIMEOUT_SECONDS 10
 #define INVERTED_CALL_TIMEOUT (INVERTED_CALL_TIMEOUT_SECONDS * -10000000LL)
 
+#define TIMEOUT_SCAN_INTERVAL_SECONDS 5
+#define TIMEOUT_SCAN_INTERVAL (TIMEOUT_SCAN_INTERVAL_SECONDS * -10000000LL)
+
 KDEFERRED_ROUTINE InvertedCallTimeoutDpcRoutine;
 
 static LONG g_RequestId = 0xFFFFFFFE;
@@ -15,6 +18,10 @@ LIST_ENTRY g_InvertedCallHandlerIrpQueue;
 // this may need to be changed to a spinlock because it is used in DPC context
 KSPIN_LOCK g_InvertedCallHandlerRequestSpinLock;
 LIST_ENTRY g_InvertedCallHandlerRequestQueue;
+
+KTIMER g_InvertedCallHandlerTimeoutTimer;
+KDPC g_InvertedCallHandlerTimeoutDpc;
+BOOLEAN g_TimeoutScannerActive = FALSE;
 
 VOID InvertedCallHandlerCsqInsertIrp(IO_CSQ* Csq, PIRP Irp)
 {
@@ -130,30 +137,54 @@ VOID InvertedCallTimeoutDpcRoutine(
 )
 {
     UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    ULONG requestId = (ULONG)(ULONG_PTR)DeferredContext;
+    LARGE_INTEGER currentTime;
+    KeQuerySystemTime(&currentTime);
 
-    PINVERTED_CALL_DATA_REQUEST request = RemoveRequestFromQueueById(requestId);
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_InvertedCallHandlerRequestSpinLock, &oldIrql);
 
-    if (request)
+    // Scan the request queue for timeouts
+    PLIST_ENTRY entry = g_InvertedCallHandlerRequestQueue.Flink;
+
+    while (entry != &g_InvertedCallHandlerRequestQueue)
     {
-        // We won the race - this request timed out
-        BLORGFS_PRINT("InvertedCall: Request %lu timed out after %d seconds\n",
-            request->RequestId, INVERTED_CALL_TIMEOUT_SECONDS);
+        PINVERTED_CALL_DATA_REQUEST request =
+            CONTAINING_RECORD(entry, INVERTED_CALL_DATA_REQUEST, ListEntry);
 
-        // Set timeout status and signal waiting thread
-        request->Completion.Status = STATUS_UNSUCCESSFUL;
-        KeSetEvent(&request->CompletionEvent, EVENT_INCREMENT, FALSE);
+        PLIST_ENTRY nextEntry = entry->Flink; // Save next before potential removal
+
+        if (request->ExpiryTime.QuadPart < currentTime.QuadPart) // Convert to positive for comparison
+        {
+            // Request timed out - remove from queue
+            RemoveEntryList(entry);
+
+            BLORGFS_PRINT("InvertedCall: Request %lu timed out after %d seconds\n",
+                request->RequestId, INVERTED_CALL_TIMEOUT_SECONDS);
+        }
+
+        entry = nextEntry;
+    }
+
+    KeReleaseSpinLock(&g_InvertedCallHandlerRequestSpinLock, oldIrql);
+
+    // Schedule next scan if scanner is still active
+    if (g_TimeoutScannerActive)
+    {
+        LARGE_INTEGER nextScan = { .QuadPart = TIMEOUT_SCAN_INTERVAL };
+        KeSetTimer(&g_InvertedCallHandlerTimeoutTimer, nextScan, &g_InvertedCallHandlerTimeoutDpc);
     }
 }
 
-// Requires IRP to be in FSP context and pending
 NTSTATUS CreateInvertedCallRequest(
     enum InvertedCallType InvertedCallType,
     PCUNICODE_STRING Path,
-    PINVERTED_CALL_DATA_REQUEST* OutRequest
+    PIRP OriginalIrp,
+    PBLORG_TRANSACTION_COMPLETION_ROUTINE CompletionRoutine,
+    const union TRANSACTION_CONTEXT* TransactionContext
 )
 {
     if (PATH_MAX * sizeof(WCHAR) < Path->Length)
@@ -170,19 +201,19 @@ NTSTATUS CreateInvertedCallRequest(
 
     request->InvertedCallType = InvertedCallType;
 
-    RtlCopyMemory(request->Path, Path->Buffer, Path->Length);
+    RtlCopyMemory(request->PathBuffer, Path->Buffer, Path->Length);
 
     request->PathLength = Path->Length;
 
-    request->RequestId = (ULONG)InterlockedIncrement(&g_RequestId);
+    request->RequestId = C_CAST(ULONG, InterlockedIncrement(&g_RequestId));
 
-    KeInitializeEvent(&request->CompletionEvent, NotificationEvent, FALSE);
+    request->OriginalIrp = OriginalIrp;
 
-    KDPC dpc;
-    KTIMER timer;
+    request->CompletionRoutine = CompletionRoutine;
 
-    KeInitializeDpc(&dpc, InvertedCallTimeoutDpcRoutine, (PVOID)request->RequestId);
-    KeInitializeTimer(&timer);
+    LARGE_INTEGER currentTime;
+    KeQuerySystemTime(&currentTime);
+    request->ExpiryTime.QuadPart = currentTime.QuadPart + (-INVERTED_CALL_TIMEOUT);
 
     PIRP irp = IoCsqRemoveNextIrp(&g_InvertedCallHandlerCsq, NULL);
 
@@ -192,31 +223,17 @@ NTSTATUS CreateInvertedCallRequest(
 
         if (!systemBuffer)
         {
-            IoCsqInsertIrp(&g_InvertedCallHandlerCsq, irp, NULL);
             ExFreePool(request);
             return STATUS_INVALID_PARAMETER;
         }
 
-        systemBuffer->Header.RequestId = request->RequestId;
+        systemBuffer->RequestId = request->RequestId;
         systemBuffer->InvertedCallType = InvertedCallType;
         systemBuffer->PathLength = request->PathLength;
 
-        RtlCopyMemory(systemBuffer->Path, request->Path, request->PathLength);
+        RtlCopyMemory(systemBuffer->PathBuffer, request->PathBuffer, request->PathLength);
 
-        switch (InvertedCallType)
-        {
-            case InvertedCallTypeReadFile:
-            {
-               // systemBuffer->Context.ReadFile.StartOffset = ...
-                // systemBuffer->Context.ReadFile.Length = ...
-                break;
-            }
-
-            default:
-            { 
-                break;
-            }
-        }
+        systemBuffer->Context = *TransactionContext;
 
         irp->IoStatus.Information = UFIELD_OFFSET(BLORGFS_TRANSACT, PathLength) + request->PathLength;
 
@@ -227,23 +244,7 @@ NTSTATUS CreateInvertedCallRequest(
         InsertRequestIntoQueue(&request->ListEntry);
     }
 
-    LARGE_INTEGER timeout = { .QuadPart = INVERTED_CALL_TIMEOUT };
-    KeSetTimer(&timer, timeout, &dpc);
-
-    KeWaitForSingleObject(
-        &request->CompletionEvent,
-        Executive,
-        KernelMode,
-        FALSE,
-        NULL
-    );
-
-    // Cancel the timer in case completion happened before timeout
-    KeCancelTimer(&timer);
-
-    *OutRequest = request;
-
-    return request->Completion.Status;
+    return STATUS_PENDING;
 }
 
 void CleanupInvertedCallRequest(PINVERTED_CALL_DATA_REQUEST Request)
@@ -253,81 +254,21 @@ void CleanupInvertedCallRequest(PINVERTED_CALL_DATA_REQUEST Request)
         return;
     }
 
-    if (Request->Completion.ResponseBuffer)
-    { 
-        ExFreePool(Request->Completion.ResponseBuffer);
-    }
-
     ExFreePool(Request);
 }
 
 BOOLEAN ProcessControlResponse(const PBLORGFS_TRANSACT SystemBuffer, ULONG ResponseBufferLength)
 {
-    PINVERTED_CALL_DATA_REQUEST request = RemoveRequestFromQueueById(SystemBuffer->Header.RequestId);
+    PINVERTED_CALL_DATA_REQUEST request = RemoveRequestFromQueueById(SystemBuffer->RequestId);
 
-    if (request)
+    if (request && request->CompletionRoutine)
     {
-        // Process the response and copy data over to request response fields
-        request->Completion.Status = SystemBuffer->Payload.Status;
-
-        if (!NT_SUCCESS(request->Completion.Status))
-        {
-            BLORGFS_PRINT("ResponseBuffer has an empty buffer\n");
-            KeSetEvent(&request->CompletionEvent, 0, FALSE);
-            return FALSE;
-        }
-        
-        // validate the response buffer length with the expected length based on the request type
-        switch (request->InvertedCallType)
-        {
-            case InvertedCallTypeListDirectory:
-            {
-                PDIRECTORY_INFO dirInfo = (PDIRECTORY_INFO)SystemBuffer->Payload.ResponseBuffer;
-
-                ULONG dirInfoHeader = sizeof(DIRECTORY_INFO);
-
-                if (ResponseBufferLength < dirInfoHeader)
-                {
-                    BLORGFS_PRINT("ResponseBuffer is smalle\n");
-                    KeSetEvent(&request->CompletionEvent, EVENT_INCREMENT, FALSE);
-                    return FALSE;
-                }
-                
-                ULONG filesEntryArraySize = (ULONG)dirInfo->FileCount * sizeof(DIRECTORY_FILE_METADATA);
-                ULONG subDirArraySize = (ULONG)dirInfo->SubDirCount * sizeof(DIRECTORY_SUBDIR_METADATA);
-
-                ULONG expectedLength = dirInfoHeader + filesEntryArraySize + subDirArraySize;
-
-                if (ResponseBufferLength < expectedLength)
-                {
-                    BLORGFS_PRINT("ResponseBuffer has an empty buffer\n");
-                    KeSetEvent(&request->CompletionEvent, EVENT_INCREMENT, FALSE);
-                    return FALSE;
-                }
-
-                break;
-            }
-        }
-
-        request->Completion.ResponseBufferLength = ResponseBufferLength;
-
-        request->Completion.ResponseBuffer = ExAllocatePoolUninitialized(PagedPool, ResponseBufferLength, 'ipcr');
-
-        if (!request->Completion.ResponseBuffer)
-        {
-            BLORGFS_PRINT("ResponseBuffer local buffer could not be allocated\n");
-            KeSetEvent(&request->CompletionEvent, 0, FALSE);
-            return FALSE;
-        }
-
-        RtlCopyMemory(request->Completion.ResponseBuffer, SystemBuffer->Payload.ResponseBuffer, ResponseBufferLength);
-
-        KeSetEvent(&request->CompletionEvent, EVENT_INCREMENT, FALSE);
+        request->CompletionRoutine(request, SystemBuffer, ResponseBufferLength);
         return TRUE;
     }
     else
     {
-        BLORGFS_PRINT("Response request ID likely timed out %lu\n", SystemBuffer->Header.RequestId);
+        BLORGFS_PRINT("Response request ID likely timed out %lu\n", SystemBuffer->RequestId);
         return FALSE;
     }
 }
@@ -347,11 +288,11 @@ NTSTATUS ProcessControlRequest(PIRP Irp)
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        systemBuffer->Header.RequestId = request->RequestId;
+        systemBuffer->RequestId = request->RequestId;
         systemBuffer->InvertedCallType = request->InvertedCallType;
         systemBuffer->PathLength = request->PathLength;
 
-        RtlCopyMemory(systemBuffer->Path, request->Path, request->PathLength);
+        RtlCopyMemory(systemBuffer->PathBuffer, request->PathBuffer, request->PathLength);
 
         Irp->IoStatus.Information = UFIELD_OFFSET(BLORGFS_TRANSACT, PathLength) + request->PathLength;
 
@@ -371,6 +312,11 @@ NTSTATUS InitializeInvertedCallHandler(void)
 
     KeInitializeSpinLock(&g_InvertedCallHandlerRequestSpinLock);
     InitializeListHead(&g_InvertedCallHandlerRequestQueue);
+
+    KeInitializeDpc(&g_InvertedCallHandlerTimeoutDpc, InvertedCallTimeoutDpcRoutine, NULL);
+   
+    LARGE_INTEGER nextScan = { .QuadPart = TIMEOUT_SCAN_INTERVAL };
+    KeSetTimer(&g_InvertedCallHandlerTimeoutTimer, nextScan, &g_InvertedCallHandlerTimeoutDpc);
 
     return IoCsqInitialize(&g_InvertedCallHandlerCsq,
         InvertedCallHandlerCsqInsertIrp,

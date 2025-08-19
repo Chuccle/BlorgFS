@@ -84,30 +84,28 @@ inline PDIRECTORY_FILE_METADATA GetFileEntry(PDIRECTORY_INFO DirInfo, SIZE_T Ind
         );
 }
 
-///////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////
+
+typedef struct _READ_FILE_CONTEXT
+{
+    SIZE_T StartOffset;
+    SIZE_T Length;
+} READ_FILE_CONTEXT, *PREAD_FILE_CONTEXT;
+
+union TRANSACTION_CONTEXT
+{
+    READ_FILE_CONTEXT ReadFile;
+};
+
+////////////////////////////////////////////////////////
 
 typedef struct _BLORGFS_TRANSACT
 {
-    struct
-    {
-        ULONG RequestId;
-    } Header;
-
+    union TRANSACTION_CONTEXT Context;
+    ULONG RequestId;
     enum InvertedCallType InvertedCallType;
-
-    union
-    {
-        struct
-        {
-            SIZE_T StartOffset;
-            SIZE_T Length;
-        } ReadFile;
-    } Context;
-
-    WCHAR Path[PATH_MAX];
-    
     ULONG PathLength;
-    
+    WCHAR PathBuffer[PATH_MAX];
     struct
     {
         NTSTATUS Status;

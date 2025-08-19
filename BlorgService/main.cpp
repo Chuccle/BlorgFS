@@ -41,7 +41,7 @@ inline OvlWrapperPtr CreateWrapper(const BLORGFS_TRANSACT& TransactionData, ULON
         throw std::bad_alloc();
     }
 
-    wrapper->TransactionData.Header.RequestId = TransactionData.Header.RequestId;
+    wrapper->TransactionData.RequestId = TransactionData.RequestId;
 
     wrapper->TransactionData.Payload.Status = Status;
 
@@ -179,7 +179,7 @@ NTSTATUS ParseDirectoryInfo(const BlorgMetaFlat::Directory* const Directory, Ovl
 
 OvlWrapperPtr ReadFileHandler(const OvlWrapperPtr& CurrentWrap)
 {
-    std::wstring_view pathView(CurrentWrap->TransactionData.Path, CurrentWrap->TransactionData.PathLength / sizeof(WCHAR));
+    std::wstring_view pathView(CurrentWrap->TransactionData.PathBuffer, CurrentWrap->TransactionData.PathLength / sizeof(WCHAR));
 
     std::string getRequest = "/get_file?path=" + httplib::encode_uri_component(ConvertWideStringToUTF8(pathView));
 
@@ -205,7 +205,7 @@ OvlWrapperPtr ReadFileHandler(const OvlWrapperPtr& CurrentWrap)
 
 OvlWrapperPtr QueryFileHandler(const OvlWrapperPtr& CurrentWrap)
 {
-    std::wstring_view pathView(CurrentWrap->TransactionData.Path, CurrentWrap->TransactionData.PathLength / sizeof(WCHAR));
+    std::wstring_view pathView(CurrentWrap->TransactionData.PathBuffer, CurrentWrap->TransactionData.PathLength / sizeof(WCHAR));
 
     std::string getRequest = "/get_dir_entry_info?path=" + httplib::encode_uri_component(ConvertWideStringToUTF8(pathView));
 
@@ -244,7 +244,7 @@ OvlWrapperPtr QueryFileHandler(const OvlWrapperPtr& CurrentWrap)
 
 OvlWrapperPtr ListDirectoryHandler(const OvlWrapperPtr& CurrentWrap)
 {
-    std::wstring_view pathView(CurrentWrap->TransactionData.Path, CurrentWrap->TransactionData.PathLength / sizeof(WCHAR));
+    std::wstring_view pathView(CurrentWrap->TransactionData.PathBuffer, CurrentWrap->TransactionData.PathLength / sizeof(WCHAR));
 
     std::string getRequest = "/get_dir_info?path=" + httplib::encode_uri_component(ConvertWideStringToUTF8(pathView));
 
