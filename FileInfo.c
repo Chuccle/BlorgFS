@@ -1,174 +1,236 @@
-#include "Driver.h"
+﻿#include "Driver.h"
+
+static inline void QueryBasicInfo(
+   const PCOMMON_CONTEXT CommonContext,
+    PFILE_BASIC_INFORMATION BasicInfo,
+    PLONG Length
+)
+{
+    if (*Length < sizeof(FILE_BASIC_INFORMATION))
+    {
+        *Length = -1;
+        return;
+    }
+
+    BasicInfo->CreationTime.QuadPart = CommonContext->CreationTime;
+    BasicInfo->LastAccessTime.QuadPart = CommonContext->LastAccessedTime;
+    BasicInfo->LastWriteTime.QuadPart = CommonContext->LastModifiedTime;
+    BasicInfo->ChangeTime.QuadPart = CommonContext->LastModifiedTime;
+    BasicInfo->FileAttributes = (GET_NODE_TYPE(CommonContext) == BLORGFS_FCB_SIGNATURE)
+        ? FILE_ATTRIBUTE_NORMAL
+        : FILE_ATTRIBUTE_DIRECTORY;
+
+    *Length -= sizeof(FILE_BASIC_INFORMATION);
+}
+
+static inline void QueryStandardInfo(
+    const PCOMMON_CONTEXT CommonContext,
+    PFILE_STANDARD_INFORMATION StandardInfo,
+    PLONG Length
+)
+{
+    if (*Length < sizeof(FILE_STANDARD_INFORMATION))
+    {
+        *Length = -1;
+        return;
+    }
+
+    StandardInfo->AllocationSize = CommonContext->Header.AllocationSize;
+    StandardInfo->EndOfFile = CommonContext->Header.AllocationSize;
+    StandardInfo->NumberOfLinks = 1;
+    StandardInfo->DeletePending = FALSE;
+    StandardInfo->Directory = (GET_NODE_TYPE(CommonContext) == BLORGFS_DCB_SIGNATURE);
+
+    *Length -= sizeof(FILE_STANDARD_INFORMATION);
+}
+
+static inline void QueryInternalInfo(
+    PFILE_INTERNAL_INFORMATION InternalInfo,
+    PLONG Length
+)
+{
+    if (*Length < sizeof(FILE_INTERNAL_INFORMATION))
+    {
+        *Length = -1;
+        return;
+    }
+
+    InternalInfo->IndexNumber.QuadPart = 0;
+    *Length -= sizeof(FILE_INTERNAL_INFORMATION);
+}
+
+
+static inline void QueryEaInfo(
+    PFILE_EA_INFORMATION EaInfo,
+    PLONG Length
+)
+{
+    if (*Length < sizeof(FILE_EA_INFORMATION))
+    {
+        *Length = -1;
+        return;
+    }
+
+    EaInfo->EaSize = 0;
+    *Length -= sizeof(FILE_EA_INFORMATION);
+}
+
+static inline void QueryPositionInfo(
+    const PFILE_OBJECT FileObject,
+    PFILE_POSITION_INFORMATION PositionInfo,
+    PLONG Length
+)
+{
+    if (*Length < sizeof(FILE_POSITION_INFORMATION))
+    {
+        *Length = -1;
+        return;
+    }
+
+    PositionInfo->CurrentByteOffset = FileObject->CurrentByteOffset;
+    *Length -= sizeof(FILE_POSITION_INFORMATION);
+}
+
+static inline void QueryNameInfo(
+    const PCOMMON_CONTEXT CommonContext,
+    PFILE_NAME_INFORMATION NameInfo,
+    PLONG Length
+)
+{
+    ULONG requiredSize = sizeof(FILE_NAME_INFORMATION) + CommonContext->FullPath.Length;
+
+    if (*Length < (LONG)requiredSize)
+    {
+        *Length = -1;
+        return;
+    }
+
+    NameInfo->FileNameLength = CommonContext->FullPath.Length;
+    RtlCopyMemory(NameInfo->FileName,
+        CommonContext->FullPath.Buffer,
+        NameInfo->FileNameLength);
+    *Length -= requiredSize;
+    
+}
+
+
+static inline void QueryNetworkInfo(
+    const PCOMMON_CONTEXT CommonContext,
+    PFILE_NETWORK_OPEN_INFORMATION NetworkInfo,
+    PLONG Length
+)
+{
+    if (*Length < sizeof(FILE_NETWORK_OPEN_INFORMATION))
+    {
+        *Length = -1;
+        return;
+    }
+
+    NetworkInfo->AllocationSize = CommonContext->Header.AllocationSize;
+    NetworkInfo->EndOfFile = CommonContext->Header.AllocationSize;
+    NetworkInfo->CreationTime.QuadPart = CommonContext->CreationTime;
+    NetworkInfo->LastAccessTime.QuadPart = CommonContext->LastAccessedTime;
+    NetworkInfo->LastWriteTime.QuadPart = CommonContext->LastModifiedTime;
+    NetworkInfo->ChangeTime.QuadPart = CommonContext->LastModifiedTime;
+    NetworkInfo->FileAttributes = (GET_NODE_TYPE(CommonContext) == BLORGFS_FCB_SIGNATURE)
+        ? FILE_ATTRIBUTE_NORMAL
+        : FILE_ATTRIBUTE_DIRECTORY;
+
+    *Length -= sizeof(FILE_NETWORK_OPEN_INFORMATION);
+}
 
 static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     // GetVolumeInformation crashes without this being implemented, come on Windows!
     FILE_INFORMATION_CLASS fileInfoClass = IrpSp->Parameters.QueryFile.FileInformationClass;
-    ULONG inputLength = IrpSp->Parameters.QueryFile.Length;
+    LONG length = IrpSp->Parameters.QueryFile.Length;
     PVOID systemBuffer = Irp->AssociatedIrp.SystemBuffer;
-    PFILE_OBJECT fileObject = IrpSp->FileObject;
 
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
-    ULONG bytesWritten = 0;
+    PFILE_OBJECT fileObject = IrpSp->FileObject;
+    PCOMMON_CONTEXT commonContext = IrpSp->FileObject->FsContext;
 
     switch (fileInfoClass)
     {
-        case FilePositionInformation:
+        case FileAllInformation:
         {
-            if (inputLength < sizeof(FILE_POSITION_INFORMATION))
-            {
-                result = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
+            PFILE_ALL_INFORMATION allInfo = systemBuffer;
 
-            PFILE_POSITION_INFORMATION positionInfo = systemBuffer;
+            //
+            //  Reserve space for the internal sections
+            //
+            length -= (sizeof(FILE_ACCESS_INFORMATION) +
+                sizeof(FILE_MODE_INFORMATION) +
+                sizeof(FILE_ALIGNMENT_INFORMATION));
 
-            positionInfo->CurrentByteOffset = fileObject->CurrentByteOffset;
+            QueryBasicInfo(commonContext, &allInfo->BasicInformation, &length);
+            QueryStandardInfo(commonContext, &allInfo->StandardInformation, &length);
+            QueryInternalInfo(&allInfo->InternalInformation, &length);
+            QueryEaInfo(&allInfo->EaInformation, &length);
+            QueryPositionInfo(fileObject, &allInfo->PositionInformation, &length);
+            QueryNameInfo(commonContext, &allInfo->NameInformation, &length);
 
-            result = STATUS_SUCCESS;
-            bytesWritten = sizeof(FILE_POSITION_INFORMATION);
-            break;
-        }
-        case FileNormalizedNameInformation:
-        case FileNameInformation:
-        {
-            // REVIEW!!!!
-            if (inputLength < sizeof(FILE_NAME_INFORMATION))
-            {
-                result = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-
-            PFILE_NAME_INFORMATION nameInfo = systemBuffer;
-
-            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
-
-            // Check if the buffer is large enough to hold the string
-            if (inputLength - UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) >= commonContext->FullPath.Length)
-            {
-                nameInfo->FileNameLength = commonContext->FullPath.Length;
-                RtlCopyMemory(nameInfo->FileName, commonContext->FullPath.Buffer, nameInfo->FileNameLength);
-            }
-            else
-            {
-                bytesWritten = 0;
-                result = STATUS_BUFFER_OVERFLOW;
-                break;
-            }
-
-            bytesWritten = UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) + nameInfo->FileNameLength;
-
-            result = STATUS_SUCCESS;
             break;
         }
         case FileBasicInformation:
         {
-            if (inputLength < sizeof(FILE_BASIC_INFORMATION))
-            {
-                result = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-
-            PFILE_BASIC_INFORMATION basicInfo = systemBuffer;
-
-            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
-
-            basicInfo->CreationTime.QuadPart = commonContext->CreationTime;
-            basicInfo->LastAccessTime.QuadPart = commonContext->LastAccessedTime;
-            basicInfo->LastWriteTime.QuadPart = commonContext->LastModifiedTime;
-            basicInfo->ChangeTime.QuadPart = commonContext->LastModifiedTime;
-            basicInfo->FileAttributes = (GET_NODE_TYPE(commonContext) == BLORGFS_FCB_SIGNATURE) ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_DIRECTORY;
-
-            result = STATUS_SUCCESS;
-            bytesWritten = sizeof(FILE_BASIC_INFORMATION);
+            QueryBasicInfo(commonContext, systemBuffer, &length);
             break;
         }
         case FileStandardInformation:
         {
-            if (inputLength < sizeof(FILE_STANDARD_INFORMATION))
-            {
-                result = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-
-            PFILE_STANDARD_INFORMATION standardInfo = systemBuffer;
-
-            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
-
-            standardInfo->AllocationSize = commonContext->Header.AllocationSize;
-            standardInfo->EndOfFile = commonContext->Header.AllocationSize;
-            standardInfo->NumberOfLinks = 0;
-            standardInfo->DeletePending = FALSE;
-            standardInfo->Directory = (GET_NODE_TYPE(commonContext) == BLORGFS_DCB_SIGNATURE);
-
-            result = STATUS_SUCCESS;
-            bytesWritten = sizeof(FILE_STANDARD_INFORMATION);
+            QueryStandardInfo(commonContext, systemBuffer, &length);
             break;
         }
-        case FileAttributeTagInformation:
+        case FileInternalInformation:
         {
-            if (inputLength < sizeof(FILE_ATTRIBUTE_TAG_INFORMATION))
-            {
-                result = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-
-            PFILE_ATTRIBUTE_TAG_INFORMATION attributeTagInfo = systemBuffer;
-
-            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
-
-            attributeTagInfo->FileAttributes = (GET_NODE_TYPE(commonContext) == BLORGFS_FCB_SIGNATURE) ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_DIRECTORY;
-
-            result = STATUS_SUCCESS;
-            bytesWritten = sizeof(FILE_ATTRIBUTE_TAG_INFORMATION);
+            QueryInternalInfo(systemBuffer, &length);
+            break;
+        }
+        case FileEaInformation:
+        {
+            QueryEaInfo(systemBuffer, &length);
+            break;
+        }
+        case FilePositionInformation:
+        {
+            QueryPositionInfo(fileObject, systemBuffer, &length);
+            break;
+        }
+        case FileNameInformation:
+        {
+            QueryNameInfo(commonContext, systemBuffer, &length);
+            break;
+        }
+        case FileNormalizedNameInformation:
+        {
+            QueryNameInfo(commonContext, systemBuffer, &length);
             break;
         }
         case FileNetworkOpenInformation:
         {
-            if (inputLength < sizeof(FILE_NETWORK_OPEN_INFORMATION))
-            {
-                result = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-
-            PFILE_NETWORK_OPEN_INFORMATION networkOpenInfo = systemBuffer;
-
-            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
-
-            networkOpenInfo->AllocationSize = commonContext->Header.AllocationSize;
-            networkOpenInfo->EndOfFile = commonContext->Header.AllocationSize;
-            networkOpenInfo->CreationTime.QuadPart = commonContext->CreationTime;
-            networkOpenInfo->LastAccessTime.QuadPart = commonContext->LastAccessedTime;
-            networkOpenInfo->LastWriteTime.QuadPart = commonContext->LastModifiedTime;
-            networkOpenInfo->ChangeTime.QuadPart = commonContext->LastModifiedTime;
-            networkOpenInfo->FileAttributes = (GET_NODE_TYPE(commonContext) == BLORGFS_FCB_SIGNATURE) ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_DIRECTORY;
-            
-            result = STATUS_SUCCESS;
-            bytesWritten = sizeof(FILE_ATTRIBUTE_TAG_INFORMATION);
-            break;
-        }
-        case FileAllInformation:
-        {
-            if (inputLength < sizeof(FILE_ALL_INFORMATION))
-            {
-                result = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-
-            //PFILE_ALL_INFORMATION allInfo = (PFILE_ALL_INFORMATION)Irp->AssociatedIrp.SystemBuffer;
-
-            result = STATUS_INVALID_DEVICE_REQUEST;
-            bytesWritten = 0;
+            QueryNetworkInfo(commonContext, systemBuffer, &length);
             break;
         }
         default:
         {
             result = STATUS_INVALID_DEVICE_REQUEST;
-            bytesWritten = 0;
+            length = 0;
+            break;
         }
     }
 
-    Irp->IoStatus.Information = bytesWritten;
+    //
+    //  If we overflowed the buffer, set length to 0 and return STATUS_BUFFER_OVERFLOW
+    //
+    
+    if (length < 0)
+    {
+        result = STATUS_BUFFER_OVERFLOW;
+        length = 0;
+    }
+
+    Irp->IoStatus.Information = IrpSp->Parameters.QueryFile.Length - length;
 
     return result;
 }

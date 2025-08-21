@@ -115,7 +115,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             BOOLEAN initialQuery = !ccb->SearchPattern.Buffer &&
                 !FlagOn(ccb->Flags, CCB_FLAG_MATCH_ALL);
 
-            if (initialQuery || restartScan)
+            if (initialQuery)
             {
                 if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_WAIT)))
                 {
@@ -123,20 +123,25 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     return FsdPostRequest(Irp, IrpSp);
                 }
 
-                if (restartScan)
-                {
-                    ccb->CurrentIndex = 0;
-                }
-
                 //
                 // Protect against race condition where CCB has been modified in the time window before being locked by another thread
                 //
 
-                if (!restartScan && (ccb->SearchPattern.Buffer || FlagOn(ccb->Flags, CCB_FLAG_MATCH_ALL)))
+                if (ccb->SearchPattern.Buffer || FlagOn(ccb->Flags, CCB_FLAG_MATCH_ALL))
                 {
                     initialQuery = FALSE;
                     ExConvertExclusiveToSharedLite(dcb->Header.Resource);
                 }
+            }
+            else if (restartScan)
+            {
+                if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_WAIT)))
+                {
+                    BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
+                    return FsdPostRequest(Irp, IrpSp);
+                }
+
+                ccb->CurrentIndex = 0;
             }
             else
             {

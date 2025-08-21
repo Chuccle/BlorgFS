@@ -1,7 +1,110 @@
 #include "Driver.h"
 
-static NTSTATUS BlorgOpenExistingFcbShared(PIRP Irp, PFILE_OBJECT FileObject, PACCESS_MASK DesiredAccess, USHORT ShareAccess, PFCB Fcb)
+static inline BOOLEAN CheckFileAccess(const PACCESS_MASK DesiredAccess, BOOLEAN IsReadOnly)
 {
+    //
+    // Reject only truly unsupported flags (same as FAT)
+    //
+
+    if (FlagOn(*DesiredAccess, ~(DELETE |
+        READ_CONTROL |
+        WRITE_OWNER |
+        WRITE_DAC |
+        SYNCHRONIZE |
+        ACCESS_SYSTEM_SECURITY |
+        FILE_WRITE_DATA |
+        FILE_READ_EA |
+        FILE_WRITE_EA |
+        FILE_READ_ATTRIBUTES |
+        FILE_WRITE_ATTRIBUTES |
+        FILE_LIST_DIRECTORY |
+        FILE_TRAVERSE |
+        FILE_DELETE_CHILD |
+        FILE_APPEND_DATA |
+        MAXIMUM_ALLOWED)))
+    {
+        KdBreakPoint();
+        return FALSE;
+    }
+
+    if (IsReadOnly)
+    {
+        ACCESS_MASK AccessMask = DELETE | READ_CONTROL | WRITE_OWNER | WRITE_DAC |
+            SYNCHRONIZE | ACCESS_SYSTEM_SECURITY | FILE_READ_DATA |
+            FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES |
+            FILE_WRITE_ATTRIBUTES | FILE_EXECUTE | FILE_LIST_DIRECTORY |
+            FILE_TRAVERSE;
+
+        if (FlagOn(*DesiredAccess, ~AccessMask))
+        {
+            KdBreakPoint();
+            return FALSE;
+        }
+
+    }
+
+    return TRUE;
+}
+
+static inline BOOLEAN CheckDirectoryAccess(const PACCESS_MASK DesiredAccess, BOOLEAN IsReadOnly)
+{
+    //
+    // Reject only truly unsupported flags (same as FAT)
+    //
+    
+    if (FlagOn(*DesiredAccess, ~(DELETE |
+        READ_CONTROL |
+        WRITE_OWNER |
+        WRITE_DAC |
+        SYNCHRONIZE |
+        ACCESS_SYSTEM_SECURITY |
+        FILE_WRITE_DATA |
+        FILE_READ_EA |
+        FILE_WRITE_EA |
+        FILE_READ_ATTRIBUTES |
+        FILE_WRITE_ATTRIBUTES |
+        FILE_LIST_DIRECTORY |
+        FILE_TRAVERSE |
+        FILE_DELETE_CHILD |
+        FILE_APPEND_DATA |
+        MAXIMUM_ALLOWED)))
+    {
+        KdBreakPoint();
+        return FALSE;
+    }
+
+    if (IsReadOnly)
+    {
+        ACCESS_MASK AccessMask = DELETE | READ_CONTROL | WRITE_OWNER | WRITE_DAC |
+            SYNCHRONIZE | ACCESS_SYSTEM_SECURITY | FILE_READ_DATA |
+            FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES |
+            FILE_WRITE_ATTRIBUTES | FILE_EXECUTE | FILE_LIST_DIRECTORY |
+            FILE_TRAVERSE;
+
+         //
+         //  If this is a subdirectory also allow add file/directory and delete.
+         //
+         
+        AccessMask |= FILE_ADD_SUBDIRECTORY | FILE_ADD_FILE | FILE_DELETE_CHILD;
+
+        if (FlagOn(*DesiredAccess, ~AccessMask))
+        {
+            KdBreakPoint();
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+static inline NTSTATUS OpenExistingFcbShared(PIRP Irp, PFILE_OBJECT FileObject, const PACCESS_MASK DesiredAccess, USHORT ShareAccess, PFCB Fcb)
+{
+
+    if (!CheckFileAccess(DesiredAccess, TRUE))
+    {
+        return STATUS_ACCESS_DENIED;
+    }
+
     if (1 == InterlockedIncrement64(&Fcb->RefCount))
     {
         IoSetShareAccess(*DesiredAccess, ShareAccess, FileObject, &Fcb->ShareAccess);
@@ -27,8 +130,13 @@ static NTSTATUS BlorgOpenExistingFcbShared(PIRP Irp, PFILE_OBJECT FileObject, PA
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS BlorgOpenExistingDcbShared(PIRP Irp, PFILE_OBJECT FileObject, PACCESS_MASK DesiredAccess, USHORT ShareAccess, PDCB Dcb, const PDEVICE_OBJECT VolumeDeviceObject)
+static inline NTSTATUS OpenExistingDcbShared(PIRP Irp, PFILE_OBJECT FileObject, const PACCESS_MASK DesiredAccess, USHORT ShareAccess, PDCB Dcb, const PDEVICE_OBJECT VolumeDeviceObject)
 {
+    if (!CheckDirectoryAccess(DesiredAccess, TRUE))
+    {
+        return STATUS_ACCESS_DENIED;
+    }
+
     PCCB pCcb;
 
     NTSTATUS result = BlorgCreateCCB(&pCcb, VolumeDeviceObject);
@@ -63,8 +171,13 @@ static NTSTATUS BlorgOpenExistingDcbShared(PIRP Irp, PFILE_OBJECT FileObject, PA
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS BlorgOpenExistingFcbExclusive(PIRP Irp, PFILE_OBJECT FileObject, PACCESS_MASK DesiredAccess, USHORT ShareAccess, PFCB Fcb)
+static inline NTSTATUS BlorgOpenExistingFcbExclusive(PIRP Irp, PFILE_OBJECT FileObject, const PACCESS_MASK DesiredAccess, USHORT ShareAccess, PFCB Fcb)
 {
+    if (!CheckFileAccess(DesiredAccess, TRUE))
+    {
+        return STATUS_ACCESS_DENIED;
+    }
+
     if (0 == Fcb->RefCount)
     {
         IoSetShareAccess(*DesiredAccess, ShareAccess, FileObject, &Fcb->ShareAccess);
@@ -91,8 +204,13 @@ static NTSTATUS BlorgOpenExistingFcbExclusive(PIRP Irp, PFILE_OBJECT FileObject,
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS BlorgOpenExistingDcbExclusive(PIRP Irp, PFILE_OBJECT FileObject, PACCESS_MASK DesiredAccess, USHORT ShareAccess, PDCB Dcb, PDEVICE_OBJECT VolumeDeviceObject)
+static inline NTSTATUS OpenExistingDcbExclusive(PIRP Irp, PFILE_OBJECT FileObject, const PACCESS_MASK DesiredAccess, USHORT ShareAccess, PDCB Dcb, PDEVICE_OBJECT VolumeDeviceObject)
 {
+    if (!CheckDirectoryAccess(DesiredAccess, TRUE))
+    {
+        return STATUS_ACCESS_DENIED;
+    }
+
     PCCB pCcb;
 
     NTSTATUS result = BlorgCreateCCB(&pCcb, VolumeDeviceObject);
@@ -148,15 +266,6 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
     if (FILE_OPEN != createDisposition && FILE_OPEN_IF != createDisposition)
     {
-        return STATUS_ACCESS_DENIED;
-    }
-
-    //
-    // Only allow to be opened for read or execute access.
-    //
-
-    if (FlagOn(*desiredAccess, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE) != *desiredAccess)
-    {
         KdBreakPoint();
         return STATUS_ACCESS_DENIED;
     }
@@ -169,7 +278,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
         if (0 == fileObject->FileName.Length)
         {
-            return BlorgOpenExistingFcbShared(Irp, fileObject, desiredAccess, shareAccess, GetVolumeDeviceExtension(VolumeDeviceObject)->Vcb);
+            return OpenExistingFcbShared(Irp, fileObject, desiredAccess, shareAccess, GetVolumeDeviceExtension(VolumeDeviceObject)->Vcb);
         }
         
         filePath.String = fileObject->FileName;
@@ -191,7 +300,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         //
         
         if ((BLORGFS_DCB_SIGNATURE != GET_NODE_TYPE(relatedFileObject->FsContext)) 
-            || (BLORGFS_ROOT_DCB_SIGNATURE != GET_NODE_TYPE(relatedFileObject->FsContext)))
+            && (BLORGFS_ROOT_DCB_SIGNATURE != GET_NODE_TYPE(relatedFileObject->FsContext)))
         {
             return STATUS_INVALID_PARAMETER;
         }
@@ -251,7 +360,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             ExFreePool(filePath.String.Buffer);
         }
         
-        return BlorgOpenExistingDcbShared(Irp, fileObject, desiredAccess, shareAccess, parentDcb, VolumeDeviceObject);
+        return OpenExistingDcbShared(Irp, fileObject, desiredAccess, shareAccess, parentDcb, VolumeDeviceObject);
     }
 
     BLORGFS_PRINT(" ->NormalisedFileName             = %wZ\n", &filePath.String);
@@ -281,7 +390,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     return STATUS_FILE_IS_A_DIRECTORY;
                 }
 
-                NTSTATUS result = BlorgOpenExistingDcbShared(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
+                NTSTATUS result = OpenExistingDcbShared(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
 
@@ -306,7 +415,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     return STATUS_NOT_A_DIRECTORY;
                 }
 
-                NTSTATUS result = BlorgOpenExistingFcbShared(Irp, fileObject, desiredAccess, shareAccess, (PFCB)desiredNode);
+                NTSTATUS result = OpenExistingFcbShared(Irp, fileObject, desiredAccess, shareAccess, (PFCB)desiredNode);
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
 
@@ -387,7 +496,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     return STATUS_FILE_IS_A_DIRECTORY;
                 }
 
-                result = BlorgOpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
+                result = OpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
                 
@@ -447,7 +556,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         {
             case BLORGFS_DCB_SIGNATURE:
             {
-                result = BlorgOpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
+                result = OpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
 
