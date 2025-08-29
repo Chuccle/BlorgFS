@@ -1,16 +1,12 @@
 #include "Driver.h"
 
-static_assert(FSP_THREAD_COUNT <= MAXIMUM_WAIT_OBJECTS, "System threads cannot exceed MAXIMUM_WAIT_OBJECTS");
-
 NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject);
 NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp);
 
-volatile BOOLEAN g_FspThreadsActive;
-KEVENT g_FspTerminationEvent;
-HANDLE g_FspThreadHandle[FSP_THREAD_COUNT];
+IO_WORKITEM_ROUTINE FspDispatch;
+
 IO_CSQ g_FspCsq;
-KEVENT g_FspWorkEvent;
 KSPIN_LOCK g_FspIrpQueueSpinLock;
 LIST_ENTRY g_FspIrpQueue;
 
@@ -75,9 +71,11 @@ VOID FspCsqCompleteCanceledIrp(IO_CSQ* Csq, PIRP Irp)
     CompleteRequest(Irp, STATUS_CANCELLED, IO_NO_INCREMENT);
 }
 
-// System threads disable kernel APCs so no need to explicitly disable APCs here.
-VOID FspDispatch(_In_ PVOID StartContext)
 
+VOID FspDispatch(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_opt_ PVOID Context
+)
 /*++
 
 Routine Description:
@@ -96,7 +94,8 @@ Return Value:
 --*/
 
 {
-    UNREFERENCED_PARAMETER(StartContext);
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Context);
 
     //
     //  Now case on the function code.  For each major function code,
@@ -108,103 +107,93 @@ Return Value:
     //  satisfied right away and then read can be done.
     //
 
-    while (TRUE)
+    PIRP irp = IoCsqRemoveNextIrp(&g_FspCsq, NULL);
+
+    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+        
+    while (irp)
     {
 
-        PVOID waitObjectArray[2] = { &g_FspWorkEvent, &g_FspTerminationEvent };
+        //
+        //  Extract the IrpContext and IrpSp, and loop.
+        //
+            
+        ULONG_PTR flags = (ULONG_PTR)irp->Tail.Overlay.DriverContext[0];
+            
+        SetFlag(flags, IRP_CONTEXT_FLAG_WAIT | IRP_CONTEXT_FLAG_IN_FSP);
+            
+        irp->Tail.Overlay.DriverContext[0] = (PVOID)flags;
 
-        if (STATUS_WAIT_1 == KeWaitForMultipleObjects(2,
-            waitObjectArray,
-            WaitAny,
-            Executive,
-            KernelMode,
-            FALSE,
-            NULL,
-            NULL))
-        {
-            break;
-        }
+        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
 
-        PIRP irp = IoCsqRemoveNextIrp(&g_FspCsq, NULL);
+        BLORGFS_PRINT("FspDispatch: Irp = %p\n", irp);
 
-        NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+        FsRtlEnterFileSystem();
         
-        while (irp)
+        //
+        //  If this Irp was top level, note it in our thread local storage.
+        //
+
+        if (FlagOn((ULONG_PTR)irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_RECURSIVE_CALL))
         {
-
-            //
-            //  Extract the IrpContext and IrpSp, and loop.
-            //
-            
-            ULONG_PTR flags = (ULONG_PTR)irp->Tail.Overlay.DriverContext[0];
-            
-            SetFlag(flags, IRP_CONTEXT_FLAG_WAIT | IRP_CONTEXT_FLAG_IN_FSP);
-            
-            irp->Tail.Overlay.DriverContext[0] = (PVOID)flags;
-
-            PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
-
-            BLORGFS_PRINT("FspDispatch: Irp = %p\n", irp);
-
-            //
-            //  If this Irp was top level, note it in our thread local storage.
-            //
-
-            if (FlagOn((ULONG_PTR)irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_RECURSIVE_CALL))
-            {
-                IoSetTopLevelIrp((PIRP)FSRTL_FSP_TOP_LEVEL_IRP);
-            }
-            else
-            {
-                IoSetTopLevelIrp(irp);
-            }
-
-            switch (irpSp->MajorFunction)
-            {
-                case IRP_MJ_CREATE:
-                {
-                    result = BlorgVolumeCreate(irp, irpSp, irpSp->DeviceObject);
-                    break;
-                }
-                case IRP_MJ_READ:
-                {
-                    result = BlorgVolumeRead(irp, irpSp);
-                    break;
-                }
-                case IRP_MJ_DIRECTORY_CONTROL:
-                {
-                    result = BlorgVolumeDirectoryControl(irp, irpSp);
-                    break;
-                }
-
-                //
-                //  For any other major operations, return an invalid
-                //  request.
-                //
-
-                default:
-                {
-                    break;
-                }
-            }
-
-            CompleteRequest(irp, result, IO_DISK_INCREMENT);
-
-            IoSetTopLevelIrp(NULL);
-
-            irp = IoCsqRemoveNextIrp(&g_FspCsq, NULL);
+            IoSetTopLevelIrp((PIRP)FSRTL_FSP_TOP_LEVEL_IRP);
+        }
+        else
+        {
+            IoSetTopLevelIrp(irp);
         }
 
-    }
+        switch (irpSp->MajorFunction)
+        {
+            case IRP_MJ_CREATE:
+            {
+                result = BlorgVolumeCreate(irp, irpSp, irpSp->DeviceObject);
+                break;
+            }
+            case IRP_MJ_READ:
+            {
+                result = BlorgVolumeRead(irp, irpSp);
+                break;
+            }
+            case IRP_MJ_DIRECTORY_CONTROL:
+            {
+                result = BlorgVolumeDirectoryControl(irp, irpSp);
+                break;
+            }
 
-    PsTerminateSystemThread(STATUS_SUCCESS);
+            //
+            //  For any other major operations, return an invalid
+            //  request.
+            //
+
+            default:
+            {
+                break;
+            }
+        }
+
+        // We can still get STATUS_PENDING in FSP if FSP needs to use inverted call
+        if (STATUS_PENDING != result)
+        {
+            CompleteRequest(irp, result, IO_DISK_INCREMENT);
+        }
+
+        IoSetTopLevelIrp(NULL);
+
+        FsRtlExitFileSystem();
+
+        IoFreeWorkItem(irp->Tail.Overlay.DriverContext[1]);
+        irp->Tail.Overlay.DriverContext[1] = NULL;
+
+        irp = IoCsqRemoveNextIrp(&g_FspCsq, NULL);
+    }
 }
 
 //
 //  Local support routine.
 //
 
-static void AddToWorkqueue(
+static NTSTATUS AddToWorkqueue(
     IN PIRP Irp,
     IN PIO_STACK_LOCATION IrpSp
 )
@@ -221,8 +210,18 @@ static void AddToWorkqueue(
         //
         
         IoCsqInsertIrp(&g_FspCsq, Irp, NULL);
-        KeSetEvent(&g_FspWorkEvent, EVENT_INCREMENT, FALSE);
     }
+
+    Irp->Tail.Overlay.DriverContext[1] = IoAllocateWorkItem(IrpSp->DeviceObject);
+
+    if (!Irp->Tail.Overlay.DriverContext[1])
+    {
+        return STATUS_NO_MEMORY;
+    }
+
+    IoQueueWorkItem(Irp->Tail.Overlay.DriverContext[1], FspDispatch, CustomPriorityWorkQueue + 13, NULL);
+
+    return STATUS_PENDING;
 }
 
 void PrePostIrp(
@@ -315,24 +314,13 @@ Return Value:
 {
     NT_ASSERT(ARGUMENT_PRESENT(Irp));
 
-    if (!g_FspThreadsActive)
-    {
-        //
-        //  And return to our caller
-        //
-
-        return STATUS_DEVICE_REMOVED;
-    }
-
     PrePostIrp(NULL, Irp);
-
-    AddToWorkqueue(Irp, IrpSp);
 
     //
     //  And return to our caller
     //
 
-    return STATUS_PENDING;
+    return AddToWorkqueue(Irp, IrpSp);
 }
 
 void OplockComplete(PVOID Context, PIRP Irp)
@@ -349,93 +337,16 @@ void OplockComplete(PVOID Context, PIRP Irp)
     }
 }
 
-NTSTATUS CreateWorkQueue(void)
+NTSTATUS InitialiseWorkQueue(void)
 {
-    g_FspThreadsActive = TRUE;
-
     KeInitializeSpinLock(&g_FspIrpQueueSpinLock);
     InitializeListHead(&g_FspIrpQueue);
 
-    KeInitializeEvent(&g_FspWorkEvent, SynchronizationEvent, FALSE);
-    KeInitializeEvent(&g_FspTerminationEvent, NotificationEvent, FALSE);
-
-    NTSTATUS result = IoCsqInitialize(&g_FspCsq,
+    return IoCsqInitialize(&g_FspCsq,
         FspCsqInsertIrp,
         FspCsqRemoveIrp,
         FspCsqPeekNextIrp,
         FspCsqAcquireLock,
         FspCsqReleaseLock,
         FspCsqCompleteCanceledIrp);
-
-    for (int i = 0; i < FSP_THREAD_COUNT; ++i)
-    {
-        result = PsCreateSystemThread(&g_FspThreadHandle[i], DELETE | SYNCHRONIZE, NULL, NULL, NULL, FspDispatch, NULL);
-    }
-
-    return result;
-}
-
-void DestroyWorkQueue(void)
-{
-    g_FspThreadsActive = FALSE;
-
-    PVOID* waitObjectArray = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(PKTHREAD) * FSP_THREAD_COUNT, 'abw');
-
-    if (!waitObjectArray)
-    {
-        BLORGFS_PRINT("Failed to allocate the wait object array to allow FSP threads to flush and terminate\n");
-        return;
-    }
-
-    for (int i = 0; i < FSP_THREAD_COUNT; ++i)
-    {
-        if (NT_ERROR(ObReferenceObjectByHandle(g_FspThreadHandle[i], DELETE | SYNCHRONIZE, *PsThreadType, KernelMode, &waitObjectArray[i], NULL)))
-        {
-            BLORGFS_PRINT("Failed to initialise the wait object array to allow FSP threads to flush and terminate\n");
-            
-            for (int j = 0; j < i; ++j)
-            {
-                ObDereferenceObject(waitObjectArray[j]);
-            }
-
-            ExFreePool(waitObjectArray);
-            return;
-        }
-    }
-
-    PVOID waitBlockArray = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(KWAIT_BLOCK) * FSP_THREAD_COUNT, 'abw');
-
-    if (!waitBlockArray)
-    { 
-        BLORGFS_PRINT("Failed to allocate the wait block array to allow FSP threads to flush and terminate\n");
-
-        for (int i = 0; i < FSP_THREAD_COUNT; ++i)
-        {
-            ObDereferenceObject(waitObjectArray[i]);
-        }
-        
-        ExFreePool(waitObjectArray);
-        return;
-    }
-
-    KeEnterCriticalRegion();
-    KeSetEvent(&g_FspTerminationEvent, EVENT_INCREMENT, TRUE);
-    KeWaitForMultipleObjects(FSP_THREAD_COUNT, waitObjectArray, WaitAll, Executive, KernelMode, FALSE, NULL, waitBlockArray);
-    KeLeaveCriticalRegion();
-
-    ExFreePool(waitObjectArray);
-    ExFreePool(waitBlockArray);
-
-    for (int i = 0; i < FSP_THREAD_COUNT; ++i)
-    {
-        ZwClose(g_FspThreadHandle[i]);
-    }
-
-    PIRP irp = IoCsqRemoveNextIrp(&g_FspCsq, NULL);
-
-    while (irp)
-    {
-        CompleteRequest(irp, STATUS_CANCELLED, IO_NO_INCREMENT);
-        irp = IoCsqRemoveNextIrp(&g_FspCsq, NULL);
-    }
 }

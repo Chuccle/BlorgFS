@@ -151,7 +151,7 @@ NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
         return result;
     }
 
-    result = CreateWorkQueue();
+    result = InitialiseWorkQueue();
 
     if (!NT_SUCCESS(result))
     {
@@ -176,7 +176,6 @@ static void DeleteBlorgVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
     if (VolumeDeviceObject)
     {
         PBLORGFS_VDO_DEVICE_EXTENSION pDevExt = GetVolumeDeviceExtension(VolumeDeviceObject);
-        DestroyWorkQueue();
         BlorgFreeFileContext(pDevExt->Vcb, VolumeDeviceObject);
         BlorgFreeFileContext(pDevExt->RootDcb, VolumeDeviceObject);
         ExDeleteNPagedLookasideList(&pDevExt->NonPagedNodeLookasideList);
