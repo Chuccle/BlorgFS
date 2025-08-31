@@ -187,15 +187,29 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                         SetFlag(ccb->Flags, CCB_FLAG_MATCH_ALL);
                     }
 
-                    FreeHttpDirectoryInfo(ccb->Entries);
+                    FreeDirectoryInfo(ccb->Entries);
+                    ccb->Entries = NULL;
 
-                    result = GetHttpDirectoryInfo(&dcb->FullPath, &ccb->Entries);
+                    PINVERTED_CALL_DATA_REQUEST request = NULL;
 
+
+                    result = CreateInvertedCallRequest(InvertedCallTypeListDirectory, &dcb->FullPath, &request);
+                     
                     if (!NT_SUCCESS(result))
                     {
+                        CleanupInvertedCallRequest(request);
                         ExReleaseResourceLite(dcb->Header.Resource);
                         return result;
                     }
+
+                    if (request && request->Completion.ResponseBuffer &&
+                        request->Completion.ResponseBufferLength >= sizeof(DIRECTORY_INFO))
+                    {
+                        ccb->Entries = request->Completion.ResponseBuffer;
+                        request->Completion.ResponseBuffer = NULL; // Prevent double free
+                    }
+
+                    CleanupInvertedCallRequest(request);
 
                     ExConvertExclusiveToSharedLite(dcb->Header.Resource);
                 }
@@ -221,15 +235,28 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                     SetFlag(ccb->Flags, CCB_FLAG_MATCH_ALL);
 
-                    FreeHttpDirectoryInfo(ccb->Entries);
+                    FreeDirectoryInfo(ccb->Entries);
+                    ccb->Entries = NULL;
 
-                    result = GetHttpDirectoryInfo(&dcb->FullPath, &ccb->Entries);
+                    PINVERTED_CALL_DATA_REQUEST request = NULL;
+                    
+                    result = CreateInvertedCallRequest(InvertedCallTypeListDirectory, &dcb->FullPath, &request);
 
                     if (!NT_SUCCESS(result))
                     {
+                        CleanupInvertedCallRequest(request);
                         ExReleaseResourceLite(dcb->Header.Resource);
                         return result;
                     }
+                    
+                    if (request && request->Completion.ResponseBuffer &&
+                        request->Completion.ResponseBufferLength >= sizeof(DIRECTORY_INFO))
+                    {
+                        ccb->Entries = request->Completion.ResponseBuffer;
+                        request->Completion.ResponseBuffer = NULL; // Prevent double free
+                    }
+
+                    CleanupInvertedCallRequest(request);
 
                     ExConvertExclusiveToSharedLite(dcb->Header.Resource);
                 }

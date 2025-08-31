@@ -1,8 +1,10 @@
 #include "Driver.h"
+#include <BlorgFSCTL.h>
 
-static inline void HandleUserFSRequest(ULONG FsctlCode, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+static inline NTSTATUS HandleUserFSRequest(ULONG FsctlCode, PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     UNREFERENCED_PARAMETER(IrpSp);
+    NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (FsctlCode)
     {
@@ -50,7 +52,37 @@ static inline void HandleUserFSRequest(ULONG FsctlCode, PIRP Irp, PIO_STACK_LOCA
             // FileSystemControlGetRetrievalPointers(pDeviceObject, pIrp, pIrpSp);
             break;
         }
+        case FSCTL_BLORGFS_TRANSACT:
+        {
+            if (IrpSp->Parameters.FileSystemControl.OutputBufferLength < UFIELD_OFFSET(BLORGFS_TRANSACT, Payload.ResponseBuffer))
+            {
+               result = STATUS_BUFFER_TOO_SMALL;
+               break;
+            }
+
+            PBLORGFS_TRANSACT systemBuffer = (Irp->MdlAddress) ? MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute) : NULL;
+
+            if (!systemBuffer)
+            {
+                return FALSE;
+            }
+
+            ULONG responseBufferLength = IrpSp->Parameters.FileSystemControl.OutputBufferLength - UFIELD_OFFSET(BLORGFS_TRANSACT, Payload.ResponseBuffer);
+
+            if (responseBufferLength > 0)
+            {
+                ProcessControlResponse(systemBuffer, responseBufferLength);
+            }
+            
+            RtlZeroMemory(systemBuffer, IrpSp->Parameters.FileSystemControl.OutputBufferLength);
+
+            result = ProcessControlRequest(Irp);
+
+            break;
+        }
     }
+
+    return result;
 }
 
 static NTSTATUS BlorgVolumeFileSystemControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
@@ -58,12 +90,11 @@ static NTSTATUS BlorgVolumeFileSystemControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
     PDEVICE_OBJECT targetDeviceObject = NULL;
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-
     switch (IrpSp->MinorFunction)
     {
         case IRP_MN_USER_FS_REQUEST:
         {
-            HandleUserFSRequest(IrpSp->Parameters.FileSystemControl.FsControlCode, Irp, IrpSp);
+            result = HandleUserFSRequest(IrpSp->Parameters.FileSystemControl.FsControlCode, Irp, IrpSp);
             break;
         }
         case IRP_MN_MOUNT_VOLUME:
@@ -118,6 +149,7 @@ NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
+    FsRtlEnterFileSystem();
     switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
@@ -132,12 +164,16 @@ NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         case BLORGFS_FSDO_MAGIC:
         {
             result = BlorgVolumeFileSystemControl(Irp, irpSp);
+            if (STATUS_PENDING != result)
+            {
+                CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            }
             break;
         }
     }
+    FsRtlExitFileSystem();
 
     Irp->IoStatus.Status = result;
 
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return Irp->IoStatus.Status;
 }
