@@ -133,7 +133,7 @@ jobs:
 
     - name: Initialize CodeQL (C/C++)
       if: matrix.language == 'c-cpp'
-      uses: github/codeql-action/init@v3
+      uses: github/codeql-action/init@v4
       with:
         languages: ${{ matrix.language }}
         build-mode: ${{ matrix.build-mode }}
@@ -143,7 +143,7 @@ jobs:
 
     - name: Initialize CodeQL (Actions)
       if: matrix.language == 'actions'
-      uses: github/codeql-action/init@v3
+      uses: github/codeql-action/init@v4
       with:
         languages: ${{ matrix.language }}
         build-mode: ${{ matrix.build-mode }}
@@ -160,7 +160,7 @@ jobs:
         }
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
+      uses: github/codeql-action/analyze@v4
       with:
         category: "/language:${{ matrix.language }}"
         output: 'sarif-results'
@@ -181,7 +181,7 @@ jobs:
         output: sarif-results/cpp.sarif
 
     - name: Upload SARIF
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: sarif-results
 
