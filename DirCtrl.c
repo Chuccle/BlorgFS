@@ -1,4 +1,7 @@
 #include "Driver.h"
+#include <ntintsafe.h>
+
+BLORG_TRANSACTION_COMPLETION_ROUTINE BlorgListDirectoryCompletionRoutine;
 
 typedef NTSTATUS(*PFILL_ROUTINE)(
     PVOID Out,
@@ -18,6 +21,56 @@ typedef NTSTATUS(*PFILL_ROUTINE)(
 static inline ULONG AlignEntrySize(ULONG size)
 {
     return (size + 7u) & ~7u;
+}
+
+static inline BOOLEAN ValidateDirectoryInformation(PVOID RawBuffer, ULONG ResponseBufferLength)
+{
+    if (!RawBuffer || sizeof(DIRECTORY_INFO) > ResponseBufferLength)
+    {
+        return FALSE;
+    }
+
+    PDIRECTORY_INFO dirInfo = RawBuffer;
+
+    ULONG subDirSize;
+    if (!NT_SUCCESS(RtlULongMult(C_CAST(ULONG, dirInfo->SubDirCount), sizeof(DIRECTORY_SUBDIR_METADATA), &subDirSize)))
+    {
+        return FALSE;
+    }
+
+    ULONG subDirsEnd;
+    if (!NT_SUCCESS(RtlULongAdd(C_CAST(ULONG, dirInfo->SubDirsOffset), subDirSize, &subDirsEnd)))
+    {
+        return FALSE;
+    }
+
+    if (dirInfo->SubDirsOffset < sizeof(DIRECTORY_INFO) ||
+        dirInfo->SubDirsOffset > ResponseBufferLength ||
+        subDirsEnd > ResponseBufferLength)
+    {
+        return FALSE;
+    }
+
+    ULONG fileSize;
+    if (!NT_SUCCESS(RtlULongMult(C_CAST(ULONG, dirInfo->FileCount), sizeof(DIRECTORY_FILE_METADATA), &fileSize)))
+    {
+        return FALSE;
+    }
+
+    ULONG filesEnd;
+    if (!NT_SUCCESS(RtlULongAdd(C_CAST(ULONG, dirInfo->FilesOffset), fileSize, &filesEnd)))
+    {
+        return FALSE;
+    }
+
+    if (dirInfo->FilesOffset < sizeof(DIRECTORY_INFO) ||
+        dirInfo->FilesOffset > ResponseBufferLength ||
+        filesEnd > ResponseBufferLength)
+    {
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 static inline BOOLEAN MatchPattern(const PUNICODE_STRING EntryName, const PUNICODE_STRING SearchPattern, ULONGLONG Flags)
@@ -99,12 +152,12 @@ static inline NTSTATUS FillFileIdBothDirInfo(
     ULONG rawSize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + Name->Length;
     ULONG alignedSize = AlignEntrySize(rawSize);
 
-    if (RemainingLength < alignedSize)
+    if (RemainingLength < rawSize)
     {
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    RtlZeroMemory(Out, alignedSize);
+    RtlZeroMemory(Out, rawSize);
 
     Out->NextEntryOffset = (ReturnSingle || IsLast) ? 0 : alignedSize;
     Out->FileIndex = Index;
@@ -144,12 +197,12 @@ static inline NTSTATUS FillFileFullDirInfo(
     ULONG rawSize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + Name->Length;
     ULONG alignedSize = AlignEntrySize(rawSize);
 
-    if (RemainingLength < alignedSize)
+    if (RemainingLength < rawSize)
     {
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    RtlZeroMemory(Out, alignedSize);
+    RtlZeroMemory(Out, rawSize);
 
     Out->NextEntryOffset = (ReturnSingle || IsLast) ? 0 : alignedSize;
     Out->FileIndex = Index;
@@ -312,18 +365,13 @@ static NTSTATUS EnumerateDirectoryEntries(
                 size,
                 attrs,
                 ReturnSingle,
-                (index == TotalEntries - 1), // IsLast flag for NextEntryOffset
+                (index == TotalEntries - 1),
                 &written
             );
 
             if (!NT_SUCCESS(st))
             {
-                //
-                // Buffer overflow or other error - return what we've written so far
-                //
-                *BytesUsed = totalWritten;
-                *FinalIndex = index;
-                return st;
+                break; // out of buffer
             }
 
             cursor += written;
@@ -335,13 +383,11 @@ static NTSTATUS EnumerateDirectoryEntries(
 
             if (ReturnSingle)
             {
-                // Only wanted one entry - stop here
                 break;
             }
         }
         else
         {
-            // Entry doesn't match pattern - skip to next
             index++;
         }
     }
@@ -349,6 +395,191 @@ static NTSTATUS EnumerateDirectoryEntries(
     *BytesUsed = totalWritten;
     *FinalIndex = index;
     return found ? STATUS_SUCCESS : STATUS_NO_MORE_FILES;
+}
+
+void BlorgListDirectoryCompletionRoutine(
+    PINVERTED_CALL_DATA_REQUEST Request,
+    PBLORGFS_TRANSACT TransactionData,
+    ULONG ResponseBufferLength
+)
+{
+    // basic checks here
+    if (!NT_SUCCESS(TransactionData->Payload.Status))
+    {
+        CompleteRequest(Request->OriginalIrp, TransactionData->Payload.Status, IO_DISK_INCREMENT);
+        return;
+    }
+
+    // validate the transaction data is safe to read
+    if (!ValidateDirectoryInformation(TransactionData->Payload.ResponseBuffer, ResponseBufferLength))
+    {
+        BLORGFS_PRINT("BlorgListDirectoryCompletionRoutine: Invalid directory information\n");
+        CompleteRequest(Request->OriginalIrp, STATUS_INVALID_PARAMETER, IO_DISK_INCREMENT);
+        return;
+    };
+
+    // set the CCB entries to be the directory information we received
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Request->OriginalIrp);
+    PDCB dcb = irpSp->FileObject->FsContext;
+    PCCB ccb = irpSp->FileObject->FsContext2;
+    // Always wait
+    ExAcquireResourceExclusiveLite(dcb->Header.Resource, TRUE);
+
+    FreeDirectoryInfo(ccb->Entries);
+
+    ccb->Entries = ExAllocatePoolUninitialized(NonPagedPoolNx, ResponseBufferLength, 'Dir');
+
+    if (!ccb->Entries)
+    {
+        ExReleaseResourceLite(dcb->Header.Resource);
+        CompleteRequest(Request->OriginalIrp, STATUS_NO_MEMORY, IO_DISK_INCREMENT);
+        return;
+    }
+
+    memcpy(ccb->Entries, TransactionData->Payload.ResponseBuffer, ResponseBufferLength);
+
+    ExConvertExclusiveToSharedLite(dcb->Header.Resource);
+
+    NTSTATUS result = STATUS_SUCCESS;
+
+    BOOLEAN returnSingleEntry = FlagOn(irpSp->Flags, SL_RETURN_SINGLE_ENTRY);
+    BOOLEAN indexSpecified = FlagOn(irpSp->Flags, SL_INDEX_SPECIFIED);
+
+    ULONG remainingLength = irpSp->Parameters.QueryDirectory.Length;
+    BOOLEAN updateCcb = FALSE;
+    ULONG index = (indexSpecified) ? irpSp->Parameters.QueryDirectory.FileIndex : (ULONG)ccb->CurrentIndex;
+
+    ULONG totalEntries = C_CAST(ULONG, ccb->Entries->FileCount + ccb->Entries->SubDirCount);
+
+    __try
+    {
+        switch (irpSp->Parameters.QueryDirectory.FileInformationClass)
+        {
+            case FileIdBothDirectoryInformation:
+            {
+                PFILE_ID_BOTH_DIR_INFORMATION dirInfo = (!Request->OriginalIrp->MdlAddress) ?
+                    Request->OriginalIrp->UserBuffer :
+                    MmGetSystemAddressForMdlSafe(Request->OriginalIrp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
+
+                if (!dirInfo)
+                {
+                    result = STATUS_INSUFFICIENT_RESOURCES;
+                    break;
+                }
+
+                if (!Request->OriginalIrp->MdlAddress && UserMode == Request->OriginalIrp->RequestorMode)
+                {
+                    ProbeForRead(Request->OriginalIrp->UserBuffer, irpSp->Parameters.QueryDirectory.Length, sizeof(UCHAR));
+                }
+
+                SIZE_T used = 0;
+                result = EnumerateDirectoryEntries(
+                    ccb,
+                    index,
+                    totalEntries,
+                    &ccb->SearchPattern,
+                    ccb->Flags,
+                    returnSingleEntry,
+                    dirInfo,
+                    remainingLength,
+                    FillFileIdBothDirInfo,
+                    &used,
+                    &index
+                );
+
+                if (NT_SUCCESS(result))
+                {
+                    Request->OriginalIrp->IoStatus.Information = used;
+                }
+
+                updateCcb = !indexSpecified;
+                break;
+            }
+            case FileDirectoryInformation:
+            {
+                result = STATUS_NOT_IMPLEMENTED;
+                break;
+            }
+            case FileFullDirectoryInformation:
+            {
+                PFILE_FULL_DIR_INFORMATION dirInfo = (!Request->OriginalIrp->MdlAddress) ? Request->OriginalIrp->UserBuffer : MmGetSystemAddressForMdlSafe(Request->OriginalIrp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
+
+                if (!dirInfo)
+                {
+                    result = STATUS_INSUFFICIENT_RESOURCES;
+                    break;
+                }
+
+                if (!Request->OriginalIrp->MdlAddress && UserMode == Request->OriginalIrp->RequestorMode)
+                {
+                    ProbeForRead(Request->OriginalIrp->UserBuffer, irpSp->Parameters.QueryDirectory.Length, sizeof(UCHAR));
+                }
+
+                SIZE_T used = 0;
+                result = EnumerateDirectoryEntries(
+                    ccb,
+                    index,
+                    totalEntries,
+                    &ccb->SearchPattern,
+                    ccb->Flags,
+                    returnSingleEntry,
+                    dirInfo,
+                    remainingLength,
+                    FillFileFullDirInfo,
+                    &used,
+                    &index
+                );
+
+                if (NT_SUCCESS(result))
+                {
+                    Request->OriginalIrp->IoStatus.Information = used;
+                }
+
+                updateCcb = !indexSpecified;
+                break;
+            }
+            case FileIdFullDirectoryInformation:
+            {
+                result = STATUS_NOT_IMPLEMENTED;
+                break;
+            }
+            case FileNamesInformation:
+            {
+                result = STATUS_NOT_IMPLEMENTED;
+                break;
+            }
+            case FileBothDirectoryInformation:
+            {
+                result = STATUS_NOT_IMPLEMENTED;
+                break;
+            }
+            default:
+            {
+                result = STATUS_INVALID_INFO_CLASS;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+
+        //
+        //  We had a problem filling in the user's buffer, so stop and
+        //  fail this request.  This is the only reason any exception
+        //  would have occured at this level.
+        //
+
+        updateCcb = FALSE;
+        result = GetExceptionCode();
+    }
+
+    ExReleaseResourceLite(dcb->Header.Resource);
+
+    if (updateCcb)
+    {
+        ccb->CurrentIndex = index;
+    }
+
+    CompleteRequest(Request->OriginalIrp, result, IO_DISK_INCREMENT);
 }
 
 NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
@@ -449,13 +680,6 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                 if (initialQuery || restartScan)
                 {
-                    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP))
-                    {
-                        BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                        ExReleaseResourceLite(dcb->Header.Resource);
-                        return FsdPostRequest(Irp, IrpSp);
-                    }
-
                     RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
 
                     if (ccb->SearchPattern.Buffer)
@@ -476,30 +700,19 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                         SetFlag(ccb->Flags, CCB_FLAG_MATCH_ALL);
                     }
 
-                    FreeHttpDirectoryInfo(ccb->Entries);
+                    union TRANSACTION_CONTEXT transactionContext = { 0 };
 
-                    result = GetHttpDirectoryInfo(&dcb->FullPath, &ccb->Entries);
+                    result = CreateInvertedCallRequest(InvertedCallTypeListDirectory, &dcb->FullPath, Irp, BlorgListDirectoryCompletionRoutine, &transactionContext);
 
-                    if (!NT_SUCCESS(result))
-                    {
-                        ExReleaseResourceLite(dcb->Header.Resource);
-                        return result;
-                    }
+                    ExReleaseResourceLite(dcb->Header.Resource);
 
-                    ExConvertExclusiveToSharedLite(dcb->Header.Resource);
+                    return result;
                 }
             }
             else
             {
                 if (initialQuery || restartScan)
                 {
-                    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP))
-                    {
-                        BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                        ExReleaseResourceLite(dcb->Header.Resource);
-                        return FsdPostRequest(Irp, IrpSp);
-                    }
-
                     RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
 
                     if (ccb->SearchPattern.Buffer)
@@ -510,17 +723,13 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                     SetFlag(ccb->Flags, CCB_FLAG_MATCH_ALL);
 
-                    FreeHttpDirectoryInfo(ccb->Entries);
+                    union TRANSACTION_CONTEXT transactionContext = { 0 };
 
-                    result = GetHttpDirectoryInfo(&dcb->FullPath, &ccb->Entries);
+                    result = CreateInvertedCallRequest(InvertedCallTypeListDirectory, &dcb->FullPath, Irp, BlorgListDirectoryCompletionRoutine, &transactionContext);
 
-                    if (!NT_SUCCESS(result))
-                    {
-                        ExReleaseResourceLite(dcb->Header.Resource);
-                        return result;
-                    }
+                    ExReleaseResourceLite(dcb->Header.Resource);
 
-                    ExConvertExclusiveToSharedLite(dcb->Header.Resource);
+                    return result;
                 }
             }
 

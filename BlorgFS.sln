@@ -7,6 +7,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "BlorgFS", "BlorgFS.vcxproj"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "VolumeTester", "VolumeTester\VolumeTester.vcxproj", "{F59E8702-E6DA-4E27-A274-7B7E929C42C2}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "BlorgService", "BlorgService\BlorgService.vcxproj", "{C6FA04DC-D5A0-483D-8A5B-8080E104D81D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -35,6 +37,14 @@ Global
 		{F59E8702-E6DA-4E27-A274-7B7E929C42C2}.Release|ARM64.Build.0 = Release|x64
 		{F59E8702-E6DA-4E27-A274-7B7E929C42C2}.Release|x64.ActiveCfg = Release|x64
 		{F59E8702-E6DA-4E27-A274-7B7E929C42C2}.Release|x64.Build.0 = Release|x64
+		{C6FA04DC-D5A0-483D-8A5B-8080E104D81D}.Debug|ARM64.ActiveCfg = Debug|x64
+		{C6FA04DC-D5A0-483D-8A5B-8080E104D81D}.Debug|ARM64.Build.0 = Debug|x64
+		{C6FA04DC-D5A0-483D-8A5B-8080E104D81D}.Debug|x64.ActiveCfg = Debug|x64
+		{C6FA04DC-D5A0-483D-8A5B-8080E104D81D}.Debug|x64.Build.0 = Debug|x64
+		{C6FA04DC-D5A0-483D-8A5B-8080E104D81D}.Release|ARM64.ActiveCfg = Release|x64
+		{C6FA04DC-D5A0-483D-8A5B-8080E104D81D}.Release|ARM64.Build.0 = Release|x64
+		{C6FA04DC-D5A0-483D-8A5B-8080E104D81D}.Release|x64.ActiveCfg = Release|x64
+		{C6FA04DC-D5A0-483D-8A5B-8080E104D81D}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
