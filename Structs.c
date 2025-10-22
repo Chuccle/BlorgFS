@@ -1,6 +1,6 @@
 #include "Driver.h"
 
-NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, PCUNICODE_STRING Name, const PDEVICE_OBJECT VolumeDeviceObject, ULONGLONG Size)
+NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject, ULONGLONG Size)
 {
     *Fcb = NULL;
 
@@ -86,14 +86,14 @@ NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, PCUNICODE_STRING Name, const
     fcb->Header.PagingIoResource = &nonPaged->HdrPagingIoResource;
 
     fcb->NonPaged = nonPaged;
-    fcb->VolumeDeviceObject = VolumeDeviceObject;
+    fcb->VolumeDeviceObject = C_CAST(PDEVICE_OBJECT, VolumeDeviceObject);
 
     *Fcb = fcb;
 
     return STATUS_SUCCESS;
 }
 
-NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, PCUNICODE_STRING Name, const PDEVICE_OBJECT VolumeDeviceObject)
+NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     *Dcb = NULL;
 
@@ -173,14 +173,14 @@ NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, PCUNICODE_STRING Name, const
     dcb->Header.PagingIoResource = &nonPaged->HdrPagingIoResource;
 
     dcb->NonPaged = nonPaged;
-    dcb->VolumeDeviceObject = VolumeDeviceObject;
+    dcb->VolumeDeviceObject = C_CAST(PDEVICE_OBJECT, VolumeDeviceObject);
 
     *Dcb = dcb;
 
     return STATUS_SUCCESS;
 }
 
-inline NTSTATUS BlorgCreateCCB(CCB** Ccb, const PDEVICE_OBJECT VolumeDeviceObject)
+inline NTSTATUS BlorgCreateCCB(CCB** Ccb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     *Ccb = NULL;
 
@@ -212,7 +212,7 @@ do                                                                              
 }                                                                                                                                    \
 while(0)
 
-void BlorgFreeFileContext(PVOID Context, PDEVICE_OBJECT VolumeDeviceObject)
+void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     switch (GET_NODE_TYPE(Context))
     {
@@ -264,7 +264,7 @@ void BlorgFreeFileContext(PVOID Context, PDEVICE_OBJECT VolumeDeviceObject)
     }
 }
 
-static UNICODE_STRING GetLastComponent(PCUNICODE_STRING Path)
+static UNICODE_STRING GetLastComponent(const UNICODE_STRING* Path)
 {
     UNICODE_STRING lastComponent = { 0 };
 
@@ -296,7 +296,7 @@ static UNICODE_STRING GetLastComponent(PCUNICODE_STRING Path)
     PWCHAR start = (current < Path->Buffer) ? Path->Buffer : current + 1;
 
     // Calculate component length
-    USHORT componentLength = (USHORT)((pathEnd - start + 1) * sizeof(WCHAR));
+    USHORT componentLength = C_CAST(USHORT, (pathEnd - start + 1) * sizeof(WCHAR));
 
     if (componentLength > 0)
     {
@@ -308,7 +308,7 @@ static UNICODE_STRING GetLastComponent(PCUNICODE_STRING Path)
     return lastComponent;
 }
 
-inline static BOOLEAN ArePathComponentsEqual(PCUNICODE_STRING Component1, PCUNICODE_STRING Component2)
+inline static BOOLEAN ArePathComponentsEqual(const UNICODE_STRING* Component1, const UNICODE_STRING* Component2)
 {
     // Quick length check
     if (Component1->Length != Component2->Length)
@@ -320,7 +320,7 @@ inline static BOOLEAN ArePathComponentsEqual(PCUNICODE_STRING Component1, PCUNIC
     return RtlEqualUnicodeString(Component1, Component2, TRUE);
 }
 
-inline static PCOMMON_CONTEXT SearchByName(const PDCB ParentDcb, PCUNICODE_STRING Name)
+inline static PCOMMON_CONTEXT SearchByName(const DCB* ParentDcb, const UNICODE_STRING* Name)
 {
     PCOMMON_CONTEXT child = NULL;
     UNICODE_STRING lastComponent;
@@ -341,9 +341,9 @@ inline static PCOMMON_CONTEXT SearchByName(const PDCB ParentDcb, PCUNICODE_STRIN
     return NULL;
 }
 
-PCOMMON_CONTEXT SearchByPath(const PDCB ParentDcb, PCUNICODE_STRING Path)
+PCOMMON_CONTEXT SearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Path)
 {
-    PDCB currentDcb = ParentDcb;
+    const DCB* currentDcb = ParentDcb;
     UNICODE_STRING remainingPath = *Path;
     UNICODE_STRING component, nextRemainingPart, lastComponent;
     PCOMMON_CONTEXT child = NULL;
@@ -382,14 +382,14 @@ PCOMMON_CONTEXT SearchByPath(const PDCB ParentDcb, PCUNICODE_STRING Path)
             return (nextRemainingPart.Length == 0) ? matchingChild : NULL;
         }
 
-        currentDcb = (PDCB)matchingChild;
+        currentDcb = C_CAST(PDCB, matchingChild);
         remainingPath = nextRemainingPart;
     }
 
-    return (PCOMMON_CONTEXT)currentDcb;
+    return C_CAST(PCOMMON_CONTEXT, currentDcb);
 }
 
-NTSTATUS InsertByPath(const PDCB ParentDcb, PCUNICODE_STRING Path, const PDIRECTORY_ENTRY_METADATA DirEntryInfo, const PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out)
+NTSTATUS InsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out)
 {
     *Out = NULL;
     UNICODE_STRING remainingPath = *Path;
@@ -404,7 +404,7 @@ NTSTATUS InsertByPath(const PDCB ParentDcb, PCUNICODE_STRING Path, const PDIRECT
         FsRtlDissectName(remainingPath, &firstPart, &remainingPart);
 
         // Check if this component already exists
-        PDCB childDcb = (PDCB)SearchByName(currentDcb, &firstPart);
+        PDCB childDcb = C_CAST(PDCB, SearchByName(currentDcb, &firstPart));
 
         if (!childDcb)
         {
@@ -433,7 +433,7 @@ NTSTATUS InsertByPath(const PDCB ParentDcb, PCUNICODE_STRING Path, const PDIRECT
                     newFcb->ParentDcb = currentDcb;
                     InsertTailList(&currentDcb->ChildrenList, &newFcb->Links);
 
-                    lastCreated = (PCOMMON_CONTEXT)newFcb;
+                    lastCreated = C_CAST(PCOMMON_CONTEXT, newFcb);
                 }
                 else
                 {
@@ -450,7 +450,7 @@ NTSTATUS InsertByPath(const PDCB ParentDcb, PCUNICODE_STRING Path, const PDIRECT
                     newDcb->ParentDcb = currentDcb;
                     InsertTailList(&currentDcb->ChildrenList, &newDcb->Links);
 
-                    lastCreated = (PCOMMON_CONTEXT)newDcb;
+                    lastCreated = C_CAST(PCOMMON_CONTEXT, newDcb);
                 }
             }
             else
@@ -474,7 +474,7 @@ NTSTATUS InsertByPath(const PDCB ParentDcb, PCUNICODE_STRING Path, const PDIRECT
                 newDcb->ParentDcb = currentDcb;
                 InsertTailList(&currentDcb->ChildrenList, &newDcb->Links);
 
-                lastCreated = (PCOMMON_CONTEXT)newDcb;
+                lastCreated = C_CAST(PCOMMON_CONTEXT, newDcb);
                 childDcb = newDcb;
             }
         }

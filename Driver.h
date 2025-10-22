@@ -5,6 +5,8 @@
 #include <wdmsec.h>
 #include <wsk.h>
 
+#define C_CAST(T, expr) ((T)(expr))
+
 #include "BlorgFSCTL.h"
 #include "Structs.h"
 #include "Util.h"

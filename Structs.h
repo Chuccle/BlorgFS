@@ -34,7 +34,7 @@ static_assert(sizeof(STRUCT_NAME) == offsetof(STRUCT_NAME, LAST_FIELD) + sizeof(
 #define BLORGFS_VCB_SIGNATURE 0xB055
 #define BLORGFS_CCB_SIGNATURE 0xBE55
 
-#define GET_NODE_TYPE(Nodeptr) (*((USHORT*)(Nodeptr)))
+#define GET_NODE_TYPE(Nodeptr) (*(C_CAST(USHORT*, Nodeptr)))
 
 typedef struct _NON_PAGED_NODE
 {
@@ -162,13 +162,13 @@ CHECK_PADDING_END(CCB, Entries);
 typedef FCB VCB;
 typedef PFCB PVCB;
 
-NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, PCUNICODE_STRING Name, const PDEVICE_OBJECT VolumeDeviceObject, ULONGLONG Size);
-NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, PCUNICODE_STRING Name, const PDEVICE_OBJECT VolumeDeviceObject);
-extern inline NTSTATUS BlorgCreateCCB(CCB** Ccb, const PDEVICE_OBJECT VolumeDeviceObject);
-void BlorgFreeFileContext(PVOID Context, const PDEVICE_OBJECT VolumeDeviceObject);
+NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject, ULONGLONG Size);
+NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject);
+extern inline NTSTATUS BlorgCreateCCB(CCB** Ccb, const DEVICE_OBJECT* VolumeDeviceObject);
+void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject);
 
-PCOMMON_CONTEXT SearchByPath(const PDCB RootDcb, PCUNICODE_STRING Path);
-NTSTATUS InsertByPath(const PDCB RootDcb, PCUNICODE_STRING Path, const PDIRECTORY_ENTRY_METADATA DirEntryInfo, const PDEVICE_OBJECT VolumeDeviceObject, PCOMMON_CONTEXT* Out);
+PCOMMON_CONTEXT SearchByPath(const DCB* RootDcb, const UNICODE_STRING* Path);
+NTSTATUS InsertByPath(PDCB RootDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out);
 
 #define IRP_CONTEXT_FLAG_DISABLE_DIRTY              0x00000001
 #define IRP_CONTEXT_FLAG_WAIT                       0x00000002
@@ -193,7 +193,7 @@ NTSTATUS InsertByPath(const PDCB RootDcb, PCUNICODE_STRING Path, const PDIRECTOR
 
 inline void BlorgSetupIrpContext(PIRP Irp, BOOLEAN Wait)
 {
-    ULONG_PTR flags = (ULONG_PTR)Irp->Tail.Overlay.DriverContext[0];
+    ULONG_PTR flags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
 
     NT_ASSERT(0 == flags);
 
@@ -213,7 +213,7 @@ inline void BlorgSetupIrpContext(PIRP Irp, BOOLEAN Wait)
         SetFlag(flags, IRP_CONTEXT_FLAG_RECURSIVE_CALL);
     }
 
-    Irp->Tail.Overlay.DriverContext[0] = (PVOID)flags;
+    Irp->Tail.Overlay.DriverContext[0] = C_CAST(PVOID, flags);
 }
 
 /////////////////////////////////////////////
@@ -264,22 +264,22 @@ typedef struct _BLORGFS_FSDO_DEVICE_EXTENSION
 CHECK_PADDING_BETWEEN(BLORGFS_FSDO_DEVICE_EXTENSION, Hdr, VolumeDeviceObject);
 CHECK_PADDING_END(BLORGFS_FSDO_DEVICE_EXTENSION, VolumeDeviceObject);
 
-inline PBLORGFS_VDO_DEVICE_EXTENSION GetVolumeDeviceExtension(PDEVICE_OBJECT VolumeDeviceObject)
+inline PBLORGFS_VDO_DEVICE_EXTENSION GetVolumeDeviceExtension(const DEVICE_OBJECT* VolumeDeviceObject)
 {
     return VolumeDeviceObject->DeviceExtension;
 }
 
-inline PBLORGFS_DDO_DEVICE_EXTENSION GetDiskDeviceExtension(PDEVICE_OBJECT DiskDeviceObject)
+inline PBLORGFS_DDO_DEVICE_EXTENSION GetDiskDeviceExtension(const DEVICE_OBJECT* DiskDeviceObject)
 {
     return DiskDeviceObject->DeviceExtension;
 }
 
-inline PBLORGFS_FSDO_DEVICE_EXTENSION GetFileSystemDeviceExtension(PDEVICE_OBJECT FileSystemDeviceObject)
+inline PBLORGFS_FSDO_DEVICE_EXTENSION GetFileSystemDeviceExtension(const DEVICE_OBJECT* FileSystemDeviceObject)
 {
     return FileSystemDeviceObject->DeviceExtension;
 }
 
-inline ULONG64 GetDeviceExtensionMagic(PDEVICE_OBJECT DeviceObject)
+inline ULONG64 GetDeviceExtensionMagic(const DEVICE_OBJECT* DeviceObject)
 {
-    return ((PBLORGFS_DEVICE_EXTENSION_HDR)DeviceObject->DeviceExtension)->Identifier;
+    return C_CAST(PBLORGFS_DEVICE_EXTENSION_HDR, DeviceObject->DeviceExtension)->Identifier;
 }

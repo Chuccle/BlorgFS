@@ -1,6 +1,6 @@
 #include "Driver.h"
 
-static inline BOOLEAN CheckFileAccess(const PACCESS_MASK DesiredAccess, BOOLEAN IsReadOnly)
+static inline BOOLEAN CheckFileAccess(const ACCESS_MASK* DesiredAccess, BOOLEAN IsReadOnly)
 {
     //
     // Reject only truly unsupported flags (same as FAT)
@@ -45,7 +45,7 @@ static inline BOOLEAN CheckFileAccess(const PACCESS_MASK DesiredAccess, BOOLEAN 
     return TRUE;
 }
 
-static inline BOOLEAN CheckDirectoryAccess(const PACCESS_MASK DesiredAccess, BOOLEAN IsReadOnly)
+static inline BOOLEAN CheckDirectoryAccess(const ACCESS_MASK* DesiredAccess, BOOLEAN IsReadOnly)
 {
     //
     // Reject only truly unsupported flags (same as FAT)
@@ -96,7 +96,7 @@ static inline BOOLEAN CheckDirectoryAccess(const PACCESS_MASK DesiredAccess, BOO
     return TRUE;
 }
 
-static inline NTSTATUS OpenExistingFcbShared(PIRP Irp, PFILE_OBJECT FileObject, const PACCESS_MASK DesiredAccess, USHORT ShareAccess, PFCB Fcb)
+static inline NTSTATUS OpenExistingFcbShared(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PFCB Fcb)
 {
 
     if (!CheckFileAccess(DesiredAccess, TRUE))
@@ -129,7 +129,7 @@ static inline NTSTATUS OpenExistingFcbShared(PIRP Irp, PFILE_OBJECT FileObject, 
     return STATUS_SUCCESS;
 }
 
-static inline NTSTATUS OpenExistingDcbShared(PIRP Irp, PFILE_OBJECT FileObject, const PACCESS_MASK DesiredAccess, USHORT ShareAccess, PDCB Dcb, const PDEVICE_OBJECT VolumeDeviceObject)
+static inline NTSTATUS OpenExistingDcbShared(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     if (!CheckDirectoryAccess(DesiredAccess, TRUE))
     {
@@ -170,7 +170,7 @@ static inline NTSTATUS OpenExistingDcbShared(PIRP Irp, PFILE_OBJECT FileObject, 
     return STATUS_SUCCESS;
 }
 
-static inline NTSTATUS BlorgOpenExistingFcbExclusive(PIRP Irp, PFILE_OBJECT FileObject, const PACCESS_MASK DesiredAccess, USHORT ShareAccess, PFCB Fcb)
+static inline NTSTATUS BlorgOpenExistingFcbExclusive(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PFCB Fcb)
 {
     if (!CheckFileAccess(DesiredAccess, TRUE))
     {
@@ -203,7 +203,7 @@ static inline NTSTATUS BlorgOpenExistingFcbExclusive(PIRP Irp, PFILE_OBJECT File
     return STATUS_SUCCESS;
 }
 
-static inline NTSTATUS OpenExistingDcbExclusive(PIRP Irp, PFILE_OBJECT FileObject, const PACCESS_MASK DesiredAccess, USHORT ShareAccess, PDCB Dcb, PDEVICE_OBJECT VolumeDeviceObject)
+static inline NTSTATUS OpenExistingDcbExclusive(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     if (!CheckDirectoryAccess(DesiredAccess, TRUE))
     {
@@ -389,7 +389,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     return STATUS_FILE_IS_A_DIRECTORY;
                 }
 
-                NTSTATUS result = OpenExistingDcbShared(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
+                NTSTATUS result = OpenExistingDcbShared(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PDCB, desiredNode), VolumeDeviceObject);
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
 
@@ -414,7 +414,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     return STATUS_NOT_A_DIRECTORY;
                 }
 
-                NTSTATUS result = OpenExistingFcbShared(Irp, fileObject, desiredAccess, shareAccess, (PFCB)desiredNode);
+                NTSTATUS result = OpenExistingFcbShared(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
 
@@ -431,7 +431,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
     ExReleaseResourceLite(vcb->Header.Resource);
 
     // Verify that this actually exists on the remote store
-    if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP))
     {
         BLORGFS_PRINT("BlorgVolumeCreate: Enqueue to Fsp\n");
         return FsdPostRequest(Irp, IrpSp);
@@ -495,7 +495,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     return STATUS_FILE_IS_A_DIRECTORY;
                 }
 
-                result = OpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
+                result = OpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PDCB, desiredNode), VolumeDeviceObject);
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
                 
@@ -520,7 +520,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     return STATUS_NOT_A_DIRECTORY;
                 }
 
-                result = BlorgOpenExistingFcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PFCB)desiredNode);
+                result = BlorgOpenExistingFcbExclusive(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
 
@@ -555,7 +555,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         {
             case BLORGFS_DCB_SIGNATURE:
             {
-                result = OpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PDCB)desiredNode, VolumeDeviceObject);
+                result = OpenExistingDcbExclusive(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PDCB, desiredNode), VolumeDeviceObject);
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
 
@@ -568,7 +568,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             }
             case BLORGFS_FCB_SIGNATURE:
             {
-                result = BlorgOpenExistingFcbExclusive(Irp, fileObject, desiredAccess, shareAccess, (PFCB)desiredNode);
+                result = BlorgOpenExistingFcbExclusive(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
                 
                 ExReleaseResourceLite(vcb->Header.Resource);
 

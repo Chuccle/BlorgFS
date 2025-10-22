@@ -47,7 +47,7 @@ Return Value:
     //  for all the other pre-acquire routines as well.
     //
 
-    if (!ExAcquireResourceSharedLite(((PFCB)Context)->Header.PagingIoResource, Wait))
+    if (!ExAcquireResourceSharedLite(C_CAST(PFCB, Context)->Header.PagingIoResource, Wait))
     {
         return FALSE;
     }
@@ -63,9 +63,9 @@ Return Value:
 
     NT_ASSERT(BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(Context));
     NT_ASSERT(NULL != PsGetCurrentThread());
-    NT_ASSERT(NULL == ((PFCB)Context)->LazyWriteThread);
+    NT_ASSERT(NULL == C_CAST(PFCB, Context)->LazyWriteThread);
 
-    ((PFCB)Context)->LazyWriteThread = PsGetCurrentThread();
+    (C_CAST(PFCB, Context))->LazyWriteThread = PsGetCurrentThread();
 
     if (!global.LazyWriteThread)
     {
@@ -81,7 +81,7 @@ Return Value:
 
     NT_ASSERT(NULL == IoGetTopLevelIrp());
 
-    IoSetTopLevelIrp((PIRP)FSRTL_CACHE_TOP_LEVEL_IRP);
+    IoSetTopLevelIrp(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP));
 
     return TRUE;
 }
@@ -119,26 +119,26 @@ Return Value:
 
     NT_ASSERT(BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(Context));
     NT_ASSERT(NULL != PsGetCurrentThread());
-    NT_ASSERT(PsGetCurrentThread() == ((PFCB)Context)->LazyWriteThread);
+    NT_ASSERT(PsGetCurrentThread() == C_CAST(PFCB, Context)->LazyWriteThread);
 
     //
     //  Release the lazy writer mark.
     //
 
-    ((PFCB)Context)->LazyWriteThread = NULL;
+    (C_CAST(PFCB, Context))->LazyWriteThread = NULL;
 
     //
     //  Check here for the EA File.  It turns out we needed the normal
     //  resource shared in this case.  Otherwise it was the PagingIoResource.
     //
 
-    ExReleaseResourceLite(((PFCB)Context)->Header.PagingIoResource);
+    ExReleaseResourceLite(C_CAST(PFCB, Context)->Header.PagingIoResource);
 
     //
     //  Clear the kludge at this point.
     //
 
-    NT_ASSERT((PIRP)FSRTL_CACHE_TOP_LEVEL_IRP == IoGetTopLevelIrp());
+    NT_ASSERT(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP) == IoGetTopLevelIrp());
 
     IoSetTopLevelIrp(NULL);
 }
@@ -189,7 +189,7 @@ Return Value:
     //  for all the other pre-acquire routines as well.
     //
 
-    if (!ExAcquireResourceSharedLite(((PFCB)Context)->Header.Resource,
+    if (!ExAcquireResourceSharedLite(C_CAST(PFCB, Context)->Header.Resource,
         Wait))
     {
 
@@ -205,7 +205,7 @@ Return Value:
 
     NT_ASSERT(NULL == IoGetTopLevelIrp());
 
-    IoSetTopLevelIrp((PIRP)FSRTL_CACHE_TOP_LEVEL_IRP);
+    IoSetTopLevelIrp(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP));
 
     return TRUE;
 }
@@ -240,11 +240,11 @@ Return Value:
     //  Clear the kludge at this point.
     //
 
-    NT_ASSERT((PIRP)FSRTL_CACHE_TOP_LEVEL_IRP == IoGetTopLevelIrp());
+    NT_ASSERT(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP) == IoGetTopLevelIrp());
 
     IoSetTopLevelIrp(NULL);
 
-    ExReleaseResourceLite(((PFCB)Context)->Header.Resource);
+    ExReleaseResourceLite(C_CAST(PFCB, Context)->Header.Resource);
 }
 
 _Function_class_(FAST_IO_CHECK_IF_POSSIBLE)
