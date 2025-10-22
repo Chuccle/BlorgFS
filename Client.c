@@ -87,9 +87,9 @@ static NTSTATUS GetContentLengthFromHeaders(const struct phr_header* Headers, SI
         {
             ANSI_STRING headerNameBuffer =
             {
-                .Buffer = (PCHAR)Headers[i].name,
-                .MaximumLength = (USHORT)Headers[i].name_len,
-                .Length = (USHORT)Headers[i].name_len
+                .Buffer = C_CAST(PCHAR, Headers[i].name),
+                .MaximumLength = C_CAST(USHORT, Headers[i].name_len),
+                .Length = C_CAST(USHORT, Headers[i].name_len)
             };
 
             if (!RtlEqualString(&headerNameBuffer, &contentLengthBuffer, TRUE))
@@ -109,7 +109,7 @@ static NTSTATUS AlignBuffer(char* OriginalBuffer, SIZE_T BufferSize, SIZE_T Cont
 {
     *Allocated = FALSE;
 
-    int alignmentOffset = (0x8 - ((UINT_PTR)OriginalBuffer & 0x7)) & 0x7;
+    int alignmentOffset = (0x8 - (C_CAST(UINT_PTR, OriginalBuffer) & 0x7)) & 0x7;
 
     // Buffer is already aligned
     if (0 == alignmentOffset)
@@ -119,7 +119,7 @@ static NTSTATUS AlignBuffer(char* OriginalBuffer, SIZE_T BufferSize, SIZE_T Cont
     }
 
     // See if we can reuse some of the slack in the original buffer
-    if (((ULONG64)alignmentOffset + ContentLength) <= BufferSize)
+    if ((C_CAST(ULONG64, alignmentOffset) + ContentLength) <= BufferSize)
     {
         RtlMoveMemory(OriginalBuffer + alignmentOffset, OriginalBuffer, ContentLength);
         *AlignedBuffer = OriginalBuffer + alignmentOffset;
@@ -288,7 +288,7 @@ static NTSTATUS ProcessEntries(BlorgMetaFlat_Directory_table_t entriesMetadata, 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS DeserializeDirectoryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTORY_INFO* OutDirInfo)
+static NTSTATUS DeserializeDirectoryInfoFlatBuffer(const HTTP_BUFFER_INFO* HttpInfo, PDIRECTORY_INFO* OutDirInfo)
 {
     if (!HttpInfo->Headers || !HttpInfo->BodyBuffer || 0 == HttpInfo->BodyBufferSize)
     {
@@ -369,7 +369,7 @@ static NTSTATUS DeserializeDirectoryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpI
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS DeserializeDirectoryEntryInfoFlatBuffer(const PHTTP_BUFFER_INFO HttpInfo, PDIRECTORY_ENTRY_METADATA DirEntryInfo)
+static NTSTATUS DeserializeDirectoryEntryInfoFlatBuffer(const HTTP_BUFFER_INFO* HttpInfo, PDIRECTORY_ENTRY_METADATA DirEntryInfo)
 {
     if (!HttpInfo->Headers || !HttpInfo->BodyBuffer || 0 == HttpInfo->BodyBufferSize)
     {
@@ -464,7 +464,7 @@ static BOOLEAN IsCharacterSafeForUrl(UCHAR c)
     return FALSE;
 }
 
-static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STRING OutputString, BOOLEAN AllocateDestination)
+static NTSTATUS UrlEncodeUnicodeString(const UNICODE_STRING* InputString, PUNICODE_STRING OutputString, BOOLEAN AllocateDestination)
 {
     UTF8_STRING utf8String;
 
@@ -474,7 +474,7 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
         return status;
     }
 
-    PUCHAR utf8Buffer = (PUCHAR)utf8String.Buffer;
+    PUCHAR utf8Buffer = C_CAST(PUCHAR, utf8String.Buffer);
     ULONG utf8Length = utf8String.Length;
     SIZE_T estimatedLength = 0;
 
@@ -495,11 +495,11 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
 
     if (AllocateDestination)
     {
-        OutputString->Buffer = (PWCHAR)ExAllocatePoolUninitialized(
+        OutputString->Buffer = C_CAST(PWCHAR, ExAllocatePoolUninitialized(
             PagedPool,
             estimatedLength * sizeof(WCHAR),
             'URLE'
-        );
+        ));
 
         if (NULL == OutputString->Buffer)
         {
@@ -507,7 +507,7 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        OutputString->MaximumLength = (USHORT)(estimatedLength * sizeof(WCHAR));
+        OutputString->MaximumLength = C_CAST(USHORT, estimatedLength * sizeof(WCHAR));
     }
     else if (OutputString->MaximumLength < estimatedLength * sizeof(WCHAR))
     {
@@ -530,7 +530,7 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
                 break;
             }
 
-            OutputString->Buffer[j++] = (WCHAR)c;
+            OutputString->Buffer[j++] = C_CAST(WCHAR, c);
         }
         else
         {
@@ -541,8 +541,8 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
             }
 
             OutputString->Buffer[j++] = L'%';
-            OutputString->Buffer[j++] = (WCHAR)HEX_TO_CHAR((c >> 4) & 0xF);
-            OutputString->Buffer[j++] = (WCHAR)HEX_TO_CHAR(c & 0xF);
+            OutputString->Buffer[j++] = C_CAST(WCHAR, HEX_TO_CHAR((c >> 4) & 0xF));
+            OutputString->Buffer[j++] = C_CAST(WCHAR, HEX_TO_CHAR(c & 0xF));
         }
     }
 
@@ -553,7 +553,7 @@ static NTSTATUS UrlEncodeUnicodeString(PUNICODE_STRING InputString, PUNICODE_STR
     return status;
 }
 
-NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO* OutDirInfo)
+NTSTATUS GetHttpDirectoryInfo(const UNICODE_STRING* Path, PDIRECTORY_INFO* OutDirInfo)
 {
     if (!Path || 0 == Path->Length || !Path->Buffer)
     {
@@ -625,7 +625,7 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO* OutDi
         return result;
     }
 
-    result = SendRecvWsk(socket, sendBuffer, (ULONG)strlen(sendBuffer), NULL, 0, TRUE);
+    result = SendRecvWsk(socket, sendBuffer, C_CAST(ULONG, strlen(sendBuffer)), NULL, 0, TRUE);
 
     if (!NT_SUCCESS(result))
     {
@@ -684,7 +684,7 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO* OutDi
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
 
-            receiveBufferSize = bytesProcessed + (ULONG)contentLength;
+            receiveBufferSize = bytesProcessed + C_CAST(ULONG, contentLength);
             receiveBuffer = newReceiveBuffer;
         }
 
@@ -723,8 +723,8 @@ NTSTATUS GetHttpDirectoryInfo(const PUNICODE_STRING Path, PDIRECTORY_INFO* OutDi
 
     HTTP_BUFFER_INFO httpInfo =
     {
-        .BodyBuffer = (receiveBuffer + bytesProcessed),
-        .BodyBufferSize = ((SIZE_T)receiveBufferSize - bytesProcessed),
+        .BodyBuffer = receiveBuffer + bytesProcessed,
+        .BodyBufferSize = C_CAST(SIZE_T, receiveBufferSize) - bytesProcessed,
         .Headers = headers,
         .HeaderCount = num_headers
     };
@@ -755,7 +755,7 @@ void FreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
     }
 }
 
-NTSTATUS GetHttpFileInformation(const PUNICODE_STRING Path, PDIRECTORY_ENTRY_METADATA DirectoryEntryInfo)
+NTSTATUS GetHttpFileInformation(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA DirectoryEntryInfo)
 {
     if (!Path || 0 == Path->Length || !Path->Buffer)
     {
@@ -820,7 +820,7 @@ NTSTATUS GetHttpFileInformation(const PUNICODE_STRING Path, PDIRECTORY_ENTRY_MET
         return result;
     }
 
-    result = SendRecvWsk(socket, sendBuffer, (ULONG)strlen(sendBuffer), NULL, 0, TRUE);
+    result = SendRecvWsk(socket, sendBuffer, C_CAST(ULONG, strlen(sendBuffer)), NULL, 0, TRUE);
 
     if (!NT_SUCCESS(result))
     {
@@ -879,7 +879,7 @@ NTSTATUS GetHttpFileInformation(const PUNICODE_STRING Path, PDIRECTORY_ENTRY_MET
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
 
-            receiveBufferSize = bytesProcessed + (ULONG)contentLength;
+            receiveBufferSize = bytesProcessed + C_CAST(ULONG, contentLength);
             receiveBuffer = newReceiveBuffer;
         }
 
@@ -921,8 +921,8 @@ NTSTATUS GetHttpFileInformation(const PUNICODE_STRING Path, PDIRECTORY_ENTRY_MET
 
     HTTP_BUFFER_INFO httpInfo =
     {
-        .BodyBuffer = (receiveBuffer + bytesProcessed),
-        .BodyBufferSize = ((SIZE_T)receiveBufferSize - bytesProcessed),
+        .BodyBuffer = receiveBuffer + bytesProcessed,
+        .BodyBufferSize = C_CAST(SIZE_T, receiveBufferSize) - bytesProcessed,
         .Headers = headers,
         .HeaderCount = num_headers
     };
@@ -945,7 +945,7 @@ NTSTATUS GetHttpFileInformation(const PUNICODE_STRING Path, PDIRECTORY_ENTRY_MET
     return result;
 }
 
-NTSTATUS GetHttpFile(const PUNICODE_STRING Path, SIZE_T StartOffset, SIZE_T Length, PHTTP_FILE_BUFFER OutputBuffer)
+NTSTATUS GetHttpFile(const UNICODE_STRING* Path, SIZE_T StartOffset, SIZE_T Length, PHTTP_FILE_BUFFER OutputBuffer)
 {
     if (!Path || 0 == Path->Length || !Path->Buffer)
     {
@@ -1015,7 +1015,7 @@ NTSTATUS GetHttpFile(const PUNICODE_STRING Path, SIZE_T StartOffset, SIZE_T Leng
         return result;
     }
 
-    result = SendRecvWsk(socket, sendBuffer, (ULONG)strlen(sendBuffer), NULL, 0, TRUE);
+    result = SendRecvWsk(socket, sendBuffer, C_CAST(ULONG, strlen(sendBuffer)), NULL, 0, TRUE);
 
     if (!NT_SUCCESS(result))
     {
@@ -1074,7 +1074,7 @@ NTSTATUS GetHttpFile(const PUNICODE_STRING Path, SIZE_T StartOffset, SIZE_T Leng
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
 
-            receiveBufferSize = bytesProcessed + (ULONG)contentLength;
+            receiveBufferSize = bytesProcessed + C_CAST(ULONG, contentLength);
             receiveBuffer = newReceiveBuffer;
         }
 
@@ -1127,7 +1127,7 @@ void FreeHttpFile(PHTTP_FILE_BUFFER FileBuffer)
     ExFreePool(FileBuffer->BaseAddress);
 }
 
-NTSTATUS GetHttpAddrInfo(PUNICODE_STRING NodeName, PUNICODE_STRING ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo)
+NTSTATUS GetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo)
 {
     return GetWskAddrInfo(NodeName, ServiceName, Hints, RemoteAddrInfo);
 }

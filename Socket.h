@@ -28,7 +28,7 @@ typedef struct _KSOCKET
 NTSTATUS InitialiseWskClient(void);
 void CleanupWskClient(void);
 
-NTSTATUS GetWskAddrInfo(PUNICODE_STRING NodeName, PUNICODE_STRING ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo);
+NTSTATUS GetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo);
 void FreeWskAddrInfo(PADDRINFOEXW AddrInfo);
 
 NTSTATUS CreateWskSocket(PKSOCKET* Socket, USHORT SocketType, ULONG Protocol, ULONG Flags, PSOCKADDR RemoteAddress);

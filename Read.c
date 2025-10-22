@@ -127,7 +127,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 startingByte.QuadPart,
                 bytesLength);
 
-            ULONG trimLength = (ULONG)((startingByte.QuadPart + bytesLength) - fcb->Header.AllocationSize.QuadPart);
+            ULONG trimLength = C_CAST(ULONG, (startingByte.QuadPart + bytesLength) - fcb->Header.AllocationSize.QuadPart);
 
             realLength = bytesLength - trimLength;
         }
@@ -136,7 +136,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         //  Do the read here
         //
 
-        if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+        if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP))
         {
             BLORGFS_PRINT("BlorgVolumeRead: Enqueue to Fsp\n");
             return FsdPostRequest(Irp, IrpSp);
@@ -192,7 +192,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             //  Now initialize the cache map.
             //
 
-            CcInitializeCacheMap(IrpSp->FileObject, (PCC_FILE_SIZES)&fcb->Header.AllocationSize, FALSE, &global.CacheManagerCallbacks, fcb);
+            CcInitializeCacheMap(IrpSp->FileObject, C_CAST(PCC_FILE_SIZES, &fcb->Header.AllocationSize), FALSE, &global.CacheManagerCallbacks, fcb);
 
             // CcSetReadAheadGranularity(IrpSp->FileObject, READ_AHEAD_GRANULARITY);
         }
@@ -217,7 +217,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 startingByte.QuadPart,
                 bytesLength);
 
-            ULONG trimLength = (ULONG)((startingByte.QuadPart + bytesLength) - fcb->Header.AllocationSize.QuadPart);
+            ULONG trimLength = C_CAST(ULONG, (startingByte.QuadPart + bytesLength) - fcb->Header.AllocationSize.QuadPart);
 
             realLength = bytesLength - trimLength;
         }
@@ -250,7 +250,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 if (!CcCopyReadEx(IrpSp->FileObject,
                     &startingByte,
                     realLength,
-                    BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_WAIT),
+                    BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_WAIT),
                     systemBuffer,
                     &Irp->IoStatus,
                     Irp->Tail.Overlay.Thread))

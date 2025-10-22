@@ -136,11 +136,11 @@ Return Value:
             //  Extract the IrpContext and IrpSp, and loop.
             //
             
-            ULONG_PTR flags = (ULONG_PTR)irp->Tail.Overlay.DriverContext[0];
+            ULONG_PTR flags = C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[0]);
             
             SetFlag(flags, IRP_CONTEXT_FLAG_WAIT | IRP_CONTEXT_FLAG_IN_FSP);
             
-            irp->Tail.Overlay.DriverContext[0] = (PVOID)flags;
+            irp->Tail.Overlay.DriverContext[0] = C_CAST(PVOID, flags);
 
             PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
 
@@ -150,9 +150,9 @@ Return Value:
             //  If this Irp was top level, note it in our thread local storage.
             //
 
-            if (FlagOn((ULONG_PTR)irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_RECURSIVE_CALL))
+            if (FlagOn(C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_RECURSIVE_CALL))
             {
-                IoSetTopLevelIrp((PIRP)FSRTL_FSP_TOP_LEVEL_IRP);
+                IoSetTopLevelIrp(C_CAST(PIRP, FSRTL_FSP_TOP_LEVEL_IRP));
             }
             else
             {

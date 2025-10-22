@@ -51,7 +51,7 @@ static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Volume
         (0 == node->RefCount))
         ||
         (BLORGFS_DCB_SIGNATURE == GET_NODE_TYPE(node)) &&
-        (IsListEmpty(&((PDCB)node)->ChildrenList)) &&
+        (IsListEmpty(&C_CAST(PDCB, node)->ChildrenList)) &&
         (0 == node->RefCount))
     {
         PDCB parentDcb = node->ParentDcb;

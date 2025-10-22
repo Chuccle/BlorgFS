@@ -37,7 +37,7 @@ static inline BOOLEAN MatchPattern(const PUNICODE_STRING EntryName, const PUNICO
     // Check if the search pattern contains wildcards
     BOOLEAN containsWildCards = FALSE;
 
-    for (ULONG i = 0; i < (SearchPattern->Length / (ULONG)sizeof(WCHAR)); i++)
+    for (ULONG i = 0; i < (SearchPattern->Length / C_CAST(ULONG, sizeof(WCHAR))); i++)
     {
         WCHAR ch = SearchPattern->Buffer[i];
 
@@ -255,7 +255,7 @@ static NTSTATUS EnumerateDirectoryEntries(
 {
     ULONG index = StartIndex;
     ULONG remaining = OutLength;
-    PUCHAR cursor = (PUCHAR)OutBuffer;
+    PUCHAR cursor = C_CAST(PUCHAR, OutBuffer);
     SIZE_T totalWritten = 0;
     BOOLEAN found = FALSE;
 
@@ -327,7 +327,7 @@ static NTSTATUS EnumerateDirectoryEntries(
             }
 
             cursor += written;
-            remaining -= (ULONG)written;
+            remaining -= C_CAST(ULONG, written);
             totalWritten += written;
             found = TRUE;
 
@@ -406,7 +406,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             if (initialQuery)
             {
-                if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_WAIT)))
+                if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_WAIT)))
                 {
                     BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
                     return FsdPostRequest(Irp, IrpSp);
@@ -424,7 +424,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             }
             else if (restartScan)
             {
-                if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_WAIT)))
+                if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_WAIT)))
                 {
                     BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
                     return FsdPostRequest(Irp, IrpSp);
@@ -434,7 +434,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             }
             else
             {
-                if (!ExAcquireResourceSharedLite(dcb->Header.Resource, BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_WAIT)))
+                if (!ExAcquireResourceSharedLite(dcb->Header.Resource, BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_WAIT)))
                 {
                     BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
                     return FsdPostRequest(Irp, IrpSp);
@@ -449,7 +449,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
                 if (initialQuery || restartScan)
                 {
-                    if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+                    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP))
                     {
                         BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
                         ExReleaseResourceLite(dcb->Header.Resource);
@@ -493,7 +493,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             {
                 if (initialQuery || restartScan)
                 {
-                    if (!BooleanFlagOn((ULONG_PTR)Irp->Tail.Overlay.DriverContext[0], IRP_CONTEXT_FLAG_IN_FSP))
+                    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP))
                     {
                         BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
                         ExReleaseResourceLite(dcb->Header.Resource);
@@ -526,9 +526,9 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             ULONG remainingLength = IrpSp->Parameters.QueryDirectory.Length;
             BOOLEAN updateCcb = FALSE;
-            ULONG index = (indexSpecified) ? IrpSp->Parameters.QueryDirectory.FileIndex : (ULONG)ccb->CurrentIndex;
+            ULONG index = (indexSpecified) ? IrpSp->Parameters.QueryDirectory.FileIndex : C_CAST(ULONG, ccb->CurrentIndex);
 
-            ULONG totalEntries = (ULONG)(ccb->Entries->FileCount + ccb->Entries->SubDirCount);
+            ULONG totalEntries = C_CAST(ULONG, ccb->Entries->FileCount + ccb->Entries->SubDirCount);
 
             __try
             {

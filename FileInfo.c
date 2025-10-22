@@ -99,7 +99,7 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             standardInfo->EndOfFile = commonContext->Header.AllocationSize;
             standardInfo->NumberOfLinks = 0;
             standardInfo->DeletePending = FALSE;
-            standardInfo->Directory = (GET_NODE_TYPE(commonContext) == BLORGFS_DCB_SIGNATURE);
+            standardInfo->Directory = GET_NODE_TYPE(commonContext) == BLORGFS_DCB_SIGNATURE;
 
             result = STATUS_SUCCESS;
             bytesWritten = sizeof(FILE_STANDARD_INFORMATION);

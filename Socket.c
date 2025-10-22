@@ -25,7 +25,7 @@ NTSTATUS SocketContextCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp, P
         return STATUS_INVALID_PARAMETER;
     }
 
-    KeSetEvent((PKEVENT)Context, EVENT_INCREMENT, FALSE);
+    KeSetEvent(C_CAST(PKEVENT, Context), EVENT_INCREMENT, FALSE);
     return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
@@ -148,7 +148,7 @@ void CleanupWskClient(void)
     WskDeregister(&WskRegistration);
 }
 
-NTSTATUS GetWskAddrInfo(PUNICODE_STRING NodeName, PUNICODE_STRING ServiceName, const PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo)
+NTSTATUS GetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo)
 {
     KSOCKET_CONTEXT socketContext;
 
@@ -160,13 +160,14 @@ NTSTATUS GetWskAddrInfo(PUNICODE_STRING NodeName, PUNICODE_STRING ServiceName, c
         return result;
     }
 
+    // massage const params
     result = WskProviderNpi.Dispatch->WskGetAddressInfo(
         WskProviderNpi.Client,
-        NodeName,
-        ServiceName,
+        C_CAST(PUNICODE_STRING, NodeName),
+        C_CAST(PUNICODE_STRING, ServiceName),
         0,
         NULL,
-        Hints,
+        C_CAST(PADDRINFOEXW, Hints),
         RemoteAddrInfo,
         NULL,
         NULL,
@@ -217,7 +218,7 @@ NTSTATUS CreateWskSocket(PKSOCKET* Socket, USHORT SocketType, ULONG Protocol, UL
         WskProviderNpi.Client,
         SocketType,
         Protocol,
-        (PSOCKADDR)&localAddress,
+        C_CAST(PSOCKADDR, &localAddress),
         RemoteAddress,
         Flags,
         NULL,
@@ -232,8 +233,8 @@ NTSTATUS CreateWskSocket(PKSOCKET* Socket, USHORT SocketType, ULONG Protocol, UL
 
     if (NT_SUCCESS(result))
     {
-        newSocket->WskSocket = (PWSK_SOCKET)newSocket->SocketContext.Irp->IoStatus.Information;
-        newSocket->WskDispatch = (PVOID)newSocket->WskSocket->Dispatch;
+        newSocket->WskSocket = C_CAST(PWSK_SOCKET, newSocket->SocketContext.Irp->IoStatus.Information);
+        newSocket->WskDispatch = C_CAST(PVOID, newSocket->WskSocket->Dispatch);
 
         *Socket = newSocket;
     }
@@ -307,7 +308,7 @@ NTSTATUS SendRecvWsk(PKSOCKET Socket, PVOID Buffer, ULONG Length, PULONG BytesWr
     {
         if (BytesWritten)
         {
-            *BytesWritten = (ULONG)Socket->SocketContext.Irp->IoStatus.Information;
+            *BytesWritten = C_CAST(ULONG, Socket->SocketContext.Irp->IoStatus.Information);
         }
     }
 
