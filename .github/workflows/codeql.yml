@@ -42,7 +42,7 @@ jobs:
       run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
 
     - name: Checkout repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@v6
       with:
         token: ${{ (matrix.language == 'c-cpp' && steps.is_dependabot.outputs.is_dependabot == 'true') && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT || github.token }}
         submodules: ${{ matrix.language == 'c-cpp' && 'recursive' || false }}
