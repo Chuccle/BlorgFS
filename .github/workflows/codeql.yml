@@ -66,7 +66,7 @@ jobs:
     - name: Cache Flatcc build
       if: matrix.language == 'c-cpp' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
       id: cache_flatcc
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           flatcc/bin/Release
@@ -108,7 +108,7 @@ jobs:
 
     - name: Cache NuGet packages
       if: matrix.language == 'c-cpp'
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ./packages
         key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config') }}
