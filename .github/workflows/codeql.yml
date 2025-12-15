@@ -186,7 +186,7 @@ jobs:
         sarif_file: sarif-results
 
     - name: Upload loc as a Build Artifact
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v6
       with:
         name: sarif-results-${{ matrix.language }}
         path: sarif-results
