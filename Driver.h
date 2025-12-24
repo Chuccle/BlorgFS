@@ -8,11 +8,13 @@
 #define C_CAST(T, expr) ((T)(expr))
 
 #include "BlorgFSCTL.h"
+#include "Statistics.h" 
 #include "Structs.h"
 #include "Util.h"
 #include "Client.h"
 #include "CacheManager.h"
 #include "FspWorkQueue.h"
+#include "Global.h"
 
 #define BLORGFS_FSDO_STRING  L"\\BlorgFS"
 #define BLORGFS_FSDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
@@ -65,13 +67,3 @@ _Dispatch_type_(IRP_MJ_QUERY_SECURITY)           DRIVER_DISPATCH BlorgQuerySecur
 _Dispatch_type_(IRP_MJ_SET_SECURITY)             DRIVER_DISPATCH BlorgSetSecurity;
 
 NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject);
-
-extern struct GLOBAL
-{
-    PDRIVER_OBJECT DriverObject;
-    PDEVICE_OBJECT FileSystemDeviceObject;
-    PDEVICE_OBJECT DiskDeviceObject;
-    PADDRINFOEXW   RemoteAddressInfo;
-    CACHE_MANAGER_CALLBACKS CacheManagerCallbacks;
-    PVOID LazyWriteThread;
-} global;

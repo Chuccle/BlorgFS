@@ -4,8 +4,6 @@ FAST_IO_DISPATCH  BlorgFsFastDispatch;
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD     DriverUnload;
 
-struct GLOBAL global;
-
 // {02EF343C-413D-4932-BBCE-15624AACE5D9}
 static const GUID BLORGFS_FSDO_GUID = { 0x2ef343c, 0x413d, 0x4932, { 0xbb, 0xce, 0x15, 0x62, 0x4a, 0xac, 0xe5, 0xd9 } };
 // {A6E07401-F24E-443E-A47C-D9BD219B9E68}
@@ -264,6 +262,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     UNREFERENCED_PARAMETER(RegistryPath);
 
     ExInitializeDriverRuntime(0);
+
+    global.ProcessorCount = KeQueryActiveProcessorCount(NULL);
 
     global.DriverObject = DriverObject;
 

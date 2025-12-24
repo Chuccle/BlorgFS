@@ -141,9 +141,11 @@
     <ClCompile Include="flatcc\src\runtime\verifier.c" />
     <ClCompile Include="FlushBuffers.c" />
     <ClCompile Include="FsCtrl.c" />
+    <ClCompile Include="Global.c" />
     <ClCompile Include="Socket.c" />
     <ClCompile Include="picohttpparser\picohttpparser.c" />
     <ClCompile Include="Shutdown.c" />
+    <ClCompile Include="Statistics.c" />
     <ClCompile Include="Structs.c" />
     <ClCompile Include="LockCtrl.c" />
     <ClCompile Include="Ea.c" />
@@ -159,10 +161,12 @@
     <ClInclude Include="Client.h" />
     <ClInclude Include="Driver.h" />
     <ClInclude Include="flatbuffers_common_reader.h" />
+    <ClInclude Include="Global.h" />
     <ClInclude Include="Socket.h" />
     <ClInclude Include="metadata_flatbuffer_reader.h" />
     <ClInclude Include="metadata_flatbuffer_verifier.h" />
     <ClInclude Include="picohttpparser\picohttpparser.h" />
+    <ClInclude Include="Statistics.h" />
     <ClInclude Include="Structs.h" />
     <ClInclude Include="Util.h" />
     <ClInclude Include="FspWorkQueue.h" />
