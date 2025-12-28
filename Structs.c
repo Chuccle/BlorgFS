@@ -180,7 +180,7 @@ NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, const UNICODE_STRING* Name, 
     return STATUS_SUCCESS;
 }
 
-inline NTSTATUS BlorgCreateCCB(CCB** Ccb, const DEVICE_OBJECT* VolumeDeviceObject)
+NTSTATUS BlorgCreateCCB(CCB** Ccb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     *Ccb = NULL;
 
@@ -202,7 +202,7 @@ inline NTSTATUS BlorgCreateCCB(CCB** Ccb, const DEVICE_OBJECT* VolumeDeviceObjec
     return STATUS_SUCCESS;
 }
 
-#define DEALLOCATE_COMMON(ctx)                                                                                                       \
+#define DEALLOCATE_COMMON_CONTEXT(ctx)                                                                                               \
 do                                                                                                                                   \
 {                                                                                                                                    \
     PCOMMON_CONTEXT commonContext = ctx;                                                                                             \
@@ -218,7 +218,7 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
     {
         case BLORGFS_FCB_SIGNATURE:
         {
-            DEALLOCATE_COMMON(Context);
+            DEALLOCATE_COMMON_CONTEXT(Context);
             PFCB fcb = Context;
             ExFreePool(fcb->FullPath.Buffer);
             RemoveEntryList(&(fcb->Links));
@@ -227,7 +227,7 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
         }
         case BLORGFS_DCB_SIGNATURE:
         {
-            DEALLOCATE_COMMON(Context);
+            DEALLOCATE_COMMON_CONTEXT(Context);
             PDCB dcb = Context;
             ExFreePool(dcb->FullPath.Buffer);
             RemoveEntryList(&(dcb->Links));
@@ -236,14 +236,14 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
         }
         case BLORGFS_VCB_SIGNATURE:
         {
-            DEALLOCATE_COMMON(Context);
+            DEALLOCATE_COMMON_CONTEXT(Context);
             PVCB vcb = Context;
             ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, vcb);
             break;
         }
         case BLORGFS_ROOT_DCB_SIGNATURE:
         {
-            DEALLOCATE_COMMON(Context);
+            DEALLOCATE_COMMON_CONTEXT(Context);
             PDCB dcb = Context;
             ExFreePool(dcb->FullPath.Buffer);
             ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
