@@ -156,7 +156,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         {
             if (!Irp->MdlAddress && UserMode == Irp->RequestorMode)
             {
-                ProbeForRead(Irp->UserBuffer, IrpSp->Parameters.QueryDirectory.Length, sizeof(UCHAR));
+                ProbeForRead(Irp->UserBuffer, IrpSp->Parameters.Read.Length, sizeof(UCHAR));
             }
             
             RtlCopyMemory(systemBuffer, fileBuffer.BodyBuffer, realLength);
