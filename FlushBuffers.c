@@ -1,22 +1,21 @@
-#include "Driver.h"
+﻿#include "Driver.h"
+
+//  IRP_MJ_FLUSH_BUFFERS handling. Currently a stub for all device types.
 
 NTSTATUS BlorgFlushBuffers(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    // PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            // result = BlorgVolumeFlushBuffers(Irp, irpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskFlushBuffers(Irp);
             break;
         }
         case BLORGFS_FSDO_MAGIC:

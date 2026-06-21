@@ -1,10 +1,9 @@
 name: "CodeQL Advanced"
 
+# Schedule-only on purpose: PREfast (RunCodeAnalysis=true in BlorgFS.vcxproj)
+# already gates every build.yml run on push/PR, so CodeQL runs weekly as a
+# deeper second opinion rather than duplicating that cost per push.
 on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
   schedule:
     - cron: '41 23 * * 6'
 
@@ -135,11 +134,9 @@ jobs:
       if: matrix.language == 'c-cpp'
       uses: github/codeql-action/init@v4
       with:
-        languages: ${{ matrix.language }}
-        build-mode: ${{ matrix.build-mode }}
-        packs: microsoft/windows-drivers@1.1.0
-        queries: security-extended,security-and-quality
-
+        languages: c-cpp
+        build-mode: manual
+        config-file: ./.github/codeql/codeql-config.yml
 
     - name: Initialize CodeQL (Actions)
       if: matrix.language == 'actions'
@@ -177,6 +174,10 @@ jobs:
           -picohttpparser/**
           -schemas/**
           -generated/**
+          -TlsFuzzTest/**
+          -TlsHandshakeTest/**
+          -TlsTest/**
+          -VolumeTester/**
         input:  sarif-results/cpp.sarif
         output: sarif-results/cpp.sarif
 

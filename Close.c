@@ -1,5 +1,16 @@
 #include "Driver.h"
 
+//
+//  IRP_MJ_CLOSE handling: drops the final reference on a node (FCB/DCB/VCB).
+//  Never takes the VCB resource: FCB/DCB closes go through
+//  BlorgNodeDereference (one interlocked decrement under the node's table
+//  bucket lock shared), and a node whose last handle leaves is deferred to
+//  the reap worker, which retires idle nodes and their newly empty
+//  ancestors in batches under a single VCB-exclusive acquire. The root DCB
+//  and VCB are never table-resident or reaped, so their counts are plain
+//  interlocked drops.
+//
+
 static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
 {
     PFILE_OBJECT fileObject = IrpSp->FileObject;
@@ -18,62 +29,34 @@ static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Volume
         case BLORGFS_DCB_SIGNATURE:
         {
             BlorgFreeFileContext(fileObject->FsContext2, VolumeDeviceObject);
-            PDCB dcb = fileObject->FsContext;
-            ExAcquireResourceExclusiveLite(vcb->Header.Resource, TRUE);
-            dcb->RefCount--;
+            BlorgNodeDereference(fileObject->FsContext);
 
-            break;
+            return STATUS_SUCCESS;
         }
         case BLORGFS_FCB_SIGNATURE:
         {
-            PFCB fcb = fileObject->FsContext;
-            ExAcquireResourceExclusiveLite(vcb->Header.Resource, TRUE);
-            fcb->RefCount--;
+            BlorgNodeDereference(fileObject->FsContext);
 
-            break;
+            return STATUS_SUCCESS;
         }
         case BLORGFS_VCB_SIGNATURE:
         {
             InterlockedDecrement64(&vcb->RefCount);
-            
+
             return STATUS_SUCCESS;
         }
         default:
         {
-            BLORGFS_PRINT("BlorgVolumeCleanup: Unknown Node type\n");
+            BLORGFS_PRINT("BlorgVolumeClose: Unknown Node type\n");
             return STATUS_INVALID_DEVICE_REQUEST;
         }
     }
-
-    PCOMMON_CONTEXT node = fileObject->FsContext;
-
-    if (((BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(node)) &&
-        (0 == node->RefCount))
-        ||
-        (BLORGFS_DCB_SIGNATURE == GET_NODE_TYPE(node)) &&
-        (IsListEmpty(&C_CAST(PDCB, node)->ChildrenList)) &&
-        (0 == node->RefCount))
-    {
-        PDCB parentDcb = node->ParentDcb;
-
-        BlorgFreeFileContext(node, VolumeDeviceObject);
-
-        while ((BLORGFS_DCB_SIGNATURE == GET_NODE_TYPE(parentDcb)) &&
-               (IsListEmpty(&parentDcb->ChildrenList)) &&
-               (0 == parentDcb->RefCount))
-        {
-            PDCB currentDcb = parentDcb;
-            parentDcb = currentDcb->ParentDcb;
-
-            BlorgFreeFileContext(currentDcb, VolumeDeviceObject);
-        }
-    }
-
-    ExReleaseResourceLite(vcb->Header.Resource);
-
-    return STATUS_SUCCESS;
 }
 
+//
+//  IRP_MJ_CLOSE dispatch entry: dispatches by device type to the
+//  per-node close handler, then completes the IRP.
+//
 NTSTATUS BlorgClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -91,7 +74,6 @@ NTSTATUS BlorgClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskClose(pIrp);
             break;
         }
         case BLORGFS_FSDO_MAGIC:

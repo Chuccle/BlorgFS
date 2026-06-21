@@ -1,22 +1,24 @@
 #include "Driver.h"
 
+//
+// Byte-range lock control (IRP_MJ_LOCK_CONTROL) dispatch. Currently a
+// stub: no lock-control support is implemented for any device type.
+//
+
 NTSTATUS BlorgLockControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    // PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(pIrp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            // result = BlorgVolumeLockControl(Irp, irpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskLockControl(pIrp);
             break;
         }
         case BLORGFS_FSDO_MAGIC:

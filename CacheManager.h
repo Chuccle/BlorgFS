@@ -1,5 +1,10 @@
 #pragma once
 
+//
+// Cache manager callback declarations: lazy-write and read-ahead
+// acquire/release pairs, plus the fast I/O possibility check.
+//
+
 _Requires_lock_held_(_Global_critical_region_)
 BOOLEAN BlorgAcquireNodeForLazyWrite(
     IN PVOID Context,

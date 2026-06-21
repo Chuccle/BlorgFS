@@ -1,4 +1,10 @@
-#pragma once
+﻿#pragma once
+
+//
+// Small shared helpers used across dispatch routines: pool
+// realloc-with-copy, IRP user-buffer locking, IRP context flag access,
+// request completion, and top-level IRP tracking.
+//
 
 inline
 __drv_allocatesMem(Mem)
@@ -76,33 +82,74 @@ _When_((PoolType& NonPagedPoolMustSucceed) != 0,
     return newBuffer;
 }
 
-inline void LockUserBuffer(IN OUT PIRP Irp, IN LOCK_OPERATION Operation, IN ULONG BufferLength)
+//
+// Builds and probes/locks an MDL for the IRP's user buffer if one isn't
+// already present, returning the outcome so callers can refuse to post a
+// request whose buffer could not be locked (posting it would later have a
+// worker thread dereference a raw user VA in the wrong process context).
+// A zero-length buffer or an MDL that already exists is success with
+// nothing to do; IoAllocateMdl failure is STATUS_INSUFFICIENT_RESOURCES;
+// a probe fault propagates its exception code (e.g. STATUS_ACCESS_VIOLATION)
+// after tearing the half-built MDL back down.
+//
+inline NTSTATUS LockUserBuffer(IN OUT PIRP Irp, IN LOCK_OPERATION Operation, IN ULONG BufferLength)
 {
-    if (!Irp->MdlAddress)
+    if (Irp->MdlAddress || 0 == BufferLength)
     {
-        PMDL mdl = IoAllocateMdl(Irp->UserBuffer, BufferLength, FALSE, FALSE, Irp);
-
-        if (mdl)
-        {
-           //
-           // Now probe the buffer described by the Irp.  If we get an exception,
-           // deallocate the Mdl and return the appropriate "expected" status.
-           //
-
-            __try
-            {
-                MmProbeAndLockPages(mdl,
-                    Irp->RequestorMode,
-                    Operation);
-
-            } 
-            __except(EXCEPTION_EXECUTE_HANDLER)
-            {
-                IoFreeMdl(mdl);
-                Irp->MdlAddress = NULL;
-            }
-        }
+        return STATUS_SUCCESS;
     }
+
+    PMDL mdl = IoAllocateMdl(Irp->UserBuffer, BufferLength, FALSE, FALSE, Irp);
+
+    if (!mdl)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    __try
+    {
+        MmProbeAndLockPages(mdl,
+            Irp->RequestorMode,
+            Operation);
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER)
+    {
+        IoFreeMdl(mdl);
+        Irp->MdlAddress = NULL;
+        return GetExceptionCode();
+    }
+
+    return STATUS_SUCCESS;
+}
+
+//
+// Irp->Tail.Overlay.DriverContext[0] carries the per-request context
+// flags (IRP_CONTEXT_FLAG_*) as a raw PVOID -- setting one requires the
+// same read-as-ULONG_PTR / SetFlag / write-back-as-PVOID dance at every
+// call site (Create.c, DirCtrl.c), since DriverContext[0] can't be
+// SetFlag'd directly (wrong type/width). Small enough to inline, shared
+// so the cast dance exists in exactly one place.
+//
+inline void SetIrpContextFlag(IN PIRP Irp, IN ULONG_PTR Flag)
+{
+    ULONG_PTR flags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
+    SetFlag(flags, Flag);
+    Irp->Tail.Overlay.DriverContext[0] = C_CAST(PVOID, flags);
+}
+
+//
+// Counterpart to SetIrpContextFlag, for flags that must be single-shot
+// across FSP re-drives of the same IRP: a flag whose payload is consumed
+// on one pass (e.g. IRP_CONTEXT_FLAG_NET_DONE and its DriverContext[1]
+// stash, BlorgVolumeCreate) is cleared at consumption so a later re-drive
+// of the IRP -- an oplock break re-queues it through OplockComplete --
+// cannot act on the flag with the payload already gone.
+//
+inline void ClearIrpContextFlag(IN PIRP Irp, IN ULONG_PTR Flag)
+{
+    ULONG_PTR flags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
+    ClearFlag(flags, Flag);
+    Irp->Tail.Overlay.DriverContext[0] = C_CAST(PVOID, flags);
 }
 
 inline void CompleteRequest(
@@ -115,7 +162,9 @@ inline void CompleteRequest(
 
 Routine Description:
 
-    This routine completes a Irp
+    This routine completes a Irp. On an error status for an input
+    operation, Information is zeroed first, since IopCompleteRequest
+    would otherwise try to copy that many bytes to the user's buffer.
 
 Arguments:
 
@@ -130,18 +179,8 @@ Return Value:
 --*/
 
 {
-    //
-    //  If we have an Irp then complete the irp.
-    //
-
     if (Irp)
     {
-        //
-        //  We got an error, so zero out the information field before
-        //  completing the request if this was an input operation.
-        //  Otherwise IopCompleteRequest will try to copy to the user's buffer.
-        //
-
         if (NT_ERROR(Status) &&
             FlagOn(Irp->Flags, IRP_INPUT_OPERATION))
         {

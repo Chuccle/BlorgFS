@@ -1,4 +1,11 @@
-#include "Driver.h"
+﻿#include "Driver.h"
+
+//
+// FILE_FS_XXX_INFORMATION query/set handlers (IRP_MJ_QUERY/SET_VOLUME_INFORMATION).
+// Reports static volume/device/attribute info; size classes report zeroed
+// (unknown) capacity. Volume is read-only, so set-volume-information is a
+// no-op stub.
+//
 
 static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
@@ -28,7 +35,6 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP Irp, PIO_STACK_LOCATION I
 
             volumeInfo->VolumeLabelLength = sizeof(volumeLabelBuffer) - sizeof(WCHAR);
 
-            // Check if the buffer is large enough to hold the string
             if (inputLength - FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel) >= volumeInfo->VolumeLabelLength)
             {
                 RtlCopyMemory(volumeInfo->VolumeLabel, volumeLabelBuffer, volumeInfo->VolumeLabelLength);
@@ -90,14 +96,12 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP Irp, PIO_STACK_LOCATION I
             attributeInfo->FileSystemAttributes = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK;
             attributeInfo->MaximumComponentNameLength = 255;
 
-            // READ ONLY VOLUME SET FOR NOW - WILL CHANGE LATER
             SetFlag(attributeInfo->FileSystemAttributes, FILE_READ_ONLY_VOLUME);
 
             WCHAR fileSystemNameBuffer[] = L"BLORGFS";
 
             attributeInfo->FileSystemNameLength = sizeof(fileSystemNameBuffer) - sizeof(WCHAR);
 
-            // Check if the buffer is large enough to hold the string
             if (inputLength - FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) >= attributeInfo->FileSystemNameLength)
             {
                 RtlCopyMemory(attributeInfo->FileSystemName, fileSystemNameBuffer, attributeInfo->FileSystemNameLength);
@@ -170,6 +174,12 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP Irp, PIO_STACK_LOCATION I
     return result;
 }
 
+//
+// IRP_MJ_QUERY_VOLUME_INFORMATION dispatch entry point: routes to the
+// per-device-type handler based on the device extension magic, completing
+// the IRP unconditionally (disk/FSDO device types currently have no
+// query handler and fall through to STATUS_INVALID_DEVICE_REQUEST).
+//
 NTSTATUS BlorgQueryVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -186,7 +196,6 @@ NTSTATUS BlorgQueryVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskFlushBuffers(Irp);
             break;
         }
         case BLORGFS_FSDO_MAGIC:
@@ -201,23 +210,26 @@ NTSTATUS BlorgQueryVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return Irp->IoStatus.Status;
 }
 
+//
+// IRP_MJ_SET_VOLUME_INFORMATION dispatch entry point. All device types are
+// currently unimplemented stubs -- the volume is read-only (see
+// FILE_READ_ONLY_VOLUME in BlorgVolumeQueryVolumeInformation), so this
+// always completes with STATUS_INVALID_DEVICE_REQUEST.
+//
 NTSTATUS BlorgSetVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    // PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            // result = BlorgVolumeSetVolumeInformation(Irp, irpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskSetVolumeInformation(Irp);
             break;
         }
         case BLORGFS_FSDO_MAGIC:

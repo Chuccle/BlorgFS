@@ -1,8 +1,19 @@
-#include "Driver.h"
+﻿#include "Driver.h"
 
+//
+//  IRP_MJ_QUERY_INFORMATION / IRP_MJ_SET_INFORMATION handling. Query side
+//  fills the supported FILE_XXX_INFORMATION classes from the in-memory
+//  FCB/DCB; set side is currently unimplemented for all device types.
+//
+
+//
+// Handles IRP_MJ_QUERY_INFORMATION for the volume device, filling the
+// supported FILE_XXX_INFORMATION classes from the in-memory FCB/DCB.
+// FilePositionInformation in particular must be implemented -- Windows'
+// GetVolumeInformation crashes without it.
+//
 static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
-    // GetVolumeInformation crashes without this being implemented, come on Windows!
     FILE_INFORMATION_CLASS fileInfoClass = IrpSp->Parameters.QueryFile.FileInformationClass;
     ULONG inputLength = IrpSp->Parameters.QueryFile.Length;
     PVOID systemBuffer = Irp->AssociatedIrp.SystemBuffer;
@@ -32,7 +43,6 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         case FileNormalizedNameInformation:
         case FileNameInformation:
         {
-            // REVIEW!!!!
             if (inputLength < sizeof(FILE_NAME_INFORMATION))
             {
                 result = STATUS_BUFFER_TOO_SMALL;
@@ -43,7 +53,6 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             PCOMMON_CONTEXT commonContext = fileObject->FsContext;
 
-            // Check if the buffer is large enough to hold the string
             if (inputLength - UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) >= commonContext->FullPath.Length)
             {
                 nameInfo->FileNameLength = commonContext->FullPath.Length;
@@ -96,13 +105,27 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             PCOMMON_CONTEXT commonContext = fileObject->FsContext;
 
             standardInfo->AllocationSize = commonContext->Header.AllocationSize;
-            standardInfo->EndOfFile = commonContext->Header.AllocationSize;
-            standardInfo->NumberOfLinks = 0;
+            standardInfo->EndOfFile = commonContext->Header.FileSize;
+            standardInfo->NumberOfLinks = 1;
             standardInfo->DeletePending = FALSE;
             standardInfo->Directory = GET_NODE_TYPE(commonContext) == BLORGFS_DCB_SIGNATURE;
 
             result = STATUS_SUCCESS;
             bytesWritten = sizeof(FILE_STANDARD_INFORMATION);
+            break;
+        }
+        case FileEaInformation:
+        {
+            if (inputLength < sizeof(FILE_EA_INFORMATION))
+            {
+                result = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            C_CAST(PFILE_EA_INFORMATION, systemBuffer)->EaSize = 0;
+
+            result = STATUS_SUCCESS;
+            bytesWritten = sizeof(FILE_EA_INFORMATION);
             break;
         }
         case FileAttributeTagInformation:
@@ -142,28 +165,95 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             networkOpenInfo->LastWriteTime.QuadPart = commonContext->LastModifiedTime;
             networkOpenInfo->ChangeTime.QuadPart = commonContext->LastModifiedTime;
             networkOpenInfo->FileAttributes = (GET_NODE_TYPE(commonContext) == BLORGFS_FCB_SIGNATURE) ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_DIRECTORY;
-            
+
             result = STATUS_SUCCESS;
-            bytesWritten = sizeof(FILE_ATTRIBUTE_TAG_INFORMATION);
+            bytesWritten = sizeof(FILE_NETWORK_OPEN_INFORMATION);
             break;
         }
         case FileAllInformation:
         {
-            if (inputLength < sizeof(FILE_ALL_INFORMATION))
+            ULONG baseLength = FIELD_OFFSET(FILE_ALL_INFORMATION, NameInformation.FileName);
+
+            if (inputLength < baseLength)
             {
                 result = STATUS_BUFFER_TOO_SMALL;
                 break;
             }
 
-            //PFILE_ALL_INFORMATION allInfo = (PFILE_ALL_INFORMATION)Irp->AssociatedIrp.SystemBuffer;
+            PFILE_ALL_INFORMATION allInfo = systemBuffer;
+            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
+            BOOLEAN isFile = (GET_NODE_TYPE(commonContext) == BLORGFS_FCB_SIGNATURE);
 
-            result = STATUS_INVALID_DEVICE_REQUEST;
-            bytesWritten = 0;
+            RtlZeroMemory(allInfo, baseLength);
+
+            allInfo->BasicInformation.CreationTime.QuadPart = commonContext->CreationTime;
+            allInfo->BasicInformation.LastAccessTime.QuadPart = commonContext->LastAccessedTime;
+            allInfo->BasicInformation.LastWriteTime.QuadPart = commonContext->LastModifiedTime;
+            allInfo->BasicInformation.ChangeTime.QuadPart = commonContext->LastModifiedTime;
+            allInfo->BasicInformation.FileAttributes = isFile ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_DIRECTORY;
+
+            allInfo->StandardInformation.AllocationSize = commonContext->Header.AllocationSize;
+            allInfo->StandardInformation.EndOfFile = commonContext->Header.FileSize;
+            allInfo->StandardInformation.NumberOfLinks = 1;
+            allInfo->StandardInformation.DeletePending = FALSE;
+            allInfo->StandardInformation.Directory = !isFile;
+
+            allInfo->PositionInformation.CurrentByteOffset = fileObject->CurrentByteOffset;
+
+            ULONG nameAvail = inputLength - baseLength;
+            ULONG nameLength = commonContext->FullPath.Length;
+            ULONG nameToCopy = (nameAvail < nameLength) ? nameAvail : nameLength;
+
+            allInfo->NameInformation.FileNameLength = nameLength;
+            RtlCopyMemory(allInfo->NameInformation.FileName, commonContext->FullPath.Buffer, nameToCopy);
+
+            bytesWritten = baseLength + nameToCopy;
+            result = (nameToCopy < nameLength) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+            break;
+        }
+        case FileStandardLinkInformation:
+        {
+            if (inputLength < sizeof(FILE_STANDARD_LINK_INFORMATION))
+            {
+                result = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            PFILE_STANDARD_LINK_INFORMATION linkInfo = systemBuffer;
+            PCOMMON_CONTEXT commonContext = fileObject->FsContext;
+
+            linkInfo->NumberOfAccessibleLinks = 1;
+            linkInfo->TotalNumberOfLinks = 1;
+            linkInfo->DeletePending = FALSE;
+            linkInfo->Directory = (GET_NODE_TYPE(commonContext) != BLORGFS_FCB_SIGNATURE);
+
+            result = STATUS_SUCCESS;
+            bytesWritten = sizeof(FILE_STANDARD_LINK_INFORMATION);
+            break;
+        }
+        case FileCaseSensitiveInformation:
+        {
+            if (inputLength < sizeof(FILE_CASE_SENSITIVE_INFORMATION))
+            {
+                result = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            C_CAST(PFILE_CASE_SENSITIVE_INFORMATION, systemBuffer)->Flags = 0;
+
+            result = STATUS_SUCCESS;
+            bytesWritten = sizeof(FILE_CASE_SENSITIVE_INFORMATION);
+            break;
+        }
+        case FileRemoteProtocolInformation:
+        {
+            result = STATUS_INVALID_PARAMETER;
             break;
         }
         default:
         {
-            result = STATUS_INVALID_DEVICE_REQUEST;
+            BLORGFS_PRINT("Unhandled QueryInformation class %d\n", fileInfoClass);
+            result = STATUS_INVALID_PARAMETER;
             bytesWritten = 0;
         }
     }
@@ -173,6 +263,12 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
     return result;
 }
 
+//
+// IRP_MJ_QUERY_INFORMATION dispatch entry point: routes to
+// BlorgVolumeQueryInformation for the volume device, is a no-op (leaves
+// STATUS_INVALID_DEVICE_REQUEST) for the disk/FSDO devices, and always
+// completes the IRP synchronously.
+//
 NTSTATUS BlorgQueryInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -189,7 +285,6 @@ NTSTATUS BlorgQueryInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskQueryInformation(pIrp);
             break;
         }
         case BLORGFS_FSDO_MAGIC:
@@ -205,23 +300,26 @@ NTSTATUS BlorgQueryInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 }
 
 
+//
+// IRP_MJ_SET_INFORMATION dispatch entry point: stubbed out for every
+// device type (every branch is a no-op), so this always completes with
+// STATUS_INVALID_DEVICE_REQUEST -- the volume is read-only, so file-info
+// mutation is not supported.
+//
 NTSTATUS BlorgSetInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    // PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            // result = BlorgVolumeSetInformation(Irp, irpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskSetInformation(Irp);
             break;
         }
         case BLORGFS_FSDO_MAGIC:

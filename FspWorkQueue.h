@@ -1,4 +1,9 @@
-#pragma once
+﻿#pragma once
+
+//
+//  IRP context flags and the FSP work-queue posting/requeue/oplock-completion
+//  declarations used to hand IRPs off to worker threads.
+//
 
 #define IRP_CONTEXT_FLAG_DISABLE_DIRTY              0x00000001
 #define IRP_CONTEXT_FLAG_WAIT                       0x00000002
@@ -14,6 +19,12 @@
 #define IRP_CONTEXT_FLAG_DISABLE_RAISE              0x00000800
 #define IRP_CONTEXT_FLAG_OVERRIDE_VERIFY            0x00001000
 #define IRP_CONTEXT_FLAG_CLEANUP_BREAKING_OPLOCK    0x00002000
+//
+//  Set by the async-HTTP completion routine when the network result for a
+//  posted IRP is ready, so the second FSP worker pass knows to skip the
+//  network call and run only the PASSIVE_LEVEL post-processing.
+//
+#define IRP_CONTEXT_FLAG_NET_DONE                   0x00004000
 
 #if (NTDDI_VERSION >= NTDDI_WINTHRESHOLD)
 #define IRP_CONTEXT_FLAG_SWAPPED_STACK              0x00100000
@@ -21,6 +32,10 @@
 
 #define IRP_CONTEXT_FLAG_PARENT_BY_CHILD            0x80000000
 
+//
+// Initializes the WAIT and RECURSIVE_CALL flags in an IRP's driver-context
+// flags word from a clean (zeroed) state.
+//
 inline void BlorgSetupIrpContext(PIRP Irp, BOOLEAN Wait)
 {
     ULONG_PTR flags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
@@ -32,12 +47,6 @@ inline void BlorgSetupIrpContext(PIRP Irp, BOOLEAN Wait)
         SetFlag(flags, IRP_CONTEXT_FLAG_WAIT);
     }
 
-    //
-    //  Set the recursive file system call parameter.  We set it true if
-    //  the TopLevelIrp field in the thread local storage is not the current
-    //  irp, otherwise we leave it as FALSE.
-    //
-
     if (IoGetTopLevelIrp() != Irp)
     {
         SetFlag(flags, IRP_CONTEXT_FLAG_RECURSIVE_CALL);
@@ -48,7 +57,11 @@ inline void BlorgSetupIrpContext(PIRP Irp, BOOLEAN Wait)
 
 NTSTATUS FsdPostRequest(IN PIRP Irp, IN PIO_STACK_LOCATION IrpSp);
 
-void PrePostIrp(IN PVOID Context, IN PIRP Irp);
+NTSTATUS FsdRequeueRequest(IN PIRP Irp);
+
+NTSTATUS PrePostIrp(IN PVOID Context, IN PIRP Irp);
+
+void OplockPrePostIrp(IN PVOID Context, IN PIRP Irp);
 
 void OplockComplete(PVOID Context, PIRP Irp);
 

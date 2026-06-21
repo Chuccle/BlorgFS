@@ -1,10 +1,27 @@
+﻿//
+// Driver load/unload: device object creation/teardown, FastIO and cache
+// manager callback wiring, mount-manager volume-arrival notification, and
+// registry-based TLS config (TlsEnabled/TlsPin/RemotePort) read at
+// DriverEntry.
+//
+
 #include "Driver.h"
+#include "Socket.h"
+#include "TlsHandshake.h"
+#include <mountmgr.h>
 
 FAST_IO_DISPATCH  BlorgFsFastDispatch;
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD     DriverUnload;
 
 struct GLOBAL global;
+
+//
+// global.LogLevel (DBG builds only): trace verbosity for BLORGFS_PRINT.
+// 0 = silent (BLORGFS_LOG still prints); raise from the debugger
+// (ed blorgfs!global.LogLevel 1) for the full per-IRP firehose. Zero-
+// initialized along with the rest of `global` (static storage duration).
+//
 
 // {02EF343C-413D-4932-BBCE-15624AACE5D9}
 static const GUID BLORGFS_FSDO_GUID = { 0x2ef343c, 0x413d, 0x4932, { 0xbb, 0xce, 0x15, 0x62, 0x4a, 0xac, 0xe5, 0xd9 } };
@@ -13,6 +30,90 @@ static const GUID BLORGFS_VDO_GUID = { 0xa6e07401, 0xf24e, 0x443e, { 0xa4, 0x7c,
 // {CC6E9F4D-1968-4D95-91AF-FFD72F35F6DA}
 static const GUID BLORGFS_DDO_GUID = { 0xcc6e9f4d, 0x1968, 0x4d95, { 0x91, 0xaf, 0xff, 0xd7, 0x2f, 0x35, 0xf6, 0xda } };
 
+//
+//  Tell the mount manager our volume has arrived. Until it does, the volume
+//  has no entry in the mount-manager database / no \??\Volume{GUID} name, so
+//  process creation can't resolve the image's backing volume and fails with
+//  STATUS_OBJECT_NAME_NOT_FOUND -- even though every file operation works
+//  through the raw B: symlink. On arrival the manager queries the device's
+//  MOUNTDEV identity (unique id / device name / suggested link name,
+//  answered in DevIoCtrl.c) and registers the volume.
+//
+//  DeviceName is the DDO's name (\Device\BlorgDrive) -- the device the B:
+//  symlink targets, i.e. the volume from the manager's point of view. Runs at
+//  PASSIVE_LEVEL from DriverEntry; failure is non-fatal (the manual symlink
+//  still gives working file I/O), but image activation needs it.
+//
+static NTSTATUS BlorgNotifyMountManagerVolumeArrival(PCUNICODE_STRING DeviceName)
+{
+    UNICODE_STRING mountMgrName = RTL_CONSTANT_STRING(MOUNTMGR_DEVICE_NAME);
+    PFILE_OBJECT mountMgrFileObject = NULL;
+    PDEVICE_OBJECT mountMgrDeviceObject = NULL;
+
+    NTSTATUS status = IoGetDeviceObjectPointer(
+        &mountMgrName,
+        FILE_READ_ATTRIBUTES,
+        &mountMgrFileObject,
+        &mountMgrDeviceObject);
+
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    ULONG targetSize = UFIELD_OFFSET(MOUNTMGR_TARGET_NAME, DeviceName) + DeviceName->Length;
+    PMOUNTMGR_TARGET_NAME target = ExAllocatePoolZero(NonPagedPoolNx, targetSize, 'MMlB');
+
+    if (!target)
+    {
+        ObDereferenceObject(mountMgrFileObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    target->DeviceNameLength = DeviceName->Length;
+    RtlCopyMemory(target->DeviceName, DeviceName->Buffer, DeviceName->Length);
+
+    KEVENT event;
+    KeInitializeEvent(&event, NotificationEvent, FALSE);
+
+    IO_STATUS_BLOCK iosb = { 0 };
+    PIRP irp = IoBuildDeviceIoControlRequest(
+        IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION,
+        mountMgrDeviceObject,
+        target,
+        targetSize,
+        NULL,
+        0,
+        FALSE,
+        &event,
+        &iosb);
+
+    if (!irp)
+    {
+        ExFreePool(target);
+        ObDereferenceObject(mountMgrFileObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = IoCallDriver(mountMgrDeviceObject, irp);
+
+    if (STATUS_PENDING == status)
+    {
+        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+        status = iosb.Status;
+    }
+
+    ExFreePool(target);
+    ObDereferenceObject(mountMgrFileObject);
+
+    return status;
+}
+
+//
+// Creates the disk device object (the DDO the B: symlink targets) via
+// WdmlibIoCreateDeviceSecure, tags its extension with BLORGFS_DDO_MAGIC,
+// and clears DO_DEVICE_INITIALIZING so I/O can reach it.
+//
 static NTSTATUS CreateBlorgDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* DiskDeviceObject)
 {
     BLORGFS_PRINT("Entering Drive Creation\n");
@@ -37,41 +138,9 @@ static NTSTATUS CreateBlorgDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE
         return result;
     }
 
-    USHORT nameBufferSize = 128 * sizeof(WCHAR);
-
-    PWCHAR nameBuffer = ExAllocatePoolZero(PagedPool, nameBufferSize, 'BFS');
-
-    if (!nameBuffer)
-    {
-        IoDeleteDevice(diskDeviceObject);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
     PBLORGFS_DDO_DEVICE_EXTENSION devExt = diskDeviceObject->DeviceExtension;
 
     devExt->Hdr.Identifier = BLORGFS_DDO_MAGIC;
-
-    RtlInitEmptyUnicodeString(&devExt->SymLinkName, nameBuffer, nameBufferSize);
-
-    result = RtlUnicodeStringPrintf(&devExt->SymLinkName,
-        BLORGFS_DOS_DRIVELETTER_FORMAT_STRING,
-        L'B');
-
-    if (!NT_SUCCESS(result))
-    {
-        ExFreePool(GetDiskDeviceExtension(diskDeviceObject)->SymLinkName.Buffer);
-        IoDeleteDevice(diskDeviceObject);
-        return result;
-    }
-
-    result = IoCreateSymbolicLink(&devExt->SymLinkName, &vdoString);
-
-    if (!NT_SUCCESS(result))
-    {
-        ExFreePool(GetDiskDeviceExtension(diskDeviceObject)->SymLinkName.Buffer);
-        IoDeleteDevice(diskDeviceObject);
-        return result;
-    }
 
     ClearFlag(diskDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
@@ -80,16 +149,27 @@ static NTSTATUS CreateBlorgDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE
     return result;
 }
 
+// Tears down the disk device object created by CreateBlorgDiskDeviceObject.
 static void DeleteBlorgDiskDeviceObject(PDEVICE_OBJECT DiskDeviceObject)
 {
     if (DiskDeviceObject)
     {
-        IoDeleteSymbolicLink(&GetDiskDeviceExtension(DiskDeviceObject)->SymLinkName);
-        ExFreePool(GetDiskDeviceExtension(DiskDeviceObject)->SymLinkName.Buffer);
         IoDeleteDevice(DiskDeviceObject);
     }
 }
 
+//
+// Creates the volume device object (VDO) at mount time: allocates the
+// device, initializes its lookaside lists, root DCB, VCB, work queue, and
+// directory-notify package, unwinding each already-initialized piece in
+// reverse order if a later step fails so no resource leaks on a partial
+// mount failure. The notify IRPs registered against the directory-notify
+// package are completed in DeleteBlorgVolumeDeviceObject (via
+// FsRtlNotifyUninitializeSync) and at handle cleanup (FsRtlNotifyCleanup).
+// FsRtlNotifyInitializeSync raises on allocation failure, which is
+// acceptable here since it only runs at driver/volume init as a load
+// failure.
+//
 NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject)
 {
     BLORGFS_PRINT("Entering Volume Creation\n");
@@ -151,7 +231,7 @@ NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
         return result;
     }
 
-    result = CreateWorkQueue();
+    result = BlorgNodeTableInit(volumeDeviceObject);
 
     if (!NT_SUCCESS(result))
     {
@@ -165,19 +245,77 @@ NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
         return result;
     }
 
+    result = CreateWorkQueue();
+
+    if (!NT_SUCCESS(result))
+    {
+        BlorgNodeTableTeardown();
+        BlorgFreeFileContext(devExt->Vcb, volumeDeviceObject);
+        BlorgFreeFileContext(devExt->RootDcb, volumeDeviceObject);
+        ExDeleteNPagedLookasideList(&devExt->NonPagedNodeLookasideList);
+        ExDeletePagedLookasideList(&devExt->FcbLookasideList);
+        ExDeletePagedLookasideList(&devExt->DcbLookasideList);
+        ExDeletePagedLookasideList(&devExt->CcbLookasideList);
+        IoDeleteDevice(volumeDeviceObject);
+        return result;
+    }
+
+    FsRtlNotifyInitializeSync(&devExt->NotifySync);
+    InitializeListHead(&devExt->NotifyList);
+
     ClearFlag(volumeDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
     *VolumeDeviceObject = volumeDeviceObject;
     return STATUS_SUCCESS;
 }
 
+//
+// Frees every node remaining in the FCB/DCB tree under RootDcb, leaf-first:
+// descend to a leaf-most node (an FCB, or a DCB with no children), free it
+// (BlorgFreeFileContext unlinks it from its parent's ChildrenList), and
+// restart from the root until the tree is empty. Runs only at volume
+// teardown, after the FSP queue is drained and no handles remain, so no
+// locking is needed. Without this walk, any nodes still cached in the
+// tree would outlive the lookaside lists they were allocated from.
+//
+static void FreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
+{
+    while (!IsListEmpty(&RootDcb->ChildrenList))
+    {
+        PCOMMON_CONTEXT node = CONTAINING_RECORD(RootDcb->ChildrenList.Flink, COMMON_CONTEXT, Links);
+
+        while ((BLORGFS_DCB_SIGNATURE == GET_NODE_TYPE(node)) &&
+               !IsListEmpty(&C_CAST(PDCB, node)->ChildrenList))
+        {
+            node = CONTAINING_RECORD(C_CAST(PDCB, node)->ChildrenList.Flink, COMMON_CONTEXT, Links);
+        }
+
+        BlorgFreeFileContext(node, VolumeDeviceObject);
+    }
+}
+
+//
+// Tears down the volume device object: completes/frees the notify sync
+// object, destroys the work queue, retires the node table and its reap
+// worker (before the tree walk, so no work item can race the frees),
+// releases the VCB, the remaining node tree, and the root DCB, deletes
+// the lookaside lists, and deletes the device -- mirrors the init order
+// in CreateBlorgVolumeDeviceObject in reverse. FsRtlNotifyUninitializeSync
+// completes any still-pending NOTIFY_CHANGE_DIRECTORY IRPs and frees the
+// notify sync object; safe even if no notifies were ever registered.
+//
 static void DeleteBlorgVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
 {
     if (VolumeDeviceObject)
     {
         PBLORGFS_VDO_DEVICE_EXTENSION pDevExt = GetVolumeDeviceExtension(VolumeDeviceObject);
+
+        FsRtlNotifyUninitializeSync(&pDevExt->NotifySync);
+
         DestroyWorkQueue();
+        BlorgNodeTableTeardown();
         BlorgFreeFileContext(pDevExt->Vcb, VolumeDeviceObject);
+        FreeFileContextTree(pDevExt->RootDcb, VolumeDeviceObject);
         BlorgFreeFileContext(pDevExt->RootDcb, VolumeDeviceObject);
         ExDeleteNPagedLookasideList(&pDevExt->NonPagedNodeLookasideList);
         ExDeletePagedLookasideList(&pDevExt->FcbLookasideList);
@@ -187,6 +325,11 @@ static void DeleteBlorgVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
     }
 }
 
+//
+// Creates the file system device object (FSDO) and registers it with the
+// I/O manager via IoRegisterFileSystem, making it visible to mount
+// requests and the FS recognizer.
+//
 static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* FileSystemDeviceObject)
 {
     BLORGFS_PRINT("Entering Filesystem Creation\n");
@@ -225,6 +368,11 @@ static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, P
     return result;
 }
 
+//
+// Tears down the file system device object: if a volume is still mounted
+// on it, dereferences and deletes that volume device object first, then
+// unregisters and deletes the FSDO itself.
+//
 static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObject)
 {
     if (FileSystemDeviceObject)
@@ -242,6 +390,19 @@ static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObj
     }
 }
 
+//
+// Driver unload callback: releases the FSDO and DDO (dereference then
+// delete, mirroring the reference taken in DriverEntry), then tears down
+// the HTTP client, path cache, TLS globals, and security descriptor.
+// Mostly the reverse of DriverEntry init order, with two deliberate
+// exceptions around the HTTP client's inputs: RemoteAddressInfo must be
+// freed while WSK is still registered (FreeHttpAddrInfo goes through
+// WskFreeAddressInfo, so it has to precede CleanupHttpClient), while
+// RemoteHostAnsi -- read by HttpBuildRequest on every request-issue
+// path -- and RemoteHostSniAnsi -- read by TlsStartHandshakeAsync on
+// every fresh TLS connection -- are only freed after CleanupHttpClient
+// has drained the client.
+//
 void DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
@@ -257,13 +418,354 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
     FreeHttpAddrInfo(global.RemoteAddressInfo);
 
     CleanupHttpClient();
+
+    if (global.RemoteHostAnsi)
+    {
+        ExFreePool(global.RemoteHostAnsi);
+        global.RemoteHostAnsi = NULL;
+    }
+
+    if (global.RemoteHostSniAnsi)
+    {
+        ExFreePool(global.RemoteHostSniAnsi);
+        global.RemoteHostSniAnsi = NULL;
+    }
+
+    PathCacheCleanup();
+
+    TlsGlobalCleanup();
+
+    BlorgFreeSecurityDescriptor();
 }
 
+//
+//  Reads TLS config from <services key>\Parameters at
+//  DriverEntry, so the backend's cert pin (and, if the operator wants,
+//  the remote port) never needs a rebuild to update -- only PortOut is
+//  actually mutated by a missing/absent RemotePort value; TlsEnabledOut
+//  and the pin (via TlsSetPin) simply keep their existing defaults
+//  (FALSE / unconfigured) when their registry values are absent.
+//
+//  Every failure path here is silently tolerated (missing Parameters
+//  key entirely, individual values missing or the wrong type/size) --
+//  this must never fail driver load, matching TlsGlobalInit's own
+//  "TLS is opt-in" policy elsewhere in this same function.
+//
+#define BLORGFS_REG_TAG 'GRBT'
+#define BLORGFS_REG_PORT_MAX_CHARS 8 // "65535" + NUL, with headroom
+#define BLORGFS_DEFAULT_REMOTE_HOST L"10.0.50.17"
+
+//
+// BuildRemoteHostAnsiString's worst case is exactly these two caps
+// combined: BLORGFS_REG_HOST_MAX_CHARS covers the host's characters plus
+// the trailing NUL, and BLORGFS_REG_PORT_MAX_CHARS covers the ':'
+// separator plus the port's characters. Client.c sizes its Host-header
+// reads against BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES (Driver.h), so a bump
+// to either cap here must be reflected there -- this assert is what makes
+// that drift a build break instead of a free-build NT_ASSERT no-op.
+//
+static_assert(
+    BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES == BLORGFS_REG_HOST_MAX_CHARS + BLORGFS_REG_PORT_MAX_CHARS,
+    "BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES must track the registry host and port caps");
+
+//
+// Reads a single registry value of the expected type into Buffer, failing
+// if the stored value doesn't match ExpectedType or exceeds BufferSize.
+// infoBuffer's fixed 256-byte headroom over KEY_VALUE_PARTIAL_INFORMATION's
+// own header covers every value this driver actually reads (a DWORD, a
+// 32-byte pin, a short port string, or a BLORGFS_REG_HOST_MAX_CHARS
+// hostname) -- not a general-purpose arbitrarily-sized read.
+//
+static NTSTATUS ReadBlorgfsRegistryValue(
+    HANDLE ParametersKey,
+    PCWSTR ValueName,
+    ULONG ExpectedType,
+    PVOID Buffer,
+    ULONG BufferSize,
+    PULONG ActualSize)
+{
+    UNICODE_STRING valueName;
+    RtlInitUnicodeString(&valueName, ValueName);
+
+    UCHAR infoBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 256];
+    ULONG resultLength = 0;
+
+    NTSTATUS status = ZwQueryValueKey(
+        ParametersKey,
+        &valueName,
+        KeyValuePartialInformation,
+        infoBuffer,
+        sizeof(infoBuffer),
+        &resultLength);
+
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    PKEY_VALUE_PARTIAL_INFORMATION info = C_CAST(PKEY_VALUE_PARTIAL_INFORMATION, infoBuffer);
+
+    if (info->Type != ExpectedType || info->DataLength > BufferSize)
+    {
+        return STATUS_OBJECT_TYPE_MISMATCH;
+    }
+
+    RtlCopyMemory(Buffer, info->Data, info->DataLength);
+    *ActualSize = info->DataLength;
+
+    return STATUS_SUCCESS;
+}
+
+//
+// Accepts a registry-supplied RemotePort only if it is all digits and
+// parses to 1..65535. Anything else -- empty, non-numeric, too long, out
+// of range -- is rejected so the caller keeps the scheme-default port: a
+// garbage port fed to GetHttpAddrInfo would otherwise surface only as an
+// opaque resolve/connect failure at driver load. The 5-character cap is
+// "65535"'s length, which also keeps the accumulator far from overflow.
+//
+static BOOLEAN IsValidPortString(const WCHAR* Port, USHORT PortChars)
+{
+    if (0 == PortChars || PortChars > 5)
+    {
+        return FALSE;
+    }
+
+    ULONG value = 0;
+
+    for (USHORT i = 0; i < PortChars; ++i)
+    {
+        if (Port[i] < L'0' || Port[i] > L'9')
+        {
+            return FALSE;
+        }
+
+        value = (value * 10) + (Port[i] - L'0');
+    }
+
+    return (value >= 1) && (value <= 65535);
+}
+
+//
+// Opens <ServiceRegistryPath>\Parameters and reads TlsEnabled, TlsPin,
+// RemotePort, and RemoteHost into the corresponding globals/PortOut/HostOut,
+// tolerating any missing key or value per the policy described above.
+// PortOut->Length/HostOut->Length are set to actualSize minus one WCHAR to
+// exclude the registry REG_SZ value's terminating NUL. RemotePort is
+// additionally validated as a real port number (IsValidPortString); an
+// invalid value is logged and ignored, keeping the scheme default.
+//
+static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRING PortOut, PUNICODE_STRING HostOut)
+{
+    UNICODE_STRING parametersSuffix = RTL_CONSTANT_STRING(L"\\Parameters");
+
+    UNICODE_STRING parametersPath;
+    parametersPath.Length = 0;
+    parametersPath.MaximumLength = ServiceRegistryPath->Length + parametersSuffix.Length + sizeof(WCHAR);
+    parametersPath.Buffer = ExAllocatePoolZero(NonPagedPoolNx, parametersPath.MaximumLength, BLORGFS_REG_TAG);
+
+    if (!parametersPath.Buffer)
+    {
+        return;
+    }
+
+    RtlAppendUnicodeStringToString(&parametersPath, ServiceRegistryPath);
+    RtlAppendUnicodeStringToString(&parametersPath, &parametersSuffix);
+
+    OBJECT_ATTRIBUTES objectAttributes;
+    InitializeObjectAttributes(&objectAttributes, &parametersPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    HANDLE parametersKey;
+    NTSTATUS status = ZwOpenKey(&parametersKey, KEY_READ, &objectAttributes);
+
+    ExFreePool(parametersPath.Buffer);
+
+    if (!NT_SUCCESS(status))
+    {
+        return;
+    }
+
+    ULONG tlsEnabledValue = 0;
+    ULONG actualSize = 0;
+
+    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"TlsEnabled", REG_DWORD, &tlsEnabledValue, sizeof(tlsEnabledValue), &actualSize)))
+    {
+        global.TlsEnabled = (0 != tlsEnabledValue);
+    }
+
+    UCHAR pinValue[TLS_HASH_LEN];
+
+    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"TlsPin", REG_BINARY, pinValue, sizeof(pinValue), &actualSize))
+        && TLS_HASH_LEN == actualSize)
+    {
+        TlsSetPin(pinValue);
+    }
+
+    WCHAR portValue[BLORGFS_REG_PORT_MAX_CHARS];
+
+    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"RemotePort", REG_SZ, portValue, sizeof(portValue), &actualSize))
+        && actualSize >= sizeof(WCHAR))
+    {
+        USHORT portChars = C_CAST(USHORT, (actualSize - sizeof(WCHAR)) / sizeof(WCHAR));
+
+        if (IsValidPortString(portValue, portChars))
+        {
+            PortOut->Length = portChars * sizeof(WCHAR);
+            RtlCopyMemory(PortOut->Buffer, portValue, PortOut->Length);
+        }
+        else
+        {
+            BLORGFS_LOG("ReadBlorgfsRegistryConfig() - ignoring invalid RemotePort registry value, using scheme default\n");
+        }
+    }
+
+    WCHAR hostValue[BLORGFS_REG_HOST_MAX_CHARS];
+
+    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"RemoteHost", REG_SZ, hostValue, sizeof(hostValue), &actualSize))
+        && actualSize >= sizeof(WCHAR))
+    {
+        HostOut->Length = C_CAST(USHORT, actualSize) - sizeof(WCHAR);
+        RtlCopyMemory(HostOut->Buffer, hostValue, HostOut->Length);
+    }
+
+    ZwClose(parametersKey);
+}
+
+//
+// Builds "global.RemoteHostAnsi" -- the ANSI "host" or "host:port"
+// authority used in every outgoing request's "Host:" header (Client.c's
+// HttpBuildRequest). PortString is NULL when the resolved port is the
+// scheme default (80 plaintext / 443 TLS), where RFC 9112 wants the port
+// omitted; otherwise it is appended so any name-based routing in front of
+// the backend sees the same authority the driver actually connected to --
+// with the plaintext default of 8080 the port is therefore normally
+// present. Truncating WCHAR->CHAR is safe here: both parts are either
+// compiled-in defaults or registry-supplied DNS names/port numbers, which
+// are ASCII-only by definition. Total size is bounded by
+// BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES (Driver.h), which Client.c relies on.
+//
+static PSTR BuildRemoteHostAnsiString(PCUNICODE_STRING HostString, PCUNICODE_STRING PortString)
+{
+    USHORT hostChars = HostString->Length / sizeof(WCHAR);
+    USHORT portChars = PortString ? PortString->Length / sizeof(WCHAR) : 0;
+    SIZE_T ansiSize = C_CAST(SIZE_T, hostChars) + (PortString ? C_CAST(SIZE_T, portChars) + 1 : 0) + 1;
+
+    NT_ASSERT(ansiSize <= BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES);
+
+    PSTR ansiHost = ExAllocatePoolZero(NonPagedPoolNx, ansiSize, BLORGFS_REG_TAG);
+
+    if (!ansiHost)
+    {
+        return NULL;
+    }
+
+    PSTR dst = ansiHost;
+    PWCH src = HostString->Buffer;
+
+    for (USHORT i = 0; i < hostChars; ++i)
+    {
+        *dst++ = C_CAST(CHAR, *src++);
+    }
+
+    if (PortString)
+    {
+        *dst++ = ':';
+        src = PortString->Buffer;
+
+        for (USHORT i = 0; i < portChars; ++i)
+        {
+            *dst++ = C_CAST(CHAR, *src++);
+        }
+    }
+
+    return ansiHost;
+}
+
+//
+// RFC 6066 3: the SNI HostName must be a DNS hostname -- IPv4 and IPv6
+// literals are explicitly not permitted. This is a shape test, not full
+// address validation: any ':' means an IPv6 literal (impossible in a
+// hostname), and a string of only digits and dots is taken as an IPv4
+// literal. It deliberately errs toward calling something a literal,
+// since the failure modes are asymmetric -- omitting SNI is always legal,
+// sending a literal in it never is.
+//
+static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
+{
+    BOOLEAN digitsAndDotsOnly = TRUE;
+
+    for (USHORT i = 0; i < HostString->Length / sizeof(WCHAR); ++i)
+    {
+        WCHAR c = HostString->Buffer[i];
+
+        if (L':' == c)
+        {
+            return TRUE;
+        }
+
+        if ((c < L'0' || c > L'9') && (L'.' != c))
+        {
+            digitsAndDotsOnly = FALSE;
+        }
+    }
+
+    return digitsAndDotsOnly;
+}
+
+//
+// Driver load entry point: initializes the path cache and TLS globals,
+// wires up the major function table, FastIO dispatch, and cache manager
+// callbacks, then creates the FSDO and DDO device objects and the HTTP
+// client in order, reads TLS/port config from the registry, resolves the
+// backend address (defaulting the port by TlsEnabled), and finally
+// announces the volume to the mount manager. Any device/client/address
+// creation step failing unwinds everything created so far and returns
+// STATUS_FAILED_DRIVER_ENTRY; the final mount-manager notification is
+// best-effort and does not fail the load.
+//
+// TlsGlobalInit is non-fatal: TLS is opt-in (global.TlsEnabled, off by
+// default), so a failure here just means it stays unusable if later
+// enabled -- it must not fail the whole driver load, since the plaintext
+// HTTP path doesn't touch this at all. See Tls.h's TlsGlobalInit comment
+// for why this one-time, driver-lifetime provider handle exists.
+//
+// TLS/port config (TlsEnabled, TlsPin, an optional RemotePort override)
+// is read from the registry before resolving the backend address, so the
+// default port can depend on whatever TlsEnabled ends up being -- see
+// ReadBlorgfsRegistryConfig. With no explicit RemotePort override, the
+// default port tracks TlsEnabled exactly (a plaintext server can't parse
+// a ClientHello, and a TLS-speaking one won't understand plaintext HTTP):
+// 443 if TRUE, 8080 if FALSE. RTL_CONSTANT_STRING only expands to a valid
+// initializer, not a general expression, hence if/else rather than a
+// ternary for picking the default. RemoteHost works the same way --
+// Parameters\RemoteHost if present, else BLORGFS_DEFAULT_REMOTE_HOST --
+// and the same resolved UNICODE_STRING both drives GetHttpAddrInfo and
+// (via BuildRemoteHostAnsiString) becomes global.RemoteHostAnsi, so the
+// Host header always names whatever address the driver actually
+// resolved/connected to, never a stale literal. The Host header carries
+// an explicit :port whenever the resolved port isn't the scheme default
+// (80 plaintext / 443 TLS) -- see BuildRemoteHostAnsiString.
+//
+// The mount-manager volume-arrival notification runs last, only once the
+// FS is registered, the disk device + B: symlink are up, and the HTTP
+// client is ready -- processing the arrival can make the manager open the
+// volume, which triggers a mount, which needs the HTTP client live. It is
+// best-effort: the manual B: symlink already provides working file I/O,
+// so a failure here is logged but does not abort the load -- it only
+// costs executable launch from the volume (the kernel needs the
+// mount-manager volume identity to resolve B: during image activation).
+//
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
-    UNREFERENCED_PARAMETER(RegistryPath);
-
     ExInitializeDriverRuntime(0);
+
+    PathCacheInit();
+
+    NTSTATUS tlsInitStatus = TlsGlobalInit();
+    if (!NT_SUCCESS(tlsInitStatus))
+    {
+        BLORGFS_LOG("DriverEntry() - TlsGlobalInit failed: 0x%X (TLS unavailable if enabled)\n", tlsInitStatus);
+    }
 
     global.DriverObject = DriverObject;
 
@@ -288,11 +790,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DriverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = BlorgQuerySecurity;
     DriverObject->MajorFunction[IRP_MJ_SET_SECURITY] = BlorgSetSecurity;
 
-#pragma warning(suppress: 28175) // "We are a filesystem. Touching FastIoDispatch is allowed"
+#pragma warning(suppress: 28175)
     DriverObject->FastIoDispatch = &BlorgFsFastDispatch;
 
     RtlZeroMemory(&BlorgFsFastDispatch, sizeof(FAST_IO_DISPATCH));
 
+    global.CacheManagerCallbacks.AcquireForLazyWrite = BlorgAcquireNodeForLazyWrite;
+    global.CacheManagerCallbacks.ReleaseFromLazyWrite = BlorgReleaseNodeFromLazyWrite;
     global.CacheManagerCallbacks.AcquireForReadAhead = BlorgAcquireNodeForReadAhead;
     global.CacheManagerCallbacks.ReleaseFromReadAhead = BlorgReleaseNodeFromReadAhead;
 
@@ -302,11 +806,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     BlorgFsFastDispatch.MdlRead = FsRtlMdlReadDev;
     BlorgFsFastDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;
     
-    PDEVICE_OBJECT fileSystemDeviceObject;
-    NTSTATUS result = CreateBlorgFileSystemDeviceObject(DriverObject, &fileSystemDeviceObject);
+    NTSTATUS result = BlorgInitializeSecurityDescriptor();
 
     if (!NT_SUCCESS(result))
     {
+        return STATUS_FAILED_DRIVER_ENTRY;
+    }
+
+    PDEVICE_OBJECT fileSystemDeviceObject;
+    result = CreateBlorgFileSystemDeviceObject(DriverObject, &fileSystemDeviceObject);
+
+    if (!NT_SUCCESS(result))
+    {
+        BlorgFreeSecurityDescriptor();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -321,6 +833,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         ObDereferenceObject(global.FileSystemDeviceObject);
         DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
+        BlorgFreeSecurityDescriptor();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -337,14 +850,47 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         ObDereferenceObject(global.DiskDeviceObject);
         DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
         global.DiskDeviceObject = NULL;
+        BlorgFreeSecurityDescriptor();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
-    ADDRINFOEXW hints = { .ai_flags = AI_CANONNAME, .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
-    UNICODE_STRING nodeString = RTL_CONSTANT_STRING(L"blorgfs-server.blorg.lan");
-    UNICODE_STRING portString = RTL_CONSTANT_STRING(L"8080");
+    WCHAR portBuffer[BLORGFS_REG_PORT_MAX_CHARS];
+    UNICODE_STRING portString;
+    portString.Length = 0;
+    portString.MaximumLength = sizeof(portBuffer);
+    portString.Buffer = portBuffer;
 
-    result = GetHttpAddrInfo(&nodeString, &portString, &hints, &global.RemoteAddressInfo);
+    WCHAR hostBuffer[BLORGFS_REG_HOST_MAX_CHARS];
+    UNICODE_STRING hostString;
+    hostString.Length = 0;
+    hostString.MaximumLength = sizeof(hostBuffer);
+    hostString.Buffer = hostBuffer;
+
+    ReadBlorgfsRegistryConfig(RegistryPath, &portString, &hostString);
+
+    if (0 == portString.Length)
+    {
+        if (global.TlsEnabled)
+        {
+            UNICODE_STRING defaultPort = RTL_CONSTANT_STRING(L"443");
+            RtlCopyUnicodeString(&portString, &defaultPort);
+        }
+        else
+        {
+            UNICODE_STRING defaultPort = RTL_CONSTANT_STRING(L"8080");
+            RtlCopyUnicodeString(&portString, &defaultPort);
+        }
+    }
+
+    if (0 == hostString.Length)
+    {
+        UNICODE_STRING defaultHost = RTL_CONSTANT_STRING(BLORGFS_DEFAULT_REMOTE_HOST);
+        RtlCopyUnicodeString(&hostString, &defaultHost);
+    }
+
+    ADDRINFOEXW hints = { .ai_flags = AI_CANONNAME, .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+
+    result = GetHttpAddrInfo(&hostString, &portString, &hints, &global.RemoteAddressInfo);
 
     if (!NT_SUCCESS(result))
     {
@@ -355,7 +901,59 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         ObDereferenceObject(global.DiskDeviceObject);
         DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
         global.DiskDeviceObject = NULL;
+        BlorgFreeSecurityDescriptor();
         return STATUS_FAILED_DRIVER_ENTRY;
+    }
+
+    UNICODE_STRING schemeDefaultPort;
+
+    if (global.TlsEnabled)
+    {
+        UNICODE_STRING tlsDefaultPort = RTL_CONSTANT_STRING(L"443");
+        schemeDefaultPort = tlsDefaultPort;
+    }
+    else
+    {
+        UNICODE_STRING plaintextDefaultPort = RTL_CONSTANT_STRING(L"80");
+        schemeDefaultPort = plaintextDefaultPort;
+    }
+
+    BOOLEAN portIsSchemeDefault = RtlEqualUnicodeString(&portString, &schemeDefaultPort, FALSE);
+
+    global.RemoteHostAnsi = BuildRemoteHostAnsiString(&hostString, portIsSchemeDefault ? NULL : &portString);
+
+    if (!global.RemoteHostAnsi)
+    {
+        FreeHttpAddrInfo(global.RemoteAddressInfo);
+        CleanupHttpClient();
+        ObDereferenceObject(global.FileSystemDeviceObject);
+        DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
+        global.FileSystemDeviceObject = NULL;
+        ObDereferenceObject(global.DiskDeviceObject);
+        DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
+        global.DiskDeviceObject = NULL;
+        BlorgFreeSecurityDescriptor();
+        return STATUS_FAILED_DRIVER_ENTRY;
+    }
+
+    if (global.TlsEnabled && !HostStringIsIpLiteral(&hostString))
+    {
+        global.RemoteHostSniAnsi = BuildRemoteHostAnsiString(&hostString, NULL);
+
+        if (!global.RemoteHostSniAnsi)
+        {
+            BLORGFS_LOG("DriverEntry() - SNI host string allocation failed; ClientHello will omit SNI\n");
+        }
+    }
+
+    {
+        UNICODE_STRING diskDeviceName = RTL_CONSTANT_STRING(BLORGFS_DDO_STRING);
+        NTSTATUS mountMgrStatus = BlorgNotifyMountManagerVolumeArrival(&diskDeviceName);
+
+        if (!NT_SUCCESS(mountMgrStatus))
+        {
+            BLORGFS_LOG("DriverEntry() - mount manager volume-arrival notification failed: 0x%X\n", mountMgrStatus);
+        }
     }
 
     return STATUS_SUCCESS;

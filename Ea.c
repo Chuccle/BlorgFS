@@ -1,22 +1,32 @@
-#include "Driver.h"
+﻿#include "Driver.h"
 
+//
+// IRP_MJ_QUERY_EA / IRP_MJ_SET_EA dispatch. BlorgFS has no extended
+// attribute store, so both handlers just report/reject accordingly per
+// device type.
+//
+
+//
+// Reports "no EAs" for a volume file rather than a hard error: some
+// callers (e.g. the image loader activating an executable) query EAs as
+// part of open, and a hard failure there aborts the open entirely.
+//
 NTSTATUS BlorgQueryEa(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    // PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            // result = BlorgVolumeQueryEa(irp, irpSp);
+            Irp->IoStatus.Information = 0;
+            result = STATUS_NO_EAS_ON_FILE;
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskQueryEa(irp);
             break;
         }
         case BLORGFS_FSDO_MAGIC:
@@ -31,23 +41,21 @@ NTSTATUS BlorgQueryEa(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return Irp->IoStatus.Status;
 }
 
+// No device type supports setting EAs; always rejected.
 NTSTATUS BlorgSetEa(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
 
-    // PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     switch (GetDeviceExtensionMagic(DeviceObject))
     {
         case BLORGFS_VDO_MAGIC:
         {
-            // result = BlorgVolumeSetEa(Irp, irpSp);
             break;
         }
         case BLORGFS_DDO_MAGIC:
         {
-            // result = BlorgDiskSetEa(Irp);
             break;
         }
         case BLORGFS_FSDO_MAGIC:

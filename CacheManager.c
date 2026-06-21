@@ -1,5 +1,10 @@
 #include "Driver.h"
 
+//
+//  Cache manager callbacks (acquire/release for lazy write and read-ahead)
+//  and the FastIoCheckIfPossible fast-I/O entry point.
+//
+
 _Requires_lock_held_(_Global_critical_region_)
 BOOLEAN
 BlorgAcquireNodeForLazyWrite(
@@ -29,37 +34,37 @@ Return Value:
 
     TRUE - if the Fcb has been acquired
 
+Notes:
+
+    We do not need to disable APC delivery to guard against a rogue user
+    issuing a suspend APC, because the caller is guaranteed to be either in
+    the system context (to which a user cannot deliver a suspend APC), or
+    to have already disabled kernel APC delivery before calling. This holds
+    for all the other pre-acquire routines as well.
+
+    The Lazy Writer is assumed to acquire this Fcb only once, so
+    LazyWriteThread must be clear on entry (asserted); it is then set so the
+    Lazy Writer never tries to advance Valid Data or deadlocks trying to
+    get the Fcb exclusive.
+
+    Cc can run this acquire on several worker threads concurrently (for
+    different files), so the first-lazy-writer seed of
+    global.LazyWriteThread is claimed with an interlocked
+    compare-exchange -- a plain check-then-set lets two racing acquires
+    both see NULL and the second silently overwrite the first.
+
+    Setting the top-level IRP to FSRTL_CACHE_TOP_LEVEL_IRP is a kludge
+    because Cc is really the top level: when it enters the file system, we
+    would otherwise think this is a recursive call and complete the request
+    with hard errors or verify.
+
 --*/
 
 {
-    //
-    //  Check here for the EA File.  It turns out we need the normal
-    //  resource shared in this case.  Otherwise we take the paging
-    //  I/O resource shared.
-    //
-
-    //
-    //  Note that we do not need to disable APC delivery to guard 
-    //  against a rogue user issuing a suspend APC. That is because 
-    //  it is guaranteed that the caller is either in the system context,
-    //  to which a user cannot deliver a suspend APC, or the caller has
-    //  already disabled kernel APC delivery before calling. This is true
-    //  for all the other pre-acquire routines as well.
-    //
-
     if (!ExAcquireResourceSharedLite(C_CAST(PFCB, Context)->Header.PagingIoResource, Wait))
     {
         return FALSE;
     }
-
-    //
-    // We assume the Lazy Writer only acquires this Fcb once.
-    // Therefore, it should be guaranteed that this flag is currently
-    // clear (the ASSERT), and then we will set this flag, to ensure
-    // that the Lazy Writer will never try to advance Valid Data, and
-    // also not deadlock by trying to get the Fcb exclusive.
-    //
-
 
     NT_ASSERT(BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(Context));
     NT_ASSERT(NULL != PsGetCurrentThread());
@@ -67,17 +72,7 @@ Return Value:
 
     (C_CAST(PFCB, Context))->LazyWriteThread = PsGetCurrentThread();
 
-    if (!global.LazyWriteThread)
-    {
-        global.LazyWriteThread = PsGetCurrentThread();
-    }
-
-    //
-    //  This is a kludge because Cc is really the top level.  When it
-    //  enters the file system, we will think it is a resursive call
-    //  and complete the request with hard errors or verify.  It will
-    //  then have to deal with them, somehow....
-    //
+    InterlockedCompareExchangePointer(&global.LazyWriteThread, PsGetCurrentThread(), NULL);
 
     NT_ASSERT(NULL == IoGetTopLevelIrp());
 
@@ -112,31 +107,13 @@ Return Value:
 --*/
 
 {
-    //
-    //  Assert that this really is an fcb and that this thread really owns
-    //  the lazy writer mark in the fcb.
-    //
-
     NT_ASSERT(BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(Context));
     NT_ASSERT(NULL != PsGetCurrentThread());
     NT_ASSERT(PsGetCurrentThread() == C_CAST(PFCB, Context)->LazyWriteThread);
 
-    //
-    //  Release the lazy writer mark.
-    //
-
     (C_CAST(PFCB, Context))->LazyWriteThread = NULL;
 
-    //
-    //  Check here for the EA File.  It turns out we needed the normal
-    //  resource shared in this case.  Otherwise it was the PagingIoResource.
-    //
-
     ExReleaseResourceLite(C_CAST(PFCB, Context)->Header.PagingIoResource);
-
-    //
-    //  Clear the kludge at this point.
-    //
 
     NT_ASSERT(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP) == IoGetTopLevelIrp());
 
@@ -172,36 +149,22 @@ Return Value:
 
     TRUE - if the Fcb has been acquired
 
+Notes:
+
+    The normal file resource (not the paging I/O resource) is acquired
+    shared here so read-ahead synchronises correctly with purges. See
+    BlorgAcquireNodeForLazyWrite for the APC-delivery and top-level-IRP
+    kludge rationale, both of which apply here too.
+
 --*/
 
 {
-    //
-    //  We acquire the normal file resource shared here to synchronize
-    //  correctly with purges.
-    //
-
-    //
-    //  Note that we do not need to disable APC delivery to guard 
-    //  against a rogue user issuing a suspend APC. That is because 
-    //  it is guaranteed that the caller is either in the system context,
-    //  to which a user cannot deliver a suspend APC, or the caller has
-    //  already disabled kernel APC delivery before calling. This is true
-    //  for all the other pre-acquire routines as well.
-    //
-
     if (!ExAcquireResourceSharedLite(C_CAST(PFCB, Context)->Header.Resource,
         Wait))
     {
 
         return FALSE;
     }
-
-    //
-    //  This is a kludge because Cc is really the top level.  We it
-    //  enters the file system, we will think it is a resursive call
-    //  and complete the request with hard errors or verify.  It will
-    //  have to deal with them, somehow....
-    //
 
     NT_ASSERT(NULL == IoGetTopLevelIrp());
 
@@ -236,10 +199,6 @@ Return Value:
 --*/
 
 {
-    //
-    //  Clear the kludge at this point.
-    //
-
     NT_ASSERT(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP) == IoGetTopLevelIrp());
 
     IoSetTopLevelIrp(NULL);
@@ -289,16 +248,17 @@ Return Value:
     BOOLEAN - TRUE if fast I/O is possible and FALSE if the caller needs
         to take the long route.
 
+Notes:
+
+    Writes are blanket-failed for now: the write path is not yet
+    implemented, so this always routes writes through the slow path.
+
 --*/
 
 {
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(IoStatus);
     UNREFERENCED_PARAMETER(Wait);
-    //
-    //  Decode the file object to get our fcb, the only one we want
-    //  to deal with is a UserFileOpen
-    //
 
     if (BLORGFS_FCB_SIGNATURE != GET_NODE_TYPE(FileObject->FsContext))
     {
@@ -307,15 +267,10 @@ Return Value:
 
     PFCB fcb = FileObject->FsContext;
 
-    LARGE_INTEGER largeLength = 
+    LARGE_INTEGER largeLength =
     {
         .QuadPart = Length
     };
-
-    //
-    //  Based on whether this is a read or write operation we call
-    //  fsrtl check for read/write
-    //
 
     if (CheckForReadOperation)
     {
@@ -331,10 +286,6 @@ Return Value:
         }
 
     }
-   
-    //
-    // Blanket fail all writes for now
-    //
-       
+
    return FALSE;
 }

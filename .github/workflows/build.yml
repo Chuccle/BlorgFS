@@ -103,6 +103,120 @@ jobs:
     - name: Build driver
       run: msbuild ${{ env.SOLUTION_NAME }} /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /bl # /bl creates msbuild.binlog
 
+    - name: Run TLS unit tests
+      shell: pwsh
+      run: |
+        $exeDir = "${{ matrix.platform }}\${{ matrix.config }}"
+
+        Write-Host "--- TlsTest ---"
+        & "$exeDir\TlsTest.exe"
+        if ($LASTEXITCODE -ne 0) { throw "TlsTest failed with exit code $LASTEXITCODE" }
+
+        Write-Host "--- TlsFuzzTest ---"
+        & "$exeDir\TlsFuzzTest.exe"
+        if ($LASTEXITCODE -ne 0) { throw "TlsFuzzTest failed with exit code $LASTEXITCODE" }
+
+    # Only run once (Release leg) since it needs openssl installed and a live
+    # s_server -- TlsTest/TlsFuzzTest above already run for every matrix leg.
+    - name: Run TLS handshake test against openssl s_server
+      if: matrix.config == 'Release'
+      shell: pwsh
+      run: |
+        choco install openssl -y --no-progress | Out-Null
+
+        # The runner image ships its own openssl.exe earlier on PATH than
+        # anything Chocolatey adds, so Get-Command (and any hardcoded guess
+        # like "OpenSSL-Win64") can silently resolve to that pre-existing,
+        # unpinned build instead of the one Chocolatey just installed. Its
+        # own install script (chtof/chocolatey-packages) locates the real
+        # install dir the same way -- via the uninstall registry entry --
+        # since the installer's target path isn't fixed across versions.
+        # Mirror that lookup instead of guessing a path.
+        $installLocation = Get-ItemProperty -Path @(
+          "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+          "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        ) -ErrorAction SilentlyContinue |
+          Where-Object { $_.DisplayName -like "OpenSSL*" } |
+          Select-Object -First 1 -ExpandProperty InstallLocation
+
+        if (-not $installLocation) { throw "Could not find OpenSSL install location in registry after choco install" }
+
+        $opensslExe = Join-Path $installLocation "bin\openssl.exe"
+        if (-not (Test-Path $opensslExe)) { throw "openssl.exe not found at resolved install location: $opensslExe" }
+
+        Write-Host "Using openssl: $opensslExe"
+        & $opensslExe version
+
+        New-Item -ItemType Directory -Force -Path tls-test-certs | Out-Null
+        & $opensslExe ecparam -name prime256v1 -genkey -noout -out tls-test-certs\key.pem
+        & $opensslExe req -new -x509 -key tls-test-certs\key.pem -out tls-test-certs\cert.pem -days 1 -subj "/CN=blorgfs-ci"
+
+        # -quiet previously hid the server's view of the handshake, so a
+        # prior failure ("SSL_write:bad length") gave no way to tell what
+        # ClientHello the server thought it received. Trade -quiet for
+        # -msg/-debug/-state and capture stdout+stderr to a file (rather
+        # than letting it interleave with the test's own async console
+        # output) so a future failure is actually diagnosable.
+        # No -naccept: we already tear the process down explicitly below
+        # via Stop-Process, so there's no need for openssl's own
+        # accept-count limit, and an unbounded accept loop is one less
+        # variable while diagnosing the real issue below.
+        #
+        # Root cause of every prior failure: -NoNewWindow makes s_server
+        # inherit THIS PowerShell process's console instead of getting its
+        # own. Console control events (Ctrl+C/Break, and things the runner
+        # sends as part of normal step supervision) are broadcast to every
+        # process sharing a console, not just the one they're meant for.
+        # openssl's accept loop has its own handler for exactly this, and
+        # "shutdown accept socket" (seen in every failing run) is the exact
+        # string it prints from that signal-triggered graceful-shutdown
+        # path in do_accept() -- explaining ACCEPT immediately followed by
+        # DONE, zero SSL_accept() calls, and zero -msg/-debug/-state trace
+        # regardless of -naccept, address family, or ClientHello content:
+        # the loop was told to stop before it ever serviced a client.
+        # Giving it its own (hidden) window/console isolates it from that.
+        # "-4"/explicit loopback stays as harmless hardening, not the fix.
+        $serverLog = "tls-test-certs\s_server.log"
+        $server = Start-Process -FilePath $opensslExe -ArgumentList @(
+          "s_server", "-tls1_3", "-ciphersuites", "TLS_AES_128_GCM_SHA256", "-groups", "P-256",
+          "-cert", "tls-test-certs\cert.pem", "-key", "tls-test-certs\key.pem",
+          "-accept", "127.0.0.1:14448", "-4", "-msg", "-debug", "-state"
+        ) -PassThru -WindowStyle Hidden -RedirectStandardOutput $serverLog -RedirectStandardError "$serverLog.err"
+
+        # Poll the listen state instead of sleeping a fixed 2s: a slow runner
+        # otherwise surfaces as a connection-refused flake in the client test.
+        # Get-NetTCPConnection (not a probe connect) so the readiness check
+        # itself doesn't consume an accept / pollute the -msg trace.
+        $listenDeadline = (Get-Date).AddSeconds(15)
+        $listening = $false
+        while ((Get-Date) -lt $listenDeadline) {
+          if ($server.HasExited) { break }
+          if (Get-NetTCPConnection -State Listen -LocalPort 14448 -ErrorAction SilentlyContinue) {
+            $listening = $true
+            break
+          }
+          Start-Sleep -Milliseconds 250
+        }
+        if (-not $listening) {
+          Write-Host "--- s_server stdout ---"
+          Get-Content $serverLog -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "--- s_server stderr ---"
+          Get-Content "$serverLog.err" -ErrorAction SilentlyContinue | Write-Host
+          throw "s_server never started listening on 14448 (exited: $($server.HasExited))"
+        }
+
+        try {
+          Write-Host "--- TlsHandshakeTest ---"
+          & "${{ matrix.platform }}\${{ matrix.config }}\TlsHandshakeTest.exe"
+          if ($LASTEXITCODE -ne 0) { throw "TlsHandshakeTest failed with exit code $LASTEXITCODE" }
+        } finally {
+          Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "--- s_server stdout ---"
+          Get-Content $serverLog -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "--- s_server stderr ---"
+          Get-Content "$serverLog.err" -ErrorAction SilentlyContinue | Write-Host
+        }
+
     - name: Upload build artifacts
       uses: actions/upload-artifact@v7
       with:

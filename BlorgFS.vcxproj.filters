@@ -100,6 +100,18 @@
     <ClCompile Include="FspWorkQueue.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Tls.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TlsHandshake.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="PathCache.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Prefetch.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Structs.h">
@@ -135,8 +147,22 @@
     <ClInclude Include="FspWorkQueue.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Tls.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TlsHandshake.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Prefetch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="BlorgFS.inf">
+      <Filter>Driver Files</Filter>
+    </Inf>
   </ItemGroup>
 </Project>
