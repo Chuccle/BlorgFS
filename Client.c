@@ -33,13 +33,17 @@
 // carried on the KSOCKET -- see Socket.h). Ciphertext is received in bulk and
 // complete records are drained out of this buffer without touching the
 // wire again (see HttpIssueTlsReceive), so this bounds how many on-wire
-// records one WSK receive can pick up, not any per-response total. Four
-// max-size records amortizes the per-receive IRP/watchdog cost against a
-// peer sending full records while staying a modest fixed allocation; it
-// must exceed one max record (5-byte header + TLS_RECORD_CIPHERTEXT_MAX)
-// or the drain loop could never make progress on a full buffer.
+// records one WSK receive can pick up, not any per-response total.
+// Sixteen max-size records (~256 KB) covers a full prefetch chunk
+// (PREFETCH_CHUNK, 512 KB == 32 records) in two bulk receives, so the
+// per-receive IRP/watchdog cost is paid ~2x per chunk instead of ~8x as
+// with the previous 4-record accumulator; per pooled connection this is
+// a bounded NonPagedPoolNx cost (32 sockets x ~256 KB = 8 MB worst
+// case, only for connections that actually spoke TLS). It must exceed
+// one max record (5-byte header + TLS_RECORD_CIPHERTEXT_MAX) or the
+// drain loop could never make progress on a full buffer.
 //
-#define HTTP_TLS_RECV_CAPACITY (4 * (5 + TLS_RECORD_CIPHERTEXT_MAX))
+#define HTTP_TLS_RECV_CAPACITY (16 * (5 + TLS_RECORD_CIPHERTEXT_MAX))
 
 //
 // Hard ceiling on a single response body's declared Content-Length. The
@@ -1510,11 +1514,15 @@ static VOID HttpIssueTlsReceiveExpandedCallout(PVOID Parameter)
 // same frame, once per buffered record) -- see HTTP_STACK_SAFETY_MARGIN/
 // HTTP_STACK_EXPAND_SIZE above for the sizing rationale.
 //
-// The loop returns to the stage machine after delivering exactly one
-// application-data record's content, so HttpReadResponse's phase logic
-// (header parse, spill copy, body completion test) runs between records
-// exactly as it does between plaintext receives; records that deliver
-// nothing are consumed entirely inside the loop. Per record:
+// During the header phase the loop returns to the stage machine after
+// delivering each application-data record's content, so
+// HttpReadResponse's phase logic (header parse, spill copy, body
+// pre-grow) runs at the first opportunity. Once the body destination is
+// known (BodyOffset != 0), buffered records are drained back-to-back --
+// each already decrypts straight to its final destination -- and the
+// stage machine only runs again when the body is complete (or overrun);
+// records that deliver nothing are consumed entirely inside the loop
+// in both phases. Per record:
 //
 //  - Outer type 0x14 (change_cipher_spec, an RFC 8446 Appendix D.4
 //    middlebox-compat no-op) is skipped without decryption -- it isn't
@@ -1559,13 +1567,15 @@ static VOID HttpIssueTlsReceiveExpandedCallout(PVOID Parameter)
 // bound (real content overrunning the MDL), which is a provably
 // misbehaving server, not connection state.
 //
-// When no complete record remains, the partial tail is compacted to the
-// front of TlsRecvBuffer (bounded by one record's size) and one bulk
-// receive is posted for all remaining space with Flags = 0 -- completes
-// on arrival, unlike the plaintext body phase's exact-length WAITALL,
-// since record boundaries can't be known before the headers they carry
-// arrive. After issuing the receive, same STATUS_PENDING-vs-synchronous-
-// completion reasoning as HttpIssueReceive applies.
+// When no complete record remains, the accumulator cursors are reset
+// (fully drained) or the partial tail is compacted to the front of
+// TlsRecvBuffer -- lazily, only once the free tail can no longer hold a
+// max-size record -- and one bulk receive is posted for all remaining
+// space with Flags = 0 (completes on arrival, unlike the plaintext body
+// phase's exact-length WAITALL, since record boundaries can't be known
+// before the headers they carry arrive) through the socket's prebuilt
+// accumulator MDL. After issuing the receive, same STATUS_PENDING-vs-
+// synchronous-completion reasoning as HttpIssueReceive applies.
 //
 static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
 {
@@ -1596,12 +1606,17 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         socket->TlsPlaintextScratch = socket->TlsRecvBuffer
             ? ExAllocatePoolUninitialized(NonPagedPoolNx, TLS_RECORD_CIPHERTEXT_MAX, HTTP_TAG)
             : NULL;
+        socket->TlsRecvMdl = socket->TlsPlaintextScratch
+            ? IoAllocateMdl(socket->TlsRecvBuffer, HTTP_TLS_RECV_CAPACITY, FALSE, FALSE, NULL)
+            : NULL;
 
-        if (!socket->TlsPlaintextScratch)
+        if (!socket->TlsRecvMdl)
         {
             HttpComplete(Ctx, STATUS_INSUFFICIENT_RESOURCES);
             return;
         }
+
+        MmBuildMdlForNonPagedPool(socket->TlsRecvMdl);
     }
 
     for (;;)
@@ -1737,12 +1752,21 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
 
         Ctx->Length += contentLen;
 
-        Ctx->Stage = HttpStageReadResponse;
-        HttpKick(Ctx);
-        return;
+        if (0 == Ctx->BodyOffset || Ctx->Length >= Ctx->BodyEndOffset)
+        {
+            Ctx->Stage = HttpStageReadResponse;
+            HttpKick(Ctx);
+            return;
+        }
     }
 
-    if (socket->TlsRecvOffset)
+    if (socket->TlsRecvOffset == socket->TlsRecvLength)
+    {
+        socket->TlsRecvLength = 0;
+        socket->TlsRecvOffset = 0;
+    }
+    else if (socket->TlsRecvOffset &&
+        (HTTP_TLS_RECV_CAPACITY - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
     {
         RtlMoveMemory(
             socket->TlsRecvBuffer,
@@ -1753,9 +1777,10 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         socket->TlsRecvOffset = 0;
     }
 
-    NTSTATUS result = ReceiveWskAsync(
+    NTSTATUS result = ReceiveWskAsyncMdl(
         socket,
-        socket->TlsRecvBuffer + socket->TlsRecvLength,
+        socket->TlsRecvMdl,
+        socket->TlsRecvLength,
         HTTP_TLS_RECV_CAPACITY - socket->TlsRecvLength,
         0,
         HttpOnTlsReceive,
@@ -1888,6 +1913,39 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
         }
         else
         {
+            if (HttpOpFileRead != Ctx->Operation)
+            {
+                SIZE_T alignedBodyOffset = (Ctx->BodyOffset + 7) & ~C_CAST(SIZE_T, 7);
+
+                if (alignedBodyOffset != Ctx->BodyOffset)
+                {
+                    SIZE_T alignedBodyEnd;
+
+                    if (!HttpCheckedAddSizeT(alignedBodyOffset, Ctx->ContentLength, &alignedBodyEnd))
+                    {
+                        HttpFail(Ctx, STATUS_INVALID_PARAMETER);
+                        return;
+                    }
+
+                    NTSTATUS alignGrowResult = HttpGrowBufferIfNeeded(Ctx, alignedBodyEnd);
+
+                    if (!NT_SUCCESS(alignGrowResult))
+                    {
+                        HttpFail(Ctx, alignGrowResult);
+                        return;
+                    }
+
+                    RtlMoveMemory(
+                        Ctx->Buffer + alignedBodyOffset,
+                        Ctx->Buffer + Ctx->BodyOffset,
+                        Ctx->Length - Ctx->BodyOffset);
+
+                    Ctx->Length += C_CAST(ULONG, alignedBodyOffset - Ctx->BodyOffset);
+                    Ctx->BodyOffset = alignedBodyOffset;
+                    Ctx->BodyEndOffset = alignedBodyEnd;
+                }
+            }
+
             NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, Ctx->BodyEndOffset);
 
             if (!NT_SUCCESS(growResult))

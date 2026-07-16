@@ -12,22 +12,31 @@
 // IRQL/issuance rules:
 //  - BlorgPrefetchServeRead / detach run at PASSIVE_LEVEL only (they are
 //    called from the paging-read dispatch path / FCB teardown). All HTTP
-//    fetch *issuance* happens there too: HttpBuildRequest's unicode->UTF8
-//    conversion touches paged code, so fetches are never issued from the
-//    DISPATCH-level fetch completions -- the pipeline is topped up on
-//    each subsequent paging read instead.
+//    fetch *issuance* happens at PASSIVE too: HttpBuildRequest's
+//    unicode->UTF8 conversion touches paged code, so fetches are never
+//    issued directly from the DISPATCH-level fetch completions. The
+//    pipeline is topped up two ways: on each paging read (serve path),
+//    and by a per-ring PASSIVE work item that a successful fetch
+//    completion queues whenever it empties a slot -- so a slot freed by
+//    a delivered waiter is refilled immediately instead of waiting for
+//    the next read to arrive (see the pump work-item fields below).
 //  - Fetch completions run at <= DISPATCH_LEVEL and touch only the ring
 //    (NonPagedPoolNx) and the parked IRP -- never the FCB, which lives in
-//    paged pool.
+//    paged pool. The pump work item honors the same rule: everything a
+//    pump needs from the file (Path, FileSize) is snapshotted into the
+//    ring at creation, so no pump -- read-path or work-item -- ever
+//    races FCB teardown.
 //  - Ring->Lock is a leaf lock: nothing else is ever acquired under it,
 //    and no fetch is issued and no 256 KB copy performed while holding it
 //    (buffers are detached from their slot under the lock and copied
 //    outside it).
 //
-// Lifetime: RefCount = 1 for the FCB attachment + 1 per in-flight fetch.
+// Lifetime: RefCount = 1 for the FCB attachment + 1 per in-flight fetch
+// + 1 while a pump work item is queued or running.
 // BlorgPrefetchDetach drops the attachment reference; whoever moves the
-// count to zero frees the ring, so a late completion can never touch a
-// freed ring. Generation invalidates stale in-flight data after a seek
+// count to zero frees the ring, so a late completion (or pump worker)
+// can never touch a freed ring. Generation invalidates stale in-flight
+// data after a seek
 // (completions compare their issue-time generation and discard), while
 // parked waiters are always delivered regardless of generation -- a
 // waiter parked on a slot wants exactly that slot's range.
@@ -153,7 +162,7 @@ struct _PREFETCH_RING
     ULONG64    NextFetchOffset;   // refill cursor (next unfetched chunk)
     ULONG64    LastConsumeClock;  // FCB.StreamClock at the last hit/park; feeds the re-aim recency test
     ULONG      Generation;        // bumped on seek; invalidates in-flight data issued under an older generation
-    LONG       RefCount;          // FCB attachment + in-flight fetches
+    LONG       RefCount;          // FCB attachment + in-flight fetches + queued/running pump work item
 
     //
     // Slots the pump may fill, PREFETCH_MIN_DEPTH..PREFETCH_DEPTH.
@@ -162,7 +171,30 @@ struct _PREFETCH_RING
     //
     ULONG      DepthLimit;
 
-    ULONG      Reserved;          // explicit pad keeping Buffers 8-aligned
+    //
+    // Completion-driven pump. A fetch completion that empties a slot
+    // (waiter delivered, or a stale-generation discard) queues
+    // PumpWorkItem so the slot is refilled at PASSIVE right away
+    // instead of on the next paging read; failed fetches deliberately
+    // do NOT queue it (the next read's pump is the retry, which keeps a
+    // dead server from driving a fetch-fail-refetch storm).
+    //
+    //  - PumpQueued: interlocked dedup flag -- at most one queued work
+    //    item at a time; cleared by the worker before it pumps, so a
+    //    completion during the pump re-queues rather than being lost.
+    //  - Detached (under Lock): set by BlorgPrefetchDetach so a
+    //    late-running worker stops issuing fetches for a closed file.
+    //    Purely an economy measure, not a lifetime one: a pump that
+    //    races the flag touches only ring-owned state, and any fetches
+    //    it issues hold ring references and complete into slots nothing
+    //    will ever read -- wasted wire bytes, never a use-after-free.
+    //
+    LONG         PumpQueued;
+    BOOLEAN      Detached;
+    
+    UCHAR        Reserved[7];  // explicit pad to 8-byte struct granule
+
+    PIO_WORKITEM PumpWorkItem;
 
     //
     // Cold: touched on hit-copy / issue / completion, not by the scan.
@@ -179,6 +211,19 @@ struct _PREFETCH_RING
     PMDL  BufferMdls[PREFETCH_DEPTH];    // MDL describing each buffer
     PIRP  Waiters[PREFETCH_DEPTH];       // paging IRP parked on an in-flight slot, if any
     PREFETCH_FETCH_CTX FetchCtx[PREFETCH_DEPTH]; // completion context per slot
+
+    //
+    // Ring-owned snapshot of the file identity the pump needs: an owned
+    // NonPagedPoolNx copy of the FCB's FullPath and the file size at
+    // ring-arm time. This is what lets every pump -- read-path and work
+    // item alike -- run without dereferencing the FCB, so no pump can
+    // ever race FCB teardown. The size snapshot only bounds how far the
+    // pipeline fetches ahead; the FS is read-only against its backend,
+    // and even a stale value merely means a tail chunk the reads then
+    // fetch directly.
+    //
+    UNICODE_STRING Path;
+    ULONG64        FileSize;
 };
 
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Hot, Lock);
@@ -187,12 +232,17 @@ CHECK_PADDING_BETWEEN(PREFETCH_RING, NextFetchOffset, LastConsumeClock);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, LastConsumeClock, Generation);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Generation, RefCount);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, RefCount, DepthLimit);
-CHECK_PADDING_BETWEEN(PREFETCH_RING, DepthLimit, Reserved);
-CHECK_PADDING_BETWEEN(PREFETCH_RING, Reserved, Buffers);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, DepthLimit, PumpQueued);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, PumpQueued, Detached);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, Detached, Reserved);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, Reserved, PumpWorkItem);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, PumpWorkItem, Buffers);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Buffers, BufferMdls);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, BufferMdls, Waiters);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Waiters, FetchCtx);
-CHECK_PADDING_END(PREFETCH_RING, FetchCtx);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, FetchCtx, Path);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, Path, FileSize);
+CHECK_PADDING_END(PREFETCH_RING, FileSize);
 
 //
 // Serve a paging read from the prefetch ring, PASSIVE_LEVEL only.

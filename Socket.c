@@ -61,6 +61,11 @@ static VOID FreeKSocket(PKSOCKET Socket)
 {
     TlsDestroyConnectionState(&Socket->Tls);
 
+    if (Socket->TlsRecvMdl)
+    {
+        IoFreeMdl(Socket->TlsRecvMdl);
+    }
+
     if (Socket->TlsRecvBuffer)
     {
         ExFreePool(Socket->TlsRecvBuffer);
@@ -648,6 +653,13 @@ static BOOLEAN SockAddrEqual(PSOCKADDR restrict A, PSOCKADDR restrict B)
 // (idle, owned by the pool) or "out" (owned by exactly one caller), and
 // the spinlock only ever protects list membership transitions, never an
 // in-flight I/O operation.
+// 
+// LIFO: the most recently used connection goes back on the head,
+// where AcquireReusableWskSocketAsync's RemoveHeadList will hand it
+// out next. A FIFO here cycles through all pooled connections,
+// maximizing each one's idle time (and with it the peer idle-close
+// races the retry path exists for); LIFO keeps a hot working set
+// sized by actual concurrency and lets the tail go cold.
 //
 // Called from the async HTTP pipeline at DISPATCH_LEVEL, so a socket that
 // doesn't fit in the pool is closed via the non-blocking CloseWskSocketAsync
@@ -669,7 +681,7 @@ NTSTATUS ReleaseReusableWskSocket(PKSOCKET Socket)
         return CloseWskSocketAsync(Socket);
     }
 
-    InsertTailList(&SocketPool.List, &Socket->PoolEntry);
+    InsertHeadList(&SocketPool.List, &Socket->PoolEntry);
     SocketPool.Count++;
     KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
 

@@ -106,7 +106,7 @@ typedef struct _KSOCKET
     //
     // TLS record-layer receive accumulator (HttpIssueTlsReceive,
     // Client.c). Per-connection rather than per-request so kept-alive
-    // reuse pays the ~80 KB allocation once per connection instead of
+    // reuse pays the ~256 KB allocation once per connection instead of
     // once per request, and so ciphertext received past one response's
     // boundary (e.g. a late NewSessionTicket) is preserved for the next
     // request's drain instead of being discarded with the request
@@ -118,8 +118,15 @@ typedef struct _KSOCKET
     // it. TlsRecvLength counts buffered ciphertext bytes; TlsRecvOffset
     // is the first unconsumed byte within them.
     //
+    // TlsRecvMdl describes the whole accumulator and is built exactly
+    // once (MmBuildMdlForNonPagedPool -- no probe/lock, nothing to
+    // unlock at completion) so every bulk ciphertext receive goes
+    // through ReceiveWskAsyncMdl instead of paying a fresh
+    // IoAllocateMdl + MmProbeAndLockPages per receive.
+    //
     PUCHAR TlsRecvBuffer;
     PUCHAR TlsPlaintextScratch;
+    PMDL   TlsRecvMdl;
     ULONG  TlsRecvLength;
     ULONG  TlsRecvOffset;
 } KSOCKET, * PKSOCKET;

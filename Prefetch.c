@@ -71,6 +71,16 @@ static VOID PrefetchFreeRing(PREFETCH_RING* Ring)
         }
     }
 
+    if (Ring->PumpWorkItem)
+    {
+        IoFreeWorkItem(Ring->PumpWorkItem);
+    }
+
+    if (Ring->Path.Buffer)
+    {
+        ExFreePool(Ring->Path.Buffer);
+    }
+
     ExFreePool(Ring);
 
     InterlockedDecrement(&PrefetchRingCount);
@@ -100,7 +110,7 @@ static VOID PrefetchReleaseRef(PREFETCH_RING* Ring)
 // symmetric however creation ends. Returns NULL at the budget cap or on
 // any allocation failure -- the stream then runs on direct fetches.
 //
-static PREFETCH_RING* PrefetchCreateRing(VOID)
+static PREFETCH_RING* PrefetchCreateRing(FCB* Fcb)
 {
     if (PrefetchMaxRings() < InterlockedIncrement(&PrefetchRingCount))
     {
@@ -137,6 +147,33 @@ static PREFETCH_RING* PrefetchCreateRing(VOID)
         MmBuildMdlForNonPagedPool(ring->BufferMdls[i]);
     }
 
+    ring->PumpWorkItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
+
+    if (!ring->PumpWorkItem)
+    {
+        PrefetchFreeRing(ring);
+        return NULL;
+    }
+
+    //
+    // Snapshot the file identity the pump needs (see the field comment in
+    // Prefetch.h): an owned non-paged copy of the path plus the current
+    // file size, so no pump ever has to reach back into the paged,
+    // teardown-prone FCB.
+    //
+    ring->Path.Buffer = ExAllocatePoolUninitialized(NonPagedPoolNx, Fcb->FullPath.Length, PREFETCH_TAG);
+
+    if (!ring->Path.Buffer)
+    {
+        PrefetchFreeRing(ring);
+        return NULL;
+    }
+
+    RtlCopyMemory(ring->Path.Buffer, Fcb->FullPath.Buffer, Fcb->FullPath.Length);
+    ring->Path.Length = Fcb->FullPath.Length;
+    ring->Path.MaximumLength = Fcb->FullPath.Length;
+    ring->FileSize = C_CAST(ULONG64, Fcb->Header.FileSize.QuadPart);
+
     KeInitializeSpinLock(&ring->Lock);
     ring->DepthLimit = PREFETCH_MIN_DEPTH;
     ring->RefCount = 1;
@@ -149,7 +186,9 @@ static PREFETCH_RING* PrefetchCreateRing(VOID)
 // every empty slot under the lock, then issue the fetches outside it
 // (HttpBuildRequest touches paged code, so this must run at
 // PASSIVE_LEVEL -- which it does, being called only from the paging-read
-// path; never from a fetch completion). Depth growth first: slots
+// path and the PASSIVE pump work item; never directly from a fetch
+// completion). Everything it needs from the file comes from the ring's
+// own Path/FileSize snapshot, never the FCB. Depth growth first: slots
 // admitted by a park's DepthLimit bump get their buffer and MDL
 // allocated here, at PASSIVE, before the reservation pass can see them.
 // NULL BufferMdls[i] is what distinguishes a never-allocated slot from
@@ -165,16 +204,17 @@ static PREFETCH_RING* PrefetchCreateRing(VOID)
 // the completion (which cannot run before issue) touch it. On a
 // synchronous issue failure the completion callback never ran and never
 // will, so the slot and the fetch's ref are released here directly
-// (never the last ref -- the caller's FCB attachment is still held). A
+// (never the last ref -- every caller holds one: the serve path via the
+// FCB attachment, the pump worker via the work item's reference). A
 // paging read may have parked on the reserved slot between the
 // reservation and the failed issue, so the failure path drains
 // Waiters[i] under the lock and completes the parked IRP with the issue
 // status -- leaving it would strand the read forever, and a later reuse
 // of the slot would complete it with data from a different range.
 //
-static VOID PrefetchPump(FCB* Fcb, PREFETCH_RING* Ring)
+static VOID PrefetchPump(PREFETCH_RING* Ring)
 {
-    ULONG64 fileSize = C_CAST(ULONG64, Fcb->Header.FileSize.QuadPart);
+    ULONG64 fileSize = Ring->FileSize;
     ULONG reserved[PREFETCH_DEPTH];
     ULONG reservedCount = 0;
 
@@ -254,7 +294,7 @@ static VOID PrefetchPump(FCB* Fcb, PREFETCH_RING* Ring)
         ULONG i = reserved[r];
 
         NTSTATUS status = BlorgHttpGetFileMdl(
-            &Fcb->FullPath,
+            &Ring->Path,
             Ring->Hot[i].RangeOffset,
             Ring->Hot[i].Length,
             Ring->BufferMdls[i],
@@ -282,6 +322,64 @@ static VOID PrefetchPump(FCB* Fcb, PREFETCH_RING* Ring)
 }
 
 //
+// PASSIVE-level work-item target for the completion-driven pump: re-tops
+// the pipeline without waiting for the next paging read. Touches only
+// ring-owned state (the pump runs off the ring's Path/FileSize
+// snapshot), so it needs no synchronization with FCB teardown at all;
+// the Detached check is an economy measure that stops a late worker
+// from fetching ahead for a closed file, and racing it is harmless (see
+// the field comment in Prefetch.h). PumpQueued is cleared before the
+// Detached check, so a completion that lands mid-pump re-queues rather
+// than being lost. The ring reference taken by PrefetchQueuePump keeps
+// the ring alive throughout and is released last.
+//
+static IO_WORKITEM_ROUTINE PrefetchPumpWorker;
+
+static VOID PrefetchPumpWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    PREFETCH_RING* ring = Context;
+
+    if (!ring)
+    {
+		return;
+    }
+
+    InterlockedExchange(&ring->PumpQueued, 0);
+
+    KIRQL irql;
+    KeAcquireSpinLock(&ring->Lock, &irql);
+    BOOLEAN detached = ring->Detached;
+    KeReleaseSpinLock(&ring->Lock, irql);
+
+    if (!detached)
+    {
+        PrefetchPump(ring);
+    }
+
+    PrefetchReleaseRef(ring);
+}
+
+//
+// Queues the ring's pump work item, deduplicated: at most one queued
+// instance at a time (PumpQueued), re-armable the moment the worker
+// starts. Callable at <= DISPATCH_LEVEL; the caller must itself hold a
+// ring reference across this call (the queued work item then holds its
+// own until the worker releases it).
+//
+static VOID PrefetchQueuePump(PREFETCH_RING* Ring)
+{
+    if (InterlockedCompareExchange(&Ring->PumpQueued, 1, 0))
+    {
+        return;
+    }
+
+    InterlockedIncrement(&Ring->RefCount);
+    IoQueueWorkItem(Ring->PumpWorkItem, PrefetchPumpWorker, DelayedWorkQueue, Ring);
+}
+
+//
 // Fetch-completion callback for a prefetch-issued HTTP range request, run at
 // <= DISPATCH_LEVEL. If a paging read parked on this slot, copies the fetched
 // bytes straight into its MDL and completes it (delivered regardless of
@@ -292,6 +390,16 @@ static VOID PrefetchPump(FCB* Fcb, PREFETCH_RING* Ring)
 // later hit, or discards it (fetch failed, or its data predates a seek --
 // the next paging read either re-fetches the range directly or has
 // re-aimed the pipeline already).
+//
+// A successful completion that leaves its slot Empty (waiter delivered,
+// or a stale-generation discard) queues the PASSIVE pump work item so
+// the freed slot is refilled now rather than on the next paging read --
+// in the RTT-bound regime that keeps the pipeline genuinely full instead
+// of always one slot short, and takes the top-up issue cost off the
+// read path. Failed fetches never queue it: the next read's pump is the
+// retry, so a dead server can't drive a fetch-fail-refetch storm. For
+// the waiter case the queue happens only after the detached buffer has
+// been donated back, so the pump can actually use the slot.
 //
 static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
 {
@@ -308,12 +416,14 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
     ring->Waiters[i] = NULL;
 
     PCHAR buffer = NULL;
+    BOOLEAN queuePump = FALSE;
 
     if (waiter)
     {
         buffer = ring->Buffers[i];
         ring->Buffers[i] = NULL;
         ring->Hot[i].State = PrefetchSlotEmpty;
+        queuePump = NT_SUCCESS(Status) && !ring->Detached;
     }
     else if (NT_SUCCESS(Status) && ctx->Generation == ring->Generation)
     {
@@ -323,6 +433,7 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
     else
     {
         ring->Hot[i].State = PrefetchSlotEmpty;
+        queuePump = NT_SUCCESS(Status) && !ring->Detached;
     }
 
     KeReleaseSpinLock(&ring->Lock, irql);
@@ -366,6 +477,11 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
         KeAcquireSpinLock(&ring->Lock, &irql);
         ring->Buffers[i] = buffer;
         KeReleaseSpinLock(&ring->Lock, irql);
+    }
+
+    if (queuePump)
+    {
+        PrefetchQueuePump(ring);
     }
 
     PrefetchReleaseRef(ring);
@@ -466,7 +582,7 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
             return STATUS_NOT_FOUND;
         }
 
-        ring = PrefetchCreateRing();
+        ring = PrefetchCreateRing(Fcb);
 
         if (!ring)
         {
@@ -485,7 +601,7 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
             return STATUS_NOT_FOUND;
         }
 
-        PrefetchPump(Fcb, ring);
+        PrefetchPump(ring);
 
         return STATUS_NOT_FOUND;
     }
@@ -537,7 +653,7 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
 
                 BLORGFS_PRINT("prefetch hit off=%llx len=%lx\n", Offset, Length);
 
-                PrefetchPump(Fcb, ring);
+                PrefetchPump(ring);
                 return result;
             }
 
@@ -569,7 +685,7 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
 
         if (rescan)
         {
-            PrefetchPump(Fcb, ring);
+            PrefetchPump(ring);
             pumped = TRUE;
         }
     }
@@ -604,7 +720,7 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
         {
             BLORGFS_PRINT("prefetch miss+rearm off=%llx streak=%llu\n", Offset, streak);
 
-            PrefetchPump(Fcb, ring);
+            PrefetchPump(ring);
         }
     }
 
@@ -617,6 +733,12 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
 // arrival instead of touching the (possibly freed) FCB; no waiters can exist
 // since a parked waiter implies an in-flight paging read still holding the
 // FCB open.
+//
+// Detached stops any later pump work item from fetching ahead for a file
+// that no longer exists; it is not needed for lifetime safety -- the
+// pump runs entirely off ring-owned state (Path/FileSize snapshot), and
+// a queued work item holds its own ring reference, so nothing here has
+// to wait for it.
 //
 VOID BlorgPrefetchDetach(FCB* Fcb)
 {
@@ -631,6 +753,7 @@ VOID BlorgPrefetchDetach(FCB* Fcb)
 
     KIRQL irql;
     KeAcquireSpinLock(&ring->Lock, &irql);
+    ring->Detached = TRUE;
     ++ring->Generation;
     KeReleaseSpinLock(&ring->Lock, irql);
 
