@@ -502,7 +502,36 @@ TEST_F(NodeTableTest, ConcurrentLookupPinAndReapNeverUseAfterFree)
     KM_THREAD* publisher = KmStartThread(ContendedPublisher, &state);
     KM_THREAD* reaper = KmStartThread(ContendedReaper, &state);
 
-    Sleep(250);
+    //
+    // Run until the window this test exists to cover has actually been
+    // exercised, rather than for a fixed wall-clock slice. A fixed sleep
+    // makes coverage a property of how fast the machine is: 250 ms was
+    // enough on a developer box and not enough on a CI runner, where a
+    // Release build on fewer cores finished the run with ObservedReaps at
+    // zero and tripped the vacuity guard below.
+    //
+    // The deadline is a backstop for the case where the race genuinely
+    // never happens -- then the guard fails, which is the correct outcome
+    // and the whole point of it.
+    //
+    const DWORD deadlineMs = 10000;
+    const DWORD startedAt = GetTickCount();
+
+    for (;;)
+    {
+        if (ReadNoFence(&state.Hits) > 0 && ReadNoFence(&state.ObservedReaps) > 0)
+        {
+            break;
+        }
+
+        if ((GetTickCount() - startedAt) >= deadlineMs)
+        {
+            break;
+        }
+
+        Sleep(5);
+    }
+
     InterlockedExchange(&state.Running, 0);
 
     for (int i = 0; i < kReaders; ++i)
