@@ -142,7 +142,16 @@ jobs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        $sandboxDir = "tests\sandbox\${{ matrix.platform }}\${{ matrix.config }}"
+
+        # Located by search, not by a fixed path. A solution build drops these
+        # in the repo-root $(Platform)\$(Configuration), while building the
+        # projects individually (which is what tools\Invoke-BlorgChecks.ps1
+        # does locally) puts them under tests\sandbox\. Hardcoding either one
+        # works in exactly one of those two places.
+        $searchRoots = @(
+          "${{ matrix.platform }}\${{ matrix.config }}",
+          "tests\sandbox\${{ matrix.platform }}\${{ matrix.config }}"
+        )
 
         $suites = @(
           'ClientSandbox.exe',
@@ -157,10 +166,16 @@ jobs:
         $failed = @()
 
         foreach ($suite in $suites) {
-          $path = Join-Path $sandboxDir $suite
-          if (-not (Test-Path $path)) { throw "$suite was not built at $path" }
+          $path = $searchRoots |
+                  ForEach-Object { Join-Path $_ $suite } |
+                  Where-Object { Test-Path $_ } |
+                  Select-Object -First 1
 
-          Write-Host "--- $suite ---"
+          if (-not $path) {
+            throw "$suite was not built -- looked in: $($searchRoots -join ', ')"
+          }
+
+          Write-Host "--- $suite ($path) ---"
           & $path
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::$suite failed with exit code $LASTEXITCODE"
