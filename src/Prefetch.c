@@ -634,6 +634,47 @@ static READ_STREAM_TRACKER* PrefetchClaimStream(FCB* Fcb, ULONG64 Offset)
 }
 
 //
+// The ring's containment test, in the one place both scanners share it:
+// TRUE when slot Index holds every byte of [Offset, Offset + Length), so
+// the read can be served from SlotOffsetOut bytes into that slot's buffer.
+// Callers hold Ring->Lock -- State, RangeOffset and Length are all written
+// under it.
+//
+// Written to be overflow-proof rather than merely correct for sane inputs,
+// because this predicate is what stands between a bad offset and a copy out
+// of a slot buffer. The obvious spelling,
+// (Offset - RangeOffset) + Length > Hot.Length, has two ways to wrap: the
+// subtraction when Offset is below RangeOffset, and the addition when the
+// difference is large. Both wrap to a small value that passes the test, and
+// the hit path then copies from buffer + (ULONG)(Offset - RangeOffset) --
+// a kernel out-of-bounds read at an attacker-influenced displacement.
+// Ordering the checks so the subtraction only runs after Offset is known
+// to be the larger, and comparing against the remaining slot bytes instead
+// of summing, leaves no expression that can wrap for any input at all. That
+// matters because the offsets reaching here are only as trustworthy as
+// whoever built the IRP: Read.c rejects negative offsets at dispatch, but
+// the safety of this copy must not depend on that check having run.
+//
+static BOOLEAN PrefetchSlotCovers(PREFETCH_RING* Ring, ULONG Index, ULONG64 Offset, ULONG Length, PULONG SlotOffsetOut)
+{
+    if (PrefetchSlotEmpty == Ring->Hot[Index].State || Offset < Ring->Hot[Index].RangeOffset)
+    {
+        return FALSE;
+    }
+
+    ULONG64 slotOffset = Offset - Ring->Hot[Index].RangeOffset;
+
+    if (slotOffset > Ring->Hot[Index].Length || Length > Ring->Hot[Index].Length - slotOffset)
+    {
+        return FALSE;
+    }
+
+    *SlotOffsetOut = C_CAST(ULONG, slotOffset);
+
+    return TRUE;
+}
+
+//
 // Counts a miss that a containment test would have served: some slot's
 // range covers [Offset, Offset + Length) but the lookup in
 // BlorgPrefetchServeRead rejected it, because that lookup demands
@@ -653,9 +694,9 @@ static VOID PrefetchCountNearMiss(PREFETCH_RING* Ring, ULONG64 Offset, ULONG Len
 
     for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
     {
-        if (PrefetchSlotEmpty == Ring->Hot[i].State ||
-            Offset < Ring->Hot[i].RangeOffset ||
-            (Offset - Ring->Hot[i].RangeOffset) + Length > Ring->Hot[i].Length)
+        ULONG slotOffset;
+
+        if (!PrefetchSlotCovers(Ring, i, Offset, Length, &slotOffset))
         {
             continue;
         }
@@ -783,14 +824,12 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
 
         for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
         {
-            if (PrefetchSlotEmpty == ring->Hot[i].State ||
-                Offset < ring->Hot[i].RangeOffset ||
-                (Offset - ring->Hot[i].RangeOffset) + Length > ring->Hot[i].Length)
+            ULONG slotOffset;
+
+            if (!PrefetchSlotCovers(ring, i, Offset, Length, &slotOffset))
             {
                 continue;
             }
-
-            ULONG slotOffset = C_CAST(ULONG, Offset - ring->Hot[i].RangeOffset);
 
             if (PrefetchSlotReady == ring->Hot[i].State)
             {

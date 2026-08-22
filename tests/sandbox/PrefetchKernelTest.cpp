@@ -321,6 +321,62 @@ TEST_F(PrefetchKernelTest, InteriorParkIsDeliveredFromItsOffsetWithinTheSlot)
     }
 }
 
+//
+// The containment test is the memory-safety boundary for the copy that
+// follows it, so it must reject an offset that no honest caller would
+// produce. Read.c screens negative offsets out at dispatch, but this
+// deliberately does not go through Read.c: the point is that the ring is
+// safe on its own, for whatever a kernel caller with a hand-built IRP
+// hands it.
+//
+// A negative LONGLONG offset arrives here widened to ULONG64, so -4096 is
+// 2^64-4096. The arithmetic is chosen so the pre-fix predicate,
+// (Offset - RangeOffset) + Length > Hot.Length, wraps to exactly zero and
+// therefore reports coverage: for a slot based at Base, a read of
+// Base + Magnitude bytes at offset -Magnitude sums to 2^64. Under that the
+// old code computed a slot displacement of (ULONG)(0 - Magnitude - Base)
+// -- near 4 GB -- and copied from there. Every slot base the ring could
+// plausibly be holding is tried, both while its fetches are in flight (the
+// park path, which would have stored the same displacement in
+// WaiterSlotOffsets and copied on completion) and once they are ready (the
+// hit path), because both consume the lookup's answer.
+//
+TEST_F(PrefetchKernelTest, WrappingOffsetIsNeverServedFromASlot)
+{
+    unsigned char* a = NewBuffer(PREFETCH_CHUNK);
+    unsigned char* b = NewBuffer(PREFETCH_CHUNK);
+
+    Serve(MakeRead(a, PREFETCH_CHUNK), 0, PREFETCH_CHUNK);
+    Serve(MakeRead(b, PREFETCH_CHUNK), PREFETCH_CHUNK, PREFETCH_CHUNK);
+
+    ASSERT_NE(nullptr, Fcb.PrefetchRing);
+
+    const ULONG magnitude = 4096;
+    const ULONG64 hostileOffset = 0ull - magnitude;
+    const ULONG largest = (PREFETCH_DEPTH + 2) * PREFETCH_CHUNK + magnitude;
+
+    unsigned char* target = NewBuffer(largest);
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        for (ULONG slot = 0; slot < PREFETCH_DEPTH + 2; ++slot)
+        {
+            ULONG length = (slot * PREFETCH_CHUNK) + magnitude;
+            PIRP irp = MakeRead(target, length);
+
+            NTSTATUS status = Serve(irp, hostileOffset, length);
+
+            ASSERT_EQ(STATUS_NOT_FOUND, status)
+                << "wrapping offset admitted by the containment test at slot base "
+                << (slot * PREFETCH_CHUNK) << " (pass " << pass << ")";
+            ASSERT_EQ(0, PrefetchModelCompletionCount(irp))
+                << "a rejected read must be left for the caller's direct fetch";
+        }
+
+        PrefetchModelCompleteAllFetches(STATUS_SUCCESS);
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Park path -- delivery and ordering
 ///////////////////////////////////////////////////////////////////////////

@@ -71,12 +71,20 @@
 // fetch efficiency, but it is no longer load-bearing for correctness of
 // coverage the way it was under exact matching.
 //
-// Pinned by InteriorOffsetCoveredByASlotIsServedFromWithinIt and
-// InteriorParkIsDeliveredFromItsOffsetWithinTheSlot in
-// tests\sandbox\PrefetchKernelTest.cpp. Both check the delivered bytes,
-// not just the status: a containment lookup that forgot to offset the copy
-// would still report success while handing back the wrong data, which is
-// worse than the miss it replaced.
+// The test is also the memory-safety boundary for the copy it admits, so
+// PrefetchSlotCovers (Prefetch.c) is written to have no expression that can
+// wrap for any input, rather than being correct only for offsets a sane
+// caller would produce. Read.c rejects negative offsets at dispatch, but
+// this must hold without that check having run.
+//
+// Pinned by InteriorOffsetCoveredByASlotIsServedFromWithinIt,
+// InteriorParkIsDeliveredFromItsOffsetWithinTheSlot and
+// WrappingOffsetIsNeverServedFromASlot in
+// tests\sandbox\PrefetchKernelTest.cpp. The first two check the delivered
+// bytes, not just the status: a containment lookup that forgot to offset
+// the copy would still report success while handing back the wrong data,
+// which is worse than the miss it replaced. The third drives the wrapping
+// offsets past every slot base the ring could hold.
 //
 // Re-aim window test: an idle ring is only re-aimed if the read that
 // missed falls OUTSIDE the range the ring is actively fetching, i.e.

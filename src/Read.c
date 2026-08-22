@@ -172,6 +172,22 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // paths share end-of-file trimming and post-read bookkeeping (file position,
 // fast-IO flag) for non-paging requests.
 //
+// A negative ByteOffset is rejected outright, before anything else reads
+// it. The I/O manager screens negative offsets out of NtReadFile (measured:
+// STATUS_INVALID_PARAMETER), so usermode cannot reach this, but a kernel
+// caller that builds its own IRP -- IoAllocateIrp plus a hand-filled
+// Parameters.Read.ByteOffset, which is exactly what a filter layered above
+// a filesystem does -- is validated by nobody. Nothing downstream would
+// catch it either: BlorgTrimReadToFileSize's two comparisons are both
+// false for a negative offset (it is neither >= FileSize nor does adding
+// the length exceed it), so the read passes through untrimmed and is then
+// widened to ULONG64, turning -4096 into 2^64-4096. Under that value the
+// prefetcher's containment test is the memory-safety boundary, so it is
+// written to be overflow-proof independently (PrefetchSlotCovers,
+// Prefetch.c) rather than relying on this check -- but the read is
+// meaningless regardless, and failing it here is what makes the answer a
+// clean error instead of a short read from wherever the arithmetic landed.
+//
 // For non-paging requests, FsRtlCheckOplock's result must be returned as-is
 // without completing the IRP when it is cancelled or pending. A non-error
 // result means the oplock check may have broken an existing conflicting
@@ -292,6 +308,14 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
     {
         Irp->IoStatus.Information = 0;
         return STATUS_SUCCESS;
+    }
+
+    if (startingByte.QuadPart < 0)
+    {
+        BLORGFS_PRINT("BlorgVolumeRead: negative byte offset %lld\n", startingByte.QuadPart);
+
+        Irp->IoStatus.Information = 0;
+        return STATUS_INVALID_PARAMETER;
     }
 
     PFCB fcb = IrpSp->FileObject->FsContext;
