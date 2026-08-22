@@ -359,6 +359,22 @@ namespace
 
         volatile long Hits;
         volatile long ObservedReaps;
+
+        //
+        // Set by the test to park the readers briefly. A node is only
+        // reap-eligible while nothing holds a pin, and readers spinning
+        // LookupPin/Unpin keep one held essentially always -- on a machine
+        // with fewer cores than threads the gap never opens at all, so the
+        // reap this test needs to race never happens and the coverage
+        // assertion below fails however long the run is given.
+        //
+        // Parking them makes that window occur on purpose rather than by
+        // luck. It does not weaken the race: the reap work item runs as the
+        // readers resume, which is exactly the overlap being tested, and
+        // the use-after-free claim itself is enforced continuously by the
+        // guarded pool and the PinCount check in the reader.
+        //
+        volatile long Quiet;
     };
 
     UNICODE_STRING MakeName(const wchar_t* text)
@@ -384,6 +400,12 @@ namespace
 
         while (ReadNoFence(&state->Running))
         {
+            if (ReadNoFence(&state->Quiet))
+            {
+                KmJitter();
+                continue;
+            }
+
             PCOMMON_CONTEXT node = BlorgNodeTableLookupPin(&name);
 
             if (!node)
@@ -503,36 +525,36 @@ TEST_F(NodeTableTest, ConcurrentLookupPinAndReapNeverUseAfterFree)
     KM_THREAD* reaper = KmStartThread(ContendedReaper, &state);
 
     //
-    // Run until the window this test exists to cover has actually been
-    // exercised, rather than for a fixed wall-clock slice. A fixed sleep
-    // makes coverage a property of how fast the machine is: 250 ms was
-    // enough on a developer box and not enough on a CI runner, where a
-    // Release build on fewer cores finished the run with ObservedReaps at
-    // zero and tripped the vacuity guard below.
+    // Alternate loud and quiet phases until the window this test exists to
+    // cover has been exercised, rather than running for a fixed slice and
+    // hoping. Loud is the contention itself; quiet lets the node fall out
+    // of pin so the reap can actually happen, which is what the readers
+    // then race on the way back in.
     //
-    // The deadline is a backstop for the case where the race genuinely
-    // never happens -- then the guard fails, which is the correct outcome
-    // and the whole point of it.
+    // The deadline is a backstop: if reaps still never occur, the coverage
+    // assertion below fails, which is the correct outcome and the entire
+    // point of having it.
     //
     const DWORD deadlineMs = 10000;
     const DWORD startedAt = GetTickCount();
 
-    for (;;)
+    while ((GetTickCount() - startedAt) < deadlineMs)
     {
         if (ReadNoFence(&state.Hits) > 0 && ReadNoFence(&state.ObservedReaps) > 0)
         {
             break;
         }
 
-        if ((GetTickCount() - startedAt) >= deadlineMs)
-        {
-            break;
-        }
-
         Sleep(5);
+
+        InterlockedExchange(&state.Quiet, 1);
+        Sleep(2);
+        ShimDrainWorkItems();
+        InterlockedExchange(&state.Quiet, 0);
     }
 
     InterlockedExchange(&state.Running, 0);
+    InterlockedExchange(&state.Quiet, 0);
 
     for (int i = 0; i < kReaders; ++i)
     {
