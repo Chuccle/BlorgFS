@@ -258,6 +258,46 @@ TEST_F(FileInfoTest, NetworkOpenInformationReportsTimesAndSize)
     EXPECT_EQ((LONGLONG)kFileSize, buffer.EndOfFile.QuadPart);
 }
 
+//
+// The existing size assertions above cannot catch a class reading the wrong
+// field, because BlorgCreateFCB sets FileSize and AllocationSize equal, so
+// both answers look right. This one drives them apart first.
+//
+// FileNetworkOpenInformation filled EndOfFile from AllocationSize, so it
+// and FileStandardInformation could report a different end-of-file for the
+// same file the moment the two stopped agreeing -- and it is
+// FileNetworkOpenInformation that the loader and Explorer take as the fast
+// path, so it is the one whose answer gets acted on. Both classes are
+// queried here against the same FCB, and the assertion is that they agree
+// with each other and with FileSize.
+//
+TEST_F(FileInfoTest, EndOfFileComesFromFileSizeNotAllocationSize)
+{
+    const LONGLONG allocation = (LONGLONG)kFileSize * 4;
+
+    Fcb->Header.AllocationSize.QuadPart = allocation;
+
+    FILE_NETWORK_OPEN_INFORMATION networkOpen{};
+    QueryRequest* networkReq = PrepareFileQuery(Fcb, FileNetworkOpenInformation, &networkOpen, sizeof(networkOpen));
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgQueryInformation(Volume, &networkReq->Irp));
+
+    FILE_STANDARD_INFORMATION standard{};
+    QueryRequest* standardReq = PrepareFileQuery(Fcb, FileStandardInformation, &standard, sizeof(standard));
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgQueryInformation(Volume, &standardReq->Irp));
+
+    EXPECT_EQ((LONGLONG)kFileSize, networkOpen.EndOfFile.QuadPart)
+        << "FileNetworkOpenInformation reported the allocation size as end-of-file";
+    EXPECT_EQ(standard.EndOfFile.QuadPart, networkOpen.EndOfFile.QuadPart)
+        << "two classes disagreed about the end of the same file";
+
+    EXPECT_EQ(allocation, networkOpen.AllocationSize.QuadPart)
+        << "the allocation size itself must still be reported as such";
+
+    Fcb->Header.AllocationSize.QuadPart = (LONGLONG)kFileSize;
+}
+
 TEST_F(FileInfoTest, AllInformationSucceedsWhenTheNameFits)
 {
     unsigned char storage[512] = {};

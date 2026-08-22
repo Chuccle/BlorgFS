@@ -12,6 +12,16 @@
 // FilePositionInformation in particular must be implemented -- Windows'
 // GetVolumeInformation crashes without it.
 //
+// Every class that reports an end-of-file reports Header.FileSize, and
+// every class that reports an allocation size reports
+// Header.AllocationSize. FileNetworkOpenInformation used to fill both from
+// AllocationSize, so it and FileStandardInformation could answer the same
+// question about the same file differently. That was invisible only
+// because BlorgCreateFCB sets the two equal today -- it is not a property
+// anything enforces, and the moment they diverge the disagreement lands on
+// FileNetworkOpenInformation, which is the fast path the loader and
+// Explorer take.
+//
 static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     FILE_INFORMATION_CLASS fileInfoClass = IrpSp->Parameters.QueryFile.FileInformationClass;
@@ -159,7 +169,7 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             PCOMMON_CONTEXT commonContext = fileObject->FsContext;
 
             networkOpenInfo->AllocationSize = commonContext->Header.AllocationSize;
-            networkOpenInfo->EndOfFile = commonContext->Header.AllocationSize;
+            networkOpenInfo->EndOfFile = commonContext->Header.FileSize;
             networkOpenInfo->CreationTime.QuadPart = commonContext->CreationTime;
             networkOpenInfo->LastAccessTime.QuadPart = commonContext->LastAccessedTime;
             networkOpenInfo->LastWriteTime.QuadPart = commonContext->LastModifiedTime;

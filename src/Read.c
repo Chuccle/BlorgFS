@@ -137,7 +137,7 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
     if (StartingByte.QuadPart >= Fcb->Header.FileSize.QuadPart)
     {
         BLORGFS_PRINT("Read beyond file size - file size = %llu, requested starting byte = %llu, requested length = %lu\n",
-            Fcb->Header.AllocationSize.QuadPart,
+            Fcb->Header.FileSize.QuadPart,
             StartingByte.QuadPart,
             BytesLength);
 
@@ -149,7 +149,7 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
     if (StartingByte.QuadPart + BytesLength > Fcb->Header.FileSize.QuadPart)
     {
         BLORGFS_PRINT("Read beyond file size - file size = %llu, requested starting byte = %llu, requested length = %lu\n",
-            Fcb->Header.AllocationSize.QuadPart,
+            Fcb->Header.FileSize.QuadPart,
             StartingByte.QuadPart,
             BytesLength);
 
