@@ -56,6 +56,30 @@ namespace
     }
 
     //
+    // The directory listing is the one response body the driver PARSES
+    // rather than copies: it is a flatbuffer, decoded in kernel mode,
+    // carrying server-supplied names, sizes and entry counts. Every other
+    // fuzzed surface here is header reassembly.
+    //
+    // Freeing what arrives matters as much as surviving it -- a listing
+    // leaked on a malformed input would show up as an outstanding pool
+    // allocation at the end of the iteration, which is the check that makes
+    // this worth running.
+    //
+    void OnDirInfo(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID CallerContext)
+    {
+        (void)CallerContext;
+
+        CompletionCalls++;
+        CompletionStatus = Status;
+
+        if (DirInfo)
+        {
+            BlorgFreeHttpDirectoryInfo(DirInfo);
+        }
+    }
+
+    //
     // At most this many chunks per input. A cap keeps one pathological
     // input from spending the whole fuzzing budget building a script.
     //
@@ -170,7 +194,21 @@ extern "C" int BlorgFuzzOnce(const unsigned char* Data, size_t Size)
     pathString.Length = (USHORT)(wcslen(path) * sizeof(wchar_t));
     pathString.MaximumLength = pathString.Length;
 
-    NTSTATUS status = BlorgHttpGetFileMdl(&pathString, 0, sizeof(target), mdl, OnFileRead, nullptr);
+    //
+    // Bit 2 of the mode byte picks the operation. The ranged read exercises
+    // header parsing and body reassembly; the directory listing additionally
+    // runs the flatbuffer through flatcc's verifier and then through
+    // HttpDeserializeDirectoryInfo, which is the only kernel-mode parser in
+    // this driver fed straight from network bytes. Fuzzing only the read
+    // left that parser -- and every entry count, name conversion and
+    // allocation size derived from it -- with no malformed-input coverage
+    // at all.
+    //
+    const bool fuzzDirectoryListing = (chunkMode & 0x04) != 0;
+
+    NTSTATUS status = fuzzDirectoryListing
+        ? BlorgHttpGetDirectoryInfo(&pathString, OnDirInfo, nullptr)
+        : BlorgHttpGetFileMdl(&pathString, 0, sizeof(target), mdl, OnFileRead, nullptr);
 
     SandboxDrainCompletions();
     ShimDrainWorkItems();

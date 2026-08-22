@@ -1,4 +1,4 @@
-﻿//
+//
 // Async HTTP client used to talk to the Blorg metadata/file server.
 // Every public entry point (BlorgHttpGetDirectoryInfo, BlorgHttpGetFileInfo,
 // BlorgHttpGetFile/BlorgHttpGetFileMdl) issues a request and returns
@@ -179,6 +179,49 @@ static BOOLEAN HttpCheckedAddSizeT(SIZE_T A, SIZE_T B, PSIZE_T Result)
     }
 
     *Result = sum;
+    return TRUE;
+}
+
+//
+// Smallest number of body bytes a listing entry can possibly occupy on the
+// wire: one uoffset_t in the vector. A flatbuffers vector of tables is a
+// length followed by 4-byte offsets, and nothing stops every one of those
+// offsets pointing at the same minimal table, so this is the true floor
+// rather than a typical figure.
+//
+#define HTTP_MIN_LISTING_ENTRY_WIRE_BYTES 4
+
+//
+// Rejects entry counts a body of this size could not honestly describe.
+//
+// The counts come from the wire. flatcc's verifier bounds them to the
+// buffer, which stops them being nonsense, but it does not stop them being
+// enormously amplified: each 4-byte vector offset expands to a
+// DIRECTORY_FILE_METADATA, which carries an inline WCHAR Name[260] and so
+// costs 560 bytes. At HTTP_MAX_CONTENT_LENGTH that is 16.7M entries
+// becoming an 8.8 GB PagedPool request from a single 64 MB response -- a
+// ~140x amplification, and a memory-pressure DoS a malicious or
+// compromised backend gets for free. The allocation failing cleanly is not
+// much comfort when the machine has spent itself trying.
+//
+// So the ceiling on ContentLength is not sufficient on its own: it bounds
+// the input, not what the input is inflated into. This ties the counts back
+// to the body that carried them.
+//
+static BOOLEAN HttpListingCountsAreCredible(SIZE_T SubdirCount, SIZE_T FilesCount, SIZE_T BodyLen)
+{
+    SIZE_T totalCount = 0;
+
+    if (!HttpCheckedAddSizeT(SubdirCount, FilesCount, &totalCount))
+    {
+        return FALSE;
+    }
+
+    if (totalCount > (BodyLen / HTTP_MIN_LISTING_ENTRY_WIRE_BYTES))
+    {
+        return FALSE;
+    }
+
     return TRUE;
 }
 
@@ -718,10 +761,26 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
     BlorgMetaFlat_FileEntryMetadata_vec_t flatFileEntries = BlorgMetaFlat_Directory_files(directory);
     SIZE_T filesCount = (flatFileEntries) ? BlorgMetaFlat_FileEntryMetadata_vec_len(flatFileEntries) : 0;
 
+    if (!HttpListingCountsAreCredible(subdirCount, filesCount, bodyLen))
+    {
+        BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - implausible entry counts for a %Iu byte body\n", bodyLen);
+        return STATUS_INVALID_PARAMETER;
+    }
+
     SIZE_T filesEntryArraySize = filesCount * sizeof(DIRECTORY_FILE_METADATA);
     SIZE_T subDirArraySize = subdirCount * sizeof(DIRECTORY_SUBDIR_METADATA);
 
-    PDIRECTORY_INFO dirInfo = ExAllocatePoolZero(PagedPool, headerSize + filesEntryArraySize + subDirArraySize, 'DBLR');
+    SIZE_T entriesSize = 0;
+    SIZE_T allocationSize = 0;
+
+    if (!HttpCheckedAddSizeT(filesEntryArraySize, subDirArraySize, &entriesSize) ||
+        !HttpCheckedAddSizeT(headerSize, entriesSize, &allocationSize))
+    {
+        BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - listing size overflowed\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    PDIRECTORY_INFO dirInfo = ExAllocatePoolZero(PagedPool, allocationSize, 'DBLR');
 
     if (!dirInfo)
     {
