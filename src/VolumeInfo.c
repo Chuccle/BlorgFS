@@ -6,6 +6,18 @@
 // (unknown) capacity. Volume is read-only, so set-volume-information is a
 // no-op stub.
 //
+// FileFsAttributeInformation deliberately does NOT advertise
+// FILE_CASE_SENSITIVE_SEARCH. Every name comparison this driver makes is
+// case-insensitive -- RtlEqualUnicodeString(CaseInSensitive = TRUE) in
+// Create.c, PathCache.c and Structs.c, over hashes built from upcased
+// characters -- so advertising the flag was a claim the volume could not
+// keep, and it contradicted FileCaseSensitiveInformation in FileInfo.c,
+// which already reports no flags at all. An application that trusts the
+// advertisement and stops normalizing case gets aliasing it did not ask
+// for: two names it believes are distinct resolve to the same file. Games
+// in particular assume the Windows default, so the safe direction here is
+// also the truthful one.
+//
 
 static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
@@ -93,7 +105,7 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP Irp, PIO_STACK_LOCATION I
             }
 
             PFILE_FS_ATTRIBUTE_INFORMATION attributeInfo = systemBuffer;
-            attributeInfo->FileSystemAttributes = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK;
+            attributeInfo->FileSystemAttributes = FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK;
             attributeInfo->MaximumComponentNameLength = 255;
 
             SetFlag(attributeInfo->FileSystemAttributes, FILE_READ_ONLY_VOLUME);

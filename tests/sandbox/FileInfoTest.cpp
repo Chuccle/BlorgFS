@@ -411,6 +411,29 @@ TEST_F(FileInfoTest, FsAttributeInformationReportsReadOnlyAndName)
     EXPECT_EQ(0, memcmp(buffer->FileSystemName, L"BLORGFS", buffer->FileSystemNameLength));
 }
 
+//
+// The volume must not claim a case sensitivity it does not have. Every name
+// comparison in this driver is case-insensitive, and
+// FileCaseSensitiveInformation (CaseSensitiveInformationReportsNoFlags,
+// above) already says so -- the attribute flag was the one place that said
+// otherwise, which left the two query classes contradicting each other. An
+// application that believes the flag and stops normalizing case gets silent
+// aliasing: two names it treats as distinct open the same file.
+//
+TEST_F(FileInfoTest, FsAttributeInformationDoesNotClaimCaseSensitiveSearch)
+{
+    unsigned char storage[64] = {};
+    auto* buffer = reinterpret_cast<PFILE_FS_ATTRIBUTE_INFORMATION>(storage);
+    QueryRequest* req = PrepareVolumeQuery(FileFsAttributeInformation, buffer, sizeof(storage));
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
+
+    EXPECT_FALSE(BooleanFlagOn(buffer->FileSystemAttributes, FILE_CASE_SENSITIVE_SEARCH))
+        << "the volume advertised case-sensitive search while comparing case-insensitively";
+    EXPECT_TRUE(BooleanFlagOn(buffer->FileSystemAttributes, FILE_CASE_PRESERVED_NAMES))
+        << "names are still returned with their original case";
+}
+
 TEST_F(FileInfoTest, FsAttributeInformationTooSmallForNameOverflows)
 {
     unsigned char storage[sizeof(FILE_FS_ATTRIBUTE_INFORMATION)] = {};
