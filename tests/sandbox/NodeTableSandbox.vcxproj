@@ -13,7 +13,7 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{5a1e9b74-3c26-49df-b8a1-7e4d2c6f0938}</ProjectGuid>
+    <ProjectGuid>{E2A5D4C7-0F36-4BE6-8159-83C2E1623622}</ProjectGuid>
     <RootNamespace>NodeTableSandbox</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
