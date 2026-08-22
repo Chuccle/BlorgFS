@@ -1,11 +1,25 @@
 name: "CodeQL Advanced"
 
-# Schedule-only on purpose: PREfast (RunCodeAnalysis=true in BlorgFS.vcxproj)
-# already gates every build.yml run on push/PR, so CodeQL runs weekly as a
-# deeper second opinion rather than duplicating that cost per push.
+# Weekly rather than per-push: PREfast (RunCodeAnalysis=true in
+# BlorgFS.vcxproj) already gates every build.yml run on push/PR, so CodeQL
+# is a deeper second opinion rather than a duplicate of that cost.
+#
+# The other two triggers exist because a schedule alone cannot validate a
+# change to this analysis. Scheduled workflows only ever run on the default
+# branch, so anything that alters what CodeQL reports -- a query-pack pin in
+# codeql-config.yml above all -- would be merged unrun and only surface as a
+# changed finding set the following Saturday. A pull request touching this
+# workflow or its config therefore runs the analysis it is changing, and
+# workflow_dispatch makes a re-scan available on demand rather than on a
+# seven-day wait (a pack bump, or re-triaging after a fix).
 on:
   schedule:
     - cron: '41 23 * * 6'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/codeql.yml'
+      - '.github/codeql/**'
 
 env:
   SOLUTION_NAME: BlorgFS.sln

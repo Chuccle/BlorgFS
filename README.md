@@ -69,6 +69,36 @@ not a substitute for running `Fast` yourself.)
   script reports this as `CLOCK`, not `FAIL`. Confirm with
   `Inf2Cat.exe /driver:x64\Debug\BlorgFS /os:10_x64 /uselocaltime`.
 
+## Continuous integration
+
+Three workflows, split by what a failure should cost you.
+
+| Workflow | Runs on | What it does |
+|---|---|---|
+| `build.yml` | push and PR to master | Both configurations, Fast tier. The merge gate. |
+| `verify.yml` | 03:00 UTC daily, or on demand | CBMC proofs and extended fuzz/interleaving runs. |
+| `codeql.yml` | Saturdays 23:41 UTC, on demand, and on any PR touching its own config | CodeQL with the pinned Microsoft driver query packs. |
+
+The daily and weekly ones are deliberately not gates: a CBMC regression or
+a new CodeQL finding is worth waking up to, not worth blocking a merge that
+PREfast and the Fast tier already cleared.
+
+`codeql.yml`'s third trigger is the one worth understanding. Scheduled
+workflows only ever run on the default branch, so a change to what CodeQL
+analyses -- above all a query-pack pin in `.github/codeql/codeql-config.yml`
+-- could otherwise only be merged unrun, and would first show up as a
+changed finding set the following Saturday. A PR touching that config or
+the workflow runs the analysis it is changing. `workflow_dispatch` covers
+the rest: re-scanning after a pack bump or a batch of fixes, without a
+seven-day wait.
+
+Both packs are pinned on purpose. A pack release must not silently change
+what a scheduled run reports -- but a pin that is never reviewed is lost
+coverage, and the windows-drivers pack is the one carrying the
+driver-specific IRQL and annotation queries. Bump it deliberately, let the
+PR trigger run it, and re-triage: previous false-positive verdicts do not
+carry across a pack version.
+
 ## Sanitizers
 
 The usermode sandbox targets build with **ASan** (`EnableASAN`) — it owns
