@@ -1,0 +1,201 @@
+name: "CodeQL Advanced"
+
+# Schedule-only on purpose: PREfast (RunCodeAnalysis=true in BlorgFS.vcxproj)
+# already gates every build.yml run on push/PR, so CodeQL runs weekly as a
+# deeper second opinion rather than duplicating that cost per push.
+on:
+  schedule:
+    - cron: '41 23 * * 6'
+
+env:
+  SOLUTION_NAME: BlorgFS.sln
+  ChocolateyUseWindowsCompression: 'true'
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ (matrix.language == 'c-cpp' && 'windows-latest') || ((matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest') }}
+    timeout-minutes: 60
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - language: actions
+          build-mode: none
+        - language: c-cpp
+          build-mode: manual
+          config: Release
+          platform: x64
+    
+    steps:
+    - name: Detect if Dependabot
+      if: matrix.language == 'c-cpp'
+      id: is_dependabot
+      shell: pwsh
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        token: ${{ (matrix.language == 'c-cpp' && steps.is_dependabot.outputs.is_dependabot == 'true') && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT || github.token }}
+        submodules: ${{ matrix.language == 'c-cpp' && 'recursive' || false }}
+
+    - name: Get flatcc commit hash
+      if: matrix.language == 'c-cpp'
+      id: flatcc_hash
+      shell: pwsh
+      run: |
+        if (Test-Path "third_party/flatcc") {
+          cd third_party/flatcc
+          $hash = git rev-parse HEAD
+          Write-Host "FlatCC Hash: $hash"
+          echo "flatcc_hash=$hash" >> $env:GITHUB_OUTPUT
+          cd ..
+        } else {
+          Write-Host "FlatCC directory not found"
+          echo "flatcc_hash=none" >> $env:GITHUB_OUTPUT
+        }
+
+    - name: Cache Flatcc build
+      if: matrix.language == 'c-cpp' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      id: cache_flatcc
+      uses: actions/cache@v5
+      with:
+        path: |
+          third_party/flatcc/bin/Release
+          third_party/flatcc/build/MSVC
+        key: ${{ runner.os }}-flatcc-${{ steps.flatcc_hash.outputs.flatcc_hash }}
+        restore-keys: |
+          ${{ runner.os }}-flatcc-
+
+    - name: Install build tools
+      if: matrix.language == 'c-cpp' && steps.cache_flatcc.outputs.cache-hit != 'true' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      shell: pwsh
+      run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+
+    # Same two defects build.yml had, and the same fix. The generator was
+    # pinned to "Visual Studio 17 2022" while the runner image moved to
+    # Visual Studio 18, and a multi-line `shell: cmd` step reports only the
+    # last command's exit code -- which was `cd ..\..\..`, so the failed
+    # configure was swallowed and CodeQL failed later for unrelated-looking
+    # reasons. Let cmake pick the generator, and fail where the error is.
+    - name: Build flatcc compiler
+      if: matrix.language == 'c-cpp' && steps.cache_flatcc.outputs.cache-hit != 'true' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        New-Item -ItemType Directory -Force -Path third_party\flatcc\build\MSVC | Out-Null
+        Push-Location third_party\flatcc\build\MSVC
+        try {
+          cmake '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' ..\..
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
+
+          cmake --build . --config Release
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed with exit code $LASTEXITCODE" }
+        } finally {
+          Pop-Location
+        }
+
+    - name: Create generated flatbuffer files
+      if: matrix.language == 'c-cpp' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $flatcc = "third_party\flatcc\bin\Release\flatcc.exe"
+        $schema = "third_party\schemas\metadata_flatbuffer.fbs"
+
+        if (-not (Test-Path $flatcc)) { throw "flatcc compiler missing at $flatcc" }
+        if (-not (Test-Path $schema)) { throw "schema missing at $schema" }
+
+        New-Item -ItemType Directory -Force -Path generated | Out-Null
+        & $flatcc -rv --common_reader -o generated $schema
+        if ($LASTEXITCODE -ne 0) { throw "flatcc codegen failed with exit code $LASTEXITCODE" }
+
+    - name: Cache NuGet packages
+      if: matrix.language == 'c-cpp'
+      uses: actions/cache@v5
+      with:
+        path: ./packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+
+    - name: Setup Developer Command Prompt
+      if: matrix.language == 'c-cpp'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ matrix.platform }}
+
+    - name: Obtain WDK from Nuget
+      if: matrix.language == 'c-cpp'
+      run: |
+        echo "Restoring NuGet packages..."
+        nuget restore ${{ env.SOLUTION_NAME }} -PackagesDirectory ".\packages"
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "NuGet restore failed"
+          exit 1
+        }
+
+    - name: Initialize CodeQL (C/C++)
+      if: matrix.language == 'c-cpp'
+      uses: github/codeql-action/init@v4
+      with:
+        languages: c-cpp
+        build-mode: manual
+        config-file: ./.github/codeql/codeql-config.yml
+
+    - name: Initialize CodeQL (Actions)
+      if: matrix.language == 'actions'
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+        queries: security-extended,security-and-quality
+
+    - name: Build driver for CodeQL analysis
+      if: matrix.language == 'c-cpp'
+      run: |
+        echo "Building solution: ${{ env.SOLUTION_NAME }}"
+        msbuild ${{ env.SOLUTION_NAME }} /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /m /verbosity:minimal
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Build failed"
+          exit 1
+        }
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4
+      with:
+        category: "/language:${{ matrix.language }}"
+        output: 'sarif-results'
+        upload: 'never'
+
+    - name: Filter-sarif
+      if: matrix.language == 'c-cpp'
+      uses: advanced-security/filter-sarif@v1
+      with:
+        patterns: |
+          -third_party/**
+          -packages/**
+          -**/*.generated.*
+          -generated/**
+          -tests/**
+        input:  sarif-results/cpp.sarif
+        output: sarif-results/cpp.sarif
+
+    - name: Upload SARIF
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: sarif-results
+
+    - name: Upload loc as a Build Artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: sarif-results-${{ matrix.language }}
+        path: sarif-results
+        retention-days: 1

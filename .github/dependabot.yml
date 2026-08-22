@@ -1,0 +1,21 @@
+version: 2
+registries:
+  schemas:
+    type: git
+    url: https://github.com
+    username: x-access-token
+    password: ${{secrets.GH_DEPENDABOT_PAT}}
+
+
+updates:
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    registries:
+      - schemas # Allow version updates for dependencies in this registry
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

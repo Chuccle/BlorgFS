@@ -1,0 +1,73 @@
+;
+; BlorgFS.inf
+;
+; Installs the BlorgFS legacy (WDM, non-PnP) filesystem driver as a
+; kernel-mode service. BlorgFS creates its own device objects in
+; DriverEntry rather than through a bus-enumerated FDO, so there is no
+; hardware ID to match and no [Manufacturer]/[Models] section -- this is
+; a Windows 10 1903+ "primitive driver" INF, installed/uninstalled as a
+; unit via the driver store (DiInstallDriver/DiUninstallDriver), e.g.:
+;
+;   rundll32.exe setupapi.dll,InstallHinfSection DefaultInstall.NTamd64 132 <path>\BlorgFS.inf
+;
+; (right-click "Install" on the INF does the same thing), not through
+; Device Manager's "Add Hardware" / "Update Driver". Test-signing must
+; already be enabled and the driver's cert trusted -- this INF only
+; installs the service, it does not touch either of those. Primitive
+; drivers require Class/ClassGuid to be filled in even without real
+; hardware behind them, and may not carry a [DefaultUninstall] section --
+; the platform derives uninstall as the inverse of install.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = "SoftwareDevice"
+ClassGuid   = {62F9C741-B25A-46CE-B54C-9BCCCE08B6F2}
+Provider    = %ManufacturerName%
+CatalogFile = BlorgFS.cat
+DriverVer   =
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+BlorgFS.sys = 1
+
+[DefaultInstall.NTamd64]
+OptionDesc = %ServiceDescription%
+CopyFiles  = BlorgFS.CopyFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = BlorgFS,,BlorgFS.Service
+
+[BlorgFS.CopyFiles]
+BlorgFS.sys
+
+[BlorgFS.Service]
+DisplayName    = %ServiceDescription%
+ServiceType    = 1  ; SERVICE_KERNEL_DRIVER
+StartType      = 3  ; SERVICE_DEMAND_START
+ErrorControl   = 1  ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\BlorgFS.sys
+LoadOrderGroup = "File System"
+AddReg         = BlorgFS.Service.AddReg
+
+[BlorgFS.Service.AddReg]
+; Seeds the one override worth setting out of the box -- Driver.c's
+; ReadBlorgfsRegistryConfig already falls back to this exact hostname
+; (BLORGFS_DEFAULT_REMOTE_HOST) when the value is absent, so this line
+; only exists to give operators a ready-to-edit registry value instead of
+; requiring reg.exe archaeology to find where the override goes. TLS
+; (TlsEnabled/TlsPin) is deliberately left unset here -- opt in explicitly
+; once a cert is available to pin.
+HKR,Parameters,RemoteHost,0x00000000,%DefaultRemoteHost%
+
+[Strings]
+ManufacturerName   = "BlorgFS Project"
+ServiceDescription = "BlorgFS Filesystem Driver"
+DiskName           = "BlorgFS Installation Disk"
+DefaultRemoteHost  = "blorgfs.blorg.lan"

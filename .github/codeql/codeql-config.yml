@@ -1,0 +1,20 @@
+name: "BlorgFS CodeQL"
+
+# Both packs pinned so a pack release can't silently change what a weekly
+# run reports.
+packs:
+  - microsoft/windows-drivers@1.1.0
+  - microsoft/cpp-queries@0.0.5
+query-filters:
+- include:
+    kind:
+      - problem
+      - path-problem
+    tags contain:
+      - security
+- include:
+    kind: alert-suppression
+- exclude:
+    tags: exclude-from-incremental
+- exclude:
+    query path: /external/examples/filters/
