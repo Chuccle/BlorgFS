@@ -365,3 +365,18 @@ FodyWeavers.xsd
 # flatcc - generated flatbuffer headers
 **/flatbuffers_common*
 **/metadata_flatbuffer*
+## BlorgFS-specific
+
+# Agent/editor session state. Contains full worktree copies of this repo,
+# so committing it would duplicate the entire tree several times over.
+.claude/
+
+# Guest diagnostic scratch written to the repo root by deploy/debug sessions
+# (listings, perf reports, service state, install logs). Root-anchored, so
+# real test data such as TlsTest/testdata/rfc8448.txt is unaffected.
+#
+# dbgsettings_out.txt in particular holds the guest's KDNET debug key, which
+# is a credential for attaching a kernel debugger to that VM -- it must never
+# enter git history.
+/*.txt
+/guest_screenshot.png
