@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -256,6 +257,50 @@ TEST_F(HttpClientTest, ContentLengthOverPolicyCeilingIsRejected)
 
     EXPECT_FALSE(NT_SUCCESS(LastRead.Status));
     EXPECT_EQ(1, LastRead.Calls);
+
+    FreeMdl();
+}
+
+//
+// A response with more headers than the parser was given room for is not
+// truncated, it is rejected outright -- picohttpparser answers -1, the same
+// as for a malformed status line, so the response looks broken rather than
+// oversized. At 16 entries that was reachable by ordinary servers: a plain
+// nginx 206 already spends five or six, and anything behind a CDN or
+// carrying the usual security and CORS headers passes 16 without trying.
+//
+// Twenty filler headers around a valid 206, which fails on a 16-entry array
+// and parses on the current one. The body still has to arrive intact, since
+// the point is that the response is USED, not merely accepted.
+//
+TEST_F(HttpClientTest, ResponseWithManyHeadersIsStillParsed)
+{
+    std::string response = "HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\n";
+
+    for (int i = 0; i < 20; ++i)
+    {
+        response += "X-Filler-" + std::to_string(i) + ": v\r\n";
+    }
+
+    response += "\r\nABCDEFGH";
+
+    const SANDBOX_STEP script[] =
+    {
+        { SandboxStepDeliver, (const unsigned char*)response.data(), response.size(), STATUS_SUCCESS, TRUE }
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char target[8] = {};
+
+    Read(target, sizeof(target));
+    Drain();
+
+    EXPECT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_SUCCESS, LastRead.Status)
+        << "a well-formed response was rejected for carrying more headers than the array held";
+    EXPECT_EQ(0, memcmp(target, "ABCDEFGH", sizeof(target)))
+        << "the body must survive a header set that fills more of the array";
 
     FreeMdl();
 }

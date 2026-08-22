@@ -24,7 +24,24 @@
 #include "picohttpparser.h"
 
 #define HTTP_TAG 'PTTH'
-#define HTTP_MAX_HEADERS 16
+//
+// How many response headers picohttpparser is given room to report. This is
+// not a policy limit -- it is the size of an array, and overflowing it is a
+// hard parse failure (-1), not a truncation, so the whole response is
+// rejected. At 16 that was reachable by ordinary servers: a plain nginx
+// 206 already spends five or six on Date/Server/Content-Type/
+// Content-Length/Connection/Accept-Ranges, and anything sitting behind a
+// CDN or adding the usual security and CORS headers passes 16 without
+// trying. The failure looked like a broken backend rather than a limit
+// being hit, because nothing distinguishes this -1 from a malformed status
+// line.
+//
+// 64 entries is 2 KB of the HTTP_CONTEXT, per in-flight request, which
+// buys enough headroom that the array stops being a thing responses can
+// collide with. It bounds nothing security-relevant on its own -- the byte
+// ceiling does that -- so there is no reason to keep it tight.
+//
+#define HTTP_MAX_HEADERS 64
 #define HTTP_INITIAL_RECV_CAPACITY (PAGE_SIZE * 4)
 #define HTTP_FILE_INITIAL_RECV_CAPACITY (PAGE_SIZE * 64) // 256 KB initial capacity for file-read responses
 
