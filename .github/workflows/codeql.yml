@@ -51,8 +51,8 @@ jobs:
       id: flatcc_hash
       shell: pwsh
       run: |
-        if (Test-Path "flatcc") {
-          cd flatcc
+        if (Test-Path "third_party/flatcc") {
+          cd third_party/flatcc
           $hash = git rev-parse HEAD
           Write-Host "FlatCC Hash: $hash"
           echo "flatcc_hash=$hash" >> $env:GITHUB_OUTPUT
@@ -68,8 +68,8 @@ jobs:
       uses: actions/cache@v5
       with:
         path: |
-          flatcc/bin/Release
-          flatcc/build/MSVC
+          third_party/flatcc/bin/Release
+          third_party/flatcc/build/MSVC
         key: ${{ runner.os }}-flatcc-${{ steps.flatcc_hash.outputs.flatcc_hash }}
         restore-keys: |
           ${{ runner.os }}-flatcc-
@@ -79,31 +79,43 @@ jobs:
       shell: pwsh
       run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
 
+    # Same two defects build.yml had, and the same fix. The generator was
+    # pinned to "Visual Studio 17 2022" while the runner image moved to
+    # Visual Studio 18, and a multi-line `shell: cmd` step reports only the
+    # last command's exit code -- which was `cd ..\..\..`, so the failed
+    # configure was swallowed and CodeQL failed later for unrelated-looking
+    # reasons. Let cmake pick the generator, and fail where the error is.
     - name: Build flatcc compiler
       if: matrix.language == 'c-cpp' && steps.cache_flatcc.outputs.cache-hit != 'true' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
-      shell: cmd
+      shell: pwsh
       run: |
-        cd flatcc
-        if not exist "build\MSVC" mkdir build\MSVC
-        cd build\MSVC
-        cmake -G "Visual Studio 17 2022" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..\..
-        cmake --build . --config Release
-        cd ..\..\..
+        $ErrorActionPreference = 'Stop'
+        New-Item -ItemType Directory -Force -Path third_party\flatcc\build\MSVC | Out-Null
+        Push-Location third_party\flatcc\build\MSVC
+        try {
+          cmake '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' ..\..
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
+
+          cmake --build . --config Release
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed with exit code $LASTEXITCODE" }
+        } finally {
+          Pop-Location
+        }
 
     - name: Create generated flatbuffer files
       if: matrix.language == 'c-cpp' && steps.flatcc_hash.outputs.flatcc_hash != 'none'
-      shell: cmd
+      shell: pwsh
       run: |
-        if exist "flatcc\bin\Release\flatcc.exe" (
-          if exist "schemas\metadata_flatbuffer.fbs" (
-            mkdir generated
-            flatcc\bin\Release\flatcc.exe -rv --common_reader -o generated schemas\metadata_flatbuffer.fbs
-          ) else (
-            echo "Schema file not found, skipping flatbuffer generation"
-          )
-        ) else (
-          echo "FlatCC compiler not found, skipping flatbuffer generation"
-        )
+        $ErrorActionPreference = 'Stop'
+        $flatcc = "third_party\flatcc\bin\Release\flatcc.exe"
+        $schema = "third_party\schemas\metadata_flatbuffer.fbs"
+
+        if (-not (Test-Path $flatcc)) { throw "flatcc compiler missing at $flatcc" }
+        if (-not (Test-Path $schema)) { throw "schema missing at $schema" }
+
+        New-Item -ItemType Directory -Force -Path generated | Out-Null
+        & $flatcc -rv --common_reader -o generated $schema
+        if ($LASTEXITCODE -ne 0) { throw "flatcc codegen failed with exit code $LASTEXITCODE" }
 
     - name: Cache NuGet packages
       if: matrix.language == 'c-cpp'
@@ -168,16 +180,11 @@ jobs:
       uses: advanced-security/filter-sarif@v1
       with:
         patterns: |
-          -flatcc/**
+          -third_party/**
           -packages/**
           -**/*.generated.*
-          -picohttpparser/**
-          -schemas/**
           -generated/**
-          -TlsFuzzTest/**
-          -TlsHandshakeTest/**
-          -TlsTest/**
-          -VolumeTester/**
+          -tests/**
         input:  sarif-results/cpp.sarif
         output: sarif-results/cpp.sarif
 

@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{826B2913-CB05-42FC-920F-AC15D58C47AF}</ProjectGuid>
+    <RootNamespace>TlsHandshakeSandbox</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <LinkIncremental>false</LinkIncremental>
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+      <ConformanceMode>false</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <EnableASAN>true</EnableASAN>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <PreprocessorDefinitions>BLORGFS_SANDBOX_BUILD;BLORGFS_KERNEL_BUILD;PADDING_CHECKS;_CRT_SECURE_NO_WARNINGS;_WINSOCK_DEPRECATED_NO_WARNINGS;GTEST_HAS_PTHREAD=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory);$(MSBuildThisFileDirectory)..\..\src;$(MSBuildThisFileDirectory)..\..;$(MSBuildThisFileDirectory)..\..\third_party\flatcc\include;$(MSBuildThisFileDirectory)..\..\third_party\picohttpparser;$(MSBuildThisFileDirectory)..\..\third_party\googletest\googletest\include;$(MSBuildThisFileDirectory)..\..\third_party\googletest\googletest;$(MSBuildThisFileDirectory)..\..\third_party\googletest\googlemock\include;$(MSBuildThisFileDirectory)..\..\third_party\googletest\googlemock;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DisableSpecificWarnings>4100;4189;4244;4267;4996;4127</DisableSpecificWarnings>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>bcrypt.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="TlsHandshakeKernelTest.cpp" />
+    <ClCompile Include="KernelModel.c" />
+    <ClCompile Include="NtShim.c" />
+    <ClCompile Include="NtShimSync.c" />
+    <ClCompile Include="Scheduler.c" />
+    <ClCompile Include="WskModel.c" />
+    <ClCompile Include="StructsModel.c" />
+    <ClCompile Include="NoStatisticsStub.c" />
+    <ClCompile Include="NoPrefetchStub.c" />
+    <ClCompile Include="NoClientStub.c" />
+    <ClCompile Include="..\..\src\Socket.c" />
+    <ClCompile Include="..\..\src\Tls.c" />
+    <ClCompile Include="..\..\src\TlsHandshake.c" />
+    <ClCompile Include="..\..\src\Structs.c" />
+    <ClCompile Include="..\..\third_party\googletest\googletest\src\gtest-all.cc" />
+    <ClCompile Include="..\..\third_party\googletest\googlemock\src\gmock-all.cc" />
+    <ClCompile Include="..\..\third_party\googletest\googlemock\src\gmock_main.cc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="KernelModel.h" />
+    <ClInclude Include="NtShim.h" />
+    <ClInclude Include="FsRtlShim.h" />
+    <ClInclude Include="WskModel.h" />
+    <ClInclude Include="SandboxPrelude.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+  <Target Name="CopyAsanRuntime" AfterTargets="Build">
+    <!--
+      ASan links against clang_rt.asan_dynamic and the loader needs the DLL
+      beside the binary; without it the exe fails to start at all rather
+      than reporting anything useful.
+    -->
+    <ItemGroup>
+      <AsanRuntime Include="$(VCToolsInstallDir)bin\Hostx64\x64\clang_rt.asan_dynamic-x86_64.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(AsanRuntime)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="Exists('%(AsanRuntime.FullPath)')" />
+  </Target>
+</Project>

@@ -40,7 +40,7 @@ jobs:
       id: flatcc_hash
       shell: pwsh
       run: |
-        cd flatcc
+        cd third_party/flatcc
         $hash = git rev-parse HEAD
         Write-Host "FlatCC Hash: $hash"
         echo "flatcc_hash=$hash" >> $env:GITHUB_OUTPUT
@@ -51,8 +51,8 @@ jobs:
       uses: actions/cache@v5
       with:
         path: |
-          flatcc/bin/Release
-          flatcc/build/MSVC
+          third_party/flatcc/bin/Release
+          third_party/flatcc/build/MSVC
         key: ${{ runner.os }}-flatcc-${{ steps.flatcc_hash.outputs.flatcc_hash }}
 
     - name: Install build tools
@@ -75,8 +75,8 @@ jobs:
       shell: pwsh
       run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path flatcc\build\MSVC | Out-Null
-          Push-Location flatcc\build\MSVC
+          New-Item -ItemType Directory -Force -Path third_party\flatcc\build\MSVC | Out-Null
+          Push-Location third_party\flatcc\build\MSVC
           try {
             # Quoted: unquoted, PowerShell hands cmake a truncated "3" and it
             # rejects the value outright. The flag itself is needed because
@@ -98,8 +98,8 @@ jobs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        $flatcc = "flatcc\bin\Release\flatcc.exe"
-        $schema = "schemas\metadata_flatbuffer.fbs"
+        $flatcc = "third_party\flatcc\bin\Release\flatcc.exe"
+        $schema = "third_party\schemas\metadata_flatbuffer.fbs"
 
         if (-not (Test-Path $flatcc))  { throw "flatcc compiler missing at $flatcc -- the flatcc build step did not produce it" }
         if (-not (Test-Path $schema))  { throw "schema missing at $schema -- is the schemas submodule checked out?" }
@@ -142,7 +142,7 @@ jobs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        $sandboxDir = "sandbox\${{ matrix.platform }}\${{ matrix.config }}"
+        $sandboxDir = "tests\sandbox\${{ matrix.platform }}\${{ matrix.config }}"
 
         $suites = @(
           'ClientSandbox.exe',

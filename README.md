@@ -4,6 +4,32 @@ Kernel-mode Windows filesystem driver presenting an HTTP backend as a mounted
 volume (B:). Read-only. Async WSK networking, an optional hand-rolled TLS 1.3
 client, a sequential-read prefetcher, and a keep-alive connection pool.
 
+## Layout
+
+```
+src/           the driver, and only the driver -- one .vcxproj, its INF,
+               and the sources that compile into BlorgFS.sys
+tests/         everything that verifies it
+  sandbox/       usermode targets that compile the real driver sources
+                 against a kernel model, plus the systematic scheduler
+                 and the CBMC harnesses under verification/
+  TlsTest/       RFC 8448 vectors        TlsFuzzTest/  record layer under ASan
+  TlsHandshakeTest/  live openssl handshake
+  PerfHarness/   workload driver and counter reader
+  VolumeTester/  volume-level behaviour against a mounted drive
+tools/         tiered check runner, metric comparison, crash triage,
+               differential correctness harness
+deploy/        VM deploy pipeline and the debugging notes
+third_party/   submodules: flatcc, picohttpparser, schemas, googletest
+```
+
+Build output stays at the repo root (`x64\<Config>\`) regardless of where a
+project lives, which is what the deploy scripts and CI artifact paths expect.
+
+The sandbox projects put their own directory on the include path so
+`src/Driver.h` can pull in `SandboxPrelude.h` without the driver naming a
+test directory.
+
 ## Checking for regressions
 
 **Run `tools\Invoke-BlorgChecks.ps1` — do not hand-roll a build command.**
@@ -55,7 +81,7 @@ the exe does not start at all.
 The driver itself builds with **KASAN**:
 
 ```bash
-msbuild BlorgFS.vcxproj -p:Configuration=Debug -p:Platform=x64 -p:EnableKASAN=true
+msbuild src\BlorgFS.vcxproj -p:Configuration=Debug -p:Platform=x64 -p:EnableKASAN=true
 ```
 
 `kasan.lib` ships in the WDK and the instrumented `.sys` is roughly double
@@ -65,7 +91,7 @@ needs `bcdedit /set kasan on` in the guest and a reboot.
 
 Note `-fsanitize=thread` is **unsupported** for `x86_64-pc-windows-msvc`;
 there is no TSan on this platform. Interleaving coverage comes from the
-systematic scheduler instead (`sandbox\Scheduler.h`).
+systematic scheduler instead (`tests\sandbox\Scheduler.h`).
 
 ## Measuring performance
 

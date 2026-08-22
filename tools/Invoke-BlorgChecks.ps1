@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     One command that answers "did I break anything?" for BlorgFS.
 
@@ -239,21 +239,21 @@ $runsTests = $Tier -in @('Fast', 'All')
 if ($runsBuild) {
     Write-Host "==> Build tier ($Configuration)" -ForegroundColor Cyan
 
-    $ok = (Invoke-Build 'BlorgFS.vcxproj' 'build:driver') -and $ok
+    $ok = (Invoke-Build 'src\BlorgFS.vcxproj' 'build:driver') -and $ok
 
     foreach ($p in @(
-        @('TlsTest\TlsTest.vcxproj', 'build:TlsTest'),
-        @('TlsFuzzTest\TlsFuzzTest.vcxproj', 'build:TlsFuzzTest'),
-        @('TlsHandshakeTest\TlsHandshakeTest.vcxproj', 'build:TlsHandshakeTest'),
-        @('PerfHarness\PerfHarness.vcxproj', 'build:PerfHarness'),
-        @('sandbox\ClientSandbox.vcxproj', 'build:ClientSandbox'),
-        @('sandbox\ClientFuzz.vcxproj', 'build:ClientFuzz'),
-        @('sandbox\SocketSandbox.vcxproj', 'build:SocketSandbox'),
-        @('sandbox\PrefetchSandbox.vcxproj', 'build:PrefetchSandbox'),
-        @('sandbox\NodeTableSandbox.vcxproj', 'build:NodeTableSandbox'),
-        @('sandbox\DispatchSandbox.vcxproj', 'build:DispatchSandbox'),
-        @('sandbox\TlsHandshakeSandbox.vcxproj', 'build:TlsHandshakeSandbox'),
-        @('VolumeTester\VolumeTester.vcxproj', 'build:VolumeTester'))) {
+        @('tests\TlsTest\TlsTest.vcxproj', 'build:TlsTest'),
+        @('tests\TlsFuzzTest\TlsFuzzTest.vcxproj', 'build:TlsFuzzTest'),
+        @('tests\TlsHandshakeTest\TlsHandshakeTest.vcxproj', 'build:TlsHandshakeTest'),
+        @('tests\PerfHarness\PerfHarness.vcxproj', 'build:PerfHarness'),
+        @('tests\sandbox\ClientSandbox.vcxproj', 'build:ClientSandbox'),
+        @('tests\sandbox\ClientFuzz.vcxproj', 'build:ClientFuzz'),
+        @('tests\sandbox\SocketSandbox.vcxproj', 'build:SocketSandbox'),
+        @('tests\sandbox\PrefetchSandbox.vcxproj', 'build:PrefetchSandbox'),
+        @('tests\sandbox\NodeTableSandbox.vcxproj', 'build:NodeTableSandbox'),
+        @('tests\sandbox\DispatchSandbox.vcxproj', 'build:DispatchSandbox'),
+        @('tests\sandbox\TlsHandshakeSandbox.vcxproj', 'build:TlsHandshakeSandbox'),
+        @('tests\VolumeTester\VolumeTester.vcxproj', 'build:VolumeTester'))) {
         $ok = (Invoke-Build $p[0] $p[1]) -and $ok
     }
 

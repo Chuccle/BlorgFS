@@ -1,11 +1,11 @@
 [submodule "schemas"]
-	path = schemas
+	path = third_party/schemas
 	url = https://github.com/Chuccle/schemas.git
 [submodule "flatcc"]
-	path = flatcc
+	path = third_party/flatcc
 	url = https://github.com/dvidelabs/flatcc.git
 [submodule "picohttpparser"]
-	path = picohttpparser
+	path = third_party/picohttpparser
 	url = https://github.com/Chuccle/picohttpparser.git
 [submodule "third_party/googletest"]
 	path = third_party/googletest

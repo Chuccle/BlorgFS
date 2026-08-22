@@ -1,27 +1,27 @@
-﻿
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.12.35527.113
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "BlorgFS", "BlorgFS.vcxproj", "{D9707A0B-3D2C-474A-BD94-A8DDF6B825D8}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "BlorgFS", "src\BlorgFS.vcxproj", "{D9707A0B-3D2C-474A-BD94-A8DDF6B825D8}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "VolumeTester", "VolumeTester\VolumeTester.vcxproj", "{F59E8702-E6DA-4E27-A274-7B7E929C42C2}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "VolumeTester", "tests\VolumeTester\VolumeTester.vcxproj", "{F59E8702-E6DA-4E27-A274-7B7E929C42C2}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TlsTest", "TlsTest\TlsTest.vcxproj", "{A3E5F9D2-6B41-4C9A-8E7F-1D2C3B4A5E6F}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TlsTest", "tests\TlsTest\TlsTest.vcxproj", "{A3E5F9D2-6B41-4C9A-8E7F-1D2C3B4A5E6F}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TlsHandshakeTest", "TlsHandshakeTest\TlsHandshakeTest.vcxproj", "{C4D6E8F1-9A2B-4D3E-8F5C-6B7A8D9E0F1A}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TlsHandshakeTest", "tests\TlsHandshakeTest\TlsHandshakeTest.vcxproj", "{C4D6E8F1-9A2B-4D3E-8F5C-6B7A8D9E0F1A}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TlsFuzzTest", "TlsFuzzTest\TlsFuzzTest.vcxproj", "{D5E7F902-AB3C-4E4F-9A6D-7C8B9EAF1B2C}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TlsFuzzTest", "tests\TlsFuzzTest\TlsFuzzTest.vcxproj", "{D5E7F902-AB3C-4E4F-9A6D-7C8B9EAF1B2C}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PerfHarness", "PerfHarness\PerfHarness.vcxproj", "{7F2C1A48-9D63-4B8E-A51C-6E0F3D7B24A9}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PerfHarness", "tests\PerfHarness\PerfHarness.vcxproj", "{7F2C1A48-9D63-4B8E-A51C-6E0F3D7B24A9}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ClientSandbox", "sandbox\ClientSandbox.vcxproj", "{3B8D5E21-47C6-4A19-9F2B-8C1D7E0A4F63}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ClientSandbox", "tests\sandbox\ClientSandbox.vcxproj", "{3B8D5E21-47C6-4A19-9F2B-8C1D7E0A4F63}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ClientFuzz", "sandbox\ClientFuzz.vcxproj", "{6C4A1F37-2B58-4D0E-91A7-3F5C8E2D6B14}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ClientFuzz", "tests\sandbox\ClientFuzz.vcxproj", "{6C4A1F37-2B58-4D0E-91A7-3F5C8E2D6B14}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SocketSandbox", "sandbox\SocketSandbox.vcxproj", "{9E4B2A15-7C83-4F61-B0D2-5A6E9C3F8147}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SocketSandbox", "tests\sandbox\SocketSandbox.vcxproj", "{9E4B2A15-7C83-4F61-B0D2-5A6E9C3F8147}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PrefetchSandbox", "sandbox\PrefetchSandbox.vcxproj", "{2D7F6C91-4E38-4B5A-8C02-1F9A3E7D5B60}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PrefetchSandbox", "tests\sandbox\PrefetchSandbox.vcxproj", "{2D7F6C91-4E38-4B5A-8C02-1F9A3E7D5B60}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

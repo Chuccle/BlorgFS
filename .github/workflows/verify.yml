@@ -1,0 +1,72 @@
+name: Exhaustive verification
+
+# Split from build.yml deliberately.
+#
+# build.yml is the PR gate: compile every configuration and run the Fast
+# tier -- crypto vectors, the fuzz corpus, and the sandbox suites. It has to
+# stay quick enough that people actually wait for it.
+#
+# This workflow is everything whose cost is measured in minutes rather than
+# seconds: bounded model checking, and fuzzing/interleaving exploration run
+# far past the sample a PR can afford. None of it is a good gate -- a CBMC
+# regression is worth a nightly failure, not a blocked merge.
+#
+# What is NOT here: the Perf tier. It needs a mounted BlorgFS volume and a
+# reachable HTTP backend, neither of which a hosted runner has, so it stays
+# a local/VM activity. See the performance section in README.md.
+
+on:
+  schedule:
+    # 03:00 UTC daily, well clear of the Dependabot window.
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  proofs:
+    runs-on: windows-latest
+    name: CBMC proofs
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Cache CBMC
+        id: cache_cbmc
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}\cbmc
+          key: ${{ runner.os }}-cbmc-6.10
+
+      - name: Install CBMC
+        if: steps.cache_cbmc.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/diffblue/cbmc/releases/download/cbmc-6.1.0/cbmc-6.1.0-win64.msi'
+          $msi = Join-Path $env:RUNNER_TEMP 'cbmc.msi'
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          # Extract rather than install: the harness only needs cbmc.exe on a
+          # path it can be pointed at, and msiexec /a keeps this from touching
+          # machine state the next job would inherit.
+          $dest = Join-Path $env:RUNNER_TEMP 'cbmc'
+          Start-Process msiexec -ArgumentList @('/a', "`"$msi`"", '/qn', "TARGETDIR=`"$dest`"") -Wait -NoNewWindow
+
+      - name: Setup Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Run CBMC proof harnesses
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cbmc = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP 'cbmc') -Filter cbmc.exe -Recurse |
+                  Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cbmc) { throw "cbmc.exe not found after install" }
+
+          & "$env:GITHUB_WORKSPACE\tools\Invoke-BlorgProofs.ps1" -CbmcPath $cbmc
+          if ($LASTEXITCODE -ne 0) { throw "CBMC proofs failed with exit code $LASTEXITCODE" }
