@@ -187,6 +187,14 @@ int WskModelDeferredCount(VOID);
 // Counters a test asserts on.
 //
 ULONG WskModelConnects(VOID);
+
+//
+// The address families of the last connect's local and remote addresses.
+// WSK derives the socket's family from the LOCAL one, so these disagreeing
+// means the driver opened a socket that cannot reach the peer it named.
+//
+USHORT WskModelLastLocalFamily(VOID);
+USHORT WskModelLastRemoteFamily(VOID);
 ULONG WskModelSends(VOID);
 ULONG WskModelReceives(VOID);
 ULONG WskModelCloses(VOID);

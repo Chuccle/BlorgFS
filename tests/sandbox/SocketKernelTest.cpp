@@ -460,6 +460,48 @@ TEST_F(SocketKernelTest, CompletionsRunAtDispatchLevel)
 ///////////////////////////////////////////////////////////////////////////
 
 //
+// The local address is what fixes a WSK socket's address family, so it has
+// to match the remote or the connect opens a socket that can never reach
+// the peer it names. It was a fixed AF_INET wildcard, which made every
+// IPv6 backend unreachable however the name resolved -- DriverEntry asks
+// for AF_UNSPEC and the pool comparison already handles AF_INET6, so the
+// only thing standing between this driver and an IPv6 server was these two
+// disagreeing.
+//
+// Both families are driven, because pinning only the v6 case would let a
+// fix that hardcoded AF_INET6 pass.
+//
+TEST_F(SocketKernelTest, LocalBindFamilyFollowsTheRemoteAddress)
+{
+    SOCKADDR_IN6 v6 = {};
+    v6.sin6_family = AF_INET6;
+    v6.sin6_port = htons(80);
+
+    ASSERT_EQ(STATUS_PENDING,
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&v6, TRUE, RecordAcquire, nullptr));
+
+    EXPECT_EQ(AF_INET6, WskModelLastRemoteFamily());
+    EXPECT_EQ(AF_INET6, WskModelLastLocalFamily())
+        << "an IPv6 remote was connected from an address of a different family";
+
+    BlorgCloseWskSocketAsync(LastAcquire.Socket);
+
+    SOCKADDR_IN v4 = {};
+    v4.sin_family = AF_INET;
+    v4.sin_port = htons(80);
+
+    LastAcquire = {};
+
+    ASSERT_EQ(STATUS_PENDING,
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&v4, TRUE, RecordAcquire, nullptr));
+
+    EXPECT_EQ(AF_INET, WskModelLastRemoteFamily());
+    EXPECT_EQ(AF_INET, WskModelLastLocalFamily());
+
+    BlorgCloseWskSocketAsync(LastAcquire.Socket);
+}
+
+//
 // A released socket comes back on the next acquire, flagged Reused --
 // which is what lets the client treat a failure on it as the idle-close
 // race instead of a hard error. Getting the flag wrong would turn every

@@ -1084,6 +1084,17 @@ static NTSTATUS SocketConnectAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject,
 // set above handles every outcome, including one that comes back
 // already-completed (WSK/IoCompletion still guarantees it runs).
 //
+// The local address is what fixes the socket's address family -- WSK takes
+// it from there, not from the remote -- so it is built to match
+// RemoteAddress rather than being a fixed AF_INET wildcard. It used to be
+// the latter, which made every IPv6 backend unreachable no matter what the
+// resolver returned: DriverEntry resolves AF_UNSPEC and everything from the
+// pool comparison down handles AF_INET6, and then the connect asked for an
+// IPv4 socket. A zeroed SOCKADDR_STORAGE carrying only the family is the
+// wildcard for either one -- INADDR_ANY and in6addr_any are both all-zero,
+// as are port, flowinfo and scope id -- so there is no per-family branch to
+// keep in step.
+//
 NTSTATUS BlorgAcquireReusableWskSocketAsync(
     const SOCKADDR* RemoteAddress,
     BOOLEAN ForceFresh,
@@ -1174,12 +1185,9 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
         TRUE
     );
 
-    SOCKADDR_IN localAddress =
-    {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = 0
-    };
+    SOCKADDR_STORAGE localAddress = { 0 };
+
+    localAddress.ss_family = RemoteAddress->sa_family;
 
     ArmSocketTimeout(
         &connectCtx->Timeout,

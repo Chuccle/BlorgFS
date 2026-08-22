@@ -45,6 +45,16 @@ static WSK_MODEL_BEHAVIOUR ReceiveBehaviour;
 static WSK_MODEL_BEHAVIOUR ConnectBehaviour;
 
 static volatile LONG Connects = 0;
+
+//
+// The address family the driver asked WskSocketConnect for, taken from the
+// LOCAL address: real WSK fixes the socket's family from that parameter,
+// not from the remote, so a local address of the wrong family is how an
+// otherwise correct connect ends up on a socket that can never reach the
+// peer. Recorded per connect so a test can assert the two agree.
+//
+static USHORT LastLocalFamily = 0;
+static USHORT LastRemoteFamily = 0;
 static volatile LONG Sends = 0;
 static volatile LONG Receives = 0;
 static volatile LONG Closes = 0;
@@ -371,9 +381,12 @@ static NTSTATUS WskModelSocketConnect(
     ULONG Flags, PVOID SocketContext, const VOID* Dispatch,
     PVOID OwningProcess, PVOID OwningThread, PVOID SecurityDescriptor, PIRP Irp)
 {
-    (void)Client; (void)SocketType; (void)Protocol; (void)LocalAddress;
-    (void)RemoteAddress; (void)Flags; (void)SocketContext; (void)Dispatch;
+    (void)Client; (void)SocketType; (void)Protocol; (void)Flags;
+    (void)SocketContext; (void)Dispatch;
     (void)OwningProcess; (void)OwningThread; (void)SecurityDescriptor;
+
+    LastLocalFamily = LocalAddress ? LocalAddress->sa_family : 0;
+    LastRemoteFamily = RemoteAddress ? RemoteAddress->sa_family : 0;
 
     InterlockedIncrement(&Connects);
 
@@ -486,6 +499,8 @@ const unsigned char* WskModelLastSendBytes(SIZE_T* LengthOut)
 }
 
 ULONG WskModelConnects(VOID) { return (ULONG)Connects; }
+USHORT WskModelLastLocalFamily(VOID) { return LastLocalFamily; }
+USHORT WskModelLastRemoteFamily(VOID) { return LastRemoteFamily; }
 ULONG WskModelSends(VOID) { return (ULONG)Sends; }
 ULONG WskModelReceives(VOID) { return (ULONG)Receives; }
 ULONG WskModelCloses(VOID) { return (ULONG)Closes; }
@@ -506,6 +521,8 @@ VOID WskModelReset(VOID)
     LeaveCriticalSection(&PendingCs);
 
     Connects = 0;
+    LastLocalFamily = 0;
+    LastRemoteFamily = 0;
     Sends = 0;
     Receives = 0;
     Closes = 0;
