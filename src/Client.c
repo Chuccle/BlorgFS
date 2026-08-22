@@ -82,6 +82,27 @@
 #define HTTP_MAX_CONTENT_LENGTH C_CAST(SIZE_T, (64 * 1024 * 1024))
 
 //
+// Hard ceiling on the status line plus headers of a single response, and
+// the second half of the same untrusted-peer policy as
+// HTTP_MAX_CONTENT_LENGTH. Content-Length bounds what a peer can make this
+// driver allocate once it has declared a size; this bounds what it can
+// make it allocate by never declaring one at all.
+//
+// The header phase completes on whatever arrives and re-posts until
+// picohttpparser finds the terminating CRLFCRLF, growing Ctx->Buffer a page
+// at a time as it goes -- so a peer that streams header bytes and simply
+// never terminates them drove the buffer up to HttpGrowBufferIfNeeded's
+// only limit, MAXULONG. That is close to 4 GB of NonPagedPoolNx per
+// in-flight request, from a peer that has sent no valid response at all;
+// non-paged pool exhaustion takes the machine down, not just this driver.
+//
+// 64 KB is several times what any real server sends (nginx defaults to
+// 8 KB, IIS to 16 KB) and still leaves room for a listing response's
+// headers to grow, so the ceiling is unreachable by accident.
+//
+#define HTTP_MAX_HEADER_BYTES C_CAST(ULONG, (64 * 1024))
+
+//
 // Checked SIZE_T addition. Returns FALSE (and leaves *Result unspecified)
 // on overflow instead of wrapping. Every BodyOffset + ContentLength
 // computation in this file -- combining a wire-parsed, untrusted length
@@ -1452,8 +1473,9 @@ static VOID HttpIssueReceiveDispatch(HTTP_CONTEXT* Ctx)
 }
 
 //
-// Issues the next plaintext receive: header-phase (unbounded, grows Buffer
-// as needed) or body-phase (exact remainder via WSK_FLAG_WAITALL, into
+// Issues the next plaintext receive: header-phase (grows Buffer a page at
+// a time, bounded by HTTP_MAX_HEADER_BYTES in HttpParseHeaders) or
+// body-phase (exact remainder via WSK_FLAG_WAITALL, into
 // Buffer or the caller's MDL). Checks remaining stack first and expands via
 // callout if low -- see the stack-safety discussion above; Wait = FALSE is
 // required at DISPATCH_LEVEL (Wait = TRUE there returns
@@ -1464,7 +1486,9 @@ static VOID HttpIssueReceiveDispatch(HTTP_CONTEXT* Ctx)
 // already be freed. Two receive regimes are selected by whether headers
 // have been parsed yet (BodyOffset != 0): header phase posts the
 // remaining capacity and completes on whatever arrives (Flags = 0),
-// growing a page at a time if the headers alone overflow it; body phase
+// growing a page at a time if the headers alone overflow it -- and only
+// re-posting while HttpParseHeaders keeps answering STATUS_BUFFER_TOO_SMALL,
+// which it stops doing past HTTP_MAX_HEADER_BYTES; body phase
 // posts exactly the outstanding remainder with WSK_FLAG_WAITALL -- one
 // completion for the whole body rather than one per arriving segment,
 // into either the caller's locked MDL (TargetMdl set, body byte i at MDL
@@ -2130,7 +2154,12 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
 //
 // Parses HTTP response headers out of Ctx->Buffer via picohttpparser,
 // resolves Content-Length, and computes BodyOffset/BodyEndOffset. Returns
-// STATUS_BUFFER_TOO_SMALL if more bytes are needed for the headers alone.
+// STATUS_BUFFER_TOO_SMALL if more bytes are needed for the headers alone --
+// unless HTTP_MAX_HEADER_BYTES has already accumulated, in which case the
+// answer is STATUS_INVALID_NETWORK_RESPONSE and the request fails. This is
+// the only place that distinction can be drawn: "incomplete" is the signal
+// that makes the caller post another receive and grow the buffer again, so
+// a peer that never terminates its headers is bounded here or nowhere.
 // A Content-Length over HTTP_MAX_CONTENT_LENGTH is rejected outright
 // rather than truncated or silently capped: truncating would let a
 // malicious/buggy server cause this code to read or dispatch a body
@@ -2165,7 +2194,9 @@ static NTSTATUS HttpParseHeaders(HTTP_CONTEXT* Ctx)
 
     if (-2 == bytesProcessed)
     {
-        return STATUS_BUFFER_TOO_SMALL;
+        return (Ctx->Length >= HTTP_MAX_HEADER_BYTES)
+            ? STATUS_INVALID_NETWORK_RESPONSE
+            : STATUS_BUFFER_TOO_SMALL;
     }
 
     if (bytesProcessed < 0)

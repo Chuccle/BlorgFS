@@ -306,6 +306,48 @@ TEST_F(HttpClientTest, ResponseWithManyHeadersIsStillParsed)
 }
 
 //
+// The pool-exhaustion shape: a peer that sends header bytes and never
+// terminates them. picohttpparser answers "incomplete" for as long as this
+// goes on, which is the signal that makes the client post another receive
+// and grow its NonPagedPoolNx buffer again -- so before HTTP_MAX_HEADER_BYTES
+// the only limit was HttpGrowBufferIfNeeded's MAXULONG, close to 4 GB of
+// non-paged pool per in-flight request from a peer that has sent no valid
+// response at all.
+//
+// One unterminated header line rather than many short ones, because many
+// short ones hit HTTP_MAX_HEADERS first and fail as a parse error -- a
+// different bound that was already there, and not the one under test.
+//
+// The exact status is the assertion. A run without the cap also fails this
+// request eventually, once the peer runs out of script, so "did it fail"
+// does not distinguish the two; STATUS_INVALID_NETWORK_RESPONSE is reachable
+// only through the ceiling.
+//
+TEST_F(HttpClientTest, UnterminatedHeadersAreRejectedRatherThanGrownWithoutLimit)
+{
+    std::string flood = "HTTP/1.1 206 Partial Content\r\nX-Endless: ";
+    flood.append(256 * 1024, 'a');
+
+    const SANDBOX_STEP script[] =
+    {
+        { SandboxStepDeliver, (const unsigned char*)flood.data(), flood.size(), STATUS_SUCCESS, TRUE }
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char target[8] = {};
+
+    Read(target, sizeof(target));
+    Drain();
+
+    EXPECT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_INVALID_NETWORK_RESPONSE, LastRead.Status)
+        << "unterminated headers must be refused at the ceiling, not grown into";
+
+    FreeMdl();
+}
+
+//
 // The peer closes mid-body. Response bytes were already consumed, so this
 // is NOT the idle-close race and must not be retried -- a retry would
 // re-read a partial body onto itself.
