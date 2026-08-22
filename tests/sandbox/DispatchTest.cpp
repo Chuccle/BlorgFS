@@ -14,6 +14,8 @@ extern "C" {
 #include "..\..\src\Driver.h"
 }
 
+#include "DeviceKindScope.h"
+
 TEST(DispatchSandbox, LinksEveryDispatchTranslationUnit)
 {
     SUCCEED() << "every dispatch .c compiled and linked against the kernel model";
@@ -69,4 +71,49 @@ TEST(DispatchSandbox, ShimHooksActuallyFlipTheBranchTheyClaimTo)
         KeWaitForMultipleObjects(2, objects, WaitAny, Executive, KernelMode, FALSE, nullptr, nullptr))
         << "the work event's signal (index 0) was not reported now that it is set too -- "
            "WaitAny must return the lowest-indexed signalled object";
+}
+
+//
+// A flush on a read-only volume has nothing to write back, so the honest
+// answer is success. It used to return STATUS_INVALID_DEVICE_REQUEST, which
+// reaches an application as "Incorrect function" -- the same misleading
+// error that hid the statistics IOCTL routing bug -- and some applications
+// treat a failed flush as fatal rather than as "this volume needs no
+// flushing".
+//
+// All three of the driver's device objects, because BlorgFlushBuffers is
+// reached on any of them and the old stub answered identically for each.
+// The unknown device is the control: a flush arriving on a device this
+// driver does not own is a routing error, and turning that into success
+// would hide it.
+//
+TEST(DispatchSandbox, FlushBuffersSucceedsOnEveryDeviceThisDriverOwns)
+{
+    DEVICE_OBJECT device;
+    memset(&device, 0, sizeof(device));
+
+    PDEVICE_OBJECT* const slots[] =
+    {
+        &global.VolumeDeviceObject,
+        &global.DiskDeviceObject,
+        &global.FileSystemDeviceObject
+    };
+
+    for (PDEVICE_OBJECT* slot : slots)
+    {
+        ScopedDeviceKind asOurs(slot, &device);
+
+        IRP irp;
+        memset(&irp, 0, sizeof(irp));
+
+        EXPECT_EQ(STATUS_SUCCESS, BlorgFlushBuffers(&device, &irp));
+        EXPECT_EQ(STATUS_SUCCESS, irp.IoStatus.Status);
+        EXPECT_EQ(1u, irp.CompletionCount) << "a flush must be completed exactly once";
+    }
+
+    IRP foreign;
+    memset(&foreign, 0, sizeof(foreign));
+
+    EXPECT_EQ(STATUS_INVALID_DEVICE_REQUEST, BlorgFlushBuffers(&device, &foreign))
+        << "a flush on a device this driver does not own is a routing error, not a no-op";
 }
