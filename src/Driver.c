@@ -299,6 +299,16 @@ static void FreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
 // completes any still-pending NOTIFY_CHANGE_DIRECTORY IRPs and frees the
 // notify sync object; safe even if no notifies were ever registered.
 //
+// The work queue is destroyed before the node frees below, and that order
+// is not free: freeing a node runs FsRtlUninitializeOplock, which hands
+// every IRP the oplock package still holds to BlorgOplockComplete -- after
+// the queue has been stopped and drained. BlorgOplockComplete checks the
+// ThreadsActive gate for that reason and completes those IRPs rather than
+// queueing them where nothing would ever pick them up. Reversing the order
+// here instead would run oplock-released IRPs through live workers against
+// a volume already mid-teardown, which is worse; the gate keeps the
+// teardown sequence as it is and makes the late completions safe.
+//
 static void DeleteBlorgVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
 {
     if (VolumeDeviceObject)

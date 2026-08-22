@@ -487,18 +487,32 @@ Return Value:
 // otherwise completes it with the failure status. Mirrors BlorgOplockPrePostIrp's
 // pending/parking side of the FsRtlCheckOplock contract.
 //
+// The ThreadsActive gate is the same one BlorgFsdPostRequest and
+// BlorgFsdRequeueRequest consult, and here it is not the advisory
+// race-narrowing it is there -- it is load-bearing. Volume teardown calls
+// BlorgDestroyWorkQueue, which stops the workers and drains the queue, and
+// only then frees the node tree; freeing a node runs
+// FsRtlUninitializeOplock, which completes every IRP the oplock package
+// still holds through this routine. Queueing those would deposit them in a
+// queue with no workers left to dispatch them and no drain left to cancel
+// them -- an IRP the caller waits on forever. The other two gate readers can
+// return STATUS_DEVICE_REMOVED and let their caller complete the IRP; a
+// callback has no such return path, so it completes the IRP itself, with the
+// status its siblings hand back for exactly this condition.
+//
 void BlorgOplockComplete(PVOID Context, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Context);
 
-    if (STATUS_SUCCESS == Irp->IoStatus.Status)
+    if (STATUS_SUCCESS == Irp->IoStatus.Status && ReadAcquire(&FspQueue.ThreadsActive))
     {
         AddToWorkqueue(Irp);
+        return;
     }
-    else
-    {
-        BlorgCompleteRequest(Irp, Irp->IoStatus.Status, IO_DISK_INCREMENT);
-    }
+
+    NTSTATUS result = NT_SUCCESS(Irp->IoStatus.Status) ? STATUS_DEVICE_REMOVED : Irp->IoStatus.Status;
+
+    BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
 }
 
 //

@@ -423,4 +423,61 @@ TEST_F(FspWorkQueueStressTest, TeardownDrainFreesTheStashOnAnIrpItCancels)
         << "the stash the re-queue attached was orphaned when the drain cancelled the IRP";
 }
 
+//
+// The teardown ordering DeleteBlorgVolumeDeviceObject actually uses:
+// BlorgDestroyWorkQueue stops the workers and drains the queue, and only then
+// are the nodes freed -- and freeing a node runs FsRtlUninitializeOplock,
+// which releases every IRP the oplock package is still holding through
+// BlorgOplockComplete. Those arrive after the queue is dead.
+//
+// Queueing one there is not a race but a certainty, and it strands the IRP
+// twice over: no worker is left to dispatch it and no drain is left to
+// cancel it, so the caller waits forever on a volume that has gone. The
+// success status is the one that matters -- a failed break already
+// completed the IRP before this change, so it is the granted break, the
+// normal outcome, that had the bug.
+//
+TEST_F(FspWorkQueueStressTest, OplockReleaseAfterTeardownCompletesTheIrpRatherThanQueueingIt)
+{
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
+
+    BlorgDestroyWorkQueue();
+
+    StressIrpSlot slot{};
+    slot.Stack.MajorFunction = IRP_MJ_READ;
+    slot.Stack.FileObject = &slot.FileObject;
+    slot.Irp.StackLocation = &slot.Stack;
+    slot.Irp.IoStatus.Status = STATUS_SUCCESS;
+
+    BlorgOplockComplete(nullptr, &slot.Irp);
+
+    EXPECT_EQ(1u, slot.Irp.CompletionCount)
+        << "an oplock release arriving after teardown left the IRP in a queue nothing drains";
+    EXPECT_EQ(STATUS_DEVICE_REMOVED, slot.Irp.IoStatus.Status);
+}
+
+//
+// The same callback while the queue is alive must still re-queue: the gate
+// above is a teardown check, not a new policy for oplock breaks.
+//
+TEST_F(FspWorkQueueStressTest, OplockReleaseOnALiveQueueStillRequeuesForAWorkerPass)
+{
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
+
+    StressIrpSlot slot{};
+    slot.Stack.MajorFunction = IRP_MJ_READ;
+    slot.Stack.FileObject = &slot.FileObject;
+    slot.Irp.StackLocation = &slot.Stack;
+    slot.Irp.IoStatus.Status = STATUS_SUCCESS;
+
+    BlorgOplockComplete(nullptr, &slot.Irp);
+
+    EXPECT_EQ(0u, slot.Irp.CompletionCount) << "a re-queued IRP must not be completed yet";
+
+    BlorgDestroyWorkQueue();
+
+    EXPECT_EQ(1u, slot.Irp.CompletionCount);
+    EXPECT_EQ(STATUS_CANCELLED, slot.Irp.IoStatus.Status);
+}
+
 } // namespace
