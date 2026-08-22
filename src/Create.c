@@ -21,6 +21,18 @@
 //  from VM/VIX flakiness, and the cause of many "frozen VM" incidents.
 //  See deploy/DEBUGGING.md.
 //
+//  MAXIMUM_ALLOWED is inside the read-only mask, not outside it. It is not
+//  a request for write access -- it means "grant whatever I am entitled
+//  to" -- and the entitlement is already decided before this runs: the
+//  devices are FILE_DEVICE_SECURE_OPEN, so the I/O manager resolves
+//  MAXIMUM_ALLOWED against the device security descriptor and sets the
+//  handle's granted access from that. This check is the second, independent
+//  gate, and denying the bit here turned a read handle the caller was
+//  entitled to into ACCESS_DENIED -- which is what applications that open
+//  with MAXIMUM_ALLOWED as a matter of habit were getting. It was in the
+//  first mask (the set this volume understands at all) and missing from the
+//  read-only one, so the rejection was an omission rather than a policy.
+//
 static inline BOOLEAN CheckFileAccess(const ACCESS_MASK* DesiredAccess, BOOLEAN IsReadOnly)
 {
     if (FlagOn(*DesiredAccess, ~(DELETE |
@@ -49,7 +61,7 @@ static inline BOOLEAN CheckFileAccess(const ACCESS_MASK* DesiredAccess, BOOLEAN 
             SYNCHRONIZE | ACCESS_SYSTEM_SECURITY | FILE_READ_DATA |
             FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES |
             FILE_WRITE_ATTRIBUTES | FILE_EXECUTE | FILE_LIST_DIRECTORY |
-            FILE_TRAVERSE;
+            FILE_TRAVERSE | MAXIMUM_ALLOWED;
 
         if (FlagOn(*DesiredAccess, ~AccessMask))
         {
@@ -94,7 +106,7 @@ static inline BOOLEAN CheckDirectoryAccess(const ACCESS_MASK* DesiredAccess, BOO
             SYNCHRONIZE | ACCESS_SYSTEM_SECURITY | FILE_READ_DATA |
             FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES |
             FILE_WRITE_ATTRIBUTES | FILE_EXECUTE | FILE_LIST_DIRECTORY |
-            FILE_TRAVERSE;
+            FILE_TRAVERSE | MAXIMUM_ALLOWED;
 
         AccessMask |= FILE_ADD_SUBDIRECTORY | FILE_ADD_FILE | FILE_DELETE_CHILD;
 

@@ -344,6 +344,44 @@ TEST_F(CreateDirectoryTest, DirectoryReadOnlyMaskAllowsChildMutationBitsThatFile
     EXPECT_EQ(nullptr, fileOpener.FileObject.FsContext);
 }
 
+//
+// MAXIMUM_ALLOWED means "grant whatever I am entitled to", and what the
+// caller is entitled to has already been settled by the time this check
+// runs -- the devices are FILE_DEVICE_SECURE_OPEN, so the I/O manager
+// resolved the bit against the device security descriptor and set the
+// handle's granted access from it. Denying it here turned a read handle
+// the caller was entitled to into ACCESS_DENIED, which is what every
+// application that opens with MAXIMUM_ALLOWED out of habit was getting.
+//
+// Files and directories both, since the two masks are maintained
+// separately and an omission in one is invisible from the other.
+//
+TEST_F(CreateDirectoryTest, MaximumAllowedIsInsideTheReadOnlyMask)
+{
+    PCOMMON_CONTEXT dir = MakePublishedNode(L"\\media", TRUE);
+    ASSERT_NE(nullptr, dir);
+    PCOMMON_CONTEXT file = MakePublishedNode(L"\\clip.bin", FALSE);
+    ASSERT_NE(nullptr, file);
+
+    CreateOpener dirOpener;
+    PrepareOpener(&dirOpener, Path(L"\\media"), MAXIMUM_ALLOWED, kShareAll, 0);
+    BlorgCreate(Volume, &dirOpener.CreateIrp);
+
+    EXPECT_EQ(STATUS_SUCCESS, dirOpener.CreateIrp.IoStatus.Status)
+        << "a directory opened with MAXIMUM_ALLOWED was refused a read handle";
+
+    CloseOpener(&dirOpener);
+
+    CreateOpener fileOpener;
+    PrepareOpener(&fileOpener, Path(L"\\clip.bin"), MAXIMUM_ALLOWED, kShareAll, 0);
+    BlorgCreate(Volume, &fileOpener.CreateIrp);
+
+    EXPECT_EQ(STATUS_SUCCESS, fileOpener.CreateIrp.IoStatus.Status)
+        << "a file opened with MAXIMUM_ALLOWED was refused a read handle";
+
+    CloseOpener(&fileOpener);
+}
+
 TEST_F(CreateDirectoryTest, OpenExistingDcbDeniesAccessOutsideReadOnlyMask)
 {
     PCOMMON_CONTEXT node = MakePublishedNode(L"\\media", TRUE);
