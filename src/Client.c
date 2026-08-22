@@ -473,11 +473,26 @@ static BOOLEAN HttpHeaderNameEquals(const char* Name, SIZE_T NameLength, const c
 
 //
 // Scans parsed headers for Content-Length and parses its value. Returns
-// STATUS_NOT_FOUND if absent (caller decides whether that's an error).
+// STATUS_NOT_FOUND if absent (caller decides whether that's an error), and
+// STATUS_INVALID_NETWORK_RESPONSE if the response carries more than one.
+//
+// The whole header set is scanned rather than stopping at the first match,
+// which is the point. Taking the first and ignoring the rest is the classic
+// request-smuggling primitive read from the client side: this driver keeps
+// a keep-alive connection pool, so if a proxy or origin ahead of it frames
+// a response by a different Content-Length than the one used here, the
+// leftover bytes stay in the stream and become the head of the NEXT
+// response read on that socket -- one request's body served as another's.
+// A response that declares its own length twice is malformed by RFC 9110
+// either way; rejecting it costs nothing real and removes the ambiguity
+// entirely, which is what "be conservative in what you accept" means for a
+// length-prefixed protocol.
 //
 static NTSTATUS GetContentLengthFromHeaders(const struct phr_header* Headers, SIZE_T HeaderCount, PSIZE_T ContentLength)
 {
     static const char contentLengthName[] = "content-length";
+
+    NTSTATUS result = STATUS_NOT_FOUND;
 
     for (SIZE_T i = 0; i < HeaderCount; ++i)
     {
@@ -486,10 +501,15 @@ static NTSTATUS GetContentLengthFromHeaders(const struct phr_header* Headers, SI
             continue;
         }
 
-        return StrToSize(Headers[i].value, Headers[i].value_len, ContentLength);
+        if (STATUS_NOT_FOUND != result)
+        {
+            return STATUS_INVALID_NETWORK_RESPONSE;
+        }
+
+        result = StrToSize(Headers[i].value, Headers[i].value_len, ContentLength);
     }
 
-    return STATUS_NOT_FOUND;
+    return result;
 }
 
 #define HEX_TO_CHAR(x) ((x) < 10 ? '0' + (x) : 'A' + (x) - 10)

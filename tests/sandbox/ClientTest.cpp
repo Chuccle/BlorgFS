@@ -306,6 +306,52 @@ TEST_F(HttpClientTest, ResponseWithManyHeadersIsStillParsed)
 }
 
 //
+// Two Content-Length headers. Taking the first and ignoring the second is
+// how a client ends up framing a response differently from whatever proxy
+// or origin produced it -- and because this driver pools keep-alive
+// connections, the bytes it did not consume do not vanish, they become the
+// head of the next response read on the same socket. That is response
+// smuggling, read from the client side: one request's body served as
+// another's answer.
+//
+// Both orderings are checked. A short-then-long pair leaves the tail on the
+// wire; long-then-short over-reads into whatever follows. Neither may be
+// accepted, so the assertion is the status rather than the byte count.
+//
+TEST_F(HttpClientTest, DuplicateContentLengthIsRejected)
+{
+    static const SANDBOX_STEP shortFirst[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Length: 8\r\n\r\nABCDEFGH")
+    };
+
+    static const SANDBOX_STEP longFirst[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nContent-Length: 4\r\n\r\nABCDEFGH")
+    };
+
+    const SANDBOX_STEP* const scripts[] = { shortFirst, longFirst };
+
+    for (const SANDBOX_STEP* script : scripts)
+    {
+        SandboxSetPeerScript(script, 1);
+
+        LastRead = {};
+
+        unsigned char target[8] = {};
+
+        Read(target, sizeof(target));
+        Drain();
+
+        EXPECT_EQ(1, LastRead.Calls);
+        EXPECT_EQ(STATUS_INVALID_NETWORK_RESPONSE, LastRead.Status)
+            << "a response declaring its own length twice must not be framed by either value";
+
+        FreeMdl();
+    }
+}
+
+//
 // The pool-exhaustion shape: a peer that sends header bytes and never
 // terminates them. picohttpparser answers "incomplete" for as long as this
 // goes on, which is the signal that makes the client post another receive
