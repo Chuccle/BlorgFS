@@ -78,8 +78,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path flatcc\build\MSVC | Out-Null
           Push-Location flatcc\build\MSVC
           try {
-            # -DCMAKE_POLICY_VERSION_MINIMUM=3.5 handles flatcc's old cmake_minimum_required.
-            cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..\..
+            # Quoted: unquoted, PowerShell hands cmake a truncated "3" and it
+            # rejects the value outright. The flag itself is needed because
+            # flatcc's cmake_minimum_required predates what CMake 4 accepts.
+            cmake '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' ..\..
             if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
 
             cmake --build . --config Release
