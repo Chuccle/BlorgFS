@@ -244,21 +244,18 @@ TEST_F(PrefetchKernelTest, ResidentChunkIsServedAsAHit)
 }
 
 //
-// A read whose range is entirely covered by a resident slot, but which
-// starts inside that slot rather than exactly on its boundary, is a MISS
-// today: the lookup tests Offset == RangeOffset, not containment. The ring
-// already holds every byte being asked for and the read still pays a full
-// HTTP round trip to fetch them again.
+// A read whose range is entirely covered by a resident slot is served from
+// it even when it starts inside the slot rather than on its boundary. Under
+// the old exact-offset lookup this was a miss that paid a full round trip
+// re-fetching bytes the ring already held.
 //
-// This is pinned deliberately rather than treated as a bug to fix in place.
-// PrefetchNearMisses exists to size the problem on real workloads before
-// anyone widens the lookup, because containment matching also means copying
-// from a slot interior, which the hit path does not do today. If the lookup
-// is changed, this test flips to STATUS_SUCCESS -- that is the signal to
-// update it, the counter's meaning, and Prefetch.h's lookup contract
-// together, not to delete it.
+// The fill byte is what makes this meaningful: it proves the copy came from
+// the correct position inside the slot, not merely that a hit was reported.
+// A containment lookup that forgot to offset the copy would still return
+// STATUS_SUCCESS here while handing the reader the wrong bytes -- silent
+// data corruption, and far worse than the miss it replaced.
 //
-TEST_F(PrefetchKernelTest, InteriorOffsetCoveredByASlotIsANearMiss)
+TEST_F(PrefetchKernelTest, InteriorOffsetCoveredByASlotIsServedFromWithinIt)
 {
     unsigned char* a = NewBuffer(PREFETCH_CHUNK);
     unsigned char* b = NewBuffer(PREFETCH_CHUNK);
@@ -268,9 +265,8 @@ TEST_F(PrefetchKernelTest, InteriorOffsetCoveredByASlotIsANearMiss)
 
     ASSERT_NE(nullptr, Fcb.PrefetchRing);
 
+    PrefetchModelSetFillByte(0x7E);
     PrefetchModelCompleteAllFetches(STATUS_SUCCESS);
-
-    const ULONG64 before = ShimStatistics.PrefetchNearMisses;
 
     const ULONG interiorLength = 4096;
     unsigned char* target = NewBuffer(interiorLength);
@@ -278,12 +274,51 @@ TEST_F(PrefetchKernelTest, InteriorOffsetCoveredByASlotIsANearMiss)
 
     NTSTATUS status = Serve(irp, (2 * PREFETCH_CHUNK) + interiorLength, interiorLength);
 
-    EXPECT_EQ(STATUS_NOT_FOUND, status)
-        << "exact-offset lookup should still reject an interior read; if this now "
-           "succeeds the lookup was widened -- see the comment above";
+    ASSERT_EQ(STATUS_SUCCESS, status)
+        << "the slot covers this range, so containment lookup must serve it as a hit";
+    EXPECT_EQ(interiorLength, irp->IoStatus.Information);
 
-    EXPECT_EQ(before + 1, ShimStatistics.PrefetchNearMisses)
-        << "a miss whose bytes were already in the ring must be counted as a near miss";
+    for (SIZE_T i = 0; i < interiorLength; ++i)
+    {
+        ASSERT_EQ(0x7E, target[i]) << "interior hit copied from the wrong offset at " << i;
+    }
+}
+
+//
+// The park counterpart. A read admitted by containment onto a slot that is
+// still in flight must be delivered from its own offset inside that slot
+// when the fetch lands, not from the head of the buffer.
+//
+TEST_F(PrefetchKernelTest, InteriorParkIsDeliveredFromItsOffsetWithinTheSlot)
+{
+    unsigned char* a = NewBuffer(PREFETCH_CHUNK);
+    unsigned char* b = NewBuffer(PREFETCH_CHUNK);
+
+    Serve(MakeRead(a, PREFETCH_CHUNK), 0, PREFETCH_CHUNK);
+    Serve(MakeRead(b, PREFETCH_CHUNK), PREFETCH_CHUNK, PREFETCH_CHUNK);
+
+    ASSERT_NE(nullptr, Fcb.PrefetchRing);
+    ASSERT_GT(PrefetchModelFetchesPending(), 0) << "the slot must still be in flight to park on";
+
+    const ULONG interiorLength = 4096;
+    unsigned char* target = NewBuffer(interiorLength);
+    PIRP irp = MakeRead(target, interiorLength);
+
+    NTSTATUS status = Serve(irp, (2 * PREFETCH_CHUNK) + interiorLength, interiorLength);
+
+    ASSERT_EQ(STATUS_PENDING, status) << "an in-flight slot covering the range should be parked on";
+
+    PrefetchModelSetFillByte(0x3C);
+    PrefetchModelSettle(STATUS_SUCCESS);
+
+    EXPECT_EQ(1, PrefetchModelCompletionCount(irp)) << "a parked paging IRP must complete exactly once";
+    EXPECT_EQ(STATUS_SUCCESS, PrefetchModelCompletionStatus(irp));
+    EXPECT_EQ(interiorLength, PrefetchModelCompletionBytes(irp));
+
+    for (SIZE_T i = 0; i < interiorLength; ++i)
+    {
+        ASSERT_EQ(0x3C, target[i]) << "interior park delivered from the wrong offset at " << i;
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -573,6 +608,94 @@ TEST_F(PrefetchKernelTest, RingBudgetIsReleasedOnEveryPath)
 ///////////////////////////////////////////////////////////////////////////
 // Seek and generation
 ///////////////////////////////////////////////////////////////////////////
+
+//
+// A sequential reader that merely outruns an empty pipeline re-aims the
+// ring even though the ring was already fetching ahead of it, and that
+// re-aim bumps Generation and discards the in-flight chunks.
+//
+// The re-aim path cannot tell this apart from a real seek: it is gated on
+// streak >= PREFETCH_ARM_STREAK, and a seek resets the streak to 1, so
+// every re-aim fires on a currently-sequential stream. The only thing
+// separating "pipeline points somewhere stale" from "pipeline is fine, the
+// reader is just ahead of it" is whether the fetch cursor had already
+// passed the offset being served -- which is what PrefetchReaimsInPlace
+// records.
+//
+// Reads here are contiguous with each other (so the streak builds) but sit
+// at chunk interiors (so none match a slot and none consume), which is the
+// shape the measured workload produces. Fetches are deliberately left
+// pending so the slots stay in flight and the discard is real.
+//
+TEST_F(PrefetchKernelTest, SequentialReaderOutrunningThePipelineIsNotReaimed)
+{
+    unsigned char* a = NewBuffer(PREFETCH_CHUNK);
+    unsigned char* b = NewBuffer(PREFETCH_CHUNK);
+
+    Serve(MakeRead(a, PREFETCH_CHUNK), 0, PREFETCH_CHUNK);
+    Serve(MakeRead(b, PREFETCH_CHUNK), PREFETCH_CHUNK, PREFETCH_CHUNK);
+
+    ASSERT_NE(nullptr, Fcb.PrefetchRing);
+    ASSERT_GT(PrefetchModelFetchesPending(), 0) << "ring must be fetching ahead for this to be in-window";
+
+    const ULONG64 reaimsBefore = ShimStatistics.PrefetchReaims;
+    const ULONG64 suppressedBefore = ShimStatistics.PrefetchReaimsSuppressed;
+
+    const ULONG shortLength = 4096;
+    ULONG64 offset = (2 * PREFETCH_CHUNK) + shortLength;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        Serve(MakeRead(NewBuffer(shortLength), shortLength), offset, shortLength);
+        offset += shortLength;
+    }
+
+    EXPECT_EQ(reaimsBefore, ShimStatistics.PrefetchReaims)
+        << "the reader is inside the range the ring is fetching, so re-aiming would only "
+           "discard the in-flight chunks it is waiting for";
+
+    EXPECT_GT(ShimStatistics.PrefetchReaimsSuppressed, suppressedBefore)
+        << "the idle test should have fired and the window test vetoed it";
+}
+
+//
+// The counterpart, and the reason the veto tests the pipeline WINDOW rather
+// than simply asking whether the fetch cursor is ahead of the reader. After
+// a backward seek the cursor is also ahead -- far ahead -- but there the
+// ring's coverage is genuinely useless and it must be re-pointed. A veto
+// written as "cursor is ahead, do nothing" would strand a backward-seeking
+// reader on direct fetches forever.
+//
+TEST_F(PrefetchKernelTest, BackwardSeekStillReaimsEvenThoughTheCursorIsAhead)
+{
+    const ULONG64 farOffset = 64ull * 1024 * 1024;
+
+    Serve(MakeRead(NewBuffer(PREFETCH_CHUNK), PREFETCH_CHUNK), farOffset, PREFETCH_CHUNK);
+    Serve(MakeRead(NewBuffer(PREFETCH_CHUNK), PREFETCH_CHUNK), farOffset + PREFETCH_CHUNK, PREFETCH_CHUNK);
+
+    ASSERT_NE(nullptr, Fcb.PrefetchRing);
+
+    PrefetchModelCompleteAllFetches(STATUS_SUCCESS);
+    ShimDrainWorkItems();
+
+    const ULONG64 reaimsBefore = ShimStatistics.PrefetchReaims;
+
+    //
+    // Seek back to the start and establish a streak there. The ring's
+    // cursor is still tens of megabytes ahead, well outside the window
+    // covering these reads.
+    //
+    ULONG64 offset = 0;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        Serve(MakeRead(NewBuffer(PREFETCH_CHUNK), PREFETCH_CHUNK), offset, PREFETCH_CHUNK);
+        offset += PREFETCH_CHUNK;
+    }
+
+    EXPECT_GT(ShimStatistics.PrefetchReaims, reaimsBefore)
+        << "a backward seek leaves the cursor ahead but the coverage useless -- it must re-aim";
+}
 
 //
 // A seek away from the stream, then a new streak elsewhere. Data fetched

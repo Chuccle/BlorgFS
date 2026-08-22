@@ -386,6 +386,8 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("      of which near       %12llu  (%.1f%% of miss, slot covered the range)\n",
         t.PrefetchNearMisses, SafeRatio(t.PrefetchNearMisses, t.PrefetchMisses));
     printf("    re-aims               %12llu\n", t.PrefetchReaims);
+    printf("      suppressed (in-window) %9llu  (reader had outrun the pipeline; not re-aimed)\n",
+        t.PrefetchReaimsSuppressed);
     printf("    depth growths         %12llu\n", t.PrefetchDepthGrowths);
     printf("    fetches issued/failed %12llu / %llu\n", t.PrefetchFetchesIssued, t.PrefetchFetchesFailed);
     printf("    stale discards        %12llu\n", t.PrefetchStaleDiscards);
@@ -867,6 +869,7 @@ static bool WriteReport(
     fprintf(f, "PrefetchMissRate=%.4f\n", SafeRatio(t.PrefetchMisses, served));
     fprintf(f, "PrefetchNearMisses=%llu\n", t.PrefetchNearMisses);
     fprintf(f, "PrefetchReaims=%llu\n", t.PrefetchReaims);
+    fprintf(f, "PrefetchReaimsSuppressed=%llu\n", t.PrefetchReaimsSuppressed);
     fprintf(f, "PrefetchDepthGrowths=%llu\n", t.PrefetchDepthGrowths);
     fprintf(f, "PrefetchFetchesIssued=%llu\n", t.PrefetchFetchesIssued);
     fprintf(f, "PrefetchFetchesFailed=%llu\n", t.PrefetchFetchesFailed);

@@ -15,6 +15,13 @@
 #define STATISTICS_TAG 'tSPB'
 
 PBLORGFS_STATISTICS BlorgStatisticsTable = NULL;
+
+//
+// The raw allocation behind BlorgStatisticsTable. Kept separately because
+// the table pointer is aligned forward off this block, and ExFreePool must
+// be handed back exactly what ExAllocatePool returned.
+//
+static PVOID StatisticsTableAllocation = NULL;
 ULONG BlorgStatisticsEntryStride = 0;
 ULONG BlorgStatisticsProcessorCount = 0;
 BLORGFS_STATISTICS_GLOBAL BlorgStatisticsGauges = { 0 };
@@ -39,6 +46,15 @@ static LONG64 StatisticsEpochQpc = 0;
 // multiple (the FILESYSTEM_STATISTICS contract, and the property that
 // keeps two processors' counters off one cache line) and so is not
 // sizeof(BLORGFS_STATISTICS).
+//
+// A 64-byte stride only delivers that second property if the base is
+// itself 64-byte aligned. ExAllocatePool guarantees only
+// MEMORY_ALLOCATION_ALIGNMENT (16 on x64), so from a 16-aligned base every
+// entry boundary lands mid-cache-line and two adjacent processors share
+// one -- exactly the false sharing the stride exists to prevent, on the
+// hottest write in the driver. Hence the over-allocate-and-align below:
+// StatisticsTableAllocation owns the raw block for the free,
+// BlorgStatisticsTable is the aligned view everything else uses.
 //
 static PBLORGFS_STATISTICS StatisticsEntry(ULONG Index)
 {
@@ -169,15 +185,19 @@ NTSTATUS BlorgStatisticsInitialize(VOID)
         return STATUS_UNSUCCESSFUL;
     }
 
-    BlorgStatisticsTable = ExAllocatePoolZero(
+    StatisticsTableAllocation = ExAllocatePoolZero(
         NonPagedPoolNx,
-        C_CAST(SIZE_T, stride) * processors,
+        (C_CAST(SIZE_T, stride) * processors) + (BLORGFS_STATISTICS_LINE - 1),
         STATISTICS_TAG);
 
-    if (!BlorgStatisticsTable)
+    if (!StatisticsTableAllocation)
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    BlorgStatisticsTable = C_CAST(PBLORGFS_STATISTICS,
+        (C_CAST(ULONG_PTR, StatisticsTableAllocation) + (BLORGFS_STATISTICS_LINE - 1)) &
+        ~C_CAST(ULONG_PTR, BLORGFS_STATISTICS_LINE - 1));
 
     BlorgStatisticsEntryStride = stride;
     BlorgStatisticsProcessorCount = processors;
@@ -191,12 +211,13 @@ NTSTATUS BlorgStatisticsInitialize(VOID)
 
 VOID BlorgStatisticsCleanup(VOID)
 {
-    if (BlorgStatisticsTable)
+    if (StatisticsTableAllocation)
     {
-        ExFreePool(BlorgStatisticsTable);
-        BlorgStatisticsTable = NULL;
+        ExFreePool(StatisticsTableAllocation);
+        StatisticsTableAllocation = NULL;
     }
 
+    BlorgStatisticsTable = NULL;
     BlorgStatisticsEntryStride = 0;
     BlorgStatisticsProcessorCount = 0;
 }

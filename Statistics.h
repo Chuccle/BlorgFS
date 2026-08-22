@@ -75,13 +75,32 @@
 // Chunk-fetch latency histogram, base-2 microsecond buckets: bucket i
 // covers [2^(i-1), 2^i) microseconds, bucket 0 catches everything under
 // 1 us, and the last bucket catches everything at or above 2^(N-2).
-// Sixteen buckets span sub-microsecond to ~16 s, covering a warm local
-// fetch at one end and a request dying on the receive watchdog at the
-// other. A distribution rather than a mean because the number that
-// decides whether playback stutters is the tail: a 99th-percentile
-// 400 ms chunk is a visible glitch that a healthy mean hides completely.
+// A distribution rather than a mean because the number that decides
+// whether playback stutters is the tail: a 99th-percentile 400 ms chunk
+// is a visible glitch that a healthy mean hides completely.
 //
-#define BLORGFS_STATISTICS_LATENCY_BUCKETS 16
+// Sized so the top bucket sits above SOCKET_RECEIVE_TIMEOUT_MS (Socket.c,
+// 30 s): 2^25 us = 33.5 s, so N - 2 = 25 and N = 27. That is the stated
+// intent -- resolve everything from a warm local fetch up to a request
+// dying on the receive watchdog -- and it only holds if the arithmetic is
+// done in microseconds.
+//
+// This was 16, on a comment claiming sixteen buckets reached "~16 s". They
+// reach 2^14 us, which is 16 MILLISECONDS -- a thousandfold error that put
+// the top bucket below the median real fetch. Measured against the live
+// backend, 33542 of 33821 samples (99.2%) landed in it, so p50, p90 and
+// p99 all reported the same saturated bound and the histogram conveyed
+// nothing at exactly the tail it exists to show.
+//
+#define BLORGFS_STATISTICS_LATENCY_BUCKETS 27
+
+//
+// Cache-line size the per-processor table is strided and aligned to. Also
+// the multiple FILESYSTEM_STATISTICS requires SizeOfCompleteStructure to
+// be, so one constant serves both: the wire contract and the false-sharing
+// property are asking for the same number for the same reason.
+//
+#define BLORGFS_STATISTICS_LINE 64
 
 //
 // Internal per-processor counter block. Held in ULONG64 throughout,
@@ -193,6 +212,27 @@ typedef struct _BLORGFS_STATISTICS
     // flight. Read it against PrefetchMisses.
     //
     ULONG64 PrefetchNearMisses;
+
+    //
+    // Re-aims the idle test asked for and the pipeline-window test vetoed,
+    // because the read being served still fell inside the range the ring
+    // was actively fetching. Re-aiming there is pure loss: it bumps
+    // Generation, discards in-flight chunks, and so makes the next reads
+    // miss as well.
+    //
+    // The idle test alone cannot see this. It is gated on
+    // streak >= PREFETCH_ARM_STREAK and a real seek resets the streak to 1,
+    // so every re-aim fires on a currently-sequential stream -- either the
+    // second read after a seek, where the ring genuinely points elsewhere,
+    // or a reader that merely outran its own pipeline. Measured against the
+    // live backend before the window test existed, 234 of 234 re-aims were
+    // the second kind.
+    //
+    // This counts the fix doing its job, so it is expected to be nonzero;
+    // what must stay at zero is wasted work, which shows up as
+    // PrefetchStaleDiscards and as fetched bytes exceeding file size.
+    //
+    ULONG64 PrefetchReaimsSuppressed;
 
 } BLORGFS_STATISTICS, * PBLORGFS_STATISTICS;
 

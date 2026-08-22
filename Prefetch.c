@@ -526,6 +526,7 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
 
     PIRP waiter = ring->Waiters[i];
     ULONG waiterLength = ring->WaiterLengths[i];
+    ULONG waiterSlotOffset = ring->WaiterSlotOffsets[i];
     ring->Waiters[i] = NULL;
 
     PCHAR buffer = NULL;
@@ -567,18 +568,21 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
 
         if (NT_SUCCESS(Status))
         {
+            ULONG availableFromSlotOffset =
+                (validBytes > waiterSlotOffset) ? (validBytes - waiterSlotOffset) : 0;
+
             ULONG copyLength = waiterLength;
 
-            if (copyLength > validBytes)
+            if (copyLength > availableFromSlotOffset)
             {
-                copyLength = validBytes;
+                copyLength = availableFromSlotOffset;
             }
 
             PVOID targetVa = MmGetSystemAddressForMdlSafe(waiter->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
 
             if (targetVa)
             {
-                RtlCopyMemory(targetVa, buffer, copyLength);
+                RtlCopyMemory(targetVa, buffer + waiterSlotOffset, copyLength);
                 waiter->IoStatus.Information = copyLength;
 
                 BLORGFS_STAT_ADD(PrefetchBytesServed, copyLength);
@@ -780,12 +784,14 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
 
         for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
         {
-            if (ring->Hot[i].RangeOffset != Offset ||
-                PrefetchSlotEmpty == ring->Hot[i].State ||
-                Length > ring->Hot[i].Length)
+            if (PrefetchSlotEmpty == ring->Hot[i].State ||
+                Offset < ring->Hot[i].RangeOffset ||
+                (Offset - ring->Hot[i].RangeOffset) + Length > ring->Hot[i].Length)
             {
                 continue;
             }
+
+            ULONG slotOffset = C_CAST(ULONG, Offset - ring->Hot[i].RangeOffset);
 
             if (PrefetchSlotReady == ring->Hot[i].State)
             {
@@ -800,7 +806,7 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
 
                 if (targetVa)
                 {
-                    RtlCopyMemory(targetVa, buffer, Length);
+                    RtlCopyMemory(targetVa, buffer + slotOffset, Length);
                     Irp->IoStatus.Information = Length;
                     result = STATUS_SUCCESS;
                 }
@@ -833,6 +839,7 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
                     }
 
                     ring->WaiterLengths[i] = Length;
+                    ring->WaiterSlotOffsets[i] = slotOffset;
                     IoMarkIrpPending(Irp);
                     ring->Waiters[i] = Irp;
                     ring->LastConsumeClock = serveClock;
@@ -866,27 +873,46 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
     if (streak >= PREFETCH_ARM_STREAK)
     {
         BOOLEAN reaimed = FALSE;
+        BOOLEAN suppressed = FALSE;
 
         KeAcquireSpinLock(&ring->Lock, &irql);
 
+        ULONG64 windowBytes = C_CAST(ULONG64, ring->DepthLimit) * PREFETCH_CHUNK;
+        ULONG64 windowStart = (ring->NextFetchOffset > windowBytes) ? (ring->NextFetchOffset - windowBytes) : 0;
+
+        BOOLEAN readerWithinPipeline =
+            (Offset + Length > windowStart) && (Offset < ring->NextFetchOffset);
+
         if (serveClock - ring->LastConsumeClock > PREFETCH_REAIM_IDLE_SERVES)
         {
-            ++ring->Generation;
+            suppressed = readerWithinPipeline;
 
-            for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
+            if (!suppressed)
             {
-                if (PrefetchSlotReady == ring->Hot[i].State)
-                {
-                    ring->Hot[i].State = PrefetchSlotEmpty;
-                }
-            }
+                ++ring->Generation;
 
-            ring->NextFetchOffset = Offset + Length;
-            ring->LastConsumeClock = serveClock;
-            reaimed = TRUE;
+                for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
+                {
+                    if (PrefetchSlotReady == ring->Hot[i].State)
+                    {
+                        ring->Hot[i].State = PrefetchSlotEmpty;
+                    }
+                }
+
+                ring->NextFetchOffset = Offset + Length;
+                ring->LastConsumeClock = serveClock;
+                reaimed = TRUE;
+            }
         }
 
         KeReleaseSpinLock(&ring->Lock, irql);
+
+        if (suppressed)
+        {
+            BLORGFS_STAT_INC(PrefetchReaimsSuppressed);
+
+            PrefetchPump(ring);
+        }
 
         if (reaimed)
         {

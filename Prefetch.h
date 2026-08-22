@@ -52,26 +52,41 @@
 // the IRP, and with it the FCB and the ring's attachment reference can
 // go away -- the pump must never run after that handoff.
 //
-// Slot lookup is an EXACT-OFFSET match, not a containment test: a read is
-// served from slot i only when Offset == Hot[i].RangeOffset and Length fits
-// within Hot[i].Length. A read that lands inside a slot it is fully covered
-// by is therefore a miss, and pays a whole round trip re-fetching bytes the
-// ring already holds. PrefetchNearMisses (Statistics.h) counts exactly those,
-// so the cost is measurable rather than assumed.
+// Slot lookup is a CONTAINMENT test: a read is served from slot i whenever
+// [Offset, Offset + Length) lies inside [Hot[i].RangeOffset,
+// RangeOffset + Hot[i].Length). It does not have to start on the slot
+// boundary, so the hit path and the park path both carry an offset into
+// the slot buffer (WaiterSlotOffsets for a park) rather than assuming the
+// read wants the head of it.
 //
-// This is why PREFETCH_CHUNK must track the real paging-read size: the two
-// only stay in phase if every read starts on a chunk boundary, and any
-// divergence turns into a permanent stream of near misses rather than a
-// gradual falloff. Widening the lookup to containment would remove that
-// fragility, at the cost of teaching the hit path to copy from a slot
-// interior -- see InteriorOffsetCoveredByASlotIsANearMiss in
-// sandbox/PrefetchKernelTest.cpp, which pins the current behaviour.
+// It was an exact-offset match until 2026-08-22, which made the ring
+// useful only while the reader stayed in phase with the chunk grid -- any
+// drift turned into a permanent stream of misses rather than a gradual
+// falloff, because a read one byte off a boundary missed a slot holding
+// every byte it wanted. PrefetchNearMisses (Statistics.h) counts reads
+// that a containment test would have served and an exact one would not, so
+// the cost of narrowing this again is measurable rather than argued.
 //
-// Measured on a full buffered sequential pass (2026-08-22): 900 near
-// misses out of 7627 misses, 3.5% of all paging reads. So the exact match
-// is NOT the dominant miss source and widening it is not worth the copy
-// complexity on its own -- re-measure with the counter before revisiting,
-// rather than re-deriving the theory.
+// Sizing PREFETCH_CHUNK to the real paging-read size still matters for
+// fetch efficiency, but it is no longer load-bearing for correctness of
+// coverage the way it was under exact matching.
+//
+// Re-aim window test: an idle ring is only re-aimed if the read that
+// missed falls OUTSIDE the range the ring is actively fetching, i.e.
+// outside [NextFetchOffset - DepthLimit * PREFETCH_CHUNK,
+// NextFetchOffset). A reader inside that window has not seeked -- it has
+// simply outrun its own pipeline -- and re-aiming there is pure loss: it
+// bumps Generation, discards the in-flight chunks, and so makes the
+// following reads miss as well, which trips the idle test again. That
+// feedback loop was measured at 234 of 234 re-aims on a single sequential
+// stream, with fetched bytes running 1.78x file size.
+//
+// The window test rather than a plain "is the cursor ahead of the reader"
+// test, because a BACKWARD seek also leaves the cursor ahead, and there
+// re-aiming is exactly right. Inside the window means the pipeline is
+// aimed correctly and the answer is to pump; outside it -- ahead of the
+// cursor, or behind the window after a backward seek -- means the
+// coverage is genuinely useless and the ring must be re-pointed.
 //
 // Re-aim policy (multi-stream): the ring is a single pipeline, so two
 // established streams on one file must not alternately steal it -- each
@@ -254,6 +269,19 @@ struct _PREFETCH_RING
     // than what the reader may legitimately see.
     //
     ULONG WaiterLengths[PREFETCH_DEPTH];
+
+    //
+    // Where inside slot i's buffer Waiters[i]'s bytes begin, recorded at
+    // park time. Nonzero whenever the read was admitted by containment
+    // rather than by starting exactly on the slot boundary, so the
+    // completion cannot assume the waiter wants the head of the buffer.
+    //
+    // The slot's Length at park time is the length the fetch was ISSUED
+    // for; a short response can still come back, so the completion clamps
+    // against what actually arrived rather than trusting the containment
+    // test that admitted the park.
+    //
+    ULONG WaiterSlotOffsets[PREFETCH_DEPTH];
     PREFETCH_FETCH_CTX FetchCtx[PREFETCH_DEPTH]; // completion context per slot
 
     //
@@ -284,7 +312,8 @@ CHECK_PADDING_BETWEEN(PREFETCH_RING, PumpWorkItem, Buffers);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Buffers, BufferMdls);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, BufferMdls, Waiters);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Waiters, WaiterLengths);
-CHECK_PADDING_BETWEEN(PREFETCH_RING, WaiterLengths, FetchCtx);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, WaiterLengths, WaiterSlotOffsets);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, WaiterSlotOffsets, FetchCtx);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, FetchCtx, Path);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Path, FileSize);
 CHECK_PADDING_END(PREFETCH_RING, FileSize);

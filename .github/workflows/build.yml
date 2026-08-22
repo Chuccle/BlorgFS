@@ -60,31 +60,54 @@ jobs:
       shell: pwsh
       run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
 
+    # pwsh, not cmd: a multi-line `shell: cmd` step reports only the LAST
+    # command's exit code, so `cd ..\..\..` at the end returned 0 and hid a
+    # failed cmake configure entirely. The build then died three steps later
+    # on a missing generated header, which points nowhere near the cause.
+    #
+    # No -G: the generator was pinned to "Visual Studio 17 2022" and the
+    # windows-latest image moved to Visual Studio 18, so cmake reported
+    # "could not find any instance of Visual Studio" and (because of the
+    # above) nothing noticed. Letting cmake pick the newest installed
+    # generator is what makes this survive the next image bump too.
     - name: Build flatcc compiler
       if: steps.cache_flatcc.outputs.cache-hit != 'true'
-      shell: cmd # Use cmd shell as cmake commands often assume it on Windows
+      shell: pwsh
       run: |
-          cd flatcc
-          mkdir build\MSVC
-          cd build\MSVC
-          REM Add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to handle old cmake_minimum_required in flatcc
-          cmake -G "Visual Studio 17 2022" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..\..
-          cmake --build . --config Release
-          cd ..\..\..
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path flatcc\build\MSVC | Out-Null
+          Push-Location flatcc\build\MSVC
+          try {
+            # -DCMAKE_POLICY_VERSION_MINIMUM=3.5 handles flatcc's old cmake_minimum_required.
+            cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..\..
+            if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
 
+            cmake --build . --config Release
+            if ($LASTEXITCODE -ne 0) { throw "cmake build failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+    # Both inputs are hard requirements -- Client.c includes the generated
+    # reader unconditionally. This previously echoed "skipping" and exited 0
+    # when either was missing, which converted a clear "flatcc did not build"
+    # into an unrelated-looking C1083 in the compile step.
     - name: Create generated flatbuffer files
-      shell: cmd # Use cmd shell as flatcc.exe is a windows executable
+      shell: pwsh
       run: |
-        if exist "flatcc\bin\Release\flatcc.exe" (
-          if exist "schemas\metadata_flatbuffer.fbs" (
-            mkdir generated
-            flatcc\bin\Release\flatcc.exe -rv --common_reader -o generated schemas\metadata_flatbuffer.fbs
-          ) else (
-            echo "Schema file not found, skipping flatbuffer generation"
-          )
-        ) else (
-          echo "FlatCC compiler not found, skipping flatbuffer generation"
-        )
+        $ErrorActionPreference = 'Stop'
+        $flatcc = "flatcc\bin\Release\flatcc.exe"
+        $schema = "schemas\metadata_flatbuffer.fbs"
+
+        if (-not (Test-Path $flatcc))  { throw "flatcc compiler missing at $flatcc -- the flatcc build step did not produce it" }
+        if (-not (Test-Path $schema))  { throw "schema missing at $schema -- is the schemas submodule checked out?" }
+
+        New-Item -ItemType Directory -Force -Path generated | Out-Null
+        & $flatcc -rv --common_reader -o generated $schema
+        if ($LASTEXITCODE -ne 0) { throw "flatcc codegen failed with exit code $LASTEXITCODE" }
+
+        $reader = "generated\metadata_flatbuffer_reader.h"
+        if (-not (Test-Path $reader)) { throw "flatcc reported success but $reader was not produced" }
 
     - name: Cache NuGet packages
       uses: actions/cache@v5
@@ -102,6 +125,48 @@ jobs:
 
     - name: Build driver
       run: msbuild ${{ env.SOLUTION_NAME }} /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /bl # /bl creates msbuild.binlog
+
+    # The sandbox suites compile the real driver sources against a kernel
+    # model and are where most of this project's coverage actually lives --
+    # IRQL and lock-order rules, the node-table pin protocol, prefetch
+    # lifetime and interleavings, dispatch and IOCTL routing, client
+    # scenarios and fuzzing. CI built them and then never ran them, so a
+    # green tick meant only that they compiled.
+    #
+    # Run the binaries directly rather than tools\Invoke-BlorgChecks.ps1
+    # -Tier Fast: the tier would rebuild everything the msbuild step above
+    # just produced. Keep this list in step with that script's Fast tier.
+    - name: Run sandbox test suites
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $sandboxDir = "sandbox\${{ matrix.platform }}\${{ matrix.config }}"
+
+        $suites = @(
+          'ClientSandbox.exe',
+          'ClientFuzz.exe',
+          'SocketSandbox.exe',
+          'PrefetchSandbox.exe',
+          'NodeTableSandbox.exe',
+          'DispatchSandbox.exe',
+          'TlsHandshakeSandbox.exe'
+        )
+
+        $failed = @()
+
+        foreach ($suite in $suites) {
+          $path = Join-Path $sandboxDir $suite
+          if (-not (Test-Path $path)) { throw "$suite was not built at $path" }
+
+          Write-Host "--- $suite ---"
+          & $path
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::$suite failed with exit code $LASTEXITCODE"
+            $failed += $suite
+          }
+        }
+
+        if ($failed.Count -gt 0) { throw "sandbox suites failed: $($failed -join ', ')" }
 
     - name: Run TLS unit tests
       shell: pwsh

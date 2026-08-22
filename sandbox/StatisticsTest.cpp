@@ -112,6 +112,38 @@ TEST(StatisticsLifecycleTest, CleanupThenInitializeRoundTrips)
     ASSERT_EQ(STATUS_SUCCESS, BlorgStatisticsInitialize());
 }
 
+//
+// Every processor's counter block must start on its own cache line. The
+// counters are written per-CPU without interlocks precisely so an update is
+// an uncontended add; if two processors share a line, that add turns into
+// cache-line ping-pong on the hottest write in the driver and the whole
+// per-CPU split buys nothing.
+//
+// A 64-byte stride alone does not give this. ExAllocatePool guarantees only
+// MEMORY_ALLOCATION_ALIGNMENT (16 on x64), and striding by 64 from a
+// 16-aligned base puts every entry boundary mid-line -- which is what this
+// code did until the base was explicitly aligned. Asserting on the stride
+// would have passed throughout; only the absolute address catches it.
+//
+TEST(StatisticsLifecycleTest, EveryProcessorEntryStartsOnItsOwnCacheLine)
+{
+    ASSERT_NE(nullptr, BlorgStatisticsTable);
+    ASSERT_GT(BlorgStatisticsProcessorCount, 0u);
+
+    EXPECT_EQ(0u, BlorgStatisticsEntryStride % BLORGFS_STATISTICS_LINE)
+        << "stride must be a whole number of cache lines";
+
+    for (ULONG i = 0; i < BlorgStatisticsProcessorCount; ++i)
+    {
+        const ULONG_PTR entry =
+            reinterpret_cast<ULONG_PTR>(BlorgStatisticsTable) +
+            (static_cast<ULONG_PTR>(i) * BlorgStatisticsEntryStride);
+
+        EXPECT_EQ(0u, entry % BLORGFS_STATISTICS_LINE)
+            << "processor " << i << "'s block shares a cache line with its neighbour";
+    }
+}
+
 TEST(StatisticsLifecycleTest, InitializeFailsCleanlyWhenPoolAllocationFails)
 {
     BlorgStatisticsCleanup();
@@ -400,18 +432,31 @@ TEST_F(StatisticsTest, RecordLatencyBucketsMicrosecondsAtPowerOfTwoBoundaries)
     }
 }
 
+//
+// The top bucket's floor is derived from the bucket count rather than
+// written as a literal. A previous version hardcoded 2^14 as "the top
+// bucket's floor", which silently stopped being true the moment the
+// histogram was resized.
+//
+static constexpr ULONG64 kTopBucketFloorMicros =
+    1ULL << (BLORGFS_STATISTICS_LATENCY_BUCKETS - 2);
+
+// The shim fixes QPC at 10,000,000 Hz (NtShim.c), so ticks = us * 10.
+static constexpr LONG64 MicrosToTicks(ULONG64 micros)
+{
+    return static_cast<LONG64>(micros * 10ULL);
+}
+
 TEST_F(StatisticsTest, RecordLatencySaturatesAtTheTopBucketInsteadOfWrapping)
 {
     ULONG64 sum = 0, max = 0;
     ULONG64 buckets[BLORGFS_STATISTICS_LATENCY_BUCKETS] = {};
 
-    const LONG64 firstTicks = 200000;      // 20,000 us -- already past 2^14, the top bucket's floor
-    const LONG64 secondTicks = 10000000000LL; // 1,000,000,000 us -- far larger, must land in the same bucket
-    const ULONG64 firstMicros = 20000ULL;
-    const ULONG64 secondMicros = 1000000000ULL;
+    const ULONG64 firstMicros = kTopBucketFloorMicros;
+    const ULONG64 secondMicros = kTopBucketFloorMicros * 64ULL;
 
-    BlorgStatisticsRecordLatency(&sum, &max, buckets, firstTicks);
-    BlorgStatisticsRecordLatency(&sum, &max, buckets, secondTicks);
+    BlorgStatisticsRecordLatency(&sum, &max, buckets, MicrosToTicks(firstMicros));
+    BlorgStatisticsRecordLatency(&sum, &max, buckets, MicrosToTicks(secondMicros));
 
     for (ULONG i = 0; i < BLORGFS_STATISTICS_LATENCY_BUCKETS - 1; ++i)
     {
@@ -421,6 +466,36 @@ TEST_F(StatisticsTest, RecordLatencySaturatesAtTheTopBucketInsteadOfWrapping)
     EXPECT_EQ(2u, buckets[BLORGFS_STATISTICS_LATENCY_BUCKETS - 1]);
     EXPECT_EQ(firstMicros + secondMicros, sum);
     EXPECT_EQ(secondMicros, max);
+}
+
+//
+// The histogram has to resolve the tail it exists to show. Sized at 16
+// buckets it topped out at 2^14 us -- 16 ms, below the median real fetch --
+// so 99.2% of samples piled into the last bucket and p50, p90 and p99 all
+// reported the same saturated bound.
+//
+// These two samples are the ones that matter in practice: the worst fetch
+// actually observed against the live backend (2.5 s), and a request dying
+// on SOCKET_RECEIVE_TIMEOUT_MS (30 s), which is the upper end the histogram
+// is explicitly sized for. Both must land strictly below the saturating
+// bucket, or the tail is unmeasurable again.
+//
+TEST_F(StatisticsTest, RecordLatencyResolvesSlowFetchesInsteadOfSaturating)
+{
+    ULONG64 sum = 0, max = 0;
+    ULONG64 buckets[BLORGFS_STATISTICS_LATENCY_BUCKETS] = {};
+
+    const ULONG64 observedWorstFetchMicros = 2528253ULL;
+    const ULONG64 receiveWatchdogMicros = 30000000ULL;
+
+    BlorgStatisticsRecordLatency(&sum, &max, buckets, MicrosToTicks(observedWorstFetchMicros));
+    BlorgStatisticsRecordLatency(&sum, &max, buckets, MicrosToTicks(receiveWatchdogMicros));
+
+    EXPECT_EQ(0u, buckets[BLORGFS_STATISTICS_LATENCY_BUCKETS - 1])
+        << "a 2.5 s fetch and a 30 s watchdog timeout must both be resolved, not saturated";
+
+    EXPECT_LT(observedWorstFetchMicros, kTopBucketFloorMicros);
+    EXPECT_LT(receiveWatchdogMicros, kTopBucketFloorMicros);
 }
 
 TEST_F(StatisticsTest, RecordLatencyIgnoresANegativeElapsedSample)
