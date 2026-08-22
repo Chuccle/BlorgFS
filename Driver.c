@@ -111,8 +111,9 @@ static NTSTATUS BlorgNotifyMountManagerVolumeArrival(PCUNICODE_STRING DeviceName
 
 //
 // Creates the disk device object (the DDO the B: symlink targets) via
-// WdmlibIoCreateDeviceSecure, tags its extension with BLORGFS_DDO_MAGIC,
-// and clears DO_DEVICE_INITIALIZING so I/O can reach it.
+// WdmlibIoCreateDeviceSecure and clears DO_DEVICE_INITIALIZING so I/O can
+// reach it. No device extension: this object is identified by its pointer
+// (BlorgDeviceKind, Driver.h) and carries no per-device state.
 //
 static NTSTATUS CreateBlorgDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* DiskDeviceObject)
 {
@@ -124,7 +125,7 @@ static NTSTATUS CreateBlorgDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE
     NTSTATUS       result = STATUS_UNSUCCESSFUL;
 
     result = WdmlibIoCreateDeviceSecure(DriverObject,
-        sizeof(BLORGFS_DDO_DEVICE_EXTENSION),
+        0,
         &vdoString,
         FILE_DEVICE_DISK,
         FILE_DEVICE_SECURE_OPEN,
@@ -137,10 +138,6 @@ static NTSTATUS CreateBlorgDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE
     {
         return result;
     }
-
-    PBLORGFS_DDO_DEVICE_EXTENSION devExt = diskDeviceObject->DeviceExtension;
-
-    devExt->Hdr.Identifier = BLORGFS_DDO_MAGIC;
 
     ClearFlag(diskDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
@@ -196,8 +193,6 @@ NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
     PBLORGFS_VDO_DEVICE_EXTENSION devExt = volumeDeviceObject->DeviceExtension;
 
     RtlZeroMemory(devExt, sizeof(BLORGFS_VDO_DEVICE_EXTENSION));
-
-    devExt->Hdr.Identifier = BLORGFS_VDO_MAGIC;
 
     ExInitializeNPagedLookasideList(&devExt->NonPagedNodeLookasideList, NULL, NULL, POOL_NX_ALLOCATION, sizeof(NON_PAGED_NODE), 'NPN', 0);
     ExInitializePagedLookasideList(&devExt->FcbLookasideList, NULL, NULL, 0, sizeof(FCB), 'FCB', 0);
@@ -341,7 +336,7 @@ static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, P
     NTSTATUS       result = STATUS_UNSUCCESSFUL;
 
     result = WdmlibIoCreateDeviceSecure(DriverObject,
-        sizeof(BLORGFS_FSDO_DEVICE_EXTENSION),
+        0,
         &fsdoString,
         FILE_DEVICE_DISK_FILE_SYSTEM,
         FILE_DEVICE_SECURE_OPEN,
@@ -355,9 +350,17 @@ static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, P
         return result;
     }
 
-    PBLORGFS_FSDO_DEVICE_EXTENSION devExt = fileSystemDeviceObject->DeviceExtension;
+    //
+    // Published so usermode can name the FSDO at all: the device lives at
+    // BLORGFS_FSDO_STRING in the object-namespace root, which CreateFile
+    // has no syntax for, so the vendor IOCTLs (the TLS pin update, the
+    // statistics query) were unreachable from usermode without this.
+    // Failure is deliberately non-fatal -- it costs those IOCTLs, not the
+    // filesystem, and the device SDDL still governs who may open it.
+    //
+    UNICODE_STRING symlinkString = RTL_CONSTANT_STRING(BLORGFS_FSDO_SYMLINK_STRING);
 
-    devExt->Hdr.Identifier = BLORGFS_FSDO_MAGIC;
+    (VOID)IoCreateSymbolicLink(&symlinkString, &fsdoString);
 
     IoRegisterFileSystem(fileSystemDeviceObject);
 
@@ -369,20 +372,26 @@ static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, P
 }
 
 //
-// Tears down the file system device object: if a volume is still mounted
-// on it, dereferences and deletes that volume device object first, then
-// unregisters and deletes the FSDO itself.
+// Tears down the file system device object: drops the usermode symbolic
+// link, then, if a volume is still mounted on it, dereferences and
+// deletes that volume device object, then unregisters and deletes the
+// FSDO itself.
 //
 static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObject)
 {
     if (FileSystemDeviceObject)
     {
-        PDEVICE_OBJECT volumeDeviceObject = GetFileSystemDeviceExtension(FileSystemDeviceObject)->VolumeDeviceObject;
+        UNICODE_STRING symlinkString = RTL_CONSTANT_STRING(BLORGFS_FSDO_SYMLINK_STRING);
+
+        (VOID)IoDeleteSymbolicLink(&symlinkString);
+
+        PDEVICE_OBJECT volumeDeviceObject = global.VolumeDeviceObject;
 
         if (volumeDeviceObject)
         {
             ObDereferenceObject(volumeDeviceObject);
             DeleteBlorgVolumeDeviceObject(volumeDeviceObject);
+            global.VolumeDeviceObject = NULL;
         }
 
         IoUnregisterFileSystem(FileSystemDeviceObject);
@@ -406,6 +415,17 @@ static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObj
 void DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
+
+    //
+    // Drain before anything is torn down. Both gates refuse new work and
+    // wait for what is already outstanding, and both must complete while
+    // the filesystem device object still exists: an in-flight request or
+    // a queued prefetch pump holds an IO work item queued against it.
+    // Rings first, since a live ring is what issues prefetch requests --
+    // draining the requests first would only let the rings issue more.
+    //
+    BlorgPrefetchDrain();
+    DrainHttpClient();
 
     ObDereferenceObject(global.FileSystemDeviceObject);
     DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
@@ -434,6 +454,8 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
     PathCacheCleanup();
 
     TlsGlobalCleanup();
+
+    BlorgStatisticsCleanup();
 
     BlorgFreeSecurityDescriptor();
 }
@@ -761,11 +783,21 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     PathCacheInit();
 
+    BlorgPrefetchInitialize();
+
+    NTSTATUS statisticsInitStatus = BlorgStatisticsInitialize();
+    if (!NT_SUCCESS(statisticsInitStatus))
+    {
+        BLORGFS_LOG("DriverEntry() - BlorgStatisticsInitialize failed: 0x%X (counters unavailable)\n", statisticsInitStatus);
+    }
+
     NTSTATUS tlsInitStatus = TlsGlobalInit();
     if (!NT_SUCCESS(tlsInitStatus))
     {
         BLORGFS_LOG("DriverEntry() - TlsGlobalInit failed: 0x%X (TLS unavailable if enabled)\n", tlsInitStatus);
     }
+
+    TlsHandshakeGlobalInit();
 
     global.DriverObject = DriverObject;
 

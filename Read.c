@@ -20,48 +20,21 @@
 //  it's derived rather than a second hardcoded constant.
 //
 
-#ifdef DBG
 //
-//  Read-pattern characterization: tracks read size/sequentiality to
-//  observe actual workload behavior. Read-only with respect to
-//  prefetcher state (Sequential is derived the same way
-//  BlorgPrefetchServeRead derives it internally -- Offset continues one
-//  of the FCB's stream trackers, sampled here before that call updates
-//  them -- but this file never writes to the ring). Printed as a rolling
-//  window (resets every STATS_WINDOW reads) rather than a session-long
-//  average so the numbers reflect current behavior.
+//  Whether a read at Offset continues any tracked stream -- the same
+//  contiguity test BlorgPrefetchServeRead applies internally, evaluated
+//  against the tracker array before the serve call updates it. Read-only
+//  with respect to prefetcher state. Unrolled by the compiler over one
+//  cache line; the OR-accumulate keeps it branch-free.
 //
-//  Reads/Sequential/SumLength/ActiveFetches are kept coherent via
-//  Interlocked ops (see below); MinLength/MaxLength/PeakActiveFetches
-//  are plain racy updates -- acceptable for a characterization trace
-//  (worst case, a printed window under-reports a peak by missing one
-//  racing update), not a correctness path. None of these are volatile:
-//  Interlocked* is a full barrier regardless of the variable's
-//  qualifiers.
+//  This is all that remains of the old DBG-only read-pattern block. The
+//  window it used to print every 256 reads -- sequential share, mean/min/max
+//  length, peak in-flight fetches -- is now carried by the always-on
+//  counters in Statistics.h, which report the same shape without a checked
+//  build and without a DbgPrint on the read path perturbing the very
+//  timings being characterized.
 //
-#define STATS_WINDOW 256
-
-typedef struct _READ_PATTERN_STATS
-{
-    LONG Reads;
-    LONG Sequential;
-    LONG64 SumLength;
-    LONG MinLength;
-    LONG MaxLength;
-    LONG ActiveFetches;
-    LONG PeakActiveFetches;
-} READ_PATTERN_STATS;
-
-static READ_PATTERN_STATS Stats = { .MinLength = MAXLONG };
-
-//
-// Whether a read at Offset continues any tracked stream -- the same
-// contiguity test BlorgPrefetchServeRead applies internally, evaluated
-// against the tracker array before the serve call updates it. Unrolled
-// by the compiler over one cache line; the OR-accumulate keeps it
-// branch-free.
-//
-static BOOLEAN StatsReadIsSequential(const FCB* Fcb, ULONG64 Offset)
+static BOOLEAN BlorgReadIsSequential(const FCB* Fcb, ULONG64 Offset)
 {
     BOOLEAN sequential = FALSE;
 
@@ -72,55 +45,6 @@ static BOOLEAN StatsReadIsSequential(const FCB* Fcb, ULONG64 Offset)
 
     return sequential;
 }
-
-//
-// Folds one paging read into the rolling read-pattern window, printing and
-// resetting the window every STATS_WINDOW reads. Debug-only instrumentation:
-// most fields use Interlocked ops for coherency, but Min/Max/PeakActiveFetches
-// are deliberately racy since this is a characterization trace, not a
-// correctness path. On a window reset, PeakActiveFetches carries the current
-// in-flight level forward as next window's starting peak rather than
-// dropping it to 0, since otherwise a sustained-but-unchanging concurrency
-// level would never show.
-//
-static VOID StatsRecordRead(BOOLEAN Sequential, ULONG Length)
-{
-    InterlockedExchangeAdd64(&Stats.SumLength, Length);
-
-    if (Sequential)
-    {
-        InterlockedIncrement(&Stats.Sequential);
-    }
-
-    if (C_CAST(LONG, Length) < Stats.MinLength)
-    {
-        Stats.MinLength = C_CAST(LONG, Length);
-    }
-
-    if (C_CAST(LONG, Length) > Stats.MaxLength)
-    {
-        Stats.MaxLength = C_CAST(LONG, Length);
-    }
-
-    if (STATS_WINDOW == InterlockedIncrement(&Stats.Reads))
-    {
-        BLORGFS_PRINT("read-pattern window: reads=%lu seq=%lu%% avgLen=%llx minLen=%lx maxLen=%lx peakFetches=%lu\n",
-            C_CAST(ULONG, STATS_WINDOW),
-            C_CAST(ULONG, (100 * C_CAST(ULONG64, Stats.Sequential)) / STATS_WINDOW),
-            C_CAST(ULONG64, Stats.SumLength) / STATS_WINDOW,
-            C_CAST(ULONG, Stats.MinLength),
-            C_CAST(ULONG, Stats.MaxLength),
-            C_CAST(ULONG, Stats.PeakActiveFetches));
-
-        Stats.Reads = 0;
-        Stats.Sequential = 0;
-        Stats.SumLength = 0;
-        Stats.MinLength = MAXLONG;
-        Stats.MaxLength = 0;
-        Stats.PeakActiveFetches = Stats.ActiveFetches;
-    }
-}
-#endif
 
 //
 //  Completion for an async non-cached read. Invoked from the WSK
@@ -153,38 +77,39 @@ static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID Ca
 {
     PIRP irp = CallerContext;
 
-#ifdef DBG
-    if (global.LogLevel >= 1)
-    {
-        InterlockedDecrement(&Stats.ActiveFetches);
-    }
-#endif
+    BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.FetchesActive);
+
+    LONG64 issueQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[2]));
 
     if (!NT_SUCCESS(Status))
     {
         BLORGFS_PRINT("BlorgReadComplete: http read failed: %8lx\n", Status);
+        BLORGFS_STAT_INC(FetchesFailed);
         CompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
 
     irp->IoStatus.Information = FileBuffer->BodyBufferSize;
 
-#ifdef DBG
-    if (global.LogLevel >= 1 && irp->Tail.Overlay.DriverContext[2])
-    {
-        LARGE_INTEGER frequency;
-        LONGLONG endStamp = KeQueryPerformanceCounter(&frequency).QuadPart;
-        LONGLONG startStamp = C_CAST(LONGLONG, C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[2]));
+    BLORGFS_STAT_INC(FetchesCompleted);
+    BLORGFS_STAT_ADD(FetchBytes, FileBuffer->BodyBufferSize);
 
-        BLORGFS_PRINT("chunk off=%llx len=%llx lat=%llu us\n",
-            IoGetCurrentIrpStackLocation(irp)->Parameters.Read.ByteOffset.QuadPart,
-            C_CAST(ULONG64, FileBuffer->BodyBufferSize),
-            C_CAST(ULONG64, ((endStamp - startStamp) * 1000000) / frequency.QuadPart));
+    PBLORGFS_STATISTICS statsBlock = BlorgStatisticsForCurrentProcessor();
+
+    if (statsBlock && issueQpc)
+    {
+        BlorgStatisticsRecordLatency(
+            &statsBlock->FetchLatencySumUs,
+            &statsBlock->FetchLatencyMaxUs,
+            statsBlock->FetchLatencyBuckets,
+            BlorgStatisticsNow() - issueQpc);
     }
-#endif
 
     if (!BooleanFlagOn(irp->Flags, IRP_PAGING_IO))
     {
+        BLORGFS_STAT_INC(UserFileReads);
+        BLORGFS_STAT_ADD(UserFileReadBytes, irp->IoStatus.Information);
+
         PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
 
         if (BooleanFlagOn(irpSp->FileObject->Flags, FO_SYNCHRONOUS_IO))
@@ -217,6 +142,7 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
             BytesLength);
 
         Irp->IoStatus.Information = 0;
+        BLORGFS_STAT_INC(ReadsEndOfFile);
         return STATUS_END_OF_FILE;
     }
 
@@ -279,10 +205,25 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // to the direct fetch below, which also keeps the prefetch pipeline topped
 // up on misses. This applies to paging reads only: they carry none of the
 // post-read bookkeeping (file-position advance, fast-IO flag) that
-// non-paging reads get in BlorgReadComplete. The DBG-only StatsRecordRead
-// call there samples sequentiality before BlorgPrefetchServeRead updates
-// the stream trackers, using the same contiguity test the prefetcher uses
+// non-paging reads get in BlorgReadComplete. The BlorgReadIsSequential
+// sample there is taken before BlorgPrefetchServeRead updates the stream
+// trackers, using the same contiguity test the prefetcher uses
 // internally -- read characterization, not prefetcher behavior.
+//
+// Both async outcomes of this path -- the prefetcher parking the read and
+// the direct fetch below -- return STATUS_PENDING out of a dispatch
+// routine that nothing else has marked pending: a paging read bypasses
+// the FSP queue (so it never reaches IoCsqInsertIrp, which does the
+// marking for posted requests) and skips the oplock package (so
+// OplockPrePostIrp never runs either). The prefetcher marks its own
+// parked IRP, since it must do so before the waiter is published;
+// the direct fetch is marked here, before the issue rather than after,
+// because a synchronously-completing issue may already have freed the
+// IRP by the time the call returns. Marking an IRP whose issue then
+// fails synchronously is harmless -- BlorgRead completes it with that
+// error, and a set PendingReturned on a completed IRP costs nothing;
+// the damaging direction is returning STATUS_PENDING unmarked, which
+// silently breaks pending propagation in any filter layered above.
 //
 // The direct async HTTP read returns STATUS_PENDING on success; the client
 // receives the body straight into the locked user MDL (zero-copy -- both
@@ -291,14 +232,39 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // from the WSK completion path, so this function neither blocks nor copies
 // nor completes the IRP itself. If issuing the request fails synchronously,
 // the callback never runs and the returned error completes the IRP
-// normally. In DBG builds, DriverContext[2] is stamped with the issue-time
-// QPC value for BlorgReadComplete's per-chunk latency trace (READ IRPs do
-// not otherwise use DriverContext[2]), and this is the one direct-fetch
-// issue site for every non-cached read (paging misses and posted
-// non-paging reads alike) that increments Stats.ActiveFetches, paired with
-// the decrement in BlorgReadComplete -- read-pattern characterization
-// only; the prefetcher's own in-flight fetches (PrefetchPump) are not
-// counted here on purpose.
+// normally. DriverContext[2] is stamped with the issue-time QPC value
+// that BlorgReadComplete turns into the chunk-latency histogram (READ
+// IRPs do not otherwise use DriverContext[2]), and this is the one
+// direct-fetch issue site for every non-cached read (paging misses and
+// posted non-paging reads alike), so it is where FetchesIssued and the
+// in-flight gauge are raised, paired with the completion accounting in
+// BlorgReadComplete. The prefetcher's own in-flight fetches are counted
+// separately as PrefetchFetchesIssued (Prefetch.c) and deliberately do
+// not land in these two, so the direct-fetch rate stays readable as
+// "what the prefetcher failed to cover".
+//
+// Both counters are raised before the issue, because a synchronously
+// completing issue runs BlorgReadComplete -- and its matching decrement --
+// before the call returns. That ordering makes the synchronous FAILURE
+// case this path's own to settle: the client's contract is that a
+// non-STATUS_PENDING return means the callback never ran (see
+// HttpGetFileCommon), so nothing else will ever terminate the fetch just
+// counted. Left unsettled, FetchesIssued outruns
+// FetchesCompleted + FetchesFailed -- which Compare-BlorgMetrics.ps1
+// reports only as a note about fetches "in flight at sample time" -- and,
+// worse, the FetchesActive gauge ratchets up permanently, taking
+// FetchesActivePeak with it, since a gauge has nothing to reset it.
+// PrefetchPump settles its own equivalent failure the same way.
+//
+// The NonCachedReads/NonCachedReadBytes pair is counted only on an IRP's
+// first pass through here, gated on IRP_CONTEXT_FLAG_IN_FSP. A read that
+// cannot issue inline is posted to the FSP, whose worker re-enters this
+// same function on the same IRP -- so counting unconditionally scored
+// every posted read twice, and since in practice essentially every
+// non-cached read takes the post path, both counters simply read 2x
+// reality. That matters beyond this driver's own telemetry:
+// NonCachedReads feeds the standard FAT_STATISTICS surface that
+// fsutil reports.
 //
 // The cached path delays CcInitializeCacheMap until the first read, in
 // case the caller never does any I/O to the file (FileObject->
@@ -396,26 +362,34 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             return STATUS_END_OF_FILE;
         }
 
+        BOOLEAN alreadyInFsp =
+            BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP);
+
         BOOLEAN canIssueInline =
-            BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP) ||
+            alreadyInFsp ||
             (BooleanFlagOn(Irp->Flags, IRP_PAGING_IO) && PASSIVE_LEVEL == KeGetCurrentIrql());
+
+        if (!alreadyInFsp)
+        {
+            BLORGFS_STAT_INC(NonCachedReads);
+            BLORGFS_STAT_ADD(NonCachedReadBytes, realLength);
+        }
 
         if (!canIssueInline)
         {
             BLORGFS_PRINT("BlorgVolumeRead: Enqueue to Fsp\n");
+            BLORGFS_STAT_INC(ReadsPosted);
             return FsdPostRequest(Irp, IrpSp);
         }
 
         if (BooleanFlagOn(Irp->Flags, IRP_PAGING_IO))
         {
-#ifdef DBG
-            if (global.LogLevel >= 1)
+            BLORGFS_STAT_INC(ReadsPagingInline);
+
+            if (BlorgReadIsSequential(fcb, C_CAST(ULONG64, startingByte.QuadPart)))
             {
-                StatsRecordRead(
-                    StatsReadIsSequential(fcb, C_CAST(ULONG64, startingByte.QuadPart)),
-                    realLength);
+                BLORGFS_STAT_INC(ReadsSequential);
             }
-#endif
 
             NTSTATUS prefetchResult = BlorgPrefetchServeRead(
                 fcb,
@@ -427,24 +401,36 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             {
                 return prefetchResult;
             }
+
+            BLORGFS_STAT_INC(PrefetchMisses);
         }
 
-#ifdef DBG
-        if (global.LogLevel >= 1)
+        Irp->Tail.Overlay.DriverContext[2] =
+            C_CAST(PVOID, C_CAST(ULONG_PTR, BlorgStatisticsNow()));
+
+        BLORGFS_STAT_INC(FetchesIssued);
+
+        BlorgStatisticsGaugeIncrement(
+            &BlorgStatisticsGauges.FetchesActive,
+            &BlorgStatisticsGauges.FetchesActivePeak);
+
+        IoMarkIrpPending(Irp);
+
+        NTSTATUS fetchStatus = BlorgHttpGetFileMdl(
+            &fcb->FullPath,
+            startingByte.QuadPart,
+            realLength,
+            Irp->MdlAddress,
+            BlorgReadComplete,
+            Irp);
+
+        if (STATUS_PENDING != fetchStatus)
         {
-            Irp->Tail.Overlay.DriverContext[2] =
-                C_CAST(PVOID, C_CAST(ULONG_PTR, KeQueryPerformanceCounter(NULL).QuadPart));
-
-            LONG active = InterlockedIncrement(&Stats.ActiveFetches);
-
-            if (active > Stats.PeakActiveFetches)
-            {
-                Stats.PeakActiveFetches = active;
-            }
+            BLORGFS_STAT_INC(FetchesFailed);
+            BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.FetchesActive);
         }
-#endif
 
-        return BlorgHttpGetFileMdl(&fcb->FullPath, startingByte.QuadPart, realLength, Irp->MdlAddress, BlorgReadComplete, Irp);
+        return fetchStatus;
     }
 
     else
@@ -466,6 +452,8 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         }
 
         BLORGFS_PRINT("Cached read.\n");
+
+        BLORGFS_STAT_INC(ReadsCached);
 
         if (!FlagOn(IrpSp->MinorFunction, IRP_MN_MDL))
         {
@@ -525,6 +513,9 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
     if (!BooleanFlagOn(Irp->Flags, IRP_PAGING_IO))
     {
+        BLORGFS_STAT_INC(UserFileReads);
+        BLORGFS_STAT_ADD(UserFileReadBytes, Irp->IoStatus.Information);
+
         if (BooleanFlagOn(IrpSp->FileObject->Flags, FO_SYNCHRONOUS_IO))
         {
             IrpSp->FileObject->CurrentByteOffset.QuadPart = startingByte.QuadPart + Irp->IoStatus.Information;
@@ -554,9 +545,9 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     BOOLEAN topLevel = IsIrpTopLevel(Irp);
 
     FsRtlEnterFileSystem();
-    switch (GetDeviceExtensionMagic(DeviceObject))
+    switch (BlorgDeviceKind(DeviceObject))
     {
-        case BLORGFS_VDO_MAGIC:
+        case BlorgDeviceVolume:
         {
             BlorgSetupIrpContext(Irp, IoIsOperationSynchronous(Irp));
             result = BlorgVolumeRead(Irp, irpSp);
@@ -566,12 +557,12 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             }
             break;
         }
-        case BLORGFS_DDO_MAGIC:
+        case BlorgDeviceDisk:
         {
             CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
-        case BLORGFS_FSDO_MAGIC:
+        case BlorgDeviceFileSystem:
         {
             CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;

@@ -35,6 +35,27 @@ static SOCKET_POOL_STATE SocketPool;
 static const ULONG MAX_SOCKET_POOL_SIZE = 32;
 
 //
+// TLS ciphertext accumulator sizing (see Socket.h). Ciphertext is
+// received in bulk and complete records are drained out of this buffer
+// without touching the wire again, so this bounds how many on-wire
+// records one WSK receive can pick up, not any per-response total. It
+// must exceed one max-size record or a drain loop could never make
+// progress on a full buffer.
+//
+// Tiered by machine size, the same coarse MmQuerySystemSize tiering the
+// prefetch ring budget uses: the worst case is this times
+// MAX_SOCKET_POOL_SIZE of NonPagedPoolNx, 8 MB at the large tier, and a
+// small machine has no business reserving that to save receive IRPs.
+//
+#define SOCKET_TLS_RECV_RECORDS_LARGE  16
+#define SOCKET_TLS_RECV_RECORDS_MEDIUM 8
+#define SOCKET_TLS_RECV_RECORDS_SMALL  4
+
+#define SOCKET_TLS_RECORD_MAX_BYTES (5 + TLS_RECORD_CIPHERTEXT_MAX)
+
+ULONG SocketTlsRecvCapacity = SOCKET_TLS_RECV_RECORDS_LARGE * SOCKET_TLS_RECORD_MAX_BYTES;
+
+//
 // Every async send/receive needs a KSOCKET_ASYNC_CONTEXT; the TLS record
 // receive path in particular issues them at a high rate. A lookaside
 // keeps that per-op allocation off the general pool; entries are handed
@@ -49,6 +70,53 @@ static KDEFERRED_ROUTINE SocketAsyncTimeoutDpc;
 
 // CloseWskSocket is defined below but referenced earlier (CleanupWskSocketPool).
 static NTSTATUS CloseWskSocket(PKSOCKET Socket);
+
+//
+// See Socket.h. The MDL is both the last thing built and the guard, so a
+// caller that failed partway through leaves nothing a later caller can
+// mistake for a finished accumulator. NonPagedPoolNx because the drain
+// loops read this at <= DISPATCH_LEVEL, and MmBuildMdlForNonPagedPool
+// because that lets every bulk receive skip a fresh IoAllocateMdl plus
+// MmProbeAndLockPages.
+//
+NTSTATUS EnsureTlsRecvBuffer(PKSOCKET Socket)
+{
+    if (Socket->TlsRecvMdl)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    if (!Socket->TlsRecvBuffer)
+    {
+        Socket->TlsRecvBuffer = ExAllocatePoolUninitialized(NonPagedPoolNx, SocketTlsRecvCapacity, SOCKET_TAG);
+
+        if (!Socket->TlsRecvBuffer)
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
+    if (!Socket->TlsPlaintextScratch)
+    {
+        Socket->TlsPlaintextScratch = ExAllocatePoolUninitialized(NonPagedPoolNx, TLS_RECORD_CIPHERTEXT_MAX, SOCKET_TAG);
+
+        if (!Socket->TlsPlaintextScratch)
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
+    Socket->TlsRecvMdl = IoAllocateMdl(Socket->TlsRecvBuffer, SocketTlsRecvCapacity, FALSE, FALSE, NULL);
+
+    if (!Socket->TlsRecvMdl)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    MmBuildMdlForNonPagedPool(Socket->TlsRecvMdl);
+
+    return STATUS_SUCCESS;
+}
 
 //
 // Single free point for a KSOCKET and everything riding on it: the TLS
@@ -299,6 +367,8 @@ static VOID SocketAsyncTimeoutDpc(PKDPC Dpc, PVOID Context, PVOID SystemArgument
 		return;
 	}
 
+    BLORGFS_STAT_INC(SocketTimeouts);
+
     InterlockedExchange(&asyncContext->Timeout.TimedOut, 1);
     IoCancelIrp(asyncContext->Timeout.Irp);
 
@@ -383,6 +453,29 @@ NTSTATUS InitialiseWskClient(void)
     SocketPool.Count = 0;
 
     ExInitializeNPagedLookasideList(&AsyncContextLookaside, NULL, NULL, POOL_NX_ALLOCATION, sizeof(KSOCKET_ASYNC_CONTEXT), SOCKET_TAG, 0);
+
+    ULONG tlsRecvRecords;
+
+    switch (MmQuerySystemSize())
+    {
+        case MmSmallSystem:
+        {
+            tlsRecvRecords = SOCKET_TLS_RECV_RECORDS_SMALL;
+            break;
+        }
+        case MmMediumSystem:
+        {
+            tlsRecvRecords = SOCKET_TLS_RECV_RECORDS_MEDIUM;
+            break;
+        }
+        default:
+        {
+            tlsRecvRecords = SOCKET_TLS_RECV_RECORDS_LARGE;
+            break;
+        }
+    }
+
+    SocketTlsRecvCapacity = tlsRecvRecords * SOCKET_TLS_RECORD_MAX_BYTES;
 
     return STATUS_SUCCESS;
 }
@@ -678,12 +771,15 @@ NTSTATUS ReleaseReusableWskSocket(PKSOCKET Socket)
     if (SocketPool.Count >= MAX_SOCKET_POOL_SIZE)
     {
         KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+        BLORGFS_STAT_INC(ConnectionsClosedPoolFull);
         return CloseWskSocketAsync(Socket);
     }
 
     InsertHeadList(&SocketPool.List, &Socket->PoolEntry);
     SocketPool.Count++;
     KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+
+    BLORGFS_STAT_INC(ConnectionsReleasedToPool);
 
     return STATUS_SUCCESS;
 }
@@ -902,6 +998,8 @@ static VOID SocketConnectTimeoutDpc(PKDPC Dpc, PVOID Context, PVOID SystemArgume
 		return;
 	}
 
+    BLORGFS_STAT_INC(SocketTimeouts);
+
     InterlockedExchange(&connectCtx->Timeout.TimedOut, 1);
     IoCancelIrp(connectCtx->Timeout.Irp);
 
@@ -945,10 +1043,12 @@ static NTSTATUS SocketConnectAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject,
             (connectCtx->RemoteAddress.ss_family == AF_INET6) ? sizeof(SOCKADDR_IN6) : sizeof(SOCKADDR_IN)
         );
 
+        BLORGFS_STAT_INC(ConnectionsFresh);
         connectCtx->CompletionRoutine(STATUS_SUCCESS, connectCtx->NewSocket, FALSE, connectCtx->CompletionContext);
     }
     else
     {
+        BLORGFS_STAT_INC(ConnectionsFailed);
         ExFreePool(connectCtx->NewSocket);
         connectCtx->CompletionRoutine(status, NULL, FALSE, connectCtx->CompletionContext);
     }
@@ -1012,6 +1112,7 @@ NTSTATUS AcquireReusableWskSocketAsync(
 
             if (SockAddrEqual(C_CAST(PSOCKADDR, &pooledSocket->RemoteAddress), RemoteAddress))
             {
+                BLORGFS_STAT_INC(ConnectionsPooled);
                 CompletionRoutine(STATUS_SUCCESS, pooledSocket, TRUE, CompletionContext);
                 return STATUS_PENDING;
             }

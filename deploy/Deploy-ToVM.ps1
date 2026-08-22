@@ -26,6 +26,13 @@
     Credentials for a guest account with admin rights. VMware Tools must be running
     in the guest for any of this to work.
 
+.PARAMETER VmPassword
+    The .vmx's own config-encryption password (separate from GuestPassword), needed
+    when the VM itself is encrypted at the VMware Workstation level -- every guest
+    operation against such a VM fails with "A password is required for this
+    operation" without it, even though "vmrun list" alone does not need it. Leave
+    unset for an unencrypted VM.
+
 .PARAMETER SnapshotName
     If given, revert to this snapshot before deploying -- the recommended way to get
     a clean, un-bugchecked VM for each iteration.
@@ -58,6 +65,7 @@ param(
     [Parameter(Mandatory = $true)][string]$VmxPath,
     [Parameter(Mandatory = $true)][string]$GuestUser,
     [Parameter(Mandatory = $true)][string]$GuestPassword,
+    [string]$VmPassword,
     [string]$SnapshotName,
     [switch]$SkipBuild,
     [ValidateSet("Debug", "Release")][string]$Configuration = "Debug",
@@ -97,7 +105,8 @@ if (-not $VmrunPath) {
 # (which mis-parses vmrun flags like "-activeWindow" as PowerShell parameter names).
 function Invoke-Vmrun {
     param([Parameter(Mandatory = $true)][string[]]$CommandArgs)
-    $output = & $VmrunPath -T ws @CommandArgs 2>&1
+    $vpArgs = if ($VmPassword) { @("-vp", $VmPassword) } else { @() }
+    $output = & $VmrunPath -T ws @vpArgs @CommandArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "vmrun $($CommandArgs -join ' ') failed:`n$output"
     }
@@ -148,7 +157,10 @@ if (-not $SkipBuild) {
 $outDir = Join-Path $RepoRoot "$Platform\$Configuration"
 $sysPath = Join-Path $outDir "BlorgFS.sys"
 $certPath = Join-Path $outDir "BlorgFS.cer"
-$catPath = Join-Path $outDir "BlorgFS.cat"
+# Inf2Cat writes the catalog next to the staged INF it validated ($stagedInfPath
+# below), not into $outDir directly -- same directory, not the same path shape
+# as $sysPath/$certPath.
+$catPath = Join-Path $outDir "BlorgFS\BlorgFS.cat"
 if (-not (Test-Path $sysPath)) { throw "BlorgFS.sys not found at '$sysPath'." }
 
 function Copy-ToGuest {
@@ -167,8 +179,19 @@ Write-Step "Copying driver files into guest"
 # BlorgFS.inf's [SourceDisksFiles] expects BlorgFS.sys (and BlorgFS.cat, if present, for
 # BlorgFS.inf's CatalogFile= to resolve) next to the INF, so all three land in the same
 # guest directory as Install-BlorgFS.ps1.
+#
+# The INF must be the *staged* copy under $outDir\BlorgFS, not the repo-root
+# BlorgFS.inf: MSBuild's stampinf step fills in DriverVer on the staged copy
+# before Inf2Cat hashes it, so the root INF (DriverVer left blank) has
+# different bytes -- and therefore a different hash -- than what's actually
+# in the catalog. Deploying the root INF makes pnputil/InstallHinfSection
+# reject the package with "hash for the file is not present in the
+# specified catalog file", even though the .sys and .cat themselves are
+# perfectly consistent with each other.
+$stagedInfPath = Join-Path $outDir "BlorgFS\BlorgFS.inf"
+if (-not (Test-Path $stagedInfPath)) { throw "Staged INF not found at '$stagedInfPath' -- did the build run stampinf/Inf2Cat?" }
 Copy-ToGuest $sysPath "$GuestDeployDir\BlorgFS.sys"
-Copy-ToGuest (Join-Path $RepoRoot "BlorgFS.inf") "$GuestDeployDir\BlorgFS.inf"
+Copy-ToGuest $stagedInfPath "$GuestDeployDir\BlorgFS.inf"
 if (Test-Path $certPath) {
     Copy-ToGuest $certPath "$GuestDeployDir\BlorgFS.cer"
 }

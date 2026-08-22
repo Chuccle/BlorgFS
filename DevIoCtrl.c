@@ -1,4 +1,4 @@
-#include "Driver.h"
+﻿#include "Driver.h"
 #include "Socket.h"
 #include "TlsHandshake.h"
 #include <mountdev.h>
@@ -42,15 +42,41 @@
 //  32-byte payload. FILE_WRITE_ACCESS: this changes what the driver
 //  trusts, so it requires the same access an admin-only write would;
 //  also enforced by the FSDO device SDDL (BLORGFS_FSDO_DEVICE_SDDL_STRING
-//  in Driver.h), which grants World no write access.
+//  in Driver.h), which grants World no write access. Device type is
+//  FILE_DEVICE_UNKNOWN, not FILE_DEVICE_FILE_SYSTEM: the latter makes the
+//  I/O manager route the request as IRP_MJ_FILE_SYSTEM_CONTROL instead of
+//  the IRP_MJ_DEVICE_CONTROL this is handled under, so it would never
+//  reach BlorgFsdoDeviceControl at all (see the same note on the
+//  statistics IOCTLs in Statistics.h).
 //
 #define IOCTL_BLORGFS_SET_TLS_PIN \
-    CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 //
-//  IRP_MJ_DEVICE_CONTROL handler for the FSDO: currently only the
-//  IOCTL_BLORGFS_SET_TLS_PIN vendor IOCTL used to push a new cert pin at
-//  runtime.
+//  IRP_MJ_DEVICE_CONTROL handler for the FSDO: the vendor IOCTLs --
+//  IOCTL_BLORGFS_SET_TLS_PIN to push a new cert pin at runtime, and the
+//  statistics query/reset pair (Statistics.h) the perf harness samples.
+//  Reachable from usermode as \\.\BlorgFS via the symbolic link
+//  DriverEntry publishes.
+//
+//  The statistics query rejects a caller whose BLORGFS_STATISTICS_RESPONSE
+//  does not match this driver's: the counter block is append-only, but a
+//  harness built against a different revision would still read the wrong
+//  fields out of the tail, and silently-wrong performance numbers are
+//  worse than none. Both size and version are checked, since a field
+//  reordering can leave the size identical.
+//
+//  Those two gate fields arrive as *input*, so the query validates
+//  InputBufferLength as well as OutputBufferLength. METHOD_BUFFERED gives
+//  one system buffer sized max(in, out) with only the first
+//  InputBufferLength bytes filled in, so a caller passing an output buffer
+//  and no input -- the natural shape for something named "query", and legal
+//  at the Win32 layer -- would otherwise have its revision decided by
+//  whatever the uninitialized tail of that buffer happened to hold. The
+//  buffer is genuinely large enough either way (OutputBufferLength is
+//  checked first), so this is a determinism fix rather than a bounds one:
+//  a revision that cannot be read is rejected as a bad parameter instead of
+//  being guessed at.
 //
 static NTSTATUS BlorgFsdoDeviceControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
@@ -68,6 +94,45 @@ static NTSTATUS BlorgFsdoDeviceControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             Irp->IoStatus.Information = 0;
             return TlsSetPin(C_CAST(const UCHAR*, Irp->AssociatedIrp.SystemBuffer));
+        }
+
+        case IOCTL_BLORGFS_QUERY_STATISTICS:
+        {
+            ULONG inLength = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+            ULONG outLength = IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+
+            Irp->IoStatus.Information = 0;
+
+            if (outLength < sizeof(BLORGFS_STATISTICS_RESPONSE))
+            {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+
+            if (inLength < sizeof(BLORGFS_STATISTICS_RESPONSE))
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            PBLORGFS_STATISTICS_RESPONSE response = Irp->AssociatedIrp.SystemBuffer;
+
+            if (BLORGFS_STATISTICS_VERSION != response->Version ||
+                sizeof(BLORGFS_STATISTICS_RESPONSE) != response->SizeOfStruct)
+            {
+                return STATUS_REVISION_MISMATCH;
+            }
+
+            BlorgStatisticsQuery(response);
+
+            Irp->IoStatus.Information = sizeof(BLORGFS_STATISTICS_RESPONSE);
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_BLORGFS_RESET_STATISTICS:
+        {
+            BlorgStatisticsReset();
+
+            Irp->IoStatus.Information = 0;
+            return STATUS_SUCCESS;
         }
         default:
         {
@@ -118,7 +183,7 @@ static NTSTATUS BlorgDiskDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp, PI
             UNICODE_STRING ddoName = RTL_CONSTANT_STRING(BLORGFS_DDO_STRING);
             UNICODE_STRING vdoName = RTL_CONSTANT_STRING(BLORGFS_VDO_STRING);
             UNICODE_STRING deviceName =
-                (BLORGFS_DDO_MAGIC == GetDeviceExtensionMagic(DeviceObject)) ? ddoName : vdoName;
+                (BlorgDeviceDisk == BlorgDeviceKind(DeviceObject)) ? ddoName : vdoName;
 
             if (outLength < sizeof(MOUNTDEV_NAME))
             {
@@ -276,18 +341,18 @@ NTSTATUS BlorgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(DeviceObject))
+    switch (BlorgDeviceKind(DeviceObject))
     {
-        case BLORGFS_VDO_MAGIC:
+        case BlorgDeviceVolume:
         {
             break;
         }
-        case BLORGFS_DDO_MAGIC:
+        case BlorgDeviceDisk:
         {
             result = BlorgDiskDeviceControl(DeviceObject, Irp, irpSp);
             break;
         }
-        case BLORGFS_FSDO_MAGIC:
+        case BlorgDeviceFileSystem:
         {
             result = BlorgFsdoDeviceControl(Irp, irpSp);
             break;

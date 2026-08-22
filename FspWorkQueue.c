@@ -112,12 +112,45 @@ VOID FspCsqReleaseLock(IO_CSQ* Csq, _IRQL_restores_ KIRQL Irql)
 }
 
 //
+// Releases the per-pass payload a queued IRP may be carrying, for the two
+// places that complete a posted IRP WITHOUT running its handler:
+// cancellation, and the teardown drain. Normally the handler consumes it
+// at the top of its next pass (BlorgVolumeCreate), so it is only ever
+// orphaned when that pass never happens.
+//
+// IRP_CONTEXT_FLAG_NET_DONE is the marker that an async completion stashed
+// something; only the create path attaches one (DirectoryControl sets the
+// same flag with nothing in DriverContext[1], which the NULL test covers).
+// The flag is cleared alongside the free so this stays single-shot, exactly
+// as consumption in BlorgVolumeCreate does.
+//
+static VOID FspDiscardPendingIrpContext(PIRP Irp)
+{
+    if (!FlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_NET_DONE))
+    {
+        return;
+    }
+
+    ClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_NET_DONE);
+
+    PVOID stash = Irp->Tail.Overlay.DriverContext[1];
+
+    if (stash)
+    {
+        ExFreePool(stash);
+        Irp->Tail.Overlay.DriverContext[1] = NULL;
+    }
+}
+
+//
 // IO_CSQ cancel callback: completes an IRP that was cancelled while still
 // queued (the CSQ has already removed it by the time this runs).
 //
 VOID FspCsqCompleteCanceledIrp(IO_CSQ* Csq, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Csq);
+
+    FspDiscardPendingIrpContext(Irp);
 
     CompleteRequest(Irp, STATUS_CANCELLED, IO_NO_INCREMENT);
 }
@@ -131,6 +164,16 @@ Routine Description:
 
     This is the main FSP thread routine that is executed to receive
     and dispatch IRP requests.
+
+    The dispatch result is scoped to one IRP, not to one wake: a major
+    function with no case here must fall through to its own
+    STATUS_INVALID_DEVICE_REQUEST and be completed. Hoisting the
+    declaration out of the drain loop instead let an unhandled major
+    inherit the previous IRP's status, and a previous STATUS_PENDING then
+    skipped completion entirely -- stranding an IRP already removed from
+    the CSQ, where not even DestroyWorkQueue's drain can reach it. Only
+    CREATE/READ/DIRECTORY_CONTROL are posted today, but PrePostIrp already
+    prepares WRITE and the EA majors.
 
     Each worker drops its own base priority to 7, one below the system
     process base it inherits. Worker CPU time (cache copies, parsing) sits
@@ -176,10 +219,10 @@ Return Value:
 
         PIRP irp = IoCsqRemoveNextIrp(&FspQueue.Csq, NULL);
 
-        NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
-        
         while (irp)
         {
+            NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
+
             ULONG_PTR flags = C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[0]);
 
             SetFlag(flags, IRP_CONTEXT_FLAG_WAIT | IRP_CONTEXT_FLAG_IN_FSP);
@@ -578,6 +621,11 @@ NTSTATUS CreateWorkQueue(void)
 // still left in the queue. CreateWorkQueue guarantees all-or-nothing
 // thread creation, so all FspQueue.ThreadCount handles are valid here.
 //
+// Each drained IRP goes through FspDiscardPendingIrpContext first: an IRP
+// re-queued by an async completion carries that completion's stashed
+// result, and cancelling it here is the one path where no handler pass
+// will ever consume it.
+//
 void DestroyWorkQueue(void)
 {
     StopWorkQueueThreads(FspQueue.ThreadCount);
@@ -586,6 +634,8 @@ void DestroyWorkQueue(void)
 
     while (irp)
     {
+        FspDiscardPendingIrpContext(irp);
+
         CompleteRequest(irp, STATUS_CANCELLED, IO_NO_INCREMENT);
         irp = IoCsqRemoveNextIrp(&FspQueue.Csq, NULL);
     }

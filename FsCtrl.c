@@ -12,9 +12,7 @@
 //  control code routes and validates in one pass: each oplock code states the
 //  node types it is legal on (the legacy codes are file-only; a directory
 //  takes its Read/Read-Handle oplock solely through the unified, METHOD_BUFFERED
-//  FSCTL_REQUEST_OPLOCK), then falls through to the common handoff. The node is
-//  only dereferenced on those oplock paths, so an unrelated FSCTL on the
-//  control device (FsContext NULL) safely reaches default. Returns
+//  FSCTL_REQUEST_OPLOCK), then falls through to the common handoff. Returns
 //  STATUS_PENDING once the IRP has been handed to the FsRtl oplock package
 //  (which then owns it -- held pending a break, or already completed), telling
 //  BlorgFileSystemControl to leave the IRP alone; validation failures return
@@ -29,7 +27,30 @@
 //  steers a grant -- FsRtl ignores it on an acknowledge: a shared (Read)
 //  grant is denied by a conflicting byte-range lock (files only), while an
 //  exclusive grant needs the sole opener, for which RefCount is our analog
-//  of fastfat's UncleanCount. After FsRtlOplockFsctrl returns, the IRP
+//  of fastfat's UncleanCount.
+//
+//  Every oplock code tests the node for NULL before reading its type, and
+//  that check is load-bearing rather than defensive. BlorgFileSystemControl
+//  routes the FSDO down this same IRP_MN_USER_FS_REQUEST arm as the volume,
+//  and a handle on the control device has no node behind it --
+//  BlorgFileSystemCreate reports FILE_OPENED and leaves FsContext NULL. The
+//  oplock FSCTLs are all FILE_ANY_ACCESS, so reaching them needs only the
+//  GENERIC_READ the FSDO's SDDL grants World (BLORGFS_FSDO_DEVICE_SDDL_STRING,
+//  Driver.h); without the check, GET_NODE_TYPE dereferences NULL and any
+//  local caller can bugcheck the machine with one FSCTL. They answer
+//  STATUS_INVALID_DEVICE_REQUEST rather than STATUS_INVALID_PARAMETER: the
+//  request is not malformed, it is aimed at a device that has no such
+//  operation.
+//
+//  FSCTL_FILESYSTEM_GET_STATISTICS(_EX) is handled first and separately:
+//  it is a volume-wide query with no node to validate, so it must not
+//  fall through the FCB/DCB type checks the oplock codes need. Answering
+//  it in the documented FILESYSTEM_STATISTICS shape (Statistics.h) is
+//  what makes `fsutil fsinfo statistics B:` work against this volume
+//  rather than needing a bespoke tool. STATUS_BUFFER_OVERFLOW from the
+//  fill is a success outcome for these FSCTLs, not an error -- callers
+//  are expected to probe with a short buffer and resize -- so the status
+//  is returned as-is alongside the byte count. After FsRtlOplockFsctrl returns, the IRP
 //  belongs to FsRtl (held pending a break, or already completed) and must
 //  not be touched or completed here; the check may have broken conflicting
 //  oplocks, so IsFastIoPossible is refreshed before releasing the lock.
@@ -42,6 +63,21 @@ static NTSTATUS BlorgUserFsCtrl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
     switch (IrpSp->Parameters.FileSystemControl.FsControlCode)
     {
+        case FSCTL_FILESYSTEM_GET_STATISTICS:
+        case FSCTL_FILESYSTEM_GET_STATISTICS_EX:
+        {
+            ULONG bytesReturned = 0;
+
+            NTSTATUS statisticsStatus = BlorgStatisticsFillFsctlBuffer(
+                Irp->AssociatedIrp.SystemBuffer,
+                IrpSp->Parameters.FileSystemControl.OutputBufferLength,
+                C_CAST(BOOLEAN, FSCTL_FILESYSTEM_GET_STATISTICS_EX == IrpSp->Parameters.FileSystemControl.FsControlCode),
+                &bytesReturned);
+
+            Irp->IoStatus.Information = bytesReturned;
+            return statisticsStatus;
+        }
+
         case FSCTL_REQUEST_OPLOCK_LEVEL_1:
         case FSCTL_REQUEST_OPLOCK_LEVEL_2:
         case FSCTL_REQUEST_BATCH_OPLOCK:
@@ -51,9 +87,9 @@ static NTSTATUS BlorgUserFsCtrl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         case FSCTL_OPLOCK_BREAK_NOTIFY:
         case FSCTL_OPLOCK_BREAK_ACK_NO_2:
         {
-            if (BLORGFS_FCB_SIGNATURE != GET_NODE_TYPE(node))
+            if (!node || BLORGFS_FCB_SIGNATURE != GET_NODE_TYPE(node))
             {
-                return STATUS_INVALID_PARAMETER;
+                return STATUS_INVALID_DEVICE_REQUEST;
             }
 
             isFile = TRUE;
@@ -62,6 +98,11 @@ static NTSTATUS BlorgUserFsCtrl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         case FSCTL_REQUEST_OPLOCK:
         {
+            if (!node)
+            {
+                return STATUS_INVALID_DEVICE_REQUEST;
+            }
+
             USHORT nodeType = GET_NODE_TYPE(node);
             PREQUEST_OPLOCK_INPUT_BUFFER inputBuffer = Irp->AssociatedIrp.SystemBuffer;
 
@@ -122,11 +163,26 @@ static NTSTATUS BlorgUserFsCtrl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 // the mount IRP's VPB (marking it mounted), and releases the DDO
 // reference the I/O manager took for the mount attempt.
 //
+// Ownership is settled by pointer identity against global.DiskDeviceObject,
+// not by reading a magic out of the target's extension. This is the one
+// device object that reaches this driver without having been created by
+// it: once IoRegisterFileSystem has run, the I/O manager offers every
+// arriving volume to every registered file system until one claims it, so
+// a disc or a USB stick going in delivers another driver's storage device
+// here. Its extension is not ours to interpret -- it can be NULL outright
+// (IoCreateDevice with DeviceExtensionSize 0), or shorter than the
+// ULONG64 a magic check reads out of it, and a value that happened to
+// match would make this driver claim a volume it does not back. A pointer
+// comparison dereferences nothing and cannot be imitated. It also stays
+// correct in the window DriverEntry opens between IoRegisterFileSystem
+// and the DDO existing: global.DiskDeviceObject is still NULL there, and
+// the explicit NULL test below keeps a NULL target from matching it.
+//
 static NTSTATUS BlorgMountVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     PDEVICE_OBJECT targetDeviceObject = IrpSp->Parameters.MountVolume.DeviceObject;
 
-    if (!targetDeviceObject || GetDeviceExtensionMagic(targetDeviceObject) != BLORGFS_DDO_MAGIC)
+    if (!targetDeviceObject || (targetDeviceObject != global.DiskDeviceObject))
     {
         return STATUS_UNRECOGNIZED_VOLUME;
     }
@@ -140,13 +196,13 @@ static NTSTATUS BlorgMountVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
     }
 
     ObReferenceObject(volumeDeviceObject);
-    GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject = volumeDeviceObject;
+    global.VolumeDeviceObject = volumeDeviceObject;
 
     PVPB vpb = IrpSp->Parameters.MountVolume.Vpb;
     KIRQL irql;
 
     IoAcquireVpbSpinLock(&irql);
-    vpb->DeviceObject = GetFileSystemDeviceExtension(global.FileSystemDeviceObject)->VolumeDeviceObject;
+    vpb->DeviceObject = volumeDeviceObject;
     vpb->VolumeLabelLength = 0;
     SetFlag(vpb->Flags, VPB_MOUNTED);
     IoReleaseVpbSpinLock(irql);
@@ -172,10 +228,10 @@ NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     FsRtlEnterFileSystem();
 
-    switch (GetDeviceExtensionMagic(DeviceObject))
+    switch (BlorgDeviceKind(DeviceObject))
     {
-        case BLORGFS_VDO_MAGIC:
-        case BLORGFS_FSDO_MAGIC:
+        case BlorgDeviceVolume:
+        case BlorgDeviceFileSystem:
         {
             switch (irpSp->MinorFunction)
             {
@@ -200,7 +256,7 @@ NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             
             break;
         }        
-        case BLORGFS_DDO_MAGIC:
+        case BlorgDeviceDisk:
         {
             break;
         }

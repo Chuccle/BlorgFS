@@ -57,5 +57,10 @@ VOID TlsStartHandshakeAsync(
 // ever been configured (TlsSetPin never called) -- a handshake must not
 // be treated as authenticated just because pinning was never set up.
 //
+// TlsHandshakeGlobalInit: initializes the pin's push lock. Must run before
+// either of the above -- called once from DriverEntry, ahead of the
+// registry read that may call TlsSetPin.
+//
+VOID TlsHandshakeGlobalInit(VOID);
 NTSTATUS TlsSetPin(const UCHAR Pin[TLS_HASH_LEN]);
 BOOLEAN TlsCheckPin(const UCHAR* Spki, ULONG SpkiLen);

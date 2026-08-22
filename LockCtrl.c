@@ -1,4 +1,4 @@
-#include "Driver.h"
+﻿#include "Driver.h"
 
 //
 // Byte-range lock control (IRP_MJ_LOCK_CONTROL) dispatch. Currently a
@@ -11,17 +11,17 @@ NTSTATUS BlorgLockControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(DeviceObject))
+    switch (BlorgDeviceKind(DeviceObject))
     {
-        case BLORGFS_VDO_MAGIC:
+        case BlorgDeviceVolume:
         {
             break;
         }
-        case BLORGFS_DDO_MAGIC:
+        case BlorgDeviceDisk:
         {
             break;
         }
-        case BLORGFS_FSDO_MAGIC:
+        case BlorgDeviceFileSystem:
         {
             break;
         }

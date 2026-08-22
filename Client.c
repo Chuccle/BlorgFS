@@ -29,21 +29,29 @@
 #define HTTP_FILE_INITIAL_RECV_CAPACITY (PAGE_SIZE * 64) // 256 KB initial capacity for file-read responses
 
 //
-// TLS bulk-receive accumulator size (one accumulator per connection,
-// carried on the KSOCKET -- see Socket.h). Ciphertext is received in bulk and
-// complete records are drained out of this buffer without touching the
-// wire again (see HttpIssueTlsReceive), so this bounds how many on-wire
-// records one WSK receive can pick up, not any per-response total.
-// Sixteen max-size records (~256 KB) covers a full prefetch chunk
-// (PREFETCH_CHUNK, 512 KB == 32 records) in two bulk receives, so the
-// per-receive IRP/watchdog cost is paid ~2x per chunk instead of ~8x as
-// with the previous 4-record accumulator; per pooled connection this is
-// a bounded NonPagedPoolNx cost (32 sockets x ~256 KB = 8 MB worst
-// case, only for connections that actually spoke TLS). It must exceed
-// one max record (5-byte header + TLS_RECORD_CIPHERTEXT_MAX) or the
-// drain loop could never make progress on a full buffer.
+// Initial receive capacity for a zero-copy (MDL) file read. Nothing but
+// the response headers ever lands in Ctx->Buffer on that path -- the body
+// goes straight to the caller's MDL -- so the buffer only has to hold a
+// 206's status line and headers, a few hundred bytes in practice, with
+// HttpGrowBufferIfNeeded growing a page at a time in the (unseen) case
+// that a server sends more. Sizing it at the general
+// HTTP_INITIAL_RECV_CAPACITY instead cost two things per chunk read: the
+// larger NonPagedPoolNx allocation, and a larger header-phase receive,
+// whose whole posted length gets filled with body bytes that
+// HttpReadResponse then has to memcpy into the MDL (the spill copy) --
+// bytes that at this size land in the MDL directly instead.
 //
-#define HTTP_TLS_RECV_CAPACITY (16 * (5 + TLS_RECORD_CIPHERTEXT_MAX))
+#define HTTP_MDL_INITIAL_RECV_CAPACITY 2048
+
+//
+// The TLS bulk-receive accumulator this file drains lives on the KSOCKET
+// and is sized and allocated by Socket.c (SocketTlsRecvCapacity,
+// EnsureTlsRecvBuffer). It is shared with the handshake, which fills it
+// first: bytes the handshake's last bulk receive pulled in past the
+// server's Finished -- a NewSessionTicket, typically -- stay buffered on
+// the connection and are drained by the first request to use it, rather
+// than being discarded and desyncing the record sequence.
+//
 
 //
 // Hard ceiling on a single response body's declared Content-Length. The
@@ -64,6 +72,65 @@
 // too-small buffer look big enough to a naive size check, turning
 // overflow into an out-of-bounds read/write primitive.
 //
+//
+// In-flight request gate, and why it is a base-referenced count rather
+// than a rundown reference.
+//
+// Driver unload has to outlive nothing: a request still on the wire will
+// later run its completion chain and its work items out of this image, so
+// unloading while one is outstanding is a use-after-unload. The obvious
+// primitive, EX_RUNDOWN_REF, is unusable here -- ExReleaseRundownProtection
+// is documented IRQL <= APC_LEVEL, and HttpFreeContext runs at
+// DISPATCH_LEVEL on the WSK completion chain for every file read.
+//
+// So: a plain interlocked count that starts at 1. That standing reference
+// is what unload releases, and it is what makes the count reach zero
+// exactly once -- an acquire refuses to lift the count off zero, so once
+// the drain has started no new request can slip in behind it. Both
+// operations are interlocked and legal at any IRQL, and the event is only
+// ever waited on by the single PASSIVE-level unload path.
+//
+static volatile LONG HttpActiveRequests = 1;
+static KEVENT HttpDrainEvent;
+
+//
+// Takes a reference for one request. Returns FALSE once the count has
+// reached zero, which only happens after DrainHttpClient has released the
+// standing reference -- so a request issued during unload is refused
+// rather than racing the teardown.
+//
+static BOOLEAN HttpAcquireActive(VOID)
+{
+    LONG current = ReadNoFence(&HttpActiveRequests);
+
+    while (0 != current)
+    {
+        LONG previous = InterlockedCompareExchange(&HttpActiveRequests, current + 1, current);
+
+        if (previous == current)
+        {
+            return TRUE;
+        }
+
+        current = previous;
+    }
+
+    return FALSE;
+}
+
+//
+// Drops one reference; whoever drops the last one signals the drain.
+// Callable at <= DISPATCH_LEVEL: KeSetEvent with Wait = FALSE is legal
+// there, and no other side of this touches anything paged.
+//
+static VOID HttpReleaseActive(VOID)
+{
+    if (0 == InterlockedDecrement(&HttpActiveRequests))
+    {
+        KeSetEvent(&HttpDrainEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
 static BOOLEAN HttpCheckedAddSizeT(SIZE_T A, SIZE_T B, PSIZE_T Result)
 {
     SIZE_T sum = A + B;
@@ -266,6 +333,16 @@ typedef struct _HTTP_CONTEXT
     ULONG RequestLength;
     ULONG Capacity;
     ULONG Length;
+
+    //
+    // QPC stamp taken when the request is built, so HttpComplete can fold
+    // metadata requests into their latency counters (Statistics.h). File
+    // reads are timed at their own issue sites instead -- the direct-fetch
+    // path off the IRP's DriverContext, the prefetcher off its fetch
+    // context -- because those two want the chunk latency the reader
+    // actually waits on, which starts before this context exists.
+    //
+    LONG64 IssueQpc;
 
 } HTTP_CONTEXT;
 
@@ -774,6 +851,8 @@ static VOID HttpFreeContext(HTTP_CONTEXT* Ctx)
     }
 
     ExFreePool(Ctx);
+
+    HttpReleaseActive();
 }
 
 //
@@ -954,6 +1033,23 @@ static BOOLEAN HttpMustBounceToPassive(const HTTP_CONTEXT* Ctx)
 }
 
 //
+// Whether this operation can ever queue Ctx->WorkItem. Only two things
+// do: the HttpDispatch/HttpComplete bounces (HttpMustBounceToPassive,
+// never true for a file read) and HttpKick's TLS handshake stage. So a
+// file read on a plaintext connection needs no work item at all, and
+// skipping it takes one pool allocation and one free off every chunk on
+// the read hot path. global.TlsEnabled is sampled here, at the one point
+// where an allocation failure can still be reported to the caller, rather
+// than at handshake time; HttpKick re-checks for NULL so that flipping
+// the flag live (the debugger poke documented in Driver.h) degrades to a
+// failed request rather than a NULL dereference.
+//
+static BOOLEAN HttpNeedsWorkItem(HTTP_OPERATION Operation)
+{
+    return HttpOpFileRead != Operation || global.TlsEnabled;
+}
+
+//
 // Stage-machine dispatcher: drives Ctx forward one step per call by
 // switching on Ctx->Stage and issuing the next async op (or completing).
 // Central re-entry point for every stage transition in this file.
@@ -994,6 +1090,12 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
         {
             if (KeGetCurrentIrql() > PASSIVE_LEVEL)
             {
+                if (!Ctx->WorkItem)
+                {
+                    HttpComplete(Ctx, STATUS_INSUFFICIENT_RESOURCES);
+                    break;
+                }
+
                 IoQueueWorkItem(Ctx->WorkItem, HttpTlsHandshakeWorker, DelayedWorkQueue, Ctx);
             }
             else
@@ -1112,6 +1214,8 @@ static BOOLEAN HttpTryRetryReusedConnection(HTTP_CONTEXT* Ctx)
     }
 
     BLORGFS_PRINT("HttpTryRetryReusedConnection: reused connection failed pre-response, retrying fresh\n");
+
+    BLORGFS_STAT_INC(KeepAliveRetries);
 
     if (Ctx->Socket)
     {
@@ -1600,23 +1704,12 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
 
     PKSOCKET socket = Ctx->Socket;
 
-    if (!socket->TlsRecvBuffer)
+    NTSTATUS accumulatorStatus = EnsureTlsRecvBuffer(socket);
+
+    if (!NT_SUCCESS(accumulatorStatus))
     {
-        socket->TlsRecvBuffer = ExAllocatePoolUninitialized(NonPagedPoolNx, HTTP_TLS_RECV_CAPACITY, HTTP_TAG);
-        socket->TlsPlaintextScratch = socket->TlsRecvBuffer
-            ? ExAllocatePoolUninitialized(NonPagedPoolNx, TLS_RECORD_CIPHERTEXT_MAX, HTTP_TAG)
-            : NULL;
-        socket->TlsRecvMdl = socket->TlsPlaintextScratch
-            ? IoAllocateMdl(socket->TlsRecvBuffer, HTTP_TLS_RECV_CAPACITY, FALSE, FALSE, NULL)
-            : NULL;
-
-        if (!socket->TlsRecvMdl)
-        {
-            HttpComplete(Ctx, STATUS_INSUFFICIENT_RESOURCES);
-            return;
-        }
-
-        MmBuildMdlForNonPagedPool(socket->TlsRecvMdl);
+        HttpComplete(Ctx, accumulatorStatus);
+        return;
     }
 
     for (;;)
@@ -1631,6 +1724,12 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
 
         UCHAR recordType = record[0];
         ULONG declaredLen = (C_CAST(ULONG, record[3]) << 8) | C_CAST(ULONG, record[4]);
+
+        if (0x15 == recordType)
+        {
+            HttpFail(Ctx, STATUS_CONNECTION_RESET);
+            return;
+        }
 
         if (declaredLen > TLS_RECORD_CIPHERTEXT_MAX ||
             (0x17 != recordType && 0x14 != recordType))
@@ -1719,6 +1818,9 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         socket->Tls.ReadSeq++;
         socket->TlsRecvOffset += 5 + declaredLen;
 
+        BLORGFS_STAT_INC(TlsRecordsDecrypted);
+        BLORGFS_STAT_ADD(TlsBytesDecrypted, innerLen);
+
         UCHAR contentType;
         ULONG contentLen;
 
@@ -1766,7 +1868,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         socket->TlsRecvOffset = 0;
     }
     else if (socket->TlsRecvOffset &&
-        (HTTP_TLS_RECV_CAPACITY - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
+        (SocketTlsRecvCapacity - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
     {
         RtlMoveMemory(
             socket->TlsRecvBuffer,
@@ -1777,11 +1879,13 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         socket->TlsRecvOffset = 0;
     }
 
+    BLORGFS_STAT_INC(TlsBulkReceives);
+
     NTSTATUS result = ReceiveWskAsyncMdl(
         socket,
         socket->TlsRecvMdl,
         socket->TlsRecvLength,
-        HTTP_TLS_RECV_CAPACITY - socket->TlsRecvLength,
+        SocketTlsRecvCapacity - socket->TlsRecvLength,
         0,
         HttpOnTlsReceive,
         Ctx);
@@ -1847,19 +1951,42 @@ static VOID HttpOnTlsReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID 
 // zero-copy mode (TargetMdl set), the body belongs in the caller's MDL,
 // not Buffer: whatever slice of it arrived piggybacked on the header
 // receive is the only body data that will ever be in Buffer, and is
-// moved into the MDL now (small: bounded by the header-phase buffer, and
-// usually zero when the server sends headers in their own segment) --
-// every subsequent receive lands in the MDL directly, so Buffer never
-// grows past the headers. In buffer mode, Buffer is pre-grown to fit the
-// full declared body now that ContentLength is known, so the remaining
-// receive loop (if any) doesn't repeatedly realloc a page at a time for
-// large files. Dispatch does not happen until the full declared
+// moved into the MDL now (usually zero, when the server sends headers in
+// their own segment) -- every subsequent receive lands in the MDL
+// directly, so Buffer never grows past the headers.
+//
+// How many bytes have arrived is not the same thing as how many the peer
+// declared, and the gap between the two is the hazard this function is
+// ordered around. The Length > BodyEndOffset test sits above everything
+// that moves a byte, deliberately: every destination below is sized from
+// the *declared* Content-Length -- the caller's MDL from the range it
+// asked for, Buffer from BodyOffset + ContentLength -- while Length is
+// whatever the peer chose to put on the wire, and the header-phase
+// receive posts the whole remaining capacity, so one burst can leave
+// Length sitting at Capacity with a Content-Length of four. Both
+// destinations then copy Length - BodyOffset bytes: the MDL spill copy
+// directly, and the flatcc alignment slide (below, metadata operations
+// only) when the headers end off an 8-byte boundary and the body has to
+// move down to the next one. Checking afterwards, as this used to, means
+// the copy has already happened by the time the response is rejected.
+// One test covers both destinations and both phases -- the same
+// arithmetic decides "over-sent" during the header phase and after a body
+// receive -- so it is not repeated per branch.
+//
+// Over-sending is a protocol violation that also desyncs a keep-alive
+// stream, so it fails the request rather than truncating, matching how a
+// short body is handled. In buffer mode, Buffer is then pre-grown to fit
+// the full declared body now that ContentLength is known, so the
+// remaining receive loop (if any) doesn't repeatedly realloc a page at a
+// time for large files. Dispatch does not happen until the full declared
 // Content-Length has arrived, looping HttpStageReceive as many times as
 // the peer needs to deliver it.
 //
 static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
 {
-    if (0 == Ctx->BodyOffset)
+    BOOLEAN headersJustParsed = (0 == Ctx->BodyOffset);
+
+    if (headersJustParsed)
     {
         NTSTATUS parseStatus = HttpParseHeaders(Ctx);
 
@@ -1891,7 +2018,21 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
             HttpFail(Ctx, STATUS_INVALID_PARAMETER);
             return;
         }
+    }
 
+    if (Ctx->Length > Ctx->BodyEndOffset)
+    {
+        BLORGFS_PRINT(
+            "HttpReadResponse() - peer sent %Iu bytes for a response ending at %Iu, rejecting\n",
+            C_CAST(SIZE_T, Ctx->Length),
+            Ctx->BodyEndOffset);
+
+        HttpFail(Ctx, STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    if (headersJustParsed)
+    {
         if (Ctx->TargetMdl)
         {
             SIZE_T spill = Ctx->Length - Ctx->BodyOffset;
@@ -1956,14 +2097,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
         }
     }
 
-    if (Ctx->Length > Ctx->BodyEndOffset)
-    {
-        BLORGFS_PRINT("Server sent data beyond declared Content-Length\n");
-
-        HttpFail(Ctx, STATUS_INVALID_PARAMETER);
-        return;
-    }
-    else if (Ctx->Length < Ctx->BodyEndOffset)
+    if (Ctx->Length < Ctx->BodyEndOffset)
     {
         HttpIssueReceiveDispatch(Ctx);
         return;
@@ -2204,6 +2338,36 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
         return;
     }
 
+    PBLORGFS_STATISTICS statsBlock = BlorgStatisticsForCurrentProcessor();
+
+    if (statsBlock && HttpOpFileRead != Ctx->Operation)
+    {
+        ULONG64* latencySum = (HttpOpDirInfo == Ctx->Operation)
+            ? &statsBlock->DirInfoLatencySumUs
+            : &statsBlock->FileInfoLatencySumUs;
+
+        ULONG64 discardedMax = 0;
+
+        BlorgStatisticsRecordLatency(
+            latencySum,
+            &discardedMax,
+            NULL,
+            BlorgStatisticsNow() - Ctx->IssueQpc);
+
+        if (NT_SUCCESS(Status))
+        {
+            statsBlock->MetaDataReadBytes += Ctx->ContentLength;
+        }
+        else if (HttpOpDirInfo == Ctx->Operation)
+        {
+            statsBlock->DirInfoFailures++;
+        }
+        else
+        {
+            statsBlock->FileInfoFailures++;
+        }
+    }
+
     if (!NT_SUCCESS(Status))
     {
         switch (Ctx->Operation)
@@ -2355,10 +2519,16 @@ static NTSTATUS HttpBuildRequest(
 //
 static HTTP_CONTEXT* HttpAllocateContext(HTTP_OPERATION Operation, int ExpectedStatusCode, SIZE_T InitialCapacity)
 {
+    if (!HttpAcquireActive())
+    {
+        return NULL;
+    }
+
     HTTP_CONTEXT* ctx = ExAllocatePoolZero(NonPagedPoolNx, sizeof(HTTP_CONTEXT), HTTP_TAG);
 
     if (!ctx)
     {
+        HttpReleaseActive();
         return NULL;
     }
 
@@ -2367,19 +2537,25 @@ static HTTP_CONTEXT* HttpAllocateContext(HTTP_OPERATION Operation, int ExpectedS
     if (!ctx->Buffer)
     {
         ExFreePool(ctx);
+        HttpReleaseActive();
         return NULL;
     }
 
-    ctx->WorkItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
-
-    if (!ctx->WorkItem)
+    if (HttpNeedsWorkItem(Operation))
     {
-        ExFreePool(ctx->Buffer);
-        ExFreePool(ctx);
-        return NULL;
+        ctx->WorkItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
+
+        if (!ctx->WorkItem)
+        {
+            ExFreePool(ctx->Buffer);
+            ExFreePool(ctx);
+            HttpReleaseActive();
+            return NULL;
+        }
     }
 
     ctx->Capacity = C_CAST(ULONG, InitialCapacity);
+    ctx->IssueQpc = BlorgStatisticsNow();
     ctx->Operation = Operation;
     ctx->ExpectedStatusCode = ExpectedStatusCode;
     ctx->Stage = HttpStageAcquireSocket;
@@ -2418,6 +2594,9 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
 
     ctx->Completion.DirInfo.Routine = CompletionRoutine;
     ctx->CallerContext = CallerContext;
+
+    BLORGFS_STAT_INC(DirInfoRequests);
+    BLORGFS_STAT_INC(MetaDataDiskReads);
 
     static const char requestFormat[] =
         "GET /get_dir_info?path=%wZ HTTP/1.1\r\n"
@@ -2464,6 +2643,9 @@ NTSTATUS BlorgHttpGetFileInformation(
 
     ctx->Completion.FileInfo.Routine = CompletionRoutine;
     ctx->CallerContext = CallerContext;
+
+    BLORGFS_STAT_INC(FileInfoRequests);
+    BLORGFS_STAT_INC(MetaDataDiskReads);
 
     static const char requestFormat[] =
         "GET /get_dir_entry_info?path=%wZ HTTP/1.1\r\n"
@@ -2523,7 +2705,7 @@ static NTSTATUS HttpGetFileCommon(
     HTTP_CONTEXT* ctx = HttpAllocateContext(
         HttpOpFileRead,
         206,
-        TargetMdl ? HTTP_INITIAL_RECV_CAPACITY : HTTP_FILE_INITIAL_RECV_CAPACITY);
+        TargetMdl ? HTTP_MDL_INITIAL_RECV_CAPACITY : HTTP_FILE_INITIAL_RECV_CAPACITY);
 
     if (!ctx)
     {
@@ -2637,7 +2819,28 @@ void FreeHttpAddrInfo(PADDRINFOEXW AddrInfo)
 //
 NTSTATUS InitialiseHttpClient(void)
 {
+    KeInitializeEvent(&HttpDrainEvent, NotificationEvent, FALSE);
+
     return InitialiseWskClient();
+}
+
+//
+// Releases the standing reference and waits for every in-flight request
+// to finish. From here on HttpAllocateContext refuses new requests, so
+// the count is monotonically decreasing and the wait terminates as soon
+// as the last outstanding completion runs -- bounded by the per-operation
+// socket watchdogs (SOCKET_RECEIVE_TIMEOUT_MS), so a dead peer cannot
+// hang unload indefinitely.
+//
+// Must run before the device objects are torn down: an outstanding
+// request may still queue an IO work item against
+// global.FileSystemDeviceObject.
+//
+VOID DrainHttpClient(void)
+{
+    HttpReleaseActive();
+
+    KeWaitForSingleObject(&HttpDrainEvent, Executive, KernelMode, FALSE, NULL);
 }
 
 //

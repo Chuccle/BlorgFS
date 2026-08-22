@@ -187,18 +187,18 @@ NTSTATUS BlorgQueryVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(DeviceObject))
+    switch (BlorgDeviceKind(DeviceObject))
     {
-        case BLORGFS_VDO_MAGIC:
+        case BlorgDeviceVolume:
         {
             result = BlorgVolumeQueryVolumeInformation(Irp, irpSp);
             break;
         }
-        case BLORGFS_DDO_MAGIC:
+        case BlorgDeviceDisk:
         {
             break;
         }
-        case BLORGFS_FSDO_MAGIC:
+        case BlorgDeviceFileSystem:
         {
             break;
         }
@@ -222,17 +222,17 @@ NTSTATUS BlorgSetVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    switch (GetDeviceExtensionMagic(DeviceObject))
+    switch (BlorgDeviceKind(DeviceObject))
     {
-        case BLORGFS_VDO_MAGIC:
+        case BlorgDeviceVolume:
         {
             break;
         }
-        case BLORGFS_DDO_MAGIC:
+        case BlorgDeviceDisk:
         {
             break;
         }
-        case BLORGFS_FSDO_MAGIC:
+        case BlorgDeviceFileSystem:
         {
             break;
         }

@@ -275,6 +275,7 @@ CHECK_PADDING_BETWEEN(COMMON_CONTEXT, RefCount, OnReapList);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, OnReapList, TableBucketIndex);
 CHECK_PADDING_END(COMMON_CONTEXT, TableBucketIndex);
 
+
 //
 // One concurrent reader position on a file: where its last read ended and
 // how many contiguous reads in a row it has issued. An FCB carries a small
@@ -302,9 +303,9 @@ CHECK_PADDING_END(READ_STREAM_TRACKER, Streak);
 // Per-file context node. Extends COMMON_CONTEXT with file locking and
 // sequential-read prefetch state.
 //
-typedef struct _FCB
+typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
 {
-    COMMON_CONTEXT  DUMMYSTRUCTNAME;
+    BLORGFS_COMMON_CONTEXT_MEMBER
     FILE_LOCK       FileLock;       // Byte-range lock state
     PVOID           LazyWriteThread;// Thread performing lazy write, if any
 
@@ -350,9 +351,9 @@ CHECK_PADDING_END(FCB, Streams);
 // Per-directory context node. Extends COMMON_CONTEXT with child linkage and
 // a shared directory-listing cache.
 //
-typedef struct _DCB
+typedef struct _DCB BLORGFS_COMMON_CONTEXT_BASE
 {
-    COMMON_CONTEXT  DUMMYSTRUCTNAME;
+    BLORGFS_COMMON_CONTEXT_MEMBER
     LIST_ENTRY ChildrenList; // Head of this directory's child node list
 
     //
@@ -412,9 +413,22 @@ CHECK_PADDING_END(CCB, Entries);
 typedef FCB VCB;
 typedef PFCB PVCB;
 
-NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject, ULONGLONG Size);
-NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject);
-NTSTATUS BlorgCreateCCB(CCB** Ccb, const DEVICE_OBJECT* VolumeDeviceObject);
+//
+// All three set their out-pointer to NULL on entry and assign it only on
+// the success return, so a caller that checked the status has a non-NULL
+// node without re-testing. Stated in SAL rather than left to the comment:
+// the walk in InsertByPath descends into a freshly created DCB with no
+// further NULL check, and PREfast can only take that as proven from the
+// annotation.
+//
+_Success_(return >= 0)
+NTSTATUS BlorgCreateFCB(_Outptr_result_nullonfailure_ FCB** Fcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject, ULONGLONG Size);
+
+_Success_(return >= 0)
+NTSTATUS BlorgCreateDCB(_Outptr_result_nullonfailure_ DCB** Dcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject);
+
+_Success_(return >= 0)
+NTSTATUS BlorgCreateCCB(_Outptr_result_nullonfailure_ CCB** Ccb, const DEVICE_OBJECT* VolumeDeviceObject);
 void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject);
 void BlorgReapEmptyAncestorDcbs(PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject);
 
@@ -473,24 +487,12 @@ VOID PathCacheInvalidateAll(VOID);
 /////////////////////////////////////////////
 
 //
-// Common header at the start of every device extension, used to identify
-// which device type a DEVICE_OBJECT's extension belongs to.
-//
-typedef struct _BLORGFS_DEVICE_EXTENSION_HDR
-{
-    UINT64 Identifier; // BLORGFS_VDO_MAGIC / BLORGFS_DDO_MAGIC / BLORGFS_FSDO_MAGIC
-} BLORGFS_DEVICE_EXTENSION_HDR, * PBLORGFS_DEVICE_EXTENSION_HDR;
-
-CHECK_PADDING_END(BLORGFS_DEVICE_EXTENSION_HDR, Identifier);
-
-//
 // Device extension for the volume device object (VDO): lookaside lists for
 // node allocation, the root directory, the VCB, and directory-change
 // notification state.
 //
 typedef struct BLORGFS_VDO_DEVICE_EXTENSION
 {
-    BLORGFS_DEVICE_EXTENSION_HDR Hdr;
     NPAGED_LOOKASIDE_LIST NonPagedNodeLookasideList; // Allocates NON_PAGED_NODE
     PAGED_LOOKASIDE_LIST FcbLookasideList; // Allocates FCB
     PAGED_LOOKASIDE_LIST DcbLookasideList; // Allocates DCB
@@ -501,7 +503,6 @@ typedef struct BLORGFS_VDO_DEVICE_EXTENSION
     LIST_ENTRY NotifyList;   // List of pending change-notification IRPs
 } BLORGFS_VDO_DEVICE_EXTENSION, * PBLORGFS_VDO_DEVICE_EXTENSION;
 
-CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, Hdr, NonPagedNodeLookasideList);
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, NonPagedNodeLookasideList, FcbLookasideList);
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, FcbLookasideList, DcbLookasideList);
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, DcbLookasideList, CcbLookasideList);
@@ -511,23 +512,14 @@ CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, Vcb, NotifySync);
 CHECK_PADDING_BETWEEN(BLORGFS_VDO_DEVICE_EXTENSION, NotifySync, NotifyList);
 CHECK_PADDING_END(BLORGFS_VDO_DEVICE_EXTENSION, NotifyList);
 
-// Device extension for the disk device object (DDO).
-typedef struct _BLORGFS_DDO_DEVICE_EXTENSION
-{
-    BLORGFS_DEVICE_EXTENSION_HDR Hdr;
-} BLORGFS_DDO_DEVICE_EXTENSION, * PBLORGFS_DDO_DEVICE_EXTENSION;
-
-CHECK_PADDING_END(BLORGFS_DDO_DEVICE_EXTENSION, Hdr);
-
-// Device extension for the file system device object (FSDO/control device).
-typedef struct _BLORGFS_FSDO_DEVICE_EXTENSION
-{
-    BLORGFS_DEVICE_EXTENSION_HDR Hdr;
-    PDEVICE_OBJECT VolumeDeviceObject; // The mounted volume device, or NULL
-} BLORGFS_FSDO_DEVICE_EXTENSION, * PBLORGFS_FSDO_DEVICE_EXTENSION;
-
-CHECK_PADDING_BETWEEN(BLORGFS_FSDO_DEVICE_EXTENSION, Hdr, VolumeDeviceObject);
-CHECK_PADDING_END(BLORGFS_FSDO_DEVICE_EXTENSION, VolumeDeviceObject);
+//
+// The disk and file-system device objects carry no extension at all. Each
+// used to hold one -- a type tag, plus (on the FSDO) the mounted volume
+// pointer -- and both of those moved: the tag is gone entirely, replaced
+// by BlorgDeviceKind's pointer comparison below, and the volume pointer
+// lives in global (Driver.h) with the other two device pointers. Nothing
+// was left, so both are now created with a zero-length extension.
+//
 
 //
 // Reinterprets a volume device object's DeviceExtension as the VDO
@@ -535,33 +527,5 @@ CHECK_PADDING_END(BLORGFS_FSDO_DEVICE_EXTENSION, VolumeDeviceObject);
 //
 inline PBLORGFS_VDO_DEVICE_EXTENSION GetVolumeDeviceExtension(const DEVICE_OBJECT* VolumeDeviceObject)
 {
-    return VolumeDeviceObject->DeviceExtension;
-}
-
-//
-// Reinterprets a disk device object's DeviceExtension as the DDO extension
-// type. Caller is responsible for the object actually being a DDO.
-//
-inline PBLORGFS_DDO_DEVICE_EXTENSION GetDiskDeviceExtension(const DEVICE_OBJECT* DiskDeviceObject)
-{
-    return DiskDeviceObject->DeviceExtension;
-}
-
-//
-// Reinterprets a file system device object's DeviceExtension as the FSDO
-// extension type. Caller is responsible for the object actually being an FSDO.
-//
-inline PBLORGFS_FSDO_DEVICE_EXTENSION GetFileSystemDeviceExtension(const DEVICE_OBJECT* FileSystemDeviceObject)
-{
-    return FileSystemDeviceObject->DeviceExtension;
-}
-
-//
-// Reads the common header's Identifier field to determine which device
-// extension type (VDO/DDO/FSDO) a device object actually carries, without
-// assuming the type up front.
-//
-inline ULONG64 GetDeviceExtensionMagic(const DEVICE_OBJECT* DeviceObject)
-{
-    return C_CAST(PBLORGFS_DEVICE_EXTENSION_HDR, DeviceObject->DeviceExtension)->Identifier;
+    return C_CAST(PBLORGFS_VDO_DEVICE_EXTENSION, VolumeDeviceObject->DeviceExtension);
 }

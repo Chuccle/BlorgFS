@@ -18,7 +18,17 @@
 //
 #define STATUS_BLORGFS_CERT_PIN_MISMATCH ((NTSTATUS)0xE0080001L)
 
-#define TLS_HS_RECORD_MAX     16384  // TLS's own max record size, RFC 8446 5.1
+//
+// A received record is capped at TLS_RECORD_CIPHERTEXT_MAX (Tls.h), not at
+// the 2^14 plaintext maximum: RFC 8446 5.1 caps TLSPlaintext.length at
+// 2^14, but 5.2 lets TLSCiphertext.length carry that plus the inner
+// content type and the AEAD tag. A server fragmenting a large certificate
+// chain at the plaintext maximum emits exactly that, so capping at 2^14
+// rejected a legal record 17 bytes over and failed the handshake outright.
+// The same constant is what Client.c's post-handshake drain and Socket.c's
+// accumulator sizing already used, so this is one shared definition rather
+// than a second one free to drift out of step with them again.
+//
 #define TLS_HS_FLIGHT_MAX     32768  // 2x max record: comfortable headroom for
                                       // a flight spanning a couple of records
 #define TLS_HS_TRANSCRIPT_MAX  8192  // generous headroom for a realistic cert chain
@@ -35,6 +45,18 @@ typedef struct _TLS_PIN_STATE
 } TLS_PIN_STATE;
 
 static TLS_PIN_STATE TlsPin;
+
+//
+// EX_PUSH_LOCK's zero-initialized state happens to be directly usable on
+// real hardware, but every other push lock in this driver (PathCache.c,
+// Structs.c) is explicitly initialized before first use, and TlsPin.Lock
+// was the one silent exception. Called once from DriverEntry, ahead of the
+// registry read that may call TlsSetPin.
+//
+VOID TlsHandshakeGlobalInit(VOID)
+{
+    ExInitializePushLock(&TlsPin.Lock);
+}
 
 //
 // Sets the configured certificate pin under exclusive lock so a concurrent
@@ -94,6 +116,16 @@ typedef enum _TLS_HS_STAGE
 typedef struct _TLS_HANDSHAKE_CONTEXT
 {
     PKSOCKET Socket;                                    // socket the handshake runs over
+
+    //
+    // QPC stamp taken as the handshake starts, so both terminal paths can
+    // report how long it took (Statistics.h). Handshake latency is
+    // per-connection rather than per-request, and lands squarely on
+    // stream startup: a fresh stream opens up to PREFETCH_DEPTH
+    // connections at once, each paying this before its first byte moves.
+    // Captured into a local before the context is zeroed on the way out.
+    //
+    LONG64 IssueQpc;
     PBLORG_TLS_HANDSHAKE_COMPLETION CompletionRoutine;   // called when the handshake finishes/fails
     PVOID CallerContext;                                 // opaque context passed to CompletionRoutine
     TLS_HS_STAGE Stage;                                  // current wait state in the handshake
@@ -141,7 +173,7 @@ typedef struct _TLS_HANDSHAKE_CONTEXT
     // header.
     //
     UCHAR RecordHeader[5];                        // current record's 5-byte header
-    UCHAR RecordPayload[TLS_HS_RECORD_MAX];        // current record's payload
+    UCHAR RecordPayload[TLS_RECORD_CIPHERTEXT_MAX];  // current record's payload
     ULONG RecordPayloadLen;                        // declared length of RecordPayload
 
     //
@@ -167,7 +199,7 @@ static VOID TlsHandshakeOnSendClientHello(NTSTATUS Status, ULONG_PTR BytesTransf
 
 static VOID TlsHandshakeIssueReceiveRecordHeader(PTLS_HANDSHAKE_CONTEXT Ctx);
 static VOID TlsHandshakeIssueReceiveRecordHeaderExpandedCallout(PVOID Parameter);
-static VOID TlsHandshakeOnReceiveRecordHeader(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID Context);
+static VOID TlsHandshakeOnBulkReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID Context);
 static VOID TlsHandshakeOnReceiveRecordPayload(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID Context);
 static VOID TlsHandshakeOnReceiveServerHello(PTLS_HANDSHAKE_CONTEXT Ctx);
 static NTSTATUS TlsHandshakeProcessFlightMessages(PTLS_HANDSHAKE_CONTEXT Ctx, BOOLEAN* Done);
@@ -220,6 +252,9 @@ VOID TlsStartHandshakeAsync(
     ctx->CompletionRoutine = CompletionRoutine;
     ctx->CallerContext = CallerContext;
     ctx->Stage = TlsHsWaitingForServerHello;
+    ctx->IssueQpc = BlorgStatisticsNow();
+
+    BLORGFS_STAT_INC(HandshakesStarted);
 
     Socket->Tls.State = TlsHandshakeInProgress;
 
@@ -301,6 +336,8 @@ static VOID TlsHandshakeFail(PTLS_HANDSHAKE_CONTEXT Ctx, NTSTATUS Status)
     PVOID callerContext = Ctx->CallerContext;
     PIO_WORKITEM workItem = Ctx->WorkItem;
 
+    BLORGFS_STAT_INC(HandshakesFailed);
+
     RtlSecureZeroMemory(Ctx, sizeof(*Ctx));
     IoFreeWorkItem(workItem);
     ExFreePool(Ctx);
@@ -342,6 +379,36 @@ static VOID TlsHandshakeIssueReceiveRecordHeaderExpandedCallout(PVOID Parameter)
 // receive inline. Check remaining stack and expand rather than guess a
 // fixed chain-length cap.
 //
+// Framing: this used to post two exact-length WAITALL receives per
+// record -- five bytes for the header, then the declared payload -- which
+// costs an IRP, an MDL allocate/probe/lock, and a watchdog timer arm and
+// cancel, twice, for every record in the server's flight. A TLS 1.3
+// server flight is four to six records once the certificate chain is
+// counted, so a handshake spent roughly ten to twelve WSK operations
+// reading a few kilobytes, and any of them that did not complete inline
+// cost a full scheduling round trip. All of that sits on connection
+// establishment, which a fresh stream pays up to PREFETCH_DEPTH times at
+// once.
+//
+// Instead the ciphertext is received in bulk into the connection's
+// accumulator (Socket.h, shared with the post-handshake record drain in
+// Client.c) and whole records are handed to the state machine straight
+// out of it, so a typical flight costs one or two receives rather than
+// ten. The accumulator is the right home for it rather than a
+// context-local buffer for a second reason: whatever the last bulk
+// receive pulls in past the server's Finished -- a NewSessionTicket,
+// typically -- stays buffered on the connection for the first request to
+// drain, instead of being discarded with the handshake context and
+// desyncing the record sequence.
+//
+// The delivery shape is deliberately unchanged: a buffered record is
+// copied into Ctx->RecordHeader/RecordPayload and fed to
+// TlsHandshakeOnReceiveRecordPayload exactly as a completed WAITALL pair
+// used to be, so every parsing, decryption, and PASSIVE-bounce path
+// downstream is untouched. Delivery is a direct call, so consecutive
+// buffered records recurse rather than iterate -- bounded by the records
+// in one flight, and covered by the same stack check as before.
+//
 static VOID TlsHandshakeIssueReceiveRecordHeader(PTLS_HANDSHAKE_CONTEXT Ctx)
 {
     SIZE_T remainingStack = IoGetRemainingStackSize();
@@ -363,12 +430,77 @@ static VOID TlsHandshakeIssueReceiveRecordHeader(PTLS_HANDSHAKE_CONTEXT Ctx)
         return;
     }
 
-    NTSTATUS result = ReceiveWskAsync(
-        Ctx->Socket,
-        Ctx->RecordHeader,
-        5,
-        WSK_FLAG_WAITALL,
-        TlsHandshakeOnReceiveRecordHeader,
+    PKSOCKET socket = Ctx->Socket;
+
+    NTSTATUS accumulatorStatus = EnsureTlsRecvBuffer(socket);
+
+    if (!NT_SUCCESS(accumulatorStatus))
+    {
+        TlsHandshakeFail(Ctx, accumulatorStatus);
+        return;
+    }
+
+    ULONG buffered = socket->TlsRecvLength - socket->TlsRecvOffset;
+
+    if (buffered >= 5)
+    {
+        PUCHAR record = socket->TlsRecvBuffer + socket->TlsRecvOffset;
+        ULONG declaredLen = (C_CAST(ULONG, record[3]) << 8) | C_CAST(ULONG, record[4]);
+
+        if (declaredLen > TLS_RECORD_CIPHERTEXT_MAX)
+        {
+            TlsHandshakeFail(Ctx, STATUS_INVALID_PARAMETER);
+            return;
+        }
+
+        if (buffered >= 5 + declaredLen)
+        {
+            RtlCopyMemory(Ctx->RecordHeader, record, 5);
+
+            if (declaredLen)
+            {
+                RtlCopyMemory(Ctx->RecordPayload, record + 5, declaredLen);
+            }
+
+            Ctx->RecordPayloadLen = declaredLen;
+            socket->TlsRecvOffset += 5 + declaredLen;
+
+            TlsHandshakeOnReceiveRecordPayload(STATUS_SUCCESS, declaredLen, Ctx);
+            return;
+        }
+    }
+
+    //
+    // No complete record buffered. Reset the cursors when fully drained,
+    // or compact the partial tail to the front so the next receive has
+    // room for a whole max-size record behind it.
+    //
+    if (socket->TlsRecvOffset == socket->TlsRecvLength)
+    {
+        socket->TlsRecvLength = 0;
+        socket->TlsRecvOffset = 0;
+    }
+    else if (socket->TlsRecvOffset &&
+        (SocketTlsRecvCapacity - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
+    {
+        RtlMoveMemory(
+            socket->TlsRecvBuffer,
+            socket->TlsRecvBuffer + socket->TlsRecvOffset,
+            socket->TlsRecvLength - socket->TlsRecvOffset);
+
+        socket->TlsRecvLength -= socket->TlsRecvOffset;
+        socket->TlsRecvOffset = 0;
+    }
+
+    BLORGFS_STAT_INC(TlsBulkReceives);
+
+    NTSTATUS result = ReceiveWskAsyncMdl(
+        socket,
+        socket->TlsRecvMdl,
+        socket->TlsRecvLength,
+        SocketTlsRecvCapacity - socket->TlsRecvLength,
+        0,
+        TlsHandshakeOnBulkReceive,
         Ctx);
 
     if (STATUS_PENDING != result)
@@ -378,17 +510,16 @@ static VOID TlsHandshakeIssueReceiveRecordHeader(PTLS_HANDSHAKE_CONTEXT Ctx)
 }
 
 //
-// Completion for a 5-byte TLS record header receive: validates the
-// declared length and issues the payload receive (or, for a zero-length
-// record, feeds the payload handler directly with BytesTransferred == 0
-// rather than special-casing a zero-length WAITALL receive, whose
-// semantics aren't worth relying on -- a zero-length record is legal
-// DER-wise, but nothing this handshake expects ever sends one).
+// Completion for a bulk ciphertext receive during the handshake: accounts
+// the arrived bytes and re-enters the drain, which either delivers a
+// now-complete record or posts another receive. A zero-byte completion is
+// the peer closing mid-handshake, which is always premature here -- unlike
+// the post-handshake path there is no "response already complete" case to
+// carve out, since the handshake only ever receives while it still needs
+// a record.
 //
-static VOID TlsHandshakeOnReceiveRecordHeader(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID Context)
+static VOID TlsHandshakeOnBulkReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID Context)
 {
-    UNREFERENCED_PARAMETER(BytesTransferred);
-
     PTLS_HANDSHAKE_CONTEXT ctx = C_CAST(PTLS_HANDSHAKE_CONTEXT, Context);
 
     if (!NT_SUCCESS(Status))
@@ -397,35 +528,17 @@ static VOID TlsHandshakeOnReceiveRecordHeader(NTSTATUS Status, ULONG_PTR BytesTr
         return;
     }
 
-    ULONG declaredLen = (C_CAST(ULONG, ctx->RecordHeader[3]) << 8) | ctx->RecordHeader[4];
-
-    if (declaredLen > TLS_HS_RECORD_MAX)
+    if (0 == BytesTransferred)
     {
-        TlsHandshakeFail(ctx, STATUS_INVALID_PARAMETER);
+        TlsHandshakeFail(ctx, STATUS_CONNECTION_DISCONNECTED);
         return;
     }
 
-    ctx->RecordPayloadLen = declaredLen;
+    ctx->Socket->TlsRecvLength += C_CAST(ULONG, BytesTransferred);
 
-    if (0 == declaredLen)
-    {
-        TlsHandshakeOnReceiveRecordPayload(STATUS_SUCCESS, 0, ctx);
-        return;
-    }
-
-    NTSTATUS result = ReceiveWskAsync(
-        ctx->Socket,
-        ctx->RecordPayload,
-        declaredLen,
-        WSK_FLAG_WAITALL,
-        TlsHandshakeOnReceiveRecordPayload,
-        ctx);
-
-    if (STATUS_PENDING != result)
-    {
-        TlsHandshakeFail(ctx, result);
-    }
+    TlsHandshakeIssueReceiveRecordHeader(ctx);
 }
+
 
 //
 // PASSIVE_LEVEL work-item callback that re-enters
@@ -961,6 +1074,19 @@ static VOID TlsHandshakeOnSendClientFinished(NTSTATUS Status, ULONG_PTR BytesTra
     PBLORG_TLS_HANDSHAKE_COMPLETION completionRoutine = ctx->CompletionRoutine;
     PVOID callerContext = ctx->CallerContext;
     PIO_WORKITEM workItem = ctx->WorkItem;
+
+    PBLORGFS_STATISTICS statsBlock = BlorgStatisticsForCurrentProcessor();
+
+    if (statsBlock)
+    {
+        statsBlock->HandshakesCompleted++;
+
+        BlorgStatisticsRecordLatency(
+            &statsBlock->HandshakeLatencySumUs,
+            &statsBlock->HandshakeLatencyMaxUs,
+            NULL,
+            BlorgStatisticsNow() - ctx->IssueQpc);
+    }
 
     RtlSecureZeroMemory(ctx, sizeof(*ctx));
     IoFreeWorkItem(workItem);

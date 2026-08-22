@@ -86,18 +86,18 @@ NTSTATUS BlorgCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
     FsRtlEnterFileSystem();
-    switch (GetDeviceExtensionMagic(DeviceObject))
+    switch (BlorgDeviceKind(DeviceObject))
     {
-        case BLORGFS_VDO_MAGIC:
+        case BlorgDeviceVolume:
         {
             result = BlorgVolumeCleanup(Irp, irpSp, DeviceObject);
             break;
         }
-        case BLORGFS_DDO_MAGIC:
+        case BlorgDeviceDisk:
         {
             break;
         }
-        case BLORGFS_FSDO_MAGIC:
+        case BlorgDeviceFileSystem:
         {
             break;
         }

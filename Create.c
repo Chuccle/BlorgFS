@@ -1,4 +1,4 @@
-#include "Driver.h"
+﻿#include "Driver.h"
 
 //
 //  IRP_MJ_CREATE handling: access/share-access checks, oplock breaks on
@@ -8,6 +8,19 @@
 //  once remote metadata is available.
 //
 
+//
+//  Rejects a desired-access mask this read-only volume cannot honour.
+//
+//  Deliberately no KdBreakPoint() here or in CheckDirectoryAccess/the
+//  disposition check below. Refusing a write on a read-only volume is an
+//  expected, well-defined outcome, not an anomaly: Explorer, Defender and
+//  SearchHost probe files with write masks unprompted, and anything that
+//  registers a library or saves settings (Steam, game launchers) opens for
+//  write as a matter of course. KdBreakPoint() is an `int 3` in Debug
+//  builds, so trapping here halted the entire guest -- indistinguishable
+//  from VM/VIX flakiness, and the cause of many "frozen VM" incidents.
+//  See deploy/DEBUGGING.md.
+//
 static inline BOOLEAN CheckFileAccess(const ACCESS_MASK* DesiredAccess, BOOLEAN IsReadOnly)
 {
     if (FlagOn(*DesiredAccess, ~(DELETE |
@@ -27,7 +40,6 @@ static inline BOOLEAN CheckFileAccess(const ACCESS_MASK* DesiredAccess, BOOLEAN 
         FILE_APPEND_DATA |
         MAXIMUM_ALLOWED)))
     {
-        KdBreakPoint();
         return FALSE;
     }
 
@@ -41,7 +53,6 @@ static inline BOOLEAN CheckFileAccess(const ACCESS_MASK* DesiredAccess, BOOLEAN 
 
         if (FlagOn(*DesiredAccess, ~AccessMask))
         {
-            KdBreakPoint();
             return FALSE;
         }
     }
@@ -74,7 +85,6 @@ static inline BOOLEAN CheckDirectoryAccess(const ACCESS_MASK* DesiredAccess, BOO
         FILE_APPEND_DATA |
         MAXIMUM_ALLOWED)))
     {
-        KdBreakPoint();
         return FALSE;
     }
 
@@ -90,7 +100,6 @@ static inline BOOLEAN CheckDirectoryAccess(const ACCESS_MASK* DesiredAccess, BOO
 
         if (FlagOn(*DesiredAccess, ~AccessMask))
         {
-            KdBreakPoint();
             return FALSE;
         }
     }
@@ -586,6 +595,22 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 //  a pre-existing zero-handle node is deferred to the reap worker, which
 //  re-checks pins under the bucket lock before freeing.
 //
+//  A relative open (RelatedFileObject set -- OBJECT_ATTRIBUTES.RootDirectory
+//  at the Nt layer) is the one shape where the full path has to be built
+//  here rather than taken from FileObject->FileName, and both halves of
+//  that join have a trap in them. The separator is conditional: the parent
+//  handle's own name already ends in one when it is the root, and appending
+//  a second produces a path ("\\leaf") that matches nothing the equivalent
+//  absolute open resolves to. The destination offsets are byte offsets into
+//  a PWCH, so they are cast rather than added to the pointer -- pointer
+//  arithmetic on UNICODE_STRING.Buffer scales by sizeof(WCHAR) and would
+//  place the leaf at twice its offset, past the end of the block for any
+//  parent deeper than the root. joinedLength is computed in a ULONG because
+//  the two USHORT lengths plus a separator can exceed what a UNICODE_STRING
+//  can describe; a path that long is rejected rather than truncated into a
+//  buffer smaller than what is about to be copied into it (STATUS_OBJECT_NAME_INVALID,
+//  matching the leading-separator rejection just above it).
+//
 NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
 {
     struct OwnedString
@@ -626,7 +651,6 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
     if (FILE_OPEN != createDisposition && FILE_OPEN_IF != createDisposition)
     {
-        KdBreakPoint();
         return STATUS_ACCESS_DENIED;
     }
 
@@ -655,26 +679,43 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
         parentDcb = relatedFileObject->FsContext;
 
-        USHORT length = relatedFileObject->FileName.Length + sizeof(WCHAR) + fileObject->FileName.Length;
+        USHORT parentLength = relatedFileObject->FileName.Length;
 
-        if (0 < length)
-        { 
-            filePath.String.Buffer = ExAllocatePoolUninitialized(PagedPool, length, 'CRET');
+        BOOLEAN parentEndsWithSeparator = (0 < parentLength) &&
+            (L'\\' == relatedFileObject->FileName.Buffer[(parentLength / sizeof(WCHAR)) - 1]);
 
-            if (!filePath.String.Buffer)
-            {
-                return STATUS_NO_MEMORY;
-            }
+        USHORT separatorLength = parentEndsWithSeparator ? 0 : C_CAST(USHORT, sizeof(WCHAR));
 
-            filePath.IsAllocated = TRUE;
+        ULONG joinedLength = parentLength + C_CAST(ULONG, separatorLength) + fileObject->FileName.Length;
 
-            RtlCopyMemory(filePath.String.Buffer, relatedFileObject->FileName.Buffer, relatedFileObject->FileName.Length);
-            filePath.String.Buffer[relatedFileObject->FileName.Length / sizeof(WCHAR)] = L'\\';
-            RtlCopyMemory(filePath.String.Buffer + relatedFileObject->FileName.Length, fileObject->FileName.Buffer, fileObject->FileName.Length);
-
-            filePath.String.Length = length;
-            filePath.String.MaximumLength = length;
+        if (MAXUSHORT < joinedLength)
+        {
+            return STATUS_OBJECT_NAME_INVALID;
         }
+
+        filePath.String.Buffer = ExAllocatePoolUninitialized(PagedPool, joinedLength, 'CRET');
+
+        if (!filePath.String.Buffer)
+        {
+            return STATUS_NO_MEMORY;
+        }
+
+        filePath.IsAllocated = TRUE;
+
+        RtlCopyMemory(filePath.String.Buffer, relatedFileObject->FileName.Buffer, parentLength);
+
+        if (separatorLength)
+        {
+            filePath.String.Buffer[parentLength / sizeof(WCHAR)] = L'\\';
+        }
+
+        RtlCopyMemory(
+            C_CAST(PUCHAR, filePath.String.Buffer) + parentLength + separatorLength,
+            fileObject->FileName.Buffer,
+            fileObject->FileName.Length);
+
+        filePath.String.Length = C_CAST(USHORT, joinedLength);
+        filePath.String.MaximumLength = C_CAST(USHORT, joinedLength);
     }
 
     if (((sizeof(WCHAR) * 2) <= filePath.String.Length) &&
@@ -850,6 +891,12 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         if (!BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_IN_FSP))
         {
             BLORGFS_PRINT("BlorgVolumeCreate: Enqueue to Fsp\n");
+
+            if (filePath.IsAllocated)
+            {
+                ExFreePool(filePath.String.Buffer);
+            }
+
             return FsdPostRequest(Irp, IrpSp);
         }
 
@@ -1115,9 +1162,9 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     BOOLEAN topLevel = IsIrpTopLevel(Irp);
 
     FsRtlEnterFileSystem();
-    switch (GetDeviceExtensionMagic(DeviceObject))
+    switch (BlorgDeviceKind(DeviceObject))
     {
-        case BLORGFS_VDO_MAGIC:
+        case BlorgDeviceVolume:
         {
             BlorgSetupIrpContext(Irp, TRUE);
             result = BlorgVolumeCreate(Irp, irpSp, DeviceObject);
@@ -1127,13 +1174,13 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             }
             break;
         }
-        case BLORGFS_DDO_MAGIC:
+        case BlorgDeviceDisk:
         {
             result = BlorgDiskCreate(Irp);
             CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
-        case BLORGFS_FSDO_MAGIC:
+        case BlorgDeviceFileSystem:
         {
             result = BlorgFileSystemCreate(Irp);
             CompleteRequest(Irp, result, IO_DISK_INCREMENT);

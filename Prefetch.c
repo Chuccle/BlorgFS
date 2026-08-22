@@ -14,14 +14,23 @@
 #define PREFETCH_TAG 'FRPB'
 
 //
-// Driver-wide count of live rings, incremented by PrefetchCreateRing and
-// decremented by PrefetchFreeRing (so the CAS-loser free and every
-// failure path stay symmetric with their create). Gates ring creation
-// against PrefetchMaxRings -- Prefetch.h's arm-time-only budget.
+// Driver-wide live-ring count, doubling as the unload drain gate. It
+// starts at 1: that standing reference belongs to the driver itself and
+// is released by BlorgPrefetchDrain, which is what lets the count reach
+// zero exactly once and lets an acquire refuse to lift it back off zero.
+// A live ring holds one count for its own existence, so "count is zero"
+// means no ring exists, and therefore no fetch is in flight and no pump
+// work item is queued or running -- all three are ring references.
 //
-static LONG PrefetchRingCount;
+// Incremented by PrefetchAcquireRing and decremented by PrefetchFreeRing,
+// so the CAS-loser free and every creation failure path stay symmetric
+// with their acquire.
+//
+static volatile LONG PrefetchRingCount = 1;
+static KEVENT PrefetchDrainEvent;
 
 static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext);
+static VOID PrefetchReleaseRing(VOID);
 
 //
 // Driver-wide ring budget by machine size, the same coarse
@@ -83,7 +92,9 @@ static VOID PrefetchFreeRing(PREFETCH_RING* Ring)
 
     ExFreePool(Ring);
 
-    InterlockedDecrement(&PrefetchRingCount);
+    BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.PrefetchRingsLive);
+
+    PrefetchReleaseRing();
 }
 
 //
@@ -110,11 +121,81 @@ static VOID PrefetchReleaseRef(PREFETCH_RING* Ring)
 // symmetric however creation ends. Returns NULL at the budget cap or on
 // any allocation failure -- the stream then runs on direct fetches.
 //
+//
+// Claims a slot for a new ring, subject to both the driver-wide budget
+// and the unload gate. One CAS loop serves both, which also fixes what
+// the previous increment-then-decrement did: that briefly pushed the
+// count past the cap, so a concurrent create could see the inflated value
+// and refuse a slot that was in fact free. The CAS never publishes a
+// count above the cap.
+//
+// The standing reference is why the budget compares against count - 1.
+//
+static BOOLEAN PrefetchAcquireRing(VOID)
+{
+    LONG maxRings = PrefetchMaxRings();
+    LONG current = ReadNoFence(&PrefetchRingCount);
+
+    while (0 != current && (current - 1) < maxRings)
+    {
+        LONG previous = InterlockedCompareExchange(&PrefetchRingCount, current + 1, current);
+
+        if (previous == current)
+        {
+            return TRUE;
+        }
+
+        current = previous;
+    }
+
+    return FALSE;
+}
+
+//
+// Drops a ring's count; whoever drops the last one signals the drain.
+// Runs at <= DISPATCH_LEVEL, where KeSetEvent with Wait = FALSE is legal.
+//
+static VOID PrefetchReleaseRing(VOID)
+{
+    if (0 == InterlockedDecrement(&PrefetchRingCount))
+    {
+        KeSetEvent(&PrefetchDrainEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+VOID BlorgPrefetchInitialize(VOID)
+{
+    KeInitializeEvent(&PrefetchDrainEvent, NotificationEvent, FALSE);
+}
+
+//
+// Releases the standing reference and waits for the last ring to go. A
+// ring outlives its FCB by however long its in-flight fetches take, so
+// without this a dismount-then-unload can race a fetch whose completion
+// routine lives in this image. Bounded by the socket watchdogs, so a dead
+// peer cannot hang unload indefinitely.
+//
+VOID BlorgPrefetchDrain(VOID)
+{
+    PrefetchReleaseRing();
+
+    KeWaitForSingleObject(&PrefetchDrainEvent, Executive, KernelMode, FALSE, NULL);
+}
+
+//
+// PrefetchRingsLive is incremented right after the ring struct itself is
+// allocated, not once construction fully succeeds: every failure path
+// from there on frees the ring through PrefetchFreeRing, whose decrement
+// is unconditional, so the increment must be in place before the first
+// possible free or the gauge goes negative on a mid-construction
+// allocation failure -- exactly the pool pressure that makes it worth
+// trusting.
+//
 static PREFETCH_RING* PrefetchCreateRing(FCB* Fcb)
 {
-    if (PrefetchMaxRings() < InterlockedIncrement(&PrefetchRingCount))
+    if (!PrefetchAcquireRing())
     {
-        InterlockedDecrement(&PrefetchRingCount);
+        BLORGFS_STAT_INC(PrefetchRingsRefused);
         return NULL;
     }
 
@@ -122,9 +203,11 @@ static PREFETCH_RING* PrefetchCreateRing(FCB* Fcb)
 
     if (!ring)
     {
-        InterlockedDecrement(&PrefetchRingCount);
+        PrefetchReleaseRing();
         return NULL;
     }
+
+    BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.PrefetchRingsLive, NULL);
 
     for (ULONG i = 0; i < PREFETCH_MIN_DEPTH; ++i)
     {
@@ -177,6 +260,8 @@ static PREFETCH_RING* PrefetchCreateRing(FCB* Fcb)
     KeInitializeSpinLock(&ring->Lock);
     ring->DepthLimit = PREFETCH_MIN_DEPTH;
     ring->RefCount = 1;
+
+    BLORGFS_STAT_INC(PrefetchRingsArmed);
 
     return ring;
 }
@@ -281,6 +366,7 @@ static VOID PrefetchPump(PREFETCH_RING* Ring)
         Ring->FetchCtx[i].Ring = Ring;
         Ring->FetchCtx[i].SlotIndex = i;
         Ring->FetchCtx[i].Generation = Ring->Generation;
+        Ring->FetchCtx[i].IssueQpc = BlorgStatisticsNow();
 
         InterlockedIncrement(&Ring->RefCount);
         Ring->NextFetchOffset += fetchLength;
@@ -301,13 +387,18 @@ static VOID PrefetchPump(PREFETCH_RING* Ring)
             PrefetchFetchComplete,
             &Ring->FetchCtx[i]);
 
+        BLORGFS_STAT_INC(PrefetchFetchesIssued);
+
         if (STATUS_PENDING != status)
         {
             BLORGFS_PRINT("PrefetchPump: issue failed: %8lx\n", status);
 
+            BLORGFS_STAT_INC(PrefetchFetchesFailed);
+
             KeAcquireSpinLock(&Ring->Lock, &irql);
             PIRP waiter = Ring->Waiters[i];
             Ring->Waiters[i] = NULL;
+            Ring->WaiterLengths[i] = 0;
             Ring->Hot[i].State = PrefetchSlotEmpty;
             KeReleaseSpinLock(&Ring->Lock, irql);
 
@@ -343,7 +434,7 @@ static VOID PrefetchPumpWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 
     if (!ring)
     {
-		return;
+        return;
     }
 
     InterlockedExchange(&ring->PumpQueued, 0);
@@ -409,10 +500,32 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
 
     ULONG validBytes = (NT_SUCCESS(Status) && FileBuffer) ? C_CAST(ULONG, FileBuffer->BodyBufferSize) : 0;
 
+    PBLORGFS_STATISTICS statsBlock = BlorgStatisticsForCurrentProcessor();
+
+    if (statsBlock)
+    {
+        if (NT_SUCCESS(Status))
+        {
+            statsBlock->FetchBytes += validBytes;
+            statsBlock->FetchesCompleted++;
+
+            BlorgStatisticsRecordLatency(
+                &statsBlock->FetchLatencySumUs,
+                &statsBlock->FetchLatencyMaxUs,
+                statsBlock->FetchLatencyBuckets,
+                BlorgStatisticsNow() - ctx->IssueQpc);
+        }
+        else
+        {
+            statsBlock->PrefetchFetchesFailed++;
+        }
+    }
+
     KIRQL irql;
     KeAcquireSpinLock(&ring->Lock, &irql);
 
     PIRP waiter = ring->Waiters[i];
+    ULONG waiterLength = ring->WaiterLengths[i];
     ring->Waiters[i] = NULL;
 
     PCHAR buffer = NULL;
@@ -432,8 +545,15 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
     }
     else
     {
+        BOOLEAN succeeded = NT_SUCCESS(Status);
+
         ring->Hot[i].State = PrefetchSlotEmpty;
-        queuePump = NT_SUCCESS(Status) && !ring->Detached;
+        queuePump = succeeded && !ring->Detached;
+
+        if (succeeded)
+        {
+            BLORGFS_STAT_INC(PrefetchStaleDiscards);
+        }
     }
 
     KeReleaseSpinLock(&ring->Lock, irql);
@@ -447,8 +567,7 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
 
         if (NT_SUCCESS(Status))
         {
-            PIO_STACK_LOCATION waiterSp = IoGetCurrentIrpStackLocation(waiter);
-            ULONG copyLength = waiterSp->Parameters.Read.Length;
+            ULONG copyLength = waiterLength;
 
             if (copyLength > validBytes)
             {
@@ -461,6 +580,8 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
             {
                 RtlCopyMemory(targetVa, buffer, copyLength);
                 waiter->IoStatus.Information = copyLength;
+
+                BLORGFS_STAT_ADD(PrefetchBytesServed, copyLength);
             }
             else
             {
@@ -510,6 +631,40 @@ static READ_STREAM_TRACKER* PrefetchClaimStream(FCB* Fcb, ULONG64 Offset)
 }
 
 //
+// Counts a miss that a containment test would have served: some slot's
+// range covers [Offset, Offset + Length) but the lookup in
+// BlorgPrefetchServeRead rejected it, because that lookup demands
+// Offset == RangeOffset exactly rather than mere coverage. Every near miss
+// is a full HTTP round trip spent re-fetching bytes the ring already held
+// or already had in flight, so this is the running cost of the exact match.
+//
+// Must run before the re-aim below, which drops Ready slots and would erase
+// the evidence. Takes Ring->Lock itself rather than extending the caller's
+// hold: this path is already committed to a network fetch, so an eight-slot
+// scan under a leaf spinlock costs nothing by comparison.
+//
+static VOID PrefetchCountNearMiss(PREFETCH_RING* Ring, ULONG64 Offset, ULONG Length)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&Ring->Lock, &irql);
+
+    for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
+    {
+        if (PrefetchSlotEmpty == Ring->Hot[i].State ||
+            Offset < Ring->Hot[i].RangeOffset ||
+            (Offset - Ring->Hot[i].RangeOffset) + Length > Ring->Hot[i].Length)
+        {
+            continue;
+        }
+
+        BLORGFS_STAT_INC(PrefetchNearMisses);
+        break;
+    }
+
+    KeReleaseSpinLock(&Ring->Lock, irql);
+}
+
+//
 // Entry point for the sequential-read prefetcher on a paging read: updates
 // this stream's tracker (READ_STREAM_TRACKER, Structs.h), arms a new ring
 // once the stream's streak is long enough, serves/parks against an
@@ -554,6 +709,13 @@ static READ_STREAM_TRACKER* PrefetchClaimStream(FCB* Fcb, ULONG64 Offset)
 // (and possibly the last in-flight-fetch reference, hence the ring
 // itself) with it. So nothing may touch Fcb or Ring after the park;
 // while the pump runs, the un-parked IRP is what keeps both alive.
+// IoMarkIrpPending is called under the lock immediately before the
+// waiter is published, for the same reason and in the same window: this
+// path returns STATUS_PENDING to a dispatch routine that never posted
+// the IRP to the CSQ (paging reads bypass the FSP queue entirely, see
+// BlorgVolumeRead) and never ran it through the oplock package, so
+// nothing else marks it, and once the waiter is visible the IRP may
+// already be completed and gone.
 // Both consuming outcomes stamp LastConsumeClock, which is what gates
 // the re-aim below. A miss from a streaked stream re-aims the pipeline only
 // if the ring has gone idle per that clock (Prefetch.h's re-aim policy);
@@ -653,6 +815,9 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
 
                 BLORGFS_PRINT("prefetch hit off=%llx len=%lx\n", Offset, Length);
 
+                BLORGFS_STAT_INC(PrefetchHits);
+                BLORGFS_STAT_ADD(PrefetchBytesServed, (STATUS_SUCCESS == result) ? Length : 0);
+
                 PrefetchPump(ring);
                 return result;
             }
@@ -664,13 +829,18 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
                     if (ring->DepthLimit < PREFETCH_DEPTH)
                     {
                         ++ring->DepthLimit;
+                        BLORGFS_STAT_INC(PrefetchDepthGrowths);
                     }
 
+                    ring->WaiterLengths[i] = Length;
+                    IoMarkIrpPending(Irp);
                     ring->Waiters[i] = Irp;
                     ring->LastConsumeClock = serveClock;
                     KeReleaseSpinLock(&ring->Lock, irql);
 
                     BLORGFS_PRINT("prefetch park off=%llx len=%lx\n", Offset, Length);
+
+                    BLORGFS_STAT_INC(PrefetchParks);
 
                     return STATUS_PENDING;
                 }
@@ -690,6 +860,8 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
         }
     }
     while (rescan);
+
+    PrefetchCountNearMiss(ring, Offset, Length);
 
     if (streak >= PREFETCH_ARM_STREAK)
     {
@@ -719,6 +891,8 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
         if (reaimed)
         {
             BLORGFS_PRINT("prefetch miss+rearm off=%llx streak=%llu\n", Offset, streak);
+
+            BLORGFS_STAT_INC(PrefetchReaims);
 
             PrefetchPump(ring);
         }

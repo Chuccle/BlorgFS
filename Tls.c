@@ -12,13 +12,60 @@
 // kernel driver and the usermode TlsTest harness (see Tls.h).
 //
 
+//
+// Process-wide algorithm provider handles, opened once by TlsGlobalInit
+// and shared by every connection. Opening a provider is a name-resolution
+// and refcount round trip that a single TLS 1.3 handshake would otherwise
+// pay about thirty times over -- one per transcript hash, one per
+// HKDF-Expand-Label HMAC, plus the ECDH and ECDSA operations -- all of it
+// on the connection-establishment critical path that a fresh stream walks
+// once per pooled connection it opens. Only AES-GCM is opened
+// BCRYPT_PROV_DISPATCH (its keys are used from the DISPATCH-level record
+// path); the rest are handshake-only and therefore PASSIVE-only. BCrypt
+// algorithm handles are safe to create hashes and keys from concurrently,
+// which is what makes one shared handle per algorithm correct here.
+//
+static BCRYPT_ALG_HANDLE TlsAesGcmProvider = NULL;
+static BCRYPT_ALG_HANDLE TlsSha256Provider = NULL;
+static BCRYPT_ALG_HANDLE TlsHmacSha256Provider = NULL;
+static BCRYPT_ALG_HANDLE TlsEcdhP256Provider = NULL;
+static BCRYPT_ALG_HANDLE TlsEcdsaP256Provider = NULL;
+
+//
+// Yields the shared provider for AlgId when TlsGlobalInit opened one, in
+// which case *OwnedOut is FALSE and the caller must not close it; falls
+// back to opening a private one the caller does close. The fallback is
+// what keeps the usermode test harnesses working (this file compiles into
+// them unmodified, see Tls.h, and they have no driver load to call
+// TlsGlobalInit from) -- in the driver the shared handle is always
+// present and nothing is opened per call.
+//
+static NTSTATUS TlsResolveProvider(
+    BCRYPT_ALG_HANDLE Shared,
+    LPCWSTR AlgId,
+    ULONG Flags,
+    BCRYPT_ALG_HANDLE* HandleOut,
+    BOOLEAN* OwnedOut)
+{
+    if (Shared)
+    {
+        *HandleOut = Shared;
+        *OwnedOut = FALSE;
+        return STATUS_SUCCESS;
+    }
+
+    *OwnedOut = TRUE;
+    return BCryptOpenAlgorithmProvider(HandleOut, AlgId, NULL, Flags);
+}
+
 NTSTATUS TlsSha256(const UCHAR* TLS_RESTRICT Data, ULONG DataLen, UCHAR Out[TLS_HASH_LEN])
 {
     BCRYPT_ALG_HANDLE algHandle = NULL;
     BCRYPT_HASH_HANDLE hashHandle = NULL;
+    BOOLEAN ownedProvider = FALSE;
     NTSTATUS status;
 
-    status = BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    status = TlsResolveProvider(TlsSha256Provider, BCRYPT_SHA256_ALGORITHM, 0, &algHandle, &ownedProvider);
 
     if (!NT_SUCCESS(status))
     {
@@ -51,7 +98,7 @@ cleanup:
         BCryptDestroyHash(hashHandle);
     }
 
-    if (algHandle)
+    if (algHandle && ownedProvider)
     {
         BCryptCloseAlgorithmProvider(algHandle, 0);
     }
@@ -66,9 +113,11 @@ NTSTATUS TlsHmacSha256(
 {
     BCRYPT_ALG_HANDLE algHandle = NULL;
     BCRYPT_HASH_HANDLE hashHandle = NULL;
+    BOOLEAN ownedProvider = FALSE;
     NTSTATUS status;
 
-    status = BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    status = TlsResolveProvider(
+        TlsHmacSha256Provider, BCRYPT_SHA256_ALGORITHM, BCRYPT_ALG_HANDLE_HMAC_FLAG, &algHandle, &ownedProvider);
 
     if (!NT_SUCCESS(status))
     {
@@ -101,7 +150,7 @@ cleanup:
         BCryptDestroyHash(hashHandle);
     }
 
-    if (algHandle)
+    if (algHandle && ownedProvider)
     {
         BCryptCloseAlgorithmProvider(algHandle, 0);
     }
@@ -257,6 +306,7 @@ NTSTATUS TlsAeadEncrypt(
 {
     BCRYPT_ALG_HANDLE algHandle = NULL;
     BCRYPT_KEY_HANDLE keyHandle = NULL;
+    BOOLEAN ownedProvider = FALSE;
     NTSTATUS status;
     UCHAR nonce[TLS_IV_LEN];
     ULONG resultLen = 0;
@@ -264,19 +314,22 @@ NTSTATUS TlsAeadEncrypt(
 
     TlsBuildNonce(StaticIv, SeqNum, nonce);
 
-    status = BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_AES_ALGORITHM, NULL, 0);
+    status = TlsResolveProvider(TlsAesGcmProvider, BCRYPT_AES_ALGORITHM, 0, &algHandle, &ownedProvider);
 
     if (!NT_SUCCESS(status))
     {
         goto cleanup;
     }
 
-    status = BCryptSetProperty(algHandle, BCRYPT_CHAINING_MODE,
-        C_CAST(PUCHAR, BCRYPT_CHAIN_MODE_GCM), sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
-
-    if (!NT_SUCCESS(status))
+    if (ownedProvider)
     {
-        goto cleanup;
+        status = BCryptSetProperty(algHandle, BCRYPT_CHAINING_MODE,
+            C_CAST(PUCHAR, BCRYPT_CHAIN_MODE_GCM), sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+
+        if (!NT_SUCCESS(status))
+        {
+            goto cleanup;
+        }
     }
 
     status = BCryptGenerateSymmetricKey(algHandle, &keyHandle, NULL, 0, C_CAST(PUCHAR, Key), TLS_KEY_LEN, 0);
@@ -304,7 +357,7 @@ cleanup:
         BCryptDestroyKey(keyHandle);
     }
 
-    if (algHandle)
+    if (algHandle && ownedProvider)
     {
         BCryptCloseAlgorithmProvider(algHandle, 0);
     }
@@ -320,6 +373,7 @@ NTSTATUS TlsAeadDecrypt(
 {
     BCRYPT_ALG_HANDLE algHandle = NULL;
     BCRYPT_KEY_HANDLE keyHandle = NULL;
+    BOOLEAN ownedProvider = FALSE;
     NTSTATUS status;
     UCHAR nonce[TLS_IV_LEN];
     ULONG resultLen = 0;
@@ -327,19 +381,22 @@ NTSTATUS TlsAeadDecrypt(
 
     TlsBuildNonce(StaticIv, SeqNum, nonce);
 
-    status = BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_AES_ALGORITHM, NULL, 0);
+    status = TlsResolveProvider(TlsAesGcmProvider, BCRYPT_AES_ALGORITHM, 0, &algHandle, &ownedProvider);
 
     if (!NT_SUCCESS(status))
     {
         goto cleanup;
     }
 
-    status = BCryptSetProperty(algHandle, BCRYPT_CHAINING_MODE,
-        C_CAST(PUCHAR, BCRYPT_CHAIN_MODE_GCM), sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
-
-    if (!NT_SUCCESS(status))
+    if (ownedProvider)
     {
-        goto cleanup;
+        status = BCryptSetProperty(algHandle, BCRYPT_CHAINING_MODE,
+            C_CAST(PUCHAR, BCRYPT_CHAIN_MODE_GCM), sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+
+        if (!NT_SUCCESS(status))
+        {
+            goto cleanup;
+        }
     }
 
     status = BCryptGenerateSymmetricKey(algHandle, &keyHandle, NULL, 0, C_CAST(PUCHAR, Key), TLS_KEY_LEN, 0);
@@ -367,7 +424,7 @@ cleanup:
         BCryptDestroyKey(keyHandle);
     }
 
-    if (algHandle)
+    if (algHandle && ownedProvider)
     {
         BCryptCloseAlgorithmProvider(algHandle, 0);
     }
@@ -376,46 +433,98 @@ cleanup:
 }
 
 //
-// Process-wide AES-GCM algorithm provider handle, opened once by
-// TlsGlobalInit and reused for every connection (see Tls.h).
-//
-static BCRYPT_ALG_HANDLE TlsAesGcmProvider = NULL;
-
-//
-// Opens and configures the process-wide AES-GCM algorithm provider used by
-// every connection's AEAD operations. Called once at driver load; a single
-// shared provider avoids reopening it per-connection.
+// Opens the process-wide algorithm providers every connection shares (see
+// their declarations at the top of this file). Called once at driver load.
+// All-or-nothing: any failure closes whatever was already opened and
+// returns, leaving every handle NULL, so the TlsResolveProvider fallback
+// keeps the crypto working -- just at the old per-call open cost -- rather
+// than leaving a half-initialized set behind. AES-GCM is the only one that
+// needs BCRYPT_PROV_DISPATCH (Socket.c destroys its keys from the WSK
+// close-completion path) and the only one carrying a chaining mode.
 //
 NTSTATUS TlsGlobalInit(VOID)
 {
+    //
+    // BCRYPT_PROV_DISPATCH is what makes keys derived from this provider
+    // usable at DISPATCH_LEVEL (see TlsImportKeyHandle) -- required in the
+    // real driver, where the record-layer hot path runs there, but usermode
+    // CNG rejects it outright (STATUS_INVALID_PARAMETER). Retried without
+    // the flag on that specific failure so the usermode test harnesses this
+    // file also compiles into (Tls.h) can still exercise TlsImportKeyHandle:
+    // none of them run anything at a real DISPATCH_LEVEL, so a
+    // non-DISPATCH-safe handle costs them nothing. In the real driver this
+    // retry is never reached -- BCRYPT_PROV_DISPATCH always succeeds there.
+    //
     NTSTATUS status = BCryptOpenAlgorithmProvider(
         &TlsAesGcmProvider, BCRYPT_AES_ALGORITHM, NULL, BCRYPT_PROV_DISPATCH);
 
     if (!NT_SUCCESS(status))
     {
+        status = BCryptOpenAlgorithmProvider(&TlsAesGcmProvider, BCRYPT_AES_ALGORITHM, NULL, 0);
+    }
+
+    if (!NT_SUCCESS(status))
+    {
+        TlsAesGcmProvider = NULL;
         return status;
     }
 
     status = BCryptSetProperty(TlsAesGcmProvider, BCRYPT_CHAINING_MODE,
         C_CAST(PUCHAR, BCRYPT_CHAIN_MODE_GCM), sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
 
+    if (NT_SUCCESS(status))
+    {
+        status = BCryptOpenAlgorithmProvider(&TlsSha256Provider, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    }
+
+    if (NT_SUCCESS(status))
+    {
+        status = BCryptOpenAlgorithmProvider(
+            &TlsHmacSha256Provider, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    }
+
+    if (NT_SUCCESS(status))
+    {
+        status = BCryptOpenAlgorithmProvider(&TlsEcdhP256Provider, BCRYPT_ECDH_P256_ALGORITHM, NULL, 0);
+    }
+
+    if (NT_SUCCESS(status))
+    {
+        status = BCryptOpenAlgorithmProvider(&TlsEcdsaP256Provider, BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0);
+    }
+
     if (!NT_SUCCESS(status))
     {
-        BCryptCloseAlgorithmProvider(TlsAesGcmProvider, 0);
-        TlsAesGcmProvider = NULL;
+        TlsGlobalCleanup();
         return status;
     }
 
     return STATUS_SUCCESS;
 }
 
-// Closes the process-wide AES-GCM provider opened by TlsGlobalInit.
+//
+// Closes the process-wide providers opened by TlsGlobalInit. Also the
+// unwind path for a partially successful TlsGlobalInit, hence the
+// per-handle NULL checks and the NULLing afterwards.
+//
 VOID TlsGlobalCleanup(VOID)
 {
-    if (TlsAesGcmProvider)
+    BCRYPT_ALG_HANDLE* providers[] =
     {
-        BCryptCloseAlgorithmProvider(TlsAesGcmProvider, 0);
-        TlsAesGcmProvider = NULL;
+        &TlsAesGcmProvider,
+        &TlsSha256Provider,
+        &TlsHmacSha256Provider,
+        &TlsEcdhP256Provider,
+        &TlsEcdsaP256Provider
+    };
+
+    for (ULONG i = 0; i < RTL_NUMBER_OF(providers); ++i)
+    {
+        if (*providers[i])
+        {
+            BCryptCloseAlgorithmProvider(*providers[i], 0);
+            *providers[i] = NULL;
+        }
     }
 }
 
@@ -491,11 +600,12 @@ NTSTATUS TlsEcdhGenerateKeyPair(UCHAR PrivateKeyOut[TLS_ECC_COORD_LEN], UCHAR Pu
 {
     BCRYPT_ALG_HANDLE algHandle = NULL;
     BCRYPT_KEY_HANDLE keyHandle = NULL;
+    BOOLEAN ownedProvider = FALSE;
     NTSTATUS status;
     ULONG resultLen;
     UCHAR blob[sizeof(BCRYPT_ECCKEY_BLOB) + 3 * TLS_ECC_COORD_LEN];
 
-    status = BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_ECDH_P256_ALGORITHM, NULL, 0);
+    status = TlsResolveProvider(TlsEcdhP256Provider, BCRYPT_ECDH_P256_ALGORITHM, 0, &algHandle, &ownedProvider);
 
     if (!NT_SUCCESS(status))
     {
@@ -535,7 +645,7 @@ cleanup:
         BCryptDestroyKey(keyHandle);
     }
 
-    if (algHandle)
+    if (algHandle && ownedProvider)
     {
         BCryptCloseAlgorithmProvider(algHandle, 0);
     }
@@ -561,6 +671,7 @@ NTSTATUS TlsEcdhComputeSharedSecret(
     BCRYPT_KEY_HANDLE ownKeyHandle = NULL;
     BCRYPT_KEY_HANDLE peerKeyHandle = NULL;
     BCRYPT_SECRET_HANDLE secretHandle = NULL;
+    BOOLEAN ownedProvider = FALSE;
     NTSTATUS status;
     ULONG resultLen;
     UCHAR ownPrivBlob[sizeof(BCRYPT_ECCKEY_BLOB) + 3 * TLS_ECC_COORD_LEN];
@@ -579,7 +690,7 @@ NTSTATUS TlsEcdhComputeSharedSecret(
     RtlCopyMemory(peerPubBlob + sizeof(BCRYPT_ECCKEY_BLOB), PeerPublicKey + 1, TLS_ECC_COORD_LEN);
     RtlCopyMemory(peerPubBlob + sizeof(BCRYPT_ECCKEY_BLOB) + TLS_ECC_COORD_LEN, PeerPublicKey + 1 + TLS_ECC_COORD_LEN, TLS_ECC_COORD_LEN);
 
-    status = BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_ECDH_P256_ALGORITHM, NULL, 0);
+    status = TlsResolveProvider(TlsEcdhP256Provider, BCRYPT_ECDH_P256_ALGORITHM, 0, &algHandle, &ownedProvider);
 
     if (!NT_SUCCESS(status))
     {
@@ -642,7 +753,7 @@ cleanup:
         BCryptDestroyKey(ownKeyHandle);
     }
 
-    if (algHandle)
+    if (algHandle && ownedProvider)
     {
         BCryptCloseAlgorithmProvider(algHandle, 0);
     }
@@ -657,6 +768,7 @@ NTSTATUS TlsEcdsaVerify(
 {
     BCRYPT_ALG_HANDLE algHandle = NULL;
     BCRYPT_KEY_HANDLE keyHandle = NULL;
+    BOOLEAN ownedProvider = FALSE;
     NTSTATUS status;
     UCHAR pubBlob[sizeof(BCRYPT_ECCKEY_BLOB) + 2 * TLS_ECC_COORD_LEN];
     BCRYPT_ECCKEY_BLOB* header = C_CAST(BCRYPT_ECCKEY_BLOB*, pubBlob);
@@ -666,7 +778,7 @@ NTSTATUS TlsEcdsaVerify(
     RtlCopyMemory(pubBlob + sizeof(BCRYPT_ECCKEY_BLOB), PublicKey + 1, TLS_ECC_COORD_LEN);
     RtlCopyMemory(pubBlob + sizeof(BCRYPT_ECCKEY_BLOB) + TLS_ECC_COORD_LEN, PublicKey + 1 + TLS_ECC_COORD_LEN, TLS_ECC_COORD_LEN);
 
-    status = BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0);
+    status = TlsResolveProvider(TlsEcdsaP256Provider, BCRYPT_ECDSA_P256_ALGORITHM, 0, &algHandle, &ownedProvider);
 
     if (!NT_SUCCESS(status))
     {
@@ -689,7 +801,7 @@ cleanup:
         BCryptDestroyKey(keyHandle);
     }
 
-    if (algHandle)
+    if (algHandle && ownedProvider)
     {
         BCryptCloseAlgorithmProvider(algHandle, 0);
     }

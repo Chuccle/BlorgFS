@@ -23,7 +23,8 @@ static ULONG NodeTableBucketIndexFor(const UNICODE_STRING* Path);
 //  sizeof(NON_PAGED_NODE) literal, so PREfast can verify this directly
 //  rather than needing to trust that the two never drift apart.
 //
-NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject, ULONGLONG Size)
+_Success_(return >= 0)
+NTSTATUS BlorgCreateFCB(_Outptr_result_nullonfailure_ FCB** Fcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject, ULONGLONG Size)
 {
     *Fcb = NULL;
 
@@ -123,7 +124,8 @@ NTSTATUS BlorgCreateFCB(FCB** Fcb, CSHORT NodeType, const UNICODE_STRING* Name, 
 // and advanced header/oplock setup. Mirrors BlorgCreateFCB's allocation
 // and rollback ordering.
 //
-NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject)
+_Success_(return >= 0)
+NTSTATUS BlorgCreateDCB(_Outptr_result_nullonfailure_ DCB** Dcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     *Dcb = NULL;
 
@@ -217,7 +219,8 @@ NTSTATUS BlorgCreateDCB(DCB** Dcb, CSHORT NodeType, const UNICODE_STRING* Name, 
 // Allocates and zero-initializes a CCB (per-open context) from the
 // volume's CCB lookaside list.
 //
-NTSTATUS BlorgCreateCCB(CCB** Ccb, const DEVICE_OBJECT* VolumeDeviceObject)
+_Success_(return >= 0)
+NTSTATUS BlorgCreateCCB(_Outptr_result_nullonfailure_ CCB** Ccb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     *Ccb = NULL;
 
@@ -389,7 +392,13 @@ typedef struct DECLSPEC_ALIGN(CACHE_LINE_SIZE) _NODE_TABLE_BUCKET
     UCHAR        Reserved[40]; // explicit pad to the 64-byte line
 } NODE_TABLE_BUCKET;
 
-C_ASSERT(CACHE_LINE_SIZE == sizeof(NODE_TABLE_BUCKET));
+//
+// One bucket per cache line. This is an absolute-size claim, so it holds
+// only where EX_PUSH_LOCK is the kernel's pointer-sized push lock; a build
+// that substitutes a fatter one simply gets larger buckets.
+//
+C_ASSERT(sizeof(EX_PUSH_LOCK) != sizeof(PVOID) ||
+         CACHE_LINE_SIZE == sizeof(NODE_TABLE_BUCKET));
 
 //
 // Deferred-reap state: idle nodes (no handles, no pins) queue here and a
@@ -989,6 +998,29 @@ PCOMMON_CONTEXT SearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Path)
 // unopened are reaped before returning, so a failed insert cannot strand
 // zero-ref nodes in the tree. Caller must hold the VCB resource exclusive.
 //
+// An intermediate component that resolves to a resident FILE is rejected
+// with STATUS_OBJECT_PATH_NOT_FOUND rather than descended into -- the
+// same answer SearchByPath gives for the same shape, and the reason that
+// check cannot be left to the caller: only DCB has a ChildrenList, so
+// treating an FCB as the next directory walks a list head that overlaps
+// the FCB's FILE_LOCK and dereferences whatever it holds. It is
+// reachable without a hostile backend: a path that was a file when its
+// FCB was created and is a directory by the time a child of it is
+// opened, with the stale FCB still resident (open, or queued to the reap
+// worker), lands here with a well-formed create for a real backend path.
+// A terminal component matching an FCB is NOT this case -- the walk ends
+// there with *Out NULL, the ordinary "already existed" result.
+//
+// currentDcb is non-NULL at every use: it starts as ParentDcb and is only
+// ever reassigned from a node the loop just proved to be a directory, or
+// from a BlorgCreateDCB the loop just proved succeeded (see the
+// _Outptr_result_nullonfailure_ contract on it). PREfast cannot follow
+// that across the loop's back edge -- it keeps the "may be NULL" fact
+// from the NEXT iteration's freshly searched `existing` and applies it to
+// the currentDcb aliased from the PREVIOUS one -- hence the single
+// suppressed C28182 below, which is that stale alias and not a reachable
+// dereference.
+//
 NTSTATUS InsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out)
 {
     *Out = NULL;
@@ -1001,86 +1033,87 @@ NTSTATUS InsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIRECTOR
     {
         FsRtlDissectName(remainingPath, &firstPart, &remainingPart);
 
-        PDCB childDcb = C_CAST(PDCB, SearchByName(currentDcb, &firstPart));
+        BOOLEAN isLastComponent = (0 == remainingPart.Length);
+        PCOMMON_CONTEXT existing = SearchByName(currentDcb, &firstPart);
 
-        if (!childDcb)
+        if (existing)
         {
-            BOOLEAN isLastComponent = (0 == remainingPart.Length);
-            NTSTATUS status;
-
             if (isLastComponent)
             {
-                if (!DirEntryInfo->IsDirectory)
-                {
-                    PFCB newFcb;
-
-                    status = BlorgCreateFCB(&newFcb, BLORGFS_FCB_SIGNATURE, Path, VolumeDeviceObject, DirEntryInfo->Size);
-
-                    if (!NT_SUCCESS(status))
-                    {
-                        BlorgReapEmptyAncestorDcbs(currentDcb, VolumeDeviceObject);
-                        return status;
-                    }
-
-                    newFcb->LastAccessedTime = DirEntryInfo->LastAccessedTime;
-                    newFcb->LastModifiedTime = DirEntryInfo->LastModifiedTime;
-                    newFcb->CreationTime = DirEntryInfo->CreationTime;
-
-                    newFcb->ParentDcb = currentDcb;
-                    InsertTailList(&currentDcb->ChildrenList, &newFcb->Links);
-
-                    lastCreated = C_CAST(PCOMMON_CONTEXT, newFcb);
-                }
-                else
-                {
-                    PDCB newDcb;
-
-                    status = BlorgCreateDCB(&newDcb, BLORGFS_DCB_SIGNATURE, Path, VolumeDeviceObject);
-
-                    if (!NT_SUCCESS(status))
-                    {
-                        BlorgReapEmptyAncestorDcbs(currentDcb, VolumeDeviceObject);
-                        return status;
-                    }
-
-                    newDcb->ParentDcb = currentDcb;
-                    InsertTailList(&currentDcb->ChildrenList, &newDcb->Links);
-
-                    lastCreated = C_CAST(PCOMMON_CONTEXT, newDcb);
-                }
+                break;
             }
-            else
+
+            if ((BLORGFS_DCB_SIGNATURE != GET_NODE_TYPE(existing)) &&
+                (BLORGFS_ROOT_DCB_SIGNATURE != GET_NODE_TYPE(existing)))
             {
-                PDCB newDcb;
-                USHORT partialLength = C_CAST(USHORT, Path->Length - (remainingPart.Length + sizeof(WCHAR)));
-                UNICODE_STRING partialPath =
-                {
-                    .Length = partialLength,
-                    .MaximumLength = partialLength,
-                    .Buffer = Path->Buffer
-                };
-
-                status = BlorgCreateDCB(&newDcb, BLORGFS_DCB_SIGNATURE, &partialPath, VolumeDeviceObject);
-
-                if (!NT_SUCCESS(status))
-                {
-                    BlorgReapEmptyAncestorDcbs(currentDcb, VolumeDeviceObject);
-                    return status;
-                }
-
-                newDcb->ParentDcb = currentDcb;
-                InsertTailList(&currentDcb->ChildrenList, &newDcb->Links);
-
-                lastCreated = C_CAST(PCOMMON_CONTEXT, newDcb);
-                childDcb = newDcb;
+                BlorgReapEmptyAncestorDcbs(currentDcb, VolumeDeviceObject);
+                return STATUS_OBJECT_PATH_NOT_FOUND;
             }
+
+            currentDcb = C_CAST(PDCB, existing);
+            remainingPath = remainingPart;
+            continue;
         }
 
-        if (childDcb)
+        NTSTATUS status;
+
+        if (isLastComponent && !DirEntryInfo->IsDirectory)
         {
-            currentDcb = childDcb;
+            PFCB newFcb;
+
+            status = BlorgCreateFCB(&newFcb, BLORGFS_FCB_SIGNATURE, Path, VolumeDeviceObject, DirEntryInfo->Size);
+
+            if (!NT_SUCCESS(status))
+            {
+                BlorgReapEmptyAncestorDcbs(currentDcb, VolumeDeviceObject);
+                return status;
+            }
+
+            newFcb->LastAccessedTime = DirEntryInfo->LastAccessedTime;
+            newFcb->LastModifiedTime = DirEntryInfo->LastModifiedTime;
+            newFcb->CreationTime = DirEntryInfo->CreationTime;
+
+            newFcb->ParentDcb = currentDcb;
+            InsertTailList(&currentDcb->ChildrenList, &newFcb->Links);
+
+            lastCreated = C_CAST(PCOMMON_CONTEXT, newFcb);
+            break;
         }
 
+        USHORT partialLength = isLastComponent
+            ? Path->Length
+            : C_CAST(USHORT, Path->Length - (remainingPart.Length + sizeof(WCHAR)));
+
+        UNICODE_STRING partialPath =
+        {
+            .Length = partialLength,
+            .MaximumLength = partialLength,
+            .Buffer = Path->Buffer
+        };
+
+        PDCB newDcb;
+
+        status = BlorgCreateDCB(&newDcb, BLORGFS_DCB_SIGNATURE, &partialPath, VolumeDeviceObject);
+
+        if (!NT_SUCCESS(status))
+        {
+            BlorgReapEmptyAncestorDcbs(currentDcb, VolumeDeviceObject);
+            return status;
+        }
+
+        newDcb->ParentDcb = currentDcb;
+
+#pragma warning(suppress: 28182)
+        InsertTailList(&currentDcb->ChildrenList, &newDcb->Links);
+
+        lastCreated = C_CAST(PCOMMON_CONTEXT, newDcb);
+
+        if (isLastComponent)
+        {
+            break;
+        }
+
+        currentDcb = newDcb;
         remainingPath = remainingPart;
     }
 

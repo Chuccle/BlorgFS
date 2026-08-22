@@ -131,6 +131,26 @@ typedef struct _KSOCKET
     ULONG  TlsRecvOffset;
 } KSOCKET, * PKSOCKET;
 
+//
+// Size of each connection's TLS ciphertext accumulator, chosen once at
+// init from MmQuerySystemSize. Read by both users of the buffer -- the
+// handshake's record drain (TlsHandshake.c) and the HTTP record drain
+// (Client.c) -- so the sizing decision lives here, with the field it
+// sizes, rather than in one of the two consumers.
+//
+extern ULONG SocketTlsRecvCapacity;
+
+//
+// Lazily allocates a connection's TLS ciphertext accumulator (buffer,
+// plaintext scratch, and the prebuilt MDL every bulk receive posts
+// through) if it does not have one yet. Idempotent, and safe to call
+// again after a partial failure: the guard is the MDL, which is built
+// last, so a run that allocated the buffer but failed on the scratch
+// retries cleanly instead of leaving a half-built accumulator that a
+// later caller would mistake for a complete one.
+//
+NTSTATUS EnsureTlsRecvBuffer(PKSOCKET Socket);
+
 NTSTATUS InitialiseWskClient(void);
 void CleanupWskClient(void);
 

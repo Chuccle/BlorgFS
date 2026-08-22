@@ -1,10 +1,17 @@
-#pragma once
+﻿#pragma once
 
 //
 // HTTP client interface: address resolution and the directory-info /
 // file-info / file-read request calls, each with an async completion
 // callback. Backs the filesystem's network-facing operations.
 //
+
+//
+// Blocks until every in-flight HTTP request has finished and refuses any
+// new one. PASSIVE_LEVEL only, called once from DriverUnload before the
+// device objects are torn down. See DrainHttpClient in Client.c.
+//
+VOID DrainHttpClient(void);
 
 NTSTATUS InitialiseHttpClient(void);
 void CleanupHttpClient(void);

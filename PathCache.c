@@ -55,7 +55,13 @@ typedef struct DECLSPEC_ALIGN(CACHE_LINE_SIZE) _PATH_CACHE_BUCKET
     UCHAR        Reserved[36]; // explicit pad to the 64-byte line
 } PATH_CACHE_BUCKET;
 
-C_ASSERT(CACHE_LINE_SIZE == sizeof(PATH_CACHE_BUCKET));
+//
+// One bucket per cache line. An absolute-size claim, so it holds only
+// where EX_PUSH_LOCK is the kernel's pointer-sized push lock; a build that
+// substitutes a fatter one simply gets larger buckets.
+//
+C_ASSERT(sizeof(EX_PUSH_LOCK) != sizeof(PVOID) ||
+         CACHE_LINE_SIZE == sizeof(PATH_CACHE_BUCKET));
 
 // Global path cache state: all buckets plus generation/count bookkeeping.
 typedef struct _PATH_CACHE_STATE
@@ -227,6 +233,17 @@ PATH_CACHE_RESULT PathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_M
     ExReleasePushLockShared(&bucket->Lock);
     KeLeaveCriticalRegion();
 
+    BLORGFS_STAT_INC(MetaDataReads);
+
+    if (PathCacheMiss == result)
+    {
+        BLORGFS_STAT_INC(PathCacheMisses);
+    }
+    else
+    {
+        BLORGFS_STAT_INC(PathCacheHits);
+    }
+
     return result;
 }
 
@@ -383,6 +400,16 @@ VOID PathCacheInvalidate(const UNICODE_STRING* Path)
 //  True when Path is Dir itself or lies beneath it: a boundary-checked prefix
 //  test so "\Movie" does not match "\Movies". Case-insensitive.
 //
+//  The boundary is normally the separator that must follow Dir inside Path,
+//  but a Dir that already ends in one has consumed it in the prefix match
+//  itself -- the character at that index is then the first character of the
+//  child's name, not a separator. The volume root ("\", the root DCB's
+//  FullPath per Driver.c, and what BlorgDirComplete passes on a root listing
+//  publish) is the only such Dir this driver produces; without the
+//  trailing-separator case it matched nothing beneath itself, silently
+//  disabling the stale-negative eviction that invalidation exists to perform
+//  for every file sitting directly in the volume root.
+//
 static BOOLEAN PathCacheIsUnder(const UNICODE_STRING* Dir, const UNICODE_STRING* Path)
 {
     if (Path->Length < Dir->Length)
@@ -395,7 +422,11 @@ static BOOLEAN PathCacheIsUnder(const UNICODE_STRING* Dir, const UNICODE_STRING*
         return FALSE;
     }
 
+    BOOLEAN dirEndsWithSeparator =
+        (0 < Dir->Length) && (L'\\' == Dir->Buffer[(Dir->Length / sizeof(WCHAR)) - 1]);
+
     return (Path->Length == Dir->Length) ||
+           dirEndsWithSeparator ||
            (L'\\' == Path->Buffer[Dir->Length / sizeof(WCHAR)]);
 }
 

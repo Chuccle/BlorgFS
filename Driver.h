@@ -1,12 +1,43 @@
-#pragma once
+﻿#pragma once
 
+//
+// The one place the kernel is substituted.
+//
+// The usermode kernel sandbox (sandbox\SandboxPrelude.h) supplies an
+// executable model of these four headers -- NT types, IRQL, pool,
+// locks, DPCs, timers, MDLs, IRPs, FsRtl and WSK. Everything below
+// this point is the driver's own code and is compiled identically in
+// both builds, which is the point: there is exactly one definition of
+// FCB, of DIRECTORY_INFO, of READ_AHEAD_GRANULARITY, of the padding
+// assertions. A sandbox that re-declared any of them would drift from
+// the driver silently, and a test that passes against a drifted copy
+// is worse than no test.
+//
+#ifdef BLORGFS_SANDBOX_BUILD
+#include "sandbox/SandboxPrelude.h"
+#else
 #include <ntifs.h>
 #include <ntstrsafe.h>
 #include <wdmsec.h>
 #include <wsk.h>
+#endif
 
 #include <limits.h>
 #define C_CAST(T, expr) ((T)(expr))
+
+//
+// An unnamed member of named struct type is an MSVC extension to C that
+// C++ does not have, so nodes embed COMMON_CONTEXT one way when this
+// header is read as C and derive from it when read as C++. Both are the
+// same layout: single non-virtual base, standard layout.
+//
+#ifdef __cplusplus
+#define BLORGFS_COMMON_CONTEXT_BASE : COMMON_CONTEXT
+#define BLORGFS_COMMON_CONTEXT_MEMBER
+#else
+#define BLORGFS_COMMON_CONTEXT_BASE
+#define BLORGFS_COMMON_CONTEXT_MEMBER COMMON_CONTEXT DUMMYSTRUCTNAME;
+#endif
 
 #define CACHE_LINE_SIZE 64
 
@@ -35,22 +66,20 @@
 #include "Util.h"
 #include "Client.h"
 #include "Prefetch.h"
+#include "Statistics.h"
 #include "CacheManager.h"
 #include "FspWorkQueue.h"
 
 #define BLORGFS_FSDO_STRING  L"\\BlorgFS"
 #define BLORGFS_FSDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
-#define BLORGFS_FSDO_MAGIC   0xDEAD00D
 
 #define BLORGFS_VDO_STRING  L"\\Device\\BlorgVolume"
 
 #define BLORGFS_VDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;WD)"
-#define BLORGFS_VDO_MAGIC   0xD3ADBEAF
 
 #define BLORGFS_DDO_STRING  L"\\Device\\BlorgDrive"
 
 #define BLORGFS_DDO_DEVICE_SDDL_STRING L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;WD)"
-#define BLORGFS_DDO_MAGIC  0xD4ADBAA5
 #define BLORGFS_DOS_DRIVELETTER_FORMAT_STRING L"\\DosDevices\\%C:"
 
 #define BLORGFS_REG_HOST_MAX_CHARS 128 // 127-char hostname + NUL, with headroom
@@ -123,6 +152,17 @@ extern struct GLOBAL
     PDRIVER_OBJECT DriverObject;               // this driver's DRIVER_OBJECT
     PDEVICE_OBJECT FileSystemDeviceObject;     // the FSD (control) device object
     PDEVICE_OBJECT DiskDeviceObject;           // the disk device object backing the B: symlink
+
+    //
+    //  The mounted volume device object, or NULL before BlorgMountVolume
+    //  has run. Held here rather than in an FSDO device extension because
+    //  these three pointers are jointly what identifies an incoming
+    //  DEVICE_OBJECT (BlorgDeviceKind, Structs.h) -- keeping one of them
+    //  behind a dereference of the very thing being identified would defeat
+    //  that. BlorgFS mounts exactly one volume, which is what makes a
+    //  single pointer sufficient.
+    //
+    PDEVICE_OBJECT VolumeDeviceObject;
     PADDRINFOEXW   RemoteAddressInfo;          // resolved backend address/port for the HTTP client
     PSTR RemoteHostAnsi; // ANSI "host[:port]" authority for outgoing Host headers
 
@@ -193,3 +233,60 @@ extern struct GLOBAL
     ULONG LogLevel;  // BLORGFS_PRINT verbosity; see macro above
 #endif
 } global;
+
+//
+// Which of this driver's three device objects a DEVICE_OBJECT is, decided
+// by pointer identity against the three global pointers (Driver.h).
+//
+// There is no type tag in the extension to read, and deliberately so. The
+// driver creates every one of these devices and already holds their
+// addresses, so a tag stored in their own extensions only ever restated
+// what the pointer already said -- while requiring a dereference of the
+// object being identified. That is unsafe for the one DEVICE_OBJECT that
+// arrives from outside: IRP_MN_MOUNT_VOLUME's
+// Parameters.MountVolume.DeviceObject is another driver's storage device,
+// offered to every registered file system as volumes arrive, and its
+// extension may be absent entirely or shorter than the tag. Comparing
+// pointers dereferences nothing, cannot be imitated by a value in foreign
+// memory, and answers BlorgDeviceUnknown for anything not ours -- which
+// every dispatch switch already handles by declining the request.
+//
+// Ordered volume-first: it takes every create, read, and directory query,
+// while the other two see only mount and control traffic.
+//
+// This works because there is exactly one device object of each kind. The
+// single volume is already assumed by BlorgMountVolume, which stores one
+// pointer; a driver mounting several would need the tag back.
+//
+typedef enum _BLORGFS_DEVICE_KIND
+{
+    BlorgDeviceUnknown = 0,
+    BlorgDeviceVolume,
+    BlorgDeviceDisk,
+    BlorgDeviceFileSystem
+} BLORGFS_DEVICE_KIND;
+
+inline BLORGFS_DEVICE_KIND BlorgDeviceKind(const DEVICE_OBJECT* DeviceObject)
+{
+    if (!DeviceObject)
+    {
+        return BlorgDeviceUnknown;
+    }
+
+    if (DeviceObject == global.VolumeDeviceObject)
+    {
+        return BlorgDeviceVolume;
+    }
+
+    if (DeviceObject == global.DiskDeviceObject)
+    {
+        return BlorgDeviceDisk;
+    }
+
+    if (DeviceObject == global.FileSystemDeviceObject)
+    {
+        return BlorgDeviceFileSystem;
+    }
+
+    return BlorgDeviceUnknown;
+}

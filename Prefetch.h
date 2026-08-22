@@ -52,6 +52,27 @@
 // the IRP, and with it the FCB and the ring's attachment reference can
 // go away -- the pump must never run after that handoff.
 //
+// Slot lookup is an EXACT-OFFSET match, not a containment test: a read is
+// served from slot i only when Offset == Hot[i].RangeOffset and Length fits
+// within Hot[i].Length. A read that lands inside a slot it is fully covered
+// by is therefore a miss, and pays a whole round trip re-fetching bytes the
+// ring already holds. PrefetchNearMisses (Statistics.h) counts exactly those,
+// so the cost is measurable rather than assumed.
+//
+// This is why PREFETCH_CHUNK must track the real paging-read size: the two
+// only stay in phase if every read starts on a chunk boundary, and any
+// divergence turns into a permanent stream of near misses rather than a
+// gradual falloff. Widening the lookup to containment would remove that
+// fragility, at the cost of teaching the hit path to copy from a slot
+// interior -- see InteriorOffsetCoveredByASlotIsANearMiss in
+// sandbox/PrefetchKernelTest.cpp, which pins the current behaviour.
+//
+// Measured on a full buffered sequential pass (2026-08-22): 900 near
+// misses out of 7627 misses, 3.5% of all paging reads. So the exact match
+// is NOT the dominant miss source and widening it is not worth the copy
+// complexity on its own -- re-measure with the counter before revisiting,
+// rather than re-deriving the theory.
+//
 // Re-aim policy (multi-stream): the ring is a single pipeline, so two
 // established streams on one file must not alternately steal it -- each
 // steal discards fetched-ahead data the other stream was about to
@@ -147,6 +168,17 @@ typedef struct _PREFETCH_FETCH_CTX
                             // data predates a seek and is discarded
                             // unless a waiter is parked on it
                             //
+
+    //
+    // QPC stamp taken as the fetch is issued, so the completion can fold
+    // this fetch into the same latency histogram the direct-fetch path
+    // feeds (Statistics.h). A prefetch fetch has no IRP to hang the stamp
+    // off the way BlorgVolumeRead uses DriverContext[2], and its latency
+    // is the more interesting of the two: it is what decides whether the
+    // pipeline can stay ahead of the reader.
+    //
+    LONG64 IssueQpc;
+
 } PREFETCH_FETCH_CTX;
 
 //
@@ -210,6 +242,18 @@ struct _PREFETCH_RING
     PCHAR Buffers[PREFETCH_DEPTH];       // per-slot fetch buffer
     PMDL  BufferMdls[PREFETCH_DEPTH];    // MDL describing each buffer
     PIRP  Waiters[PREFETCH_DEPTH];       // paging IRP parked on an in-flight slot, if any
+
+    //
+    // Bytes Waiters[i] actually asked for, recorded at park time. Not
+    // recoverable from the IRP at completion: Parameters.Read.Length is
+    // the untrimmed request, while the read parked with the length
+    // BlorgTrimReadToFileSize clipped to the FCB's current file size, and
+    // the two differ for a read straddling EOF. Reading the untrimmed
+    // value back would over-report IoStatus.Information whenever the
+    // slot's fetch (sized off the ring's file-size snapshot) is longer
+    // than what the reader may legitimately see.
+    //
+    ULONG WaiterLengths[PREFETCH_DEPTH];
     PREFETCH_FETCH_CTX FetchCtx[PREFETCH_DEPTH]; // completion context per slot
 
     //
@@ -239,7 +283,8 @@ CHECK_PADDING_BETWEEN(PREFETCH_RING, Reserved, PumpWorkItem);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, PumpWorkItem, Buffers);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Buffers, BufferMdls);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, BufferMdls, Waiters);
-CHECK_PADDING_BETWEEN(PREFETCH_RING, Waiters, FetchCtx);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, Waiters, WaiterLengths);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, WaiterLengths, FetchCtx);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, FetchCtx, Path);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Path, FileSize);
 CHECK_PADDING_END(PREFETCH_RING, FileSize);
@@ -256,7 +301,13 @@ CHECK_PADDING_END(PREFETCH_RING, FileSize);
 //                      inline async paging path).
 //   STATUS_NOT_FOUND - no coverage; caller issues its own fetch as
 //                      before. Also updates sequential detection and tops
-//                      the pipeline back up as a side effect.
+//                      the pipeline back up as a side effect. The miss is
+//                      counted by the caller rather than here, because
+//                      this returns STATUS_NOT_FOUND from several places
+//                      (no ring yet, streak too short, lost the publish
+//                      race) and the number worth having is the one that
+//                      makes hits + parks + misses add up to the paging
+//                      reads served.
 //
 NTSTATUS BlorgPrefetchServeRead(struct _FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length);
 
@@ -265,3 +316,18 @@ NTSTATUS BlorgPrefetchServeRead(struct _FCB* Fcb, PIRP Irp, ULONG64 Offset, ULON
 // with fetches still in flight: the ring is freed by the last reference.
 //
 VOID BlorgPrefetchDetach(struct _FCB* Fcb);
+
+//
+// Initializes the prefetcher's drain gate. Called once from DriverEntry,
+// before any ring can be created.
+//
+VOID BlorgPrefetchInitialize(VOID);
+
+//
+// Blocks until every prefetch ring is gone -- which means no fetch is in
+// flight and no pump work item is queued or running -- and refuses to arm
+// any new ring. PASSIVE_LEVEL only, called once from DriverUnload before
+// the device objects are torn down, since a queued pump work item is
+// queued against the filesystem device object.
+//
+VOID BlorgPrefetchDrain(VOID);

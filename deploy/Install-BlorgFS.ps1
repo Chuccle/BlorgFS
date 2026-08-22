@@ -120,10 +120,27 @@ if ($existing -notmatch "1060") {
     Start-Sleep -Seconds 1
 }
 
-# rundll32's own exit code says nothing about whether InstallHinfSection actually
-# succeeded (it returns 0 even on failure) -- confirm via sc query afterward instead,
-# and point at setupapi's own log for the real error if that comes back empty.
-rundll32.exe setupapi.dll,InstallHinfSection DefaultInstall 132 $InfPath
+# Two steps, in this order, both required:
+#
+# 1. Stage the package into the Driver Store via pnputil. BlorgFS.inf's
+#    DestinationDirs = 13 means "run from Driver Store" (driver package
+#    isolation), which InstallHinfSection's plain CopyFiles engine cannot
+#    write into directly -- without this step it fails the copy outright
+#    (interactively: a "cannot copy the file" prompt that blames the source
+#    location even though it's correct; non-interactively: silent exit 0
+#    with nothing written to setupapi.dev.log).
+#
+# 2. Actually run the [DefaultInstall.NTamd64] section via
+#    InstallHinfSection, which is what executes CopyFiles (now a cheap
+#    in-store resolve) *and* [DefaultInstall.NTamd64.Services]'s AddService.
+#    pnputil's own /install flag does NOT do this for a primitive/non-PnP
+#    driver like this one -- /install only installs against a matching
+#    hardware ID, and a primitive driver (Class=SoftwareDevice, no
+#    Manufacturer/Models section) has none, so pnputil silently stages the
+#    package and stops there, leaving the service unregistered.
+pnputil.exe /add-driver $InfPath /install
+Start-Sleep -Seconds 2
+rundll32.exe setupapi.dll,InstallHinfSection DefaultInstall.NTamd64 132 $InfPath
 Start-Sleep -Seconds 2
 
 $installed = sc.exe query $ServiceName 2>&1 | Out-String

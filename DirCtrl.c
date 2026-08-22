@@ -490,6 +490,19 @@ static VOID BlorgDirComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Cal
 // a hit, or by BlorgDirComplete on the NET_DONE pass); if still NULL,
 // there is nothing to enumerate and it is never dereferenced.
 //
+// The fetch-issuing check below is gated on !dcb->CachedListing alone,
+// not also on (initialQuery || restartScan): a second QUERY_DIRECTORY on
+// the same handle, arriving after the first has set the pattern but
+// before that first fetch has completed, is neither an initial query nor
+// a restart -- ccb->SearchPattern is already set -- so gating on those
+// used to fall through to "no listing, therefore no more files", which
+// is wrong; NULL only ever means "not fetched yet", never "empty" (an
+// empty directory still publishes a real zero-count DIRECTORY_INFO).
+// Issuing a second fetch here in that race is redundant but not unsafe:
+// BlorgDirComplete already discards whichever of two racing fetches
+// loses the publish (see its own comment), the same protection this
+// leans on for two different handles racing the same DCB.
+//
 // NOTIFY_CHANGE_DIRECTORY registers the watch with the FsRtl notify
 // package, which captures its own copy of the directory name and holds
 // the IRP pending. This volume is read-only and never changes, so
@@ -645,7 +658,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 }
             }
 
-            if ((initialQuery || restartScan) && !netDone && !dcb->CachedListing)
+            if (!netDone && !dcb->CachedListing)
             {
                 ExReleaseResourceLite(dcb->Header.Resource);
                 return BlorgHttpGetDirectoryInfo(&dcb->FullPath, BlorgDirComplete, Irp);
@@ -886,9 +899,9 @@ NTSTATUS BlorgDirectoryControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     BOOLEAN topLevel = IsIrpTopLevel(Irp);
 
     FsRtlEnterFileSystem();
-    switch (GetDeviceExtensionMagic(DeviceObject))
+    switch (BlorgDeviceKind(DeviceObject))
     {
-        case BLORGFS_VDO_MAGIC:
+        case BlorgDeviceVolume:
         {
             BlorgSetupIrpContext(Irp, IoIsOperationSynchronous(Irp));
 
@@ -899,12 +912,12 @@ NTSTATUS BlorgDirectoryControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             }
             break;
         }
-        case BLORGFS_DDO_MAGIC:
+        case BlorgDeviceDisk:
         {
             CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
-        case BLORGFS_FSDO_MAGIC:
+        case BlorgDeviceFileSystem:
         {
             CompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
