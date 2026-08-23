@@ -31,6 +31,7 @@ VOID PrefetchModelReset(VOID);
 LONG PrefetchModelFetchesPending(VOID);
 int  PrefetchModelCompleteNextFetch(NTSTATUS Status);
 int  PrefetchModelSettle(NTSTATUS Status);
+VOID BlorgPrefetchReleaseChunkPool(VOID);
 }
 
 namespace
@@ -158,6 +159,8 @@ void RingProofTeardown(void* Parameter)
 
     PrefetchModelSettle(STATUS_SUCCESS);
     ShimDrainWorkItems();
+
+    BlorgPrefetchReleaseChunkPool();
 
     if (proof->Irp)
     {

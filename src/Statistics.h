@@ -147,7 +147,7 @@ typedef struct _BLORGFS_STATISTICS
 
     // --- prefetch ring -------------------------------------------------
     ULONG64 PrefetchRingsArmed;
-    ULONG64 PrefetchRingsRefused;        // at the driver-wide ring budget
+    ULONG64 PrefetchRingsRefused;        // arm refused; only the unload drain does this now, so a nonzero value means an arm raced dismount
     ULONG64 PrefetchHits;                // chunk already resident, copy only
     ULONG64 PrefetchParks;               // chunk in flight, read parked on it
     ULONG64 PrefetchMisses;              // no coverage, caller fetches directly
@@ -258,6 +258,21 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 PrefetchRingsDetached;
     ULONG64 PrefetchRingsFreed;
 
+    //
+    // Times a pump asked the chunk pool for transfer memory and the
+    // driver-wide chunk budget had none left to give.
+    //
+    // This is the counter that replaces PrefetchRingsRefused as the
+    // pressure signal, and it means something materially different. A
+    // refusal cost a stream its whole pipeline; a starvation costs one
+    // slot of depth on one pump pass, and the next pass retries. So a
+    // nonzero value here is not a fault -- it is the budget doing its job
+    // -- and only a rate high enough to keep rings pinned near
+    // PREFETCH_MIN_DEPTH indicates the cap is genuinely too low for the
+    // offered concurrency.
+    //
+    ULONG64 PrefetchChunkStarvations;
+
 } BLORGFS_STATISTICS, * PBLORGFS_STATISTICS;
 
 //
@@ -270,6 +285,16 @@ typedef struct _BLORGFS_STATISTICS_GLOBAL
     LONG64 FetchesActive;
     LONG64 FetchesActivePeak;
     LONG64 PrefetchRingsLive;
+
+    //
+    // Chunks allocated from the system and not yet returned to it, owned
+    // and pooled alike -- the driver's actual prefetch transfer footprint,
+    // capped by PrefetchMaxChunks. PrefetchRingsLive no longer implies a
+    // footprint (an idle ring holds no chunks), so this is the gauge to
+    // read for memory, and the two together are the read for how far the
+    // pool is being shared out.
+    //
+    LONG64 PrefetchChunksLive;
 } BLORGFS_STATISTICS_GLOBAL, * PBLORGFS_STATISTICS_GLOBAL;
 
 //
@@ -278,7 +303,7 @@ typedef struct _BLORGFS_STATISTICS_GLOBAL
 // Version is checked by the driver so a stale harness fails loudly
 // instead of misreading a struct whose tail moved.
 //
-#define BLORGFS_STATISTICS_VERSION 1
+#define BLORGFS_STATISTICS_VERSION 2
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

@@ -28,8 +28,11 @@
 //    races FCB teardown.
 //  - Ring->Lock is a leaf lock: nothing else is ever acquired under it,
 //    and no fetch is issued and no 256 KB copy performed while holding it
-//    (buffers are detached from their slot under the lock and copied
-//    outside it).
+//    (a chunk is taken out of its slot under the lock and copied outside
+//    it). The chunk pool's own lock is a second leaf, never nested with
+//    this one -- every acquire and release of a chunk happens with
+//    Ring->Lock dropped -- so the two can be reasoned about separately
+//    and there is no lock order between them to get wrong.
 //
 // Lifetime: RefCount = 1 for the FCB attachment + 1 per in-flight fetch
 // + 1 while a pump work item is queued or running.
@@ -128,19 +131,27 @@
 // deepens by one per parked read up to PREFETCH_DEPTH (a park means the
 // reader caught the pipeline, so it is too shallow for this stream's
 // RTT x consumption rate; a low-RTT link that never parks stays
-// shallow), with the extra slots' buffers allocated lazily by the next
-// pump. The number of concurrent rings is capped driver-wide by system
-// size (MmQuerySystemSize, Prefetch.c); at the cap a new stream gets no
-// ring and degrades to direct fetches. The cap applies at arm time
-// only -- a live ring feeding a reader is never shrunk or detached by
-// the budget, so arming stream N+1 cannot stutter streams 1..N.
+// shallow).
+//
+// The driver-wide budget is denominated in chunks, not rings
+// (PrefetchMaxChunks, Prefetch.c), because a chunk is where the memory
+// actually is: a ring is a few hundred bytes of struct, a chunk is
+// PREFETCH_CHUNK of NonPagedPoolNx. Slots take chunks from the shared
+// pool as they reserve and hand them back the moment they are drained,
+// so a stream holds transfer memory only for the fetches it currently
+// has outstanding, and a stream that has read to EOF holds none.
+//
+// Budgeting the memory rather than the rings is what makes the scaling
+// graceful. Rings are unbounded, so every stream arms; exhausting the
+// chunk pool costs a stream depth, not its pipeline. Under pressure N
+// streams each run shallower and all keep prefetching, where a ring cap
+// would have given the first few full depth and the rest nothing at all.
 //
 
 #define PREFETCH_DEPTH 8
 
 //
-// Slots a fresh ring starts with (and the count PrefetchCreateRing
-// allocates buffers for up front). Two covers detection cost: the ring
+// Slots a fresh ring starts with. Two covers detection cost: the ring
 // arms mid-stream, and the first post-arm read parking is what signals
 // real depth demand -- growth to PREFETCH_DEPTH takes one park per slot,
 // well inside a media player's startup buffering.
@@ -222,6 +233,27 @@ typedef struct _PREFETCH_FETCH_CTX
 } PREFETCH_FETCH_CTX;
 
 //
+// One PREFETCH_CHUNK of transfer memory plus the MDL describing it, the
+// unit the driver-wide prefetch budget is denominated in.
+//
+// Buffer is NonPagedPoolNx and Mdl is built over it once, at allocation,
+// so a chunk changing hands costs a list pop and nothing else -- no pool
+// call, no MDL build, and legal at DISPATCH_LEVEL, which is where fetch
+// completions release them.
+//
+// Link is live only while the chunk sits on the free list; a chunk held
+// by a slot is reachable solely through that slot's Chunks[i], so the
+// list head can never see a chunk two slots believe they own.
+//
+typedef struct _PREFETCH_CHUNK_BLOCK
+{
+    SINGLE_LIST_ENTRY Link;   // free-list linkage; meaningless while owned by a slot
+    PCHAR             Buffer; // PREFETCH_CHUNK bytes of NonPagedPoolNx
+    PMDL              Mdl;    // MDL over Buffer, built at allocation and never rebuilt
+
+} PREFETCH_CHUNK_BLOCK;
+
+//
 // Per-FCB prefetch ring: PREFETCH_DEPTH slots of fetched/in-flight file
 // data plus the state needed to issue, serve, and reclaim them.
 //
@@ -239,7 +271,8 @@ struct _PREFETCH_RING
     //
     // Slots the pump may fill, PREFETCH_MIN_DEPTH..PREFETCH_DEPTH.
     // Bumped (under Lock) by a park in BlorgPrefetchServeRead; the next
-    // pump allocates the newly admitted slots' buffers.
+    // pump tries to take chunks for the newly admitted slots, and leaves
+    // them Empty for a later pump if the pool has none to give.
     //
     ULONG      DepthLimit;
 
@@ -270,17 +303,20 @@ struct _PREFETCH_RING
 
     //
     // Cold: touched on hit-copy / issue / completion, not by the scan.
-    // Buffers are PREFETCH_CHUNK NonPagedPoolNx, reused for every fetch
-    // (their MDLs likewise built once) -- steady-state streaming
-    // allocates nothing. The first PREFETCH_MIN_DEPTH are allocated with
-    // the ring; the rest lazily by the pump as DepthLimit grows. A NULL
-    // Buffers[i] with a non-NULL BufferMdls[i] means slot i's buffer is
-    // temporarily detached for an outside-the-lock copy (the pump skips
-    // such slots); NULL BufferMdls[i] means slot i has never been
-    // allocated.
+    // A slot owns a chunk exactly while it holds data or is fetching it
+    // -- Chunks[i] is non-NULL if and only if Hot[i].State is InFlight or
+    // Ready. An Empty slot owns nothing, so an idle ring costs its struct
+    // and no chunk memory at all, which is what lets the driver-wide
+    // budget be spent on the streams actually reading rather than
+    // reserved by the ones that have finished.
     //
-    PCHAR Buffers[PREFETCH_DEPTH];       // per-slot fetch buffer
-    PMDL  BufferMdls[PREFETCH_DEPTH];    // MDL describing each buffer
+    // Chunks come from and return to the driver-wide free list
+    // (PrefetchChunkAcquire / PrefetchChunkRelease in Prefetch.c), so
+    // steady-state streaming still allocates nothing: a chunk released by
+    // a slot that just served its bytes is the chunk the next reservation
+    // picks up. The pool is what recycles them, not the ring.
+    //
+    PREFETCH_CHUNK_BLOCK* Chunks[PREFETCH_DEPTH];  // chunk backing slot i, or NULL if the slot is Empty
     PIRP  Waiters[PREFETCH_DEPTH];       // paging IRP parked on an in-flight slot, if any
 
     //
@@ -333,9 +369,8 @@ CHECK_PADDING_BETWEEN(PREFETCH_RING, DepthLimit, PumpQueued);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, PumpQueued, Detached);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Detached, Reserved);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Reserved, PumpWorkItem);
-CHECK_PADDING_BETWEEN(PREFETCH_RING, PumpWorkItem, Buffers);
-CHECK_PADDING_BETWEEN(PREFETCH_RING, Buffers, BufferMdls);
-CHECK_PADDING_BETWEEN(PREFETCH_RING, BufferMdls, Waiters);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, PumpWorkItem, Chunks);
+CHECK_PADDING_BETWEEN(PREFETCH_RING, Chunks, Waiters);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, Waiters, WaiterLengths);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, WaiterLengths, WaiterSlotOffsets);
 CHECK_PADDING_BETWEEN(PREFETCH_RING, WaiterSlotOffsets, FetchCtx);
@@ -385,3 +420,10 @@ VOID BlorgPrefetchInitialize(VOID);
 // queued against the filesystem device object.
 //
 VOID BlorgPrefetchDrain(VOID);
+
+//
+// Returns the driver-wide chunk pool's free memory to the system. Called
+// by BlorgPrefetchDrain at unload; separately callable at any quiescent
+// point, since it reclaims only chunks no slot owns.
+//
+VOID BlorgPrefetchReleaseChunkPool(VOID);

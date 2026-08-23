@@ -288,8 +288,27 @@ int PrefetchModelSettle(NTSTATUS Status)
     }
 }
 
+//
+// DriverEntry calls BlorgPrefetchInitialize exactly once, and the chunk
+// pool's lock and the drain event are process-lifetime state, so the
+// sandbox has to do the same -- once, not per test. Re-initializing would
+// hand KmInitializeLock a fresh lock id on every test and exhaust
+// KM_MAX_LOCKS partway through the suite.
+//
+// Nothing called it before because nothing in the ring's own state needed
+// it; the chunk pool does, and an uninitialized KM_LOCK is a zeroed
+// CRITICAL_SECTION, which faults on first acquire rather than failing
+// visibly.
+//
+static LONG PrefetchInitialized;
+
 VOID PrefetchModelReset(VOID)
 {
+    if (0 == InterlockedCompareExchange(&PrefetchInitialized, 1, 0))
+    {
+        BlorgPrefetchInitialize();
+    }
+
     EnsureFetchCs();
     EnterCriticalSection(&FetchCs);
 

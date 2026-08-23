@@ -382,6 +382,8 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    armed / refused       %12llu / %llu\n", t.PrefetchRingsArmed, t.PrefetchRingsRefused);
     printf("    detached / freed      %12llu / %llu\n", t.PrefetchRingsDetached, t.PrefetchRingsFreed);
     printf("    live now              %12lld\n", stats.Gauges.PrefetchRingsLive);
+    printf("    chunks live           %12lld\n", stats.Gauges.PrefetchChunksLive);
+    printf("    chunk starvations     %12llu  (pump ran shallow; not a refusal)\n", t.PrefetchChunkStarvations);
     printf("    hit                   %12llu  (%.1f%%)\n", t.PrefetchHits, SafeRatio(t.PrefetchHits, served));
     printf("    park                  %12llu  (%.1f%%)\n", t.PrefetchParks, SafeRatio(t.PrefetchParks, served));
     printf("    miss                  %12llu  (%.1f%%)\n", t.PrefetchMisses, SafeRatio(t.PrefetchMisses, served));

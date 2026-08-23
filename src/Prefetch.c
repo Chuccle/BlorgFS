@@ -7,8 +7,8 @@
 //
 // See Prefetch.h for the design: why the ring exists, the IRQL/issuance
 // rules (all fetch issuance at PASSIVE, completions at <= DISPATCH touch
-// only the ring), the buffer-detach convention for outside-the-lock
-// copies, and the RefCount/Generation lifetime rules.
+// only the ring), the slot-owns-a-chunk rule that the driver-wide chunk
+// pool rests on, and the RefCount/Generation lifetime rules.
 //
 
 #define PREFETCH_TAG 'FRPB'
@@ -33,50 +33,192 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
 static VOID PrefetchReleaseRing(VOID);
 
 //
-// Driver-wide ring budget by machine size, the same coarse
-// MmQuerySystemSize tiering fastfat/ntfs use for cache sizing. Worst
-// case ring memory at full depth is the tier count x PREFETCH_DEPTH x
-// PREFETCH_CHUNK of NonPagedPoolNx (2/4/8 rings = 8/16/32 MB); rings a
-// stream never deepens stay far below that. Called at PASSIVE from ring
-// creation only.
+// Driver-wide chunk budget by machine size, the same coarse
+// MmQuerySystemSize tiering fastfat/ntfs use for cache sizing. The tiers
+// are the same 8/16/32 MB of NonPagedPoolNx the old ring cap worked out
+// to at full depth, but denominated in the thing that actually holds the
+// memory, so the ceiling is now a real ceiling rather than a worst case
+// that idle rings reserved and never reached.
 //
-static LONG PrefetchMaxRings(VOID)
+static LONG PrefetchMaxChunks(VOID)
 {
     switch (MmQuerySystemSize())
     {
         case MmSmallSystem:
         {
-            return 2;
+            return 16;
         }
         case MmMediumSystem:
         {
-            return 4;
+            return 32;
         }
         default:
         {
-            return 8;
+            return 64;
         }
     }
 }
 
 //
-// Frees a ring's per-slot buffers and MDLs, then the ring itself, and
-// releases its slot in the driver-wide ring budget. Called once RefCount
-// has dropped to zero -- no fetches or FCB attachment remain -- or for a
-// ring that was never published (creation failure, CAS loser).
+// Driver-wide chunk pool: every chunk not currently owned by a slot.
+//
+// ChunkCount is chunks in existence, owned and free alike, and is what
+// the budget caps -- releasing to the pool does not decrement it, since
+// a pooled chunk is still committed NonPagedPoolNx. It only falls when
+// BlorgPrefetchReleaseChunkPool actually returns memory to the system.
+//
+// The lock is a leaf below Ring->Lock, taken for a list push or pop and
+// nothing else. Release runs from fetch completions at DISPATCH_LEVEL,
+// which is why it may not allocate or free: it pushes and returns.
+//
+static SINGLE_LIST_ENTRY PrefetchChunkFreeList = { NULL };
+static KSPIN_LOCK PrefetchChunkLock;
+static volatile LONG PrefetchChunkCount;
+
+//
+// Takes a chunk for a slot about to reserve: a pooled one if there is
+// one, otherwise a fresh allocation if the budget allows, otherwise
+// NULL. NULL is an ordinary outcome, not an error -- the caller leaves
+// the slot Empty and the ring simply runs shallower this round, which is
+// the whole point of budgeting chunks instead of rings.
+//
+// PASSIVE_LEVEL only: the miss path allocates pool and builds an MDL.
+// Every caller is the pump, which is always at PASSIVE.
+//
+// The budget is claimed by CAS before the allocation so two racing pumps
+// cannot both see room and both allocate; a failed allocation gives the
+// claim straight back.
+//
+_IRQL_requires_(PASSIVE_LEVEL)
+static PREFETCH_CHUNK_BLOCK* PrefetchChunkAcquire(VOID)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&PrefetchChunkLock, &irql);
+    PSINGLE_LIST_ENTRY entry = PopEntryList(&PrefetchChunkFreeList);
+    KeReleaseSpinLock(&PrefetchChunkLock, irql);
+
+    if (entry)
+    {
+        return CONTAINING_RECORD(entry, PREFETCH_CHUNK_BLOCK, Link);
+    }
+
+    LONG maxChunks = PrefetchMaxChunks();
+    LONG current = ReadNoFence(&PrefetchChunkCount);
+
+    while (current < maxChunks)
+    {
+        LONG previous = InterlockedCompareExchange(&PrefetchChunkCount, current + 1, current);
+
+        if (previous == current)
+        {
+            break;
+        }
+
+        current = previous;
+    }
+
+    if (current >= maxChunks)
+    {
+        BLORGFS_STAT_INC(PrefetchChunkStarvations);
+        return NULL;
+    }
+
+    PREFETCH_CHUNK_BLOCK* chunk = ExAllocatePoolZero(NonPagedPoolNx, sizeof(PREFETCH_CHUNK_BLOCK), PREFETCH_TAG);
+
+    if (chunk)
+    {
+        chunk->Buffer = ExAllocatePoolUninitialized(NonPagedPoolNx, PREFETCH_CHUNK, PREFETCH_TAG);
+
+        if (chunk->Buffer)
+        {
+            chunk->Mdl = IoAllocateMdl(chunk->Buffer, PREFETCH_CHUNK, FALSE, FALSE, NULL);
+
+            if (chunk->Mdl)
+            {
+                MmBuildMdlForNonPagedPool(chunk->Mdl);
+
+                BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.PrefetchChunksLive, NULL);
+                return chunk;
+            }
+
+            ExFreePool(chunk->Buffer);
+        }
+
+        ExFreePool(chunk);
+    }
+
+    InterlockedDecrement(&PrefetchChunkCount);
+    return NULL;
+}
+
+//
+// Hands a drained chunk back for the next reservation on any ring. Runs
+// at <= DISPATCH_LEVEL (fetch completions release here), so it pushes
+// and returns without touching the pool allocator.
+//
+_IRQL_requires_max_(DISPATCH_LEVEL)
+static VOID PrefetchChunkRelease(PREFETCH_CHUNK_BLOCK* Chunk)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&PrefetchChunkLock, &irql);
+    PushEntryList(&PrefetchChunkFreeList, &Chunk->Link);
+    KeReleaseSpinLock(&PrefetchChunkLock, irql);
+}
+
+//
+// Returns every pooled chunk to the system.
+//
+// Called from BlorgPrefetchDrain once the last ring is gone, so by
+// definition no slot owns a chunk and the free list holds all of them.
+// Safe to call at any other quiescent moment too -- it takes only what is
+// on the free list, never what a slot owns -- which is what lets the
+// sandbox reclaim the pool between tests instead of reporting recycled
+// chunks as leaked.
+//
+VOID BlorgPrefetchReleaseChunkPool(VOID)
+{
+    for (;;)
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&PrefetchChunkLock, &irql);
+        PSINGLE_LIST_ENTRY entry = PopEntryList(&PrefetchChunkFreeList);
+        KeReleaseSpinLock(&PrefetchChunkLock, irql);
+
+        if (!entry)
+        {
+            break;
+        }
+
+        PREFETCH_CHUNK_BLOCK* chunk = CONTAINING_RECORD(entry, PREFETCH_CHUNK_BLOCK, Link);
+
+        IoFreeMdl(chunk->Mdl);
+        ExFreePool(chunk->Buffer);
+        ExFreePool(chunk);
+
+        InterlockedDecrement(&PrefetchChunkCount);
+        BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.PrefetchChunksLive);
+    }
+}
+
+//
+// Hands back any chunks the ring's slots still own, then frees the ring
+// itself and drops its reference. Called once RefCount has dropped to
+// zero -- no fetches or FCB attachment remain -- or for a ring that was
+// never published (creation failure, CAS loser).
+//
+// Slots still holding chunks here are the Ready ones: data fetched that
+// the reader closed the file before consuming. Those go back to the pool
+// for another stream, which is the reclamation the old ring-budget model
+// had no way to express.
 //
 static VOID PrefetchFreeRing(PREFETCH_RING* Ring)
 {
     for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
     {
-        if (Ring->BufferMdls[i])
+        if (Ring->Chunks[i])
         {
-            IoFreeMdl(Ring->BufferMdls[i]);
-        }
-
-        if (Ring->Buffers[i])
-        {
-            ExFreePool(Ring->Buffers[i]);
+            PrefetchChunkRelease(Ring->Chunks[i]);
+            Ring->Chunks[i] = NULL;
         }
     }
 
@@ -111,33 +253,29 @@ static VOID PrefetchReleaseRef(PREFETCH_RING* Ring)
 }
 
 //
-// Allocates and initializes a prefetch ring: the first PREFETCH_MIN_DEPTH
-// slots' non-paged buffers and their MDLs (built once, reused for every
-// fetch so steady-state streaming avoids repeated allocation; deeper
-// slots are allocated lazily by the pump as parks grow DepthLimit), plus
-// the ring's lock and initial RefCount for its FCB attachment. Non-paged
-// since fetch completions read the buffers at DISPATCH_LEVEL. Gated on
-// the driver-wide ring budget: the count is claimed first and released
-// by PrefetchFreeRing on every failure path, so budget accounting is
-// symmetric however creation ends. Returns NULL at the budget cap or on
-// any allocation failure -- the stream then runs on direct fetches.
+// Claims a reference for a new ring. This is now purely the unload gate:
+// a zero count means BlorgPrefetchDrain has released the standing
+// reference and the last ring is gone, and refusing here is what stops a
+// late arm from lifting the count back off zero after the drain has been
+// signalled.
 //
+// There is deliberately no cap on rings any more. Capping them capped the
+// wrong thing -- an armed ring is a few hundred bytes of struct, and the
+// megabytes are in the chunks, which PrefetchChunkAcquire budgets
+// directly. Refusing a ring cost a stream its entire pipeline; refusing a
+// chunk costs it one slot of depth, so every stream arms and pressure is
+// shared out instead of falling entirely on whoever arrived last.
 //
-// Claims a slot for a new ring, subject to both the driver-wide budget
-// and the unload gate. One CAS loop serves both, which also fixes what
-// the previous increment-then-decrement did: that briefly pushed the
-// count past the cap, so a concurrent create could see the inflated value
-// and refuse a slot that was in fact free. The CAS never publishes a
-// count above the cap.
-//
-// The standing reference is why the budget compares against count - 1.
+// The CAS loop (rather than increment-then-test) is what keeps the count
+// from transiently reading as non-zero after the drain: an increment that
+// had to be undone would let a concurrent drain observe a count it never
+// legitimately had.
 //
 static BOOLEAN PrefetchAcquireRing(VOID)
 {
-    LONG maxRings = PrefetchMaxRings();
     LONG current = ReadNoFence(&PrefetchRingCount);
 
-    while (0 != current && (current - 1) < maxRings)
+    while (0 != current)
     {
         LONG previous = InterlockedCompareExchange(&PrefetchRingCount, current + 1, current);
 
@@ -167,6 +305,7 @@ static VOID PrefetchReleaseRing(VOID)
 VOID BlorgPrefetchInitialize(VOID)
 {
     KeInitializeEvent(&PrefetchDrainEvent, NotificationEvent, FALSE);
+    KeInitializeSpinLock(&PrefetchChunkLock);
 }
 
 //
@@ -176,11 +315,18 @@ VOID BlorgPrefetchInitialize(VOID)
 // routine lives in this image. Bounded by the socket watchdogs, so a dead
 // peer cannot hang unload indefinitely.
 //
+// The chunk pool is freed only after that wait returns. Every chunk is
+// owned by a slot or sitting on the free list, and the last ring's
+// teardown is what releases its slots' chunks, so waiting first is what
+// makes "the free list holds all of them" true.
+//
 VOID BlorgPrefetchDrain(VOID)
 {
     PrefetchReleaseRing();
 
     KeWaitForSingleObject(&PrefetchDrainEvent, Executive, KernelMode, FALSE, NULL);
+
+    BlorgPrefetchReleaseChunkPool();
 }
 
 //
@@ -214,27 +360,6 @@ static PREFETCH_RING* PrefetchCreateRing(FCB* Fcb)
     }
 
     BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.PrefetchRingsLive, NULL);
-
-    for (ULONG i = 0; i < PREFETCH_MIN_DEPTH; ++i)
-    {
-        ring->Buffers[i] = ExAllocatePoolUninitialized(NonPagedPoolNx, PREFETCH_CHUNK, PREFETCH_TAG);
-
-        if (!ring->Buffers[i])
-        {
-            PrefetchFreeRing(ring);
-            return NULL;
-        }
-
-        ring->BufferMdls[i] = IoAllocateMdl(ring->Buffers[i], PREFETCH_CHUNK, FALSE, FALSE, NULL);
-
-        if (!ring->BufferMdls[i])
-        {
-            PrefetchFreeRing(ring);
-            return NULL;
-        }
-
-        MmBuildMdlForNonPagedPool(ring->BufferMdls[i]);
-    }
 
     ring->PumpWorkItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
 
@@ -273,18 +398,22 @@ static PREFETCH_RING* PrefetchCreateRing(FCB* Fcb)
 // PASSIVE_LEVEL -- which it does, being called only from the paging-read
 // path and the PASSIVE pump work item; never directly from a fetch
 // completion). Everything it needs from the file comes from the ring's
-// own Path/FileSize snapshot, never the FCB. Depth growth first: slots
-// admitted by a park's DepthLimit bump get their buffer and MDL
-// allocated here, at PASSIVE, before the reservation pass can see them.
-// NULL BufferMdls[i] is what distinguishes a never-allocated slot from
-// one whose buffer is merely detached for an outside-the-lock copy
-// (detach nulls only Buffers[i]); the unlocked BufferMdls read is
-// advisory -- concurrent pumps on one ring can race it -- and the
-// publish re-checks under the lock, with the loser freeing its copy. An
-// allocation failure just leaves the ring shallower this round; the next
-// pump retries. A NULL slot buffer in the reservation pass means the
-// slot is detached for a copy elsewhere, so such slots are skipped this
-// round. Once reserved, Hot[i] is safe to read without the lock: an
+// own Path/FileSize snapshot, never the FCB.
+//
+// Chunks are taken before the reservation lock, because acquiring one
+// may allocate and the reservation runs at DISPATCH under the ring's
+// spin lock. The count is sized by a first pass -- empty chunkless slots,
+// clipped to the chunks the file has left to fetch, so the tail of a file
+// never takes chunks it cannot use -- and anything the second pass does
+// not place goes straight back to the pool. Between the two passes
+// another pump may have moved NextFetchOffset, which is exactly why the
+// reservation re-tests rather than trusting the first pass's count.
+//
+// Coming up short is normal and is the designed behaviour under memory
+// pressure: unplaced slots stay Empty, the ring runs shallower this
+// round, and the next pump tries again. Nothing is refused outright.
+//
+// Once reserved, Hot[i] is safe to read without the lock: an
 // InFlight slot is owned by its fetch, and only this issuing thread and
 // the completion (which cannot run before issue) touch it. On a
 // synchronous issue failure the completion callback never ran and never
@@ -295,7 +424,9 @@ static PREFETCH_RING* PrefetchCreateRing(FCB* Fcb)
 // reservation and the failed issue, so the failure path drains
 // Waiters[i] under the lock and completes the parked IRP with the issue
 // status -- leaving it would strand the read forever, and a later reuse
-// of the slot would complete it with data from a different range.
+// of the slot would complete it with data from a different range. The
+// failed slot's chunk goes back to the pool with it, since an Empty slot
+// owns nothing.
 //
 static VOID PrefetchPump(PREFETCH_RING* Ring)
 {
@@ -308,52 +439,63 @@ static VOID PrefetchPump(PREFETCH_RING* Ring)
     ULONG depthLimit = Ring->DepthLimit;
     KeReleaseSpinLock(&Ring->Lock, irql);
 
-    for (ULONG i = PREFETCH_MIN_DEPTH; i < depthLimit; ++i)
+    ULONG wanted = 0;
+
+    KeAcquireSpinLock(&Ring->Lock, &irql);
+
+    for (ULONG i = 0; i < depthLimit; ++i)
     {
-        if (Ring->BufferMdls[i])
+        if (PrefetchSlotEmpty == Ring->Hot[i].State && !Ring->Chunks[i])
         {
-            continue;
+            ++wanted;
         }
-
-        PCHAR buffer = ExAllocatePoolUninitialized(NonPagedPoolNx, PREFETCH_CHUNK, PREFETCH_TAG);
-
-        if (!buffer)
-        {
-            break;
-        }
-
-        PMDL mdl = IoAllocateMdl(buffer, PREFETCH_CHUNK, FALSE, FALSE, NULL);
-
-        if (!mdl)
-        {
-            ExFreePool(buffer);
-            break;
-        }
-
-        MmBuildMdlForNonPagedPool(mdl);
-
-        KeAcquireSpinLock(&Ring->Lock, &irql);
-
-        if (Ring->BufferMdls[i])
-        {
-            KeReleaseSpinLock(&Ring->Lock, irql);
-            IoFreeMdl(mdl);
-            ExFreePool(buffer);
-            continue;
-        }
-
-        Ring->Buffers[i] = buffer;
-        Ring->BufferMdls[i] = mdl;
-        KeReleaseSpinLock(&Ring->Lock, irql);
     }
+
+    ULONG64 unfetched = (Ring->NextFetchOffset < fileSize) ? (fileSize - Ring->NextFetchOffset) : 0;
+
+    KeReleaseSpinLock(&Ring->Lock, irql);
+
+    ULONG64 chunksLeftInFile = (unfetched + PREFETCH_CHUNK - 1) / PREFETCH_CHUNK;
+
+    if (wanted > chunksLeftInFile)
+    {
+        wanted = C_CAST(ULONG, chunksLeftInFile);
+    }
+
+    PREFETCH_CHUNK_BLOCK* taken[PREFETCH_DEPTH];
+    ULONG takenCount = 0;
+
+    while (takenCount < wanted)
+    {
+        PREFETCH_CHUNK_BLOCK* chunk = PrefetchChunkAcquire();
+
+        if (!chunk)
+        {
+            break;
+        }
+
+        taken[takenCount++] = chunk;
+    }
+
+    ULONG nextTaken = 0;
 
     KeAcquireSpinLock(&Ring->Lock, &irql);
 
     for (ULONG i = 0; i < depthLimit && Ring->NextFetchOffset < fileSize; ++i)
     {
-        if (PrefetchSlotEmpty != Ring->Hot[i].State || !Ring->Buffers[i])
+        if (PrefetchSlotEmpty != Ring->Hot[i].State)
         {
             continue;
+        }
+
+        if (!Ring->Chunks[i])
+        {
+            if (nextTaken == takenCount)
+            {
+                continue;
+            }
+
+            Ring->Chunks[i] = taken[nextTaken++];
         }
 
         ULONG64 remaining = fileSize - Ring->NextFetchOffset;
@@ -375,6 +517,11 @@ static VOID PrefetchPump(PREFETCH_RING* Ring)
 
     KeReleaseSpinLock(&Ring->Lock, irql);
 
+    while (nextTaken < takenCount)
+    {
+        PrefetchChunkRelease(taken[nextTaken++]);
+    }
+
     for (ULONG r = 0; r < reservedCount; ++r)
     {
         ULONG i = reserved[r];
@@ -383,7 +530,7 @@ static VOID PrefetchPump(PREFETCH_RING* Ring)
             &Ring->Path,
             Ring->Hot[i].RangeOffset,
             Ring->Hot[i].Length,
-            Ring->BufferMdls[i],
+            Ring->Chunks[i]->Mdl,
             PrefetchFetchComplete,
             &Ring->FetchCtx[i]);
 
@@ -400,7 +547,14 @@ static VOID PrefetchPump(PREFETCH_RING* Ring)
             Ring->Waiters[i] = NULL;
             Ring->WaiterLengths[i] = 0;
             Ring->Hot[i].State = PrefetchSlotEmpty;
+            PREFETCH_CHUNK_BLOCK* chunk = Ring->Chunks[i];
+            Ring->Chunks[i] = NULL;
             KeReleaseSpinLock(&Ring->Lock, irql);
+
+            if (chunk)
+            {
+                PrefetchChunkRelease(chunk);
+            }
 
             if (waiter)
             {
@@ -476,8 +630,9 @@ static VOID PrefetchQueuePump(PREFETCH_RING* Ring)
 // bytes straight into its MDL and completes it (delivered regardless of
 // generation, since the waiter parked on this exact range, so the data is
 // right for it even if a concurrent seek re-aimed the ring in the
-// meantime -- the buffer is detached from the slot for this copy, then
-// donated back afterward for reuse); otherwise marks the slot Ready for a
+// meantime -- the chunk leaves the slot for this copy and then goes back
+// to the shared pool, not back to the slot, since the slot is now Empty
+// and an Empty slot owns nothing); otherwise marks the slot Ready for a
 // later hit, or discards it (fetch failed, or its data predates a seek --
 // the next paging read either re-fetches the range directly or has
 // re-aimed the pipeline already).
@@ -488,9 +643,9 @@ static VOID PrefetchQueuePump(PREFETCH_RING* Ring)
 // in the RTT-bound regime that keeps the pipeline genuinely full instead
 // of always one slot short, and takes the top-up issue cost off the
 // read path. Failed fetches never queue it: the next read's pump is the
-// retry, so a dead server can't drive a fetch-fail-refetch storm. For
-// the waiter case the queue happens only after the detached buffer has
-// been donated back, so the pump can actually use the slot.
+// retry, so a dead server can't drive a fetch-fail-refetch storm. The
+// chunk is released before the pump is queued, so the chunk this slot
+// just finished with is available to the pump that refills it.
 //
 static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
 {
@@ -529,13 +684,15 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
     ULONG waiterSlotOffset = ring->WaiterSlotOffsets[i];
     ring->Waiters[i] = NULL;
 
+    PREFETCH_CHUNK_BLOCK* chunk = NULL;
     PCHAR buffer = NULL;
     BOOLEAN queuePump = FALSE;
 
     if (waiter)
     {
-        buffer = ring->Buffers[i];
-        ring->Buffers[i] = NULL;
+        chunk = ring->Chunks[i];
+        buffer = chunk ? chunk->Buffer : NULL;
+        ring->Chunks[i] = NULL;
         ring->Hot[i].State = PrefetchSlotEmpty;
         queuePump = NT_SUCCESS(Status) && !ring->Detached;
     }
@@ -548,6 +705,8 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
     {
         BOOLEAN succeeded = NT_SUCCESS(Status);
 
+        chunk = ring->Chunks[i];
+        ring->Chunks[i] = NULL;
         ring->Hot[i].State = PrefetchSlotEmpty;
         queuePump = succeeded && !ring->Detached;
 
@@ -580,7 +739,7 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
 
             PVOID targetVa = MmGetSystemAddressForMdlSafe(waiter->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
 
-            if (targetVa)
+            if (targetVa && buffer)
             {
                 RtlCopyMemory(targetVa, buffer + waiterSlotOffset, copyLength);
                 waiter->IoStatus.Information = copyLength;
@@ -598,10 +757,11 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
         }
 
         BlorgCompleteRequest(waiter, waiterStatus, IO_DISK_INCREMENT);
+    }
 
-        KeAcquireSpinLock(&ring->Lock, &irql);
-        ring->Buffers[i] = buffer;
-        KeReleaseSpinLock(&ring->Lock, irql);
+    if (chunk)
+    {
+        PrefetchChunkRelease(chunk);
     }
 
     if (queuePump)
@@ -850,8 +1010,8 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
 
             if (PrefetchSlotReady == ring->Hot[i].State)
             {
-                PCHAR buffer = ring->Buffers[i];
-                ring->Buffers[i] = NULL;
+                PREFETCH_CHUNK_BLOCK* chunk = ring->Chunks[i];
+                ring->Chunks[i] = NULL;
                 ring->Hot[i].State = PrefetchSlotEmpty;
                 ring->LastConsumeClock = serveClock;
                 KeReleaseSpinLock(&ring->Lock, irql);
@@ -859,9 +1019,9 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
                 NTSTATUS result;
                 PVOID targetVa = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
 
-                if (targetVa)
+                if (targetVa && chunk)
                 {
-                    RtlCopyMemory(targetVa, buffer + slotOffset, Length);
+                    RtlCopyMemory(targetVa, chunk->Buffer + slotOffset, Length);
                     Irp->IoStatus.Information = Length;
                     result = STATUS_SUCCESS;
                 }
@@ -870,9 +1030,10 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
                     result = STATUS_INSUFFICIENT_RESOURCES;
                 }
 
-                KeAcquireSpinLock(&ring->Lock, &irql);
-                ring->Buffers[i] = buffer;
-                KeReleaseSpinLock(&ring->Lock, irql);
+                if (chunk)
+                {
+                    PrefetchChunkRelease(chunk);
+                }
 
                 BLORGFS_PRINT("prefetch hit off=%llx len=%lx\n", Offset, Length);
 
@@ -929,6 +1090,8 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
     {
         BOOLEAN reaimed = FALSE;
         BOOLEAN suppressed = FALSE;
+        PREFETCH_CHUNK_BLOCK* reclaimed[PREFETCH_DEPTH];
+        ULONG reclaimedCount = 0;
 
         KeAcquireSpinLock(&ring->Lock, &irql);
 
@@ -951,6 +1114,12 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
                     if (PrefetchSlotReady == ring->Hot[i].State)
                     {
                         ring->Hot[i].State = PrefetchSlotEmpty;
+
+                        if (ring->Chunks[i])
+                        {
+                            reclaimed[reclaimedCount++] = ring->Chunks[i];
+                            ring->Chunks[i] = NULL;
+                        }
                     }
                 }
 
@@ -961,6 +1130,11 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
         }
 
         KeReleaseSpinLock(&ring->Lock, irql);
+
+        for (ULONG r = 0; r < reclaimedCount; ++r)
+        {
+            PrefetchChunkRelease(reclaimed[r]);
+        }
 
         if (suppressed)
         {

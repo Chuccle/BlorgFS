@@ -91,6 +91,16 @@ protected:
         PrefetchModelSettle(STATUS_SUCCESS);
         ShimDrainWorkItems();
 
+        //
+        // Chunks outlive the ring on purpose -- they go back to the
+        // driver-wide pool for the next stream rather than to the
+        // allocator. That is invisible to a per-test quiescence check,
+        // which sees only that pool allocations are still live, so the
+        // pool is reclaimed here to keep recycled chunks from reading as
+        // leaked ones.
+        //
+        BlorgPrefetchReleaseChunkPool();
+
         for (PIRP irp : Irps)
         {
             IoFreeIrp(irp);
