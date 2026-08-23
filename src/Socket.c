@@ -9,8 +9,20 @@
 
 #define SOCKET_TAG 'HTTP'
 
-WSK_REGISTRATION WskRegistration;
-WSK_PROVIDER_NPI WskProviderNpi;
+//
+// The WSK client registration and the captured provider dispatch, both
+// owned entirely by this file: acquired in BlorgInitialiseWskClient,
+// released in BlorgCleanupWskClient, and read by every
+// send/receive/connect/close below.
+//
+// static because nothing outside Socket.c refers to them, and the
+// convention is that a name at file scope with external linkage is either
+// prefixed and declared in a header or belongs in `global` (Driver.h).
+// These are neither -- they are this module's private state, and leaving
+// them external published two symbols nobody was allowed to use.
+//
+static WSK_REGISTRATION WskRegistration;
+static WSK_PROVIDER_NPI WskProviderNpi;
 
 typedef struct _SOCKET_POOL_STATE
 {
