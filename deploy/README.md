@@ -14,6 +14,24 @@ difference before spending time chasing the wrong thing.
 
 ## The short version
 
+Copy `deploy/blorgfs.env.example` to `deploy/blorgfs.env`, fill it in once,
+and then deploying takes no arguments at all:
+
+```powershell
+.\deploy\Deploy-ToVM.ps1 -Configuration Release
+```
+
+`blorgfs.env` holds the VM path, the guest account, the `.vmx`
+config-encryption password, the snapshot to revert to, the backend address,
+and the KDNET key. It is **gitignored** -- every one of those is a
+credential for the debug VM, and the KDNET key in particular lets anyone on
+the network attach a kernel debugger to that guest. The committed
+`blorgfs.env.example` is the template and carries no real values.
+
+The point of it is that a session starting from nothing can deploy and debug
+without first being handed five settings by hand. Explicit arguments still
+win over the file, so nothing is locked in:
+
 ```powershell
 .\deploy\Deploy-ToVM.ps1 `
     -VmxPath "C:\path\to\Win11.vmx" `

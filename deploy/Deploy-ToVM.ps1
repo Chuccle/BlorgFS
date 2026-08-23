@@ -62,9 +62,9 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$VmxPath,
-    [Parameter(Mandatory = $true)][string]$GuestUser,
-    [Parameter(Mandatory = $true)][string]$GuestPassword,
+    [string]$VmxPath,
+    [string]$GuestUser,
+    [string]$GuestPassword,
     [string]$VmPassword,
     [string]$SnapshotName,
     [switch]$SkipBuild,
@@ -81,6 +81,34 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+
+#
+# Anything not passed explicitly falls back to blorgfs.env (gitignored;
+# see blorgfs.env.example). That is what lets a fresh session start
+# deploying without being handed the VM path, the guest account and the
+# .vmx password first. An explicit argument always wins.
+#
+$BlorgEnv = & (Join-Path $PSScriptRoot "Get-BlorgEnv.ps1")
+
+function Get-Setting($Current, $Key) {
+    if ($Current) { return $Current }
+    if ($BlorgEnv.ContainsKey($Key)) { return $BlorgEnv[$Key] }
+    return $Current
+}
+
+$VmxPath       = Get-Setting $VmxPath       "VmxPath"
+$GuestUser     = Get-Setting $GuestUser     "GuestUser"
+$GuestPassword = Get-Setting $GuestPassword "GuestPassword"
+$VmPassword    = Get-Setting $VmPassword    "VmPassword"
+$SnapshotName  = Get-Setting $SnapshotName  "SnapshotName"
+$RemoteHost    = Get-Setting $RemoteHost    "RemoteHost"
+$RemotePort    = Get-Setting $RemotePort    "RemotePort"
+
+foreach ($required in @("VmxPath", "GuestUser", "GuestPassword")) {
+    if (-not (Get-Variable -Name $required -ValueOnly)) {
+        throw "$required not supplied and not found in blorgfs.env. Copy deploylorgfs.env.example to deploylorgfs.env and fill it in, or pass -$required."
+    }
+}
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
@@ -146,10 +174,15 @@ Wait-ForTools
 
 if (-not $SkipBuild) {
     Write-Step "Building BlorgFS.sln ($Configuration|$Platform)"
-    $msbuild = (Get-Command msbuild.exe -ErrorAction SilentlyContinue).Source
-    if (-not $msbuild) {
-        throw "msbuild.exe not on PATH -- run this from a Developer PowerShell for VS, or pass -SkipBuild and deploy a prior build."
-    }
+    #
+    # Not Get-Command: PATH may hold the 32-bit MSBuild, or none at all
+    # outside a Developer PowerShell. The WDK NuGet picks its PREfast and
+    # ApiValidator tool directory from the MSBuild process architecture, so
+    # the 32-bit one silently produces a different build than the check
+    # runner does. Invoke-BlorgChecks.ps1 already knows how to find the right
+    # one; use that rather than keeping a second, weaker answer here.
+    #
+    $msbuild = & (Join-Path $RepoRoot "tools\Get-BlorgMSBuild.ps1")
     & $msbuild (Join-Path $RepoRoot "BlorgFS.sln") /p:Configuration=$Configuration /p:Platform=$Platform /m
     if ($LASTEXITCODE -ne 0) { throw "Build failed." }
 }

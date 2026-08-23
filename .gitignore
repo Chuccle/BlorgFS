@@ -380,3 +380,12 @@ FodyWeavers.xsd
 # enter git history.
 /*.txt
 /guest_screenshot.png
+
+# Local environment for the deploy/debug pipeline: VM path, guest
+# credentials, the .vmx config-encryption password, and the KDNET key.
+# Every one of those is a credential for the debug VM, so this file must
+# never enter git history. deploy/blorgfs.env.example is the committed
+# template and carries no real values.
+blorgfs.env
+deploy/blorgfs.env
+.env

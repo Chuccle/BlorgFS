@@ -93,28 +93,13 @@ function Add-Result {
 }
 
 #
-# The 64-bit MSBuild specifically: the WDK NuGet picks its PREfast and
-# ApiValidator tool directory from the MSBuild process's own architecture,
-# and the 32-bit one selects an x86 directory where those tools are
-# missing or broken. Using it silently loses the static analysis this
-# whole tier exists to run.
+# The 64-bit MSBuild specifically, and deploy/Deploy-ToVM.ps1 needs the same
+# answer -- see tools\Get-BlorgMSBuild.ps1 for why the 32-bit one silently
+# loses the static analysis this tier exists to run. One locator rather than
+# two, because the two had drifted: this one had a list, the deploy script
+# trusted PATH and simply failed outside a Developer PowerShell.
 #
-function Get-MSBuild {
-    $candidates = @(
-        'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe',
-        'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe',
-        'C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\amd64\MSBuild.exe',
-        'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\amd64\MSBuild.exe'
-    )
-
-    foreach ($c in $candidates) {
-        if (Test-Path $c) { return $c }
-    }
-
-    throw "Could not find a 64-bit MSBuild.exe. See tools\Invoke-BlorgChecks.ps1 for why the 32-bit one will not do."
-}
-
-$msbuild = Get-MSBuild
+$msbuild = & (Join-Path $PSScriptRoot "Get-BlorgMSBuild.ps1")
 
 function Invoke-Build {
     param([string]$Project, [string]$Label)
