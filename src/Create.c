@@ -603,6 +603,17 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 //  buffer smaller than what is about to be copied into it (STATUS_OBJECT_NAME_INVALID,
 //  matching the leading-separator rejection just above it).
 //
+//  The KdBreakPoint() on the final fallthrough is deliberate and is the
+//  only one left in the driver -- every other one was removed because it
+//  trapped on outcomes that are normal (see CheckFileAccess above and
+//  deploy/DEBUGGING.md). This one is different: reaching the bottom of this
+//  function means the create matched no case at all, which is a state the
+//  logic above says cannot happen. If it ever does, stopping in the
+//  debugger with the IRP still in hand is worth far more than the
+//  STATUS_INVALID_DEVICE_REQUEST that follows it. Anyone grepping for
+//  KdBreakPoint and finding one survivor should read this rather than
+//  assume it was missed.
+//
 NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
 {
     struct OwnedString

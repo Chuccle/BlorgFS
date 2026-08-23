@@ -36,7 +36,10 @@ game launchers) opens for write as a matter of course.
 an expected outcome, not an anomaly worth trapping (see the comment above
 `CheckFileAccess`). **Do not re-add them.** One deliberately remains, on the
 terminal `STATUS_INVALID_DEVICE_REQUEST` fallthrough at the end of
-`BlorgCreate`, which is a genuine "should not get here".
+`BlorgVolumeCreate`, which is a genuine "should not get here" -- the create
+matched no case at all. Its own reason is recorded in that function's header
+comment too, so grepping for `KdBreakPoint` and landing on the survivor
+turns up the explanation without having to find this file first.
 
 **Confirm it in one command.** Attach KD, break in, and resolve the
 instruction pointer:

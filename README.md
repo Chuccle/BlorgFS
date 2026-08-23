@@ -294,9 +294,17 @@ correct drift when you find it.
   explicit named `Reserved[N]` instead.
 - **`ProbeForRead` for all user-buffer validation,** including output buffers.
   `ProbeForWrite` is legacy and writes every page.
-- **Never `%wZ`/`%Z` in a `DbgPrint` reachable at `<= DISPATCH_LEVEL`** — the
-  formatting touches paged code and bugchecks. This rules it out anywhere on
-  the WSK completion chain (`HttpFail`, `HttpComplete`, `Blorg*Complete`).
+
+  Two places deliberately do not probe, both following fastfat: the cached
+  read path in `Read.c` hands `Irp->UserBuffer` to `CcCopyReadEx` under SEH,
+  and `Security.c` lets `SeQuerySecurityDescriptorInfo` write into
+  `Irp->UserBuffer` directly. In both the fault is caught rather than
+  prevented. Do not "fix" either without reading why fastfat does the same.
+- **Never `%wZ`/`%Z` in a `DbgPrint` that can run above `PASSIVE_LEVEL`** —
+  the formatting touches paged code and bugchecks. In practice that means
+  anywhere on a completion chain (`HttpFail`, `HttpComplete`,
+  `Blorg*Complete`) or in anything one can call. It is fine, and used
+  freely, on the PASSIVE-only dispatch paths.
 - IRQL is load-bearing throughout the async paths; the file-header comments in
   `Client.c`, `Prefetch.h`, and `Socket.h` state each path's contract. Read
   them before changing anything on a completion chain.
