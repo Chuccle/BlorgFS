@@ -36,6 +36,7 @@
 #include <cstring>
 #include <vector>
 #include <string>
+#include <algorithm>
 
 #include "..\..\src\Statistics.h"
 
@@ -557,6 +558,301 @@ static bool PrintFilesystemStatistics(HANDLE volume)
 // prefetcher and the HTTP path honestly -- a buffered re-read of a file
 // already resident in Cc measures memcpy, not this filesystem.
 //
+//
+// Distinct files for the stream workload, largest-first so a short file
+// cannot end a stream early and flatter the result. Recursive, because the
+// media layout that motivates this puts one file per directory.
+//
+static void CollectStreamFilesInto(
+    const std::wstring& directory,
+    unsigned long long minimumBytes,
+    std::vector<std::wstring>* files)
+{
+    std::wstring pattern = directory + L"\\*";
+
+    WIN32_FIND_DATAW find = {};
+    HANDLE handle = FindFirstFileW(pattern.c_str(), &find);
+
+    if (INVALID_HANDLE_VALUE == handle)
+    {
+        return;
+    }
+
+    do
+    {
+        if (0 == wcscmp(find.cFileName, L".") || 0 == wcscmp(find.cFileName, L".."))
+        {
+            continue;
+        }
+
+        std::wstring full = directory + L"\\" + find.cFileName;
+
+        if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            CollectStreamFilesInto(full, minimumBytes, files);
+            continue;
+        }
+
+        const unsigned long long size =
+            (static_cast<unsigned long long>(find.nFileSizeHigh) << 32) | find.nFileSizeLow;
+
+        if (size >= minimumBytes)
+        {
+            files->push_back(full);
+        }
+    }
+    while (FindNextFileW(handle, &find));
+
+    FindClose(handle);
+}
+
+static bool CollectStreamFiles(
+    const wchar_t* directory,
+    unsigned long streamCount,
+    std::vector<std::wstring>* files)
+{
+    //
+    // Big enough that a stream spends the run reading rather than opening:
+    // several times PREFETCH_CHUNK x PREFETCH_DEPTH, so the pipeline reaches
+    // steady state instead of measuring its spin-up.
+    //
+    const unsigned long long minimumBytes = 64ull * 1024 * 1024;
+
+    CollectStreamFilesInto(directory, minimumBytes, files);
+
+    if (files->size() < streamCount)
+    {
+        files->clear();
+        CollectStreamFilesInto(directory, 8ull * 1024 * 1024, files);
+    }
+
+    return !files->empty();
+}
+//
+// Concurrent-stream workload: the shape this driver actually has to survive.
+//
+// Every other workload here drives one file. That measures the pipeline but
+// says nothing about what happens when several readers want it at once,
+// which is the normal case -- a video and its subtitle track, a game
+// streaming assets while its own data file is open, a library browse
+// overlapping playback. Aggregate throughput alone is not the answer
+// either: a stream that stalls for a second has failed even if the total
+// looks healthy, so this records per-read latency and reports the tail.
+//
+// Each stream gets its own file and its own thread, reads buffered and
+// sequentially (the playback shape, and the only one that reaches the
+// prefetcher -- see BlorgVolumeRead), and runs until the deadline or EOF.
+// Latency is per ReadFile of kWorkloadReadSize, which is the stall a player
+// actually feels.
+//
+// Fairness is reported as the spread between the slowest and fastest
+// stream. Equal aggregate throughput split unequally is a different system
+// from one that shares, and only the second one plays video without
+// stuttering.
+//
+struct StreamResult
+{
+    unsigned long long Bytes;
+    std::vector<double> LatenciesMs;
+    bool Ok;
+};
+
+struct StreamContext
+{
+    const wchar_t* Path;
+    double DeadlineSeconds;
+    LARGE_INTEGER Frequency;
+    LARGE_INTEGER Start;
+    StreamResult* Result;
+};
+
+static DWORD WINAPI StreamWorker(LPVOID parameter)
+{
+    StreamContext* ctx = static_cast<StreamContext*>(parameter);
+    ctx->Result->Ok = false;
+    ctx->Result->Bytes = 0;
+
+    HANDLE file = CreateFileW(ctx->Path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+    if (INVALID_HANDLE_VALUE == file)
+    {
+        PrintLastError("open stream file");
+        return 0;
+    }
+
+    unsigned char* buffer = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, kWorkloadReadSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+
+    if (!buffer)
+    {
+        PrintLastError("allocate stream buffer");
+        CloseHandle(file);
+        return 0;
+    }
+
+    ctx->Result->LatenciesMs.reserve(65536);
+
+    for (;;)
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+
+        const double elapsed = static_cast<double>(now.QuadPart - ctx->Start.QuadPart) /
+                               static_cast<double>(ctx->Frequency.QuadPart);
+
+        if (elapsed >= ctx->DeadlineSeconds)
+        {
+            break;
+        }
+
+        LARGE_INTEGER readStart;
+        QueryPerformanceCounter(&readStart);
+
+        DWORD read = 0;
+
+        if (!ReadFile(file, buffer, kWorkloadReadSize, &read, nullptr))
+        {
+            PrintLastError("stream read");
+            break;
+        }
+
+        if (0 == read)
+        {
+            break;
+        }
+
+        LARGE_INTEGER readEnd;
+        QueryPerformanceCounter(&readEnd);
+
+        ctx->Result->LatenciesMs.push_back(
+            1000.0 * static_cast<double>(readEnd.QuadPart - readStart.QuadPart) /
+            static_cast<double>(ctx->Frequency.QuadPart));
+
+        ctx->Result->Bytes += read;
+    }
+
+    VirtualFree(buffer, 0, MEM_RELEASE);
+    CloseHandle(file);
+
+    ctx->Result->Ok = true;
+    return 0;
+}
+
+static double Percentile(std::vector<double>& sorted, double fraction)
+{
+    if (sorted.empty())
+    {
+        return 0.0;
+    }
+
+    size_t index = static_cast<size_t>(fraction * static_cast<double>(sorted.size() - 1));
+
+    return sorted[index];
+}
+
+static bool RunStreams(
+    const wchar_t* directory,
+    unsigned long streamCount,
+    double seconds,
+    unsigned long long* bytesOut,
+    double* secondsOut)
+{
+    std::vector<std::wstring> files;
+
+    if (!CollectStreamFiles(directory, streamCount, &files))
+    {
+        return false;
+    }
+
+    if (files.size() < streamCount)
+    {
+        printf("only %zu suitable files under %ws, need %lu\n", files.size(), directory, streamCount);
+        return false;
+    }
+
+    std::vector<StreamResult> results(streamCount);
+    std::vector<StreamContext> contexts(streamCount);
+    std::vector<HANDLE> threads(streamCount);
+
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+
+    for (unsigned long i = 0; i < streamCount; ++i)
+    {
+        contexts[i].Path = files[i].c_str();
+        contexts[i].DeadlineSeconds = seconds;
+        contexts[i].Frequency = frequency;
+        contexts[i].Start = start;
+        contexts[i].Result = &results[i];
+
+        threads[i] = CreateThread(nullptr, 0, StreamWorker, &contexts[i], 0, nullptr);
+
+        if (!threads[i])
+        {
+            PrintLastError("create stream thread");
+            return false;
+        }
+    }
+
+    WaitForMultipleObjects(streamCount, threads.data(), TRUE, INFINITE);
+
+    LARGE_INTEGER end;
+    QueryPerformanceCounter(&end);
+
+    for (unsigned long i = 0; i < streamCount; ++i)
+    {
+        CloseHandle(threads[i]);
+    }
+
+    const double elapsed = static_cast<double>(end.QuadPart - start.QuadPart) /
+                           static_cast<double>(frequency.QuadPart);
+
+    unsigned long long total = 0;
+    double slowest = 0.0;
+    double fastest = 0.0;
+    std::vector<double> all;
+
+    for (unsigned long i = 0; i < streamCount; ++i)
+    {
+        if (!results[i].Ok)
+        {
+            return false;
+        }
+
+        total += results[i].Bytes;
+
+        const double mbps = (static_cast<double>(results[i].Bytes) / (1024.0 * 1024.0)) / elapsed;
+
+        if (0 == i || mbps < slowest) { slowest = mbps; }
+        if (0 == i || mbps > fastest) { fastest = mbps; }
+
+        all.insert(all.end(), results[i].LatenciesMs.begin(), results[i].LatenciesMs.end());
+    }
+
+    std::sort(all.begin(), all.end());
+
+    printf("\n  per-stream (%lu streams)\n", streamCount);
+    printf("    aggregate             %12.2f MB/s\n",
+        (static_cast<double>(total) / (1024.0 * 1024.0)) / elapsed);
+    printf("    per stream mean       %12.2f MB/s\n",
+        ((static_cast<double>(total) / (1024.0 * 1024.0)) / elapsed) / static_cast<double>(streamCount));
+    printf("    slowest / fastest     %12.2f / %.2f MB/s", slowest, fastest);
+    printf("   (fairness %.2f)\n", (fastest > 0.0) ? (slowest / fastest) : 0.0);
+    printf("    reads                 %12zu\n", all.size());
+    printf("    latency p50           %12.3f ms\n", Percentile(all, 0.50));
+    printf("    latency p95           %12.3f ms\n", Percentile(all, 0.95));
+    printf("    latency p99           %12.3f ms\n", Percentile(all, 0.99));
+    printf("    latency max           %12.3f ms\n", all.empty() ? 0.0 : all.back());
+
+    *bytesOut = total;
+    *secondsOut = elapsed;
+
+    return true;
+}
+
 static bool RunSequential(const wchar_t* path, bool unbuffered, unsigned long long* bytesOut, double* secondsOut)
 {
     DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
@@ -946,7 +1242,9 @@ static void PrintUsage(void)
     printf("  reset [drive]                  start a fresh measurement window (elevated)\n");
     printf("  seq <file> [buffered]          sequential read; unbuffered unless 'buffered'\n");
     printf("  rand <file> <blockKB> <count>  random reads at a fixed block size\n");
-    printf("  meta <dir> <passes>            enumerate + open every entry, repeatedly\n\n");
+    printf("  meta <dir> <passes>            enumerate + open every entry, repeatedly\n");
+    printf("  streams <dir> <count> [secs]   N concurrent sequential readers, one file each\n");
+    printf("                                 reports aggregate, fairness and latency tail\n\n");
     printf("  --report <path>                (any workload) also write key=value metrics\n");
     printf("                                 for Compare-BlorgMetrics.ps1; position-independent\n\n");
     printf("Workload commands reset the counters first, run, then report both the\n");
@@ -1036,6 +1334,28 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
 
         ok = RunRandom(argv[2], blockKb * 1024, count, &bytes, &seconds);
         sprintf_s(label, "random read (%lu KB x %lu)", blockKb, count);
+    }
+    else if (0 == wcscmp(argv[1], L"streams"))
+    {
+        if (argc < 4)
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        const unsigned long streamCount = static_cast<unsigned long>(_wtoi(argv[3]));
+        const double runSeconds = (argc > 4) ? _wtof(argv[4]) : 30.0;
+
+        if (0 == streamCount)
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        ok = RunStreams(argv[2], streamCount, runSeconds, &bytes, &seconds);
+        sprintf_s(label, "concurrent streams (%lu x %.0f s)", streamCount, runSeconds);
     }
     else if (0 == wcscmp(argv[1], L"meta"))
     {
