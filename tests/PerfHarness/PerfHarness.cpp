@@ -1474,7 +1474,8 @@ int wmain(int argc, wchar_t** argv)
         return result;
     }
 
-    if (0 == wcscmp(argv[1], L"seq") || 0 == wcscmp(argv[1], L"rand") || 0 == wcscmp(argv[1], L"meta"))
+    if (0 == wcscmp(argv[1], L"seq") || 0 == wcscmp(argv[1], L"rand") ||
+        0 == wcscmp(argv[1], L"meta") || 0 == wcscmp(argv[1], L"streams"))
     {
         if (argc < 3)
         {

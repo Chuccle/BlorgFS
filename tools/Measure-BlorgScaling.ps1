@@ -118,7 +118,16 @@ foreach ($count in $StreamCounts) {
     $guestOut = "$GuestDeployDir\scaling-$count.txt"
     $harness = "$GuestDeployDir\PerfHarness.exe"
 
-    Invoke-GuestPowerShell "& '$harness' streams '$MediaDirectory' $count $Seconds *> '$guestOut'"
+    #
+    # Trailing backslash stripped before the argument crosses into a native
+    # command line: Windows treats a backslash before a closing quote as an
+    # escape, so a bare drive root would arrive mangled and shift every
+    # argument after it.
+    #
+    $mediaArg = $MediaDirectory.TrimEnd('\')
+    if ($mediaArg -match '^[A-Za-z]:$') { $mediaArg = "$mediaArg\." }
+
+    Invoke-GuestPowerShell "& '$harness' streams '$mediaArg' $count $Seconds *> '$guestOut'"
 
     $localOut = Join-Path $env:TEMP "blorg-scaling-$count.txt"
     Remove-Item $localOut -ErrorAction SilentlyContinue

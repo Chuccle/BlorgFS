@@ -23,8 +23,18 @@ deploy/        VM deploy pipeline and the debugging notes
 third_party/   submodules: flatcc, picohttpparser, schemas, googletest
 ```
 
-Build output stays at the repo root (`x64\<Config>\`) regardless of where a
-project lives, which is what the deploy scripts and CI artifact paths expect.
+**Build output lands in two different places, and it matters.** A *solution*
+build writes to the repo root (`x64\<Config>\`), because `$(SolutionDir)` is
+defined; building a project on its own -- which is what
+`tools\Invoke-BlorgChecks.ps1` does -- writes to `tests\<project>\x64\<Config>\`
+instead. Neither is wrong, but both exist at once and can hold binaries of
+different ages.
+
+Assume the one you want is the stale one until you have checked. This split
+has caused three separate failures: a test running against a binary with no
+ASan runtime beside it, `Invoke-TestExe` picking a stale exe by glob, and a
+32-minute-old `PerfHarness` deployed to the VM measuring nothing. CI works
+around it by searching both roots (`build.yml`).
 
 The sandbox projects put their own directory on the include path so
 `src/Driver.h` can pull in `SandboxPrelude.h` without the driver naming a
@@ -151,15 +161,41 @@ Two things to know before reading prefetch numbers:
   reaches the prefetcher at all — `BlorgPrefetchServeRead` is only called
   from the paging path, so only cache-manager reads exercise the ring.
   Unbuffered measures the no-pipelining floor, not playback.
-- **"of which near"** counts misses whose bytes the ring already held, and
-  which only missed because slot lookup demands an exact offset match (see
-  `Prefetch.h`). A high near-miss share means the ring is doing the work and
-  then throwing it away, which is a very different problem from not fetching
-  ahead far enough.
+- **"of which near"** no longer means what its name says. It counted misses a
+  containment test would have served and an exact-offset one would not -- and
+  then the lookup *became* a containment test, retiring that case. What it
+  finds now is a slot that covered the range but was already spoken for: one
+  waiter per slot, so a second concurrent reader of the same chunk falls
+  through to a direct fetch. Read it as a contention counter against
+  `PrefetchParks`, not a coverage one (`PrefetchCountNearMiss`, `Prefetch.c`).
 
 ```bash
 PerfHarness.exe seq B:\media\big.mkv --report run.txt
 ```
+
+**One stream is not the workload.** Several readers at once is the normal
+case -- a video and its subtitle track, a game streaming assets while its own
+data file is open, a library browse overlapping playback -- and it behaves
+differently enough that single-stream numbers can look healthy while the
+system is starving streams outright.
+
+```bash
+PerfHarness.exe streams B:\ 8 30
+powershell -File tools/Measure-BlorgScaling.ps1 -OutputPath baseline.txt
+```
+
+`streams` gives each reader its own file and thread and reports the **latency
+tail** (p50/p95/p99/max) and a **fairness** ratio alongside aggregate
+throughput. Aggregate alone is the wrong metric: a stream that stalls for a
+second has failed even when the total looks fine, and equal throughput split
+unequally is a different system from one that shares.
+
+`Measure-BlorgScaling.ps1` sweeps stream counts and adds scaling efficiency
+against the single-stream result. **It reboots the guest between runs**, which
+is not hygiene: the prefetch ring budget is live driver state that a counter
+reset does not touch, so a sweep without a real reset measures the previous
+run's exhausted budget from the second row onward. `sc stop` cannot provide
+that reset -- it wedges in `STOP_PENDING` (see `deploy/DEBUGGING.md`).
 
 Workload commands reset the counters first, so the numbers are attributable to
 the workload. `--report` writes flat `key=value` metrics for
