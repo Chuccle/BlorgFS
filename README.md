@@ -72,11 +72,22 @@ not a substitute for running `Fast` yourself.)
 ## Sanitizers
 
 The usermode sandbox targets build with **ASan** (`EnableASAN`) — it owns
-memory-safety there, and the gate runs under it. Two things it needs:
-`/Zi` rather than `/ZI`, and `LinkIncremental=false` in a *configuration*
-PropertyGroup (setting it inside `ClCompile` is silently ignored). The
-runtime DLL is copied beside the binary by a post-build target; without it
-the exe does not start at all.
+memory-safety there, and the gate runs under it. Three things every ASan
+target needs, and each fails in its own unhelpful way if missed:
+
+| Requirement | Symptom when missing |
+|---|---|
+| `/Zi`, not `/ZI` | ASan and Edit-and-Continue are incompatible |
+| `LinkIncremental=false` in a *configuration* PropertyGroup | `LNK4300: ignoring '/INCREMENTAL' because input module contains ASAN metadata` on every link. Setting it inside `ClCompile` is silently ignored. |
+| A `CopyAsanRuntime` post-build target | The exe exits `0xC0000135` before `main`, so the suite reports a bare non-zero exit and no output |
+
+That last one is per project and easy to get wrong, because a *solution*
+build puts every binary in one directory — so a target with no copy step
+still runs, using the DLL some other project deposited next to it.
+`tools\Invoke-BlorgChecks.ps1` builds project-by-project instead, where
+output is project-local, and there the missing copy is fatal. A target can
+therefore pass in CI and fail in the gate, or the reverse, purely on which
+build shape ran last.
 
 The driver itself builds with **KASAN**:
 
