@@ -204,12 +204,17 @@ typedef struct _BLORGFS_STATISTICS
     // goes at the end even when it belongs with the prefetch counters
     // above.
     //
-    // Reads that missed the ring, but where some slot's range actually
-    // covered the requested one -- the slot was rejected only because the
-    // lookup demands Offset == RangeOffset exactly rather than containment.
-    // This is the cost of that exact match: every near miss is a full HTTP
-    // round trip spent re-fetching bytes the ring already had or had in
-    // flight. Read it against PrefetchMisses.
+    // Reads that missed the ring while some slot's range did cover them.
+    // The name predates the lookup becoming a containment test and now
+    // overstates what it finds: the miss scan and the serve scan share
+    // PrefetchSlotCovers, so a covered-but-unserved read is almost always
+    // one thing -- the slot is in flight and another reader is already
+    // parked on it, one waiter per slot.
+    //
+    // That makes this a contention counter, not a coverage one: two
+    // readers on the same file chasing the same chunk, the second paying a
+    // full round trip for bytes already on the wire. Read it against
+    // PrefetchParks. See PrefetchCountNearMiss in Prefetch.c.
     //
     ULONG64 PrefetchNearMisses;
 

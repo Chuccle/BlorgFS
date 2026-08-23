@@ -63,9 +63,14 @@
 // useful only while the reader stayed in phase with the chunk grid -- any
 // drift turned into a permanent stream of misses rather than a gradual
 // falloff, because a read one byte off a boundary missed a slot holding
-// every byte it wanted. PrefetchNearMisses (Statistics.h) counts reads
-// that a containment test would have served and an exact one would not, so
-// the cost of narrowing this again is measurable rather than argued.
+// every byte it wanted.
+//
+// PrefetchNearMisses (Statistics.h) was the counter that measured the cost
+// of that exact match, and containment retired the case it counted. It
+// still runs, and now finds the one other way a covered slot goes unserved:
+// the slot is in flight with another reader already parked on it. Its name
+// no longer describes it -- see PrefetchCountNearMiss in Prefetch.c before
+// reading anything into the number.
 //
 // Sizing PREFETCH_CHUNK to the real paging-read size still matters for
 // fetch efficiency, but it is no longer load-bearing for correctness of

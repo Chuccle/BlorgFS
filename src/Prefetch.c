@@ -675,12 +675,28 @@ static BOOLEAN PrefetchSlotCovers(PREFETCH_RING* Ring, ULONG Index, ULONG64 Offs
 }
 
 //
-// Counts a miss that a containment test would have served: some slot's
-// range covers [Offset, Offset + Length) but the lookup in
-// BlorgPrefetchServeRead rejected it, because that lookup demands
-// Offset == RangeOffset exactly rather than mere coverage. Every near miss
-// is a full HTTP round trip spent re-fetching bytes the ring already held
-// or already had in flight, so this is the running cost of the exact match.
+// Counts a miss that some slot's range did cover, which since the lookup
+// became a containment test no longer means what the name suggests.
+//
+// It used to mean "a containment test would have served this and the
+// exact-offset one did not", and it measured the running cost of exact
+// matching. That case cannot occur any more: this scan and the serve scan
+// call the same PrefetchSlotCovers, so anything covered here was covered
+// there too. What is left is the reasons the serve path can decline a slot
+// it matched, and there is essentially one -- the slot is still in flight
+// and another reader is already parked on it. One waiter per slot, so the
+// second concurrent reader of the same range falls through to a direct
+// fetch.
+//
+// So this now measures the cost of that restriction, which is exactly the
+// multi-stream case worth watching: two readers on one file (a video and
+// its subtitle track) chasing the same chunk, where the second pays a full
+// round trip for bytes already on the wire. A small remainder is race
+// rather than contention -- the serve loop drops the lock before this
+// runs, so a fetch can land in the gap and make a slot Ready that was not.
+//
+// Read it against PrefetchParks rather than PrefetchMisses: a high ratio
+// says slots are contended, not that coverage is poor.
 //
 // Must run before the re-aim below, which drops Ready slots and would erase
 // the evidence. Takes Ring->Lock itself rather than extending the caller's
