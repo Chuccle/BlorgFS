@@ -57,17 +57,24 @@ LoadOrderGroup = "File System"
 AddReg         = BlorgFS.Service.AddReg
 
 [BlorgFS.Service.AddReg]
-; Seeds the one override worth setting out of the box -- Driver.c's
-; ReadBlorgfsRegistryConfig already falls back to this exact hostname
-; (BLORGFS_DEFAULT_REMOTE_HOST) when the value is absent, so this line
-; only exists to give operators a ready-to-edit registry value instead of
-; requiring reg.exe archaeology to find where the override goes. TLS
-; (TlsEnabled/TlsPin) is deliberately left unset here -- opt in explicitly
-; once a cert is available to pin.
+; Seeds the one override worth setting out of the box. The value must stay
+; identical to BLORGFS_DEFAULT_REMOTE_HOST in Driver.c, which is what
+; ReadBlorgfsRegistryConfig falls back to when this registry value is
+; absent -- then an INF install and a bare driver load reach the same
+; backend, and this line only decides whether operators have a
+; ready-to-edit value or have to go looking for where the override lives.
+;
+; They had drifted: this seeded "blorgfs.blorg.lan" while the driver
+; defaulted to 10.0.50.17, so an INF install with no -RemoteHost override
+; pointed at a name nothing resolves, and the comment claiming they matched
+; was the reason nobody looked.
+;
+; TLS (TlsEnabled/TlsPin) is deliberately left unset here -- opt in
+; explicitly once a cert is available to pin.
 HKR,Parameters,RemoteHost,0x00000000,%DefaultRemoteHost%
 
 [Strings]
 ManufacturerName   = "BlorgFS Project"
 ServiceDescription = "BlorgFS Filesystem Driver"
 DiskName           = "BlorgFS Installation Disk"
-DefaultRemoteHost  = "blorgfs.blorg.lan"
+DefaultRemoteHost  = "10.0.50.17"

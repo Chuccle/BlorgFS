@@ -483,6 +483,12 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
 //
 #define BLORGFS_REG_TAG 'GRBT'
 #define BLORGFS_REG_PORT_MAX_CHARS 8 // "65535" + NUL, with headroom
+//
+//  Kept identical to DefaultRemoteHost in BlorgFS.inf, which seeds
+//  Parameters\RemoteHost with the same string at install time. If the two
+//  drift, an INF install and a bare driver load reach different backends
+//  and only one of them is the one anybody tested.
+//
 #define BLORGFS_DEFAULT_REMOTE_HOST L"10.0.50.17"
 
 //
