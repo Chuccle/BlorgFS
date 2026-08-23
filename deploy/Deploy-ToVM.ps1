@@ -13,7 +13,7 @@
       2. Power the VM on (if not already) and wait for VMware Tools to come up.
       3. (optional) Build BlorgFS.sln locally with msbuild.
       4. Copy BlorgFS.sys / BlorgFS.inf / BlorgFS.cat / BlorgFS.cer / Install-BlorgFS.ps1
-         into the guest.
+         into the guest, plus PerfHarness.exe when it has been built.
       5. Run Install-BlorgFS.ps1 inside the guest as admin.
       6. If the guest reports test-signing was just turned on (exit code 2 -- see
          Install-BlorgFS.ps1), reset the VM, wait for it to come back up, and retry
@@ -232,6 +232,24 @@ if (Test-Path $catPath) {
     Copy-ToGuest $catPath "$GuestDeployDir\BlorgFS.cat"
 }
 Copy-ToGuest (Join-Path $PSScriptRoot "Install-BlorgFS.ps1") "$GuestDeployDir\Install-BlorgFS.ps1"
+
+# PerfHarness speaks a versioned statistics contract with the driver, and the
+# driver checks the version so a stale harness fails loudly rather than
+# misreading a struct whose tail has moved. Staging it with the driver is what
+# keeps that check from being the thing that finds out: deploying the two
+# separately has twice meant measuring with a harness older than the .sys
+# beside it. Skipped rather than fatal when it has not been built -- a deploy
+# for debugging has no reason to need it.
+#
+# Release specifically, and from the project's own output directory: a
+# solution build and a per-project build write to different places, so the
+# copy at the repo root can be arbitrarily older than this one.
+$harnessPath = Join-Path (Split-Path -Parent $PSScriptRoot) "tests\PerfHarness\x64\Release\PerfHarness.exe"
+if (Test-Path $harnessPath) {
+    Copy-ToGuest $harnessPath "$GuestDeployDir\PerfHarness.exe"
+} else {
+    Write-Host "  (PerfHarness.exe not built; skipping)" -ForegroundColor DarkGray
+}
 
 function Invoke-InstallInGuest {
     $extraArgs = @()
