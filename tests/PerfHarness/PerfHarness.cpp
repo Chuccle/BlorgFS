@@ -695,6 +695,14 @@ struct StreamContext
     LARGE_INTEGER Frequency;
     LARGE_INTEGER Start;
     StreamResult* Result;
+
+    //
+    // Opens the stream with FILE_FLAG_NO_BUFFERING, so every read goes to
+    // the driver instead of being served by Cc. Buffered numbers measure
+    // the filesystem; unbuffered ones measure the transport, which is what
+    // a comparison against a usermode HTTP client is actually asking about.
+    //
+    bool Unbuffered;
 };
 
 static DWORD WINAPI StreamWorker(LPVOID parameter)
@@ -703,8 +711,15 @@ static DWORD WINAPI StreamWorker(LPVOID parameter)
     ctx->Result->Ok = false;
     ctx->Result->Bytes = 0;
 
+    DWORD streamFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
+
+    if (ctx->Unbuffered)
+    {
+        streamFlags |= FILE_FLAG_NO_BUFFERING;
+    }
+
     HANDLE file = CreateFileW(ctx->Path, GENERIC_READ, FILE_SHARE_READ, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        OPEN_EXISTING, streamFlags, nullptr);
 
     if (INVALID_HANDLE_VALUE == file)
     {
@@ -712,8 +727,19 @@ static DWORD WINAPI StreamWorker(LPVOID parameter)
         return 0;
     }
 
+    //
+    // Unbuffered streams read PREFETCH-sized blocks rather than the 64 KB an
+    // application would issue. With Cc bypassed there is no read-ahead to
+    // cluster small reads, so 64 KB would leave only 64 KB per stream in
+    // flight and measure request overhead instead of transport -- and the
+    // usermode client this is compared against issues 512 KB.
+    //
+    const DWORD streamReadSize = ctx->Unbuffered
+        ? ((512u * 1024u + kSectorAlignment - 1) & ~(kSectorAlignment - 1))
+        : kWorkloadReadSize;
+
     unsigned char* buffer = static_cast<unsigned char*>(
-        VirtualAlloc(nullptr, kWorkloadReadSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        VirtualAlloc(nullptr, streamReadSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 
     if (!buffer)
     {
@@ -742,7 +768,7 @@ static DWORD WINAPI StreamWorker(LPVOID parameter)
 
         DWORD read = 0;
 
-        if (!ReadFile(file, buffer, kWorkloadReadSize, &read, nullptr))
+        if (!ReadFile(file, buffer, streamReadSize, &read, nullptr))
         {
             PrintLastError("stream read");
             break;
@@ -786,6 +812,7 @@ static bool RunStreams(
     const wchar_t* directory,
     unsigned long streamCount,
     double seconds,
+    bool unbuffered,
     unsigned long long* bytesOut,
     double* secondsOut)
 {
@@ -818,6 +845,7 @@ static bool RunStreams(
         contexts[i].Frequency = frequency;
         contexts[i].Start = start;
         contexts[i].Result = &results[i];
+        contexts[i].Unbuffered = unbuffered;
 
         threads[i] = CreateThread(nullptr, 0, StreamWorker, &contexts[i], 0, nullptr);
 
@@ -1274,7 +1302,9 @@ static void PrintUsage(void)
     printf("  seq <file> [buffered]          sequential read; unbuffered unless 'buffered'\n");
     printf("  rand <file> <blockKB> <count>  random reads at a fixed block size\n");
     printf("  meta <dir> <passes>            enumerate + open every entry, repeatedly\n");
-    printf("  streams <dir> <count> [secs]   N concurrent sequential readers, one file each\n");
+    printf("  streams <dir> <count> [secs] [unbuffered]\n");
+    printf("                                 N concurrent sequential readers, one file each;\n");
+    printf("                                 'unbuffered' bypasses Cc so every read reaches the driver\n");
     printf("                                 reports aggregate, fairness and latency tail\n\n");
     printf("  --report <path>                (any workload) also write key=value metrics\n");
     printf("                                 for Compare-BlorgMetrics.ps1; position-independent\n\n");
@@ -1385,8 +1415,11 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
             return 1;
         }
 
-        ok = RunStreams(argv[2], streamCount, runSeconds, &bytes, &seconds);
-        sprintf_s(label, "concurrent streams (%lu x %.0f s)", streamCount, runSeconds);
+        const bool unbuffered = (argc > 5) && (0 == wcscmp(argv[5], L"unbuffered"));
+
+        ok = RunStreams(argv[2], streamCount, runSeconds, unbuffered, &bytes, &seconds);
+        sprintf_s(label, "concurrent streams (%lu x %.0f s%s)", streamCount, runSeconds,
+            unbuffered ? ", unbuffered" : "");
     }
     else if (0 == wcscmp(argv[1], L"meta"))
     {
