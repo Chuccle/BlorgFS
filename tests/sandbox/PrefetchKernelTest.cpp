@@ -44,6 +44,7 @@ int  PrefetchModelCompleteNextFetch(NTSTATUS Status);
 int  PrefetchModelCompleteAllFetches(NTSTATUS Status);
 int  PrefetchModelSettle(NTSTATUS Status);
 VOID PrefetchModelReset(VOID);
+VOID PrefetchModelSetFillByte(unsigned char Value);
 
 //
 // The single counter block these targets use in place of the driver's
@@ -1054,6 +1055,187 @@ TEST_F(PrefetchKernelTest, DetachRacingCompletionsIsSafe)
     ShimDrainWorkItems();
 
     EXPECT_EQ(nullptr, Fcb.PrefetchRing);
+}
+
+//
+// Two properties at once, and they need the same setup: enough streams
+// live AT THE SAME TIME that even the largest tier cannot give them all
+// PREFETCH_MIN_DEPTH. Nothing is settled or detached inside the arming
+// loop, so chunks cannot be recycled between streams and demand is
+// genuinely unsatisfiable rather than merely bursty.
+//
+// That simultaneity is load-bearing for the ceiling assertion. An earlier
+// version of this test armed streams one at a time, letting each finish
+// before the next began; every stream was then served out of the free list
+// and the allocation path -- the only thing the budget gates -- was
+// essentially never re-entered. It passed against a driver whose budget
+// accounting was deliberately broken, which makes it worth stating plainly:
+// a ceiling can only be tested where something is actually pushing on it.
+//
+// The property this whole design exists for is the other one. Past the
+// budget every stream must still arm and still prefetch -- shallower, but
+// working. Under the old ring cap this was a cliff: streams past the cap
+// got no ring at all and fell back to full-RTT direct fetches for their
+// entire lifetime.
+//
+TEST_F(PrefetchKernelTest, EveryStreamStillArmsWhenTheChunkPoolIsExhausted)
+{
+    const int kFiles = 48;
+    const ULONG64 kFileBytes = 8 * PREFETCH_CHUNK;
+    const LONG64 kLargestTier = 64;
+
+    std::vector<FCB> fcbs(kFiles);
+    std::vector<unsigned char> buffer(PREFETCH_CHUNK, 0);
+
+    const ULONG64 refusedBefore = ShimStatistics.PrefetchRingsRefused;
+
+    for (int i = 0; i < kFiles; ++i)
+    {
+        memset(&fcbs[i], 0, sizeof(FCB));
+        fcbs[i].FullPath.Buffer = PathBuffer;
+        fcbs[i].FullPath.Length = Fcb.FullPath.Length;
+        fcbs[i].FullPath.MaximumLength = Fcb.FullPath.Length;
+        fcbs[i].Header.FileSize.QuadPart = (LONGLONG)kFileBytes;
+
+        for (ULONG64 offset = 0; offset < 2 * PREFETCH_CHUNK; offset += PREFETCH_CHUNK)
+        {
+            BlorgPrefetchServeRead(&fcbs[i], MakeRead(buffer.data(), PREFETCH_CHUNK),
+                offset, PREFETCH_CHUNK);
+        }
+    }
+
+    int armed = 0;
+
+    for (int i = 0; i < kFiles; ++i)
+    {
+        if (fcbs[i].PrefetchRing)
+        {
+            ++armed;
+        }
+    }
+
+    EXPECT_EQ(kFiles, armed)
+        << "only " << armed << " of " << kFiles << " streams armed under chunk "
+           "pressure -- exhausting the pool is supposed to cost depth, not the "
+           "whole pipeline";
+
+    EXPECT_EQ(refusedBefore, ShimStatistics.PrefetchRingsRefused)
+        << "a ring was refused under memory pressure; only the unload drain may "
+           "refuse an arm";
+
+    EXPECT_GT(ShimStatistics.PrefetchChunkStarvations, 0ull)
+        << "the pool was never actually exhausted, so this test proved nothing -- "
+           "raise kFiles above the largest budget tier";
+
+    EXPECT_LE(BlorgStatisticsGauges.PrefetchChunksLive, kLargestTier)
+        << "chunks live reached " << BlorgStatisticsGauges.PrefetchChunksLive
+        << " with " << kFiles << " streams demanding at once, above the largest "
+           "budget tier (" << kLargestTier << ") -- the budget is not bounding "
+           "allocation, so concurrency translates directly into non-paged pool";
+
+    PrefetchModelSettle(STATUS_SUCCESS);
+    ShimDrainWorkItems();
+
+    for (int i = 0; i < kFiles; ++i)
+    {
+        BlorgPrefetchDetach(&fcbs[i]);
+    }
+
+    PrefetchModelSettle(STATUS_SUCCESS);
+    ShimDrainWorkItems();
+}
+
+//
+// Chunks are recycled between unrelated files now, which is a new way to
+// serve the wrong bytes: a chunk released by one stream and handed to
+// another still holds the first file's data until the fetch overwrites it.
+// A slot that reached Ready without its fetch having actually filled it
+// would hand that stale content to the second reader as a hit.
+//
+// The two streams use distinct fill bytes, so any byte the second reader
+// receives carrying the first one's fill is the recycled chunk leaking
+// through.
+//
+// Unlike the two tests above, this one is NOT mutation-controlled, and
+// that is worth saying rather than leaving for someone to discover. Every
+// mutation tried against it destroyed its own premise -- publishing a slot
+// Ready before its fetch runs means no fetch ever writes the first file's
+// fill, so there is nothing left to leak and the test passes for the wrong
+// reason. It is a guard against a class of regression that chunk recycling
+// newly makes possible, not evidence that today's code is right.
+//
+TEST_F(PrefetchKernelTest, ARecycledChunkNeverServesAnotherFilesBytes)
+{
+    const ULONG64 kFileBytes = 4 * PREFETCH_CHUNK;
+    const unsigned char kFirstFill = 0x11;
+    const unsigned char kSecondFill = 0x22;
+
+    FCB first;
+    memset(&first, 0, sizeof(first));
+    first.FullPath.Buffer = PathBuffer;
+    first.FullPath.Length = Fcb.FullPath.Length;
+    first.FullPath.MaximumLength = Fcb.FullPath.Length;
+    first.Header.FileSize.QuadPart = (LONGLONG)kFileBytes;
+
+    std::vector<unsigned char> buffer(PREFETCH_CHUNK, 0);
+
+    PrefetchModelSetFillByte(kFirstFill);
+
+    for (ULONG64 offset = 0; offset < kFileBytes; offset += PREFETCH_CHUNK)
+    {
+        BlorgPrefetchServeRead(&first, MakeRead(buffer.data(), PREFETCH_CHUNK),
+            offset, PREFETCH_CHUNK);
+    }
+
+    PrefetchModelSettle(STATUS_SUCCESS);
+    ShimDrainWorkItems();
+
+    //
+    // Detaching returns the first file's chunks to the pool, so the second
+    // stream is handed the very chunks still holding 0x11.
+    //
+    BlorgPrefetchDetach(&first);
+
+    PrefetchModelSettle(STATUS_SUCCESS);
+    ShimDrainWorkItems();
+
+    FCB second;
+    memset(&second, 0, sizeof(second));
+    second.FullPath.Buffer = PathBuffer;
+    second.FullPath.Length = Fcb.FullPath.Length;
+    second.FullPath.MaximumLength = Fcb.FullPath.Length;
+    second.Header.FileSize.QuadPart = (LONGLONG)kFileBytes;
+
+    PrefetchModelSetFillByte(kSecondFill);
+
+    for (ULONG64 offset = 0; offset < kFileBytes; offset += PREFETCH_CHUNK)
+    {
+        std::vector<unsigned char> received(PREFETCH_CHUNK, 0);
+
+        NTSTATUS status = BlorgPrefetchServeRead(&second,
+            MakeRead(received.data(), PREFETCH_CHUNK), offset, PREFETCH_CHUNK);
+
+        PrefetchModelSettle(STATUS_SUCCESS);
+        ShimDrainWorkItems();
+
+        if (STATUS_SUCCESS != status)
+        {
+            continue;
+        }
+
+        for (ULONG b = 0; b < PREFETCH_CHUNK; ++b)
+        {
+            ASSERT_NE(kFirstFill, received[b])
+                << "byte " << b << " of the read at offset " << offset
+                << " carries the previous file's fill -- a recycled chunk reached a "
+                   "reader without its fetch having overwritten it";
+        }
+    }
+
+    BlorgPrefetchDetach(&second);
+
+    PrefetchModelSettle(STATUS_SUCCESS);
+    ShimDrainWorkItems();
 }
 
 } // namespace
