@@ -290,10 +290,9 @@ static double SafeRatio(unsigned long long numerator, unsigned long long denomin
 //
 // Renders the histogram as one line per non-empty bucket, so the shape --
 // which is the whole reason for keeping a distribution -- is visible
-// without post-processing. A bimodal distribution (a fast mode from ring
-// hits and a slow mode from direct fetches) is the signature of a
-// prefetcher that is working but not keeping up, and it is invisible in
-// any single summary number.
+// without post-processing. A bimodal distribution -- a fast mode from
+// requests the backend served warm and a slow mode from cold ones -- is
+// invisible in any single summary number.
 //
 static void PrintLatencyHistogram(const ULONG64* buckets)
 {
@@ -568,9 +567,9 @@ static bool PrintFilesystemStatistics(HANDLE volume)
 }
 
 //
-// Sequential read of one file. Unbuffered mode is what exercises the
-// prefetcher and the HTTP path honestly -- a buffered re-read of a file
-// already resident in Cc measures memcpy, not this filesystem.
+// Sequential read of one file. Unbuffered mode is what exercises the HTTP
+// path honestly -- a buffered re-read of a file already resident in Cc
+// measures memcpy, not this filesystem.
 //
 //
 // Distinct files for the stream workload, largest-first so a short file
@@ -626,9 +625,9 @@ static bool CollectStreamFiles(
     std::vector<std::wstring>* files)
 {
     //
-    // Big enough that a stream spends the run reading rather than opening:
-    // several times PREFETCH_CHUNK x PREFETCH_DEPTH, so the pipeline reaches
-    // steady state instead of measuring its spin-up.
+    // Big enough that a stream spends the run reading rather than opening,
+    // and comfortably past Cc's read-ahead window so the read reaches steady
+    // state instead of measuring its spin-up.
     //
     const unsigned long long minimumBytes = 64ull * 1024 * 1024;
 
@@ -654,8 +653,8 @@ static bool CollectStreamFiles(
 // looks healthy, so this records per-read latency and reports the tail.
 //
 // Each stream gets its own file and its own thread, reads buffered and
-// sequentially (the playback shape, and the only one that reaches the
-// prefetcher -- see BlorgVolumeRead), and runs until the deadline or EOF.
+// sequentially (the playback shape, and the only one Cc reads ahead for --
+// see BlorgVolumeRead), and runs until the deadline or EOF.
 // Latency is per ReadFile of kWorkloadReadSize, which is the stall a player
 // actually feels.
 //
@@ -711,7 +710,7 @@ static DWORD WINAPI StreamWorker(LPVOID parameter)
     }
 
     //
-    // Unbuffered streams read PREFETCH-sized blocks rather than the 64 KB an
+    // Unbuffered streams read 512 KB blocks rather than the 64 KB an
     // application would issue. With Cc bypassed there is no read-ahead to
     // cluster small reads, so 64 KB would leave only 64 KB per stream in
     // flight and measure request overhead instead of transport -- and the
@@ -965,10 +964,9 @@ static bool RunSequential(const wchar_t* path, bool unbuffered, unsigned long lo
 }
 
 //
-// Random reads at a fixed block size. This is the pattern the prefetcher
-// deliberately does not arm for, so the interesting output is the
-// contrast: near-zero prefetch hits and a direct-fetch latency
-// distribution that is the raw backend round trip.
+// Random reads at a fixed block size. Cc's read-ahead has nothing to
+// predict here, so the interesting output is a fetch-latency distribution
+// that is the raw backend round trip with no lookahead hiding any of it.
 //
 static bool RunRandom(
     const wchar_t* path,

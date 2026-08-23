@@ -3,7 +3,7 @@
 //
 // Client.c calls it from HttpKick, so it must resolve; but a target that
 // links the real TlsHandshake.c must not also link this. Same split as
-// NoPrefetchStub.c and NoClientStub.c.
+// NoClientStub.c and NoStatisticsStub.c.
 //
 
 //

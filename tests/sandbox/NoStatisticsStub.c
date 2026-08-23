@@ -6,7 +6,7 @@
 // counter calls them, so they must resolve everywhere; but a target that
 // links the real Statistics.c must not also link this, or the counters it
 // is testing are not the counters being written. Same split as
-// NoPrefetchStub.c and NoClientStub.c.
+// NoClientStub.c and NoTlsHandshakeStub.c.
 //
 // One block stands in for the driver's per-processor table. These targets
 // are not measuring contention on the counters -- they are measuring the

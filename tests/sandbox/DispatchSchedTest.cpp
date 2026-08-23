@@ -4,7 +4,7 @@
 // internal function called directly.
 //
 // Every proof before this one in the project tested a function BELOW
-// dispatch: BlorgNodeTableLookupPin, PrefetchReleaseRef, the socket
+// dispatch: BlorgNodeTableLookupPin, the socket
 // watchdog's completion routine. This one tests the thing a real I/O
 // request actually goes through first: two threads opening the SAME file
 // at the same time, both landing in BlorgVolumeCreate's warm-node branch,

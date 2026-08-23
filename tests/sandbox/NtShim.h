@@ -621,8 +621,8 @@ typedef struct _DEVICE_OBJECT DEVICE_OBJECT, * PDEVICE_OBJECT;
 //
 // The I/O objects the driver's dispatch surface names. Driver.h declares
 // every BlorgXxx dispatch routine, so these must exist even in targets
-// that never run one -- the sandbox exercises the async client, the
-// prefetch ring and the node table, not IRP_MJ dispatch.
+// that never run one -- the sandbox exercises the async client and the
+// node table, not only IRP_MJ dispatch.
 //
 // Only the fields the driver actually reads are here, and DEVICE_OBJECT
 // is real rather than opaque because BlorgGetVolumeDeviceExtension reaches
@@ -781,8 +781,7 @@ struct _IRP
 
     //
     // The buffer the request targets. Paging reads arrive with this
-    // already set by MM, and the prefetch ring copies into it for both a
-    // hit and a parked delivery.
+    // already set by MM, and the HTTP client receives straight into it.
     //
     PMDL MdlAddress;
 

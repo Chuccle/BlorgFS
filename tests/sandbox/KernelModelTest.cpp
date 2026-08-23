@@ -268,8 +268,8 @@ namespace
 
 //
 // The kernel queues a given DPC object at most once. Drivers rely on that
-// for dedup -- the prefetch pump does exactly this -- so a model that
-// queued twice would hide a real double-run bug.
+// for dedup, so a model that queued twice would hide a real double-run
+// bug.
 //
 TEST_F(KernelModelTest, DpcQueuesAtMostOnce)
 {

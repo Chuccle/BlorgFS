@@ -421,12 +421,14 @@ static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObj
 // every fresh TLS connection -- are only freed after BlorgCleanupHttpClient
 // has drained the client.
 //
-// Both drains run before anything is torn down. Each gate refuses new work
-// and waits for what is already outstanding, and both must complete while
-// the filesystem device object still exists: an in-flight request or a
-// queued prefetch pump holds an IO work item queued against it. Rings
-// first, since a live ring is what issues prefetch requests -- draining the
-// requests first would only let the rings issue more.
+// The drain runs before anything is torn down. It refuses new work and
+// waits for what is already outstanding, and must complete while the
+// filesystem device object still exists, because an in-flight request holds
+// an IO work item queued against it.
+//
+// This used to be two drains in a fixed order, rings before requests, since
+// a live prefetch ring would otherwise keep issuing into a drained client.
+// With the ring gone there is one issuer and one gate.
 //
 void DriverUnload(PDRIVER_OBJECT DriverObject)
 {

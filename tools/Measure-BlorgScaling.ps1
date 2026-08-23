@@ -10,11 +10,11 @@
     browse overlapping playback.
 
     Runs PerfHarness's `streams` workload at each stream count in turn, each
-    against a freshly restarted driver so the driver-wide prefetch ring budget
-    starts empty. That restart is not hygiene, it is the measurement: the
-    budget is consumed by files that have been closed but whose FCBs the cache
-    manager still holds, so a sweep without it measures the previous run's
-    leftovers rather than the configuration under test.
+    against a freshly rebooted guest so the Windows cache starts empty. That
+    reboot is not hygiene, it is the measurement: a second run against the
+    same files is served from RAM at thousands of MB/s with no paging reads at
+    all, so a sweep without it measures the previous run's leftovers rather
+    than the configuration under test.
 
     Emits one row per stream count and a scaling-efficiency column, plus the
     driver's own ring counters so a throughput change can be attributed rather

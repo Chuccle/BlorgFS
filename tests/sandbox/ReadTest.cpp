@@ -237,7 +237,7 @@ TEST_F(ReadTest, NonVolumeDeviceObjectReturnsInvalidDeviceRequest)
 // the I/O manager does not validate: a kernel component that builds its
 // own IRP and fills in Parameters.Read.ByteOffset itself. Nothing
 // downstream would have caught it -- the end-of-file trim's comparisons
-// are both false for a negative offset -- and it reaches the prefetcher
+// are both false for a negative offset -- and it reaches the fetch path
 // widened to ULONG64, which is why the offset check in Read.c is
 // independently overflow-proof (WrappingOffsetIsNeverServedFromASlot).
 //

@@ -145,8 +145,8 @@ typedef struct _TLS_HANDSHAKE_CONTEXT
     // QPC stamp taken as the handshake starts, so both terminal paths can
     // report how long it took (Statistics.h). Handshake latency is
     // per-connection rather than per-request, and lands squarely on
-    // stream startup: a fresh stream opens up to PREFETCH_DEPTH
-    // connections at once, each paying this before its first byte moves.
+    // stream startup: a fresh stream opens several connections at once as
+    // Cc's read-ahead fans out, each paying this before its first byte moves.
     // Captured into a local before the context is zeroed on the way out.
     //
     LONG64 IssueQpc;
@@ -411,8 +411,8 @@ static VOID TlsHandshakeIssueReceiveRecordHeaderExpandedCallout(PVOID Parameter)
 // counted, so a handshake spent roughly ten to twelve WSK operations
 // reading a few kilobytes, and any of them that did not complete inline
 // cost a full scheduling round trip. All of that sits on connection
-// establishment, which a fresh stream pays up to PREFETCH_DEPTH times at
-// once.
+// establishment, which a fresh stream pays once per connection as Cc's
+// read-ahead fans out.
 //
 // Instead the ciphertext is received in bulk into the connection's
 // accumulator (Socket.h, shared with the post-handshake record drain in

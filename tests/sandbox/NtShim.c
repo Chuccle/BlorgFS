@@ -890,10 +890,10 @@ VOID IoFreeWorkItem(PIO_WORKITEM IoWorkItem)
 
 //
 // The kernel does not dedup work items; queueing one twice before it runs
-// corrupts its list linkage. Drivers that need dedup do it themselves --
-// the prefetch ring's PumpQueued flag exists exactly for this -- so the
-// model reports a double queue rather than silently tolerating it, which
-// is what would let a broken dedup flag pass.
+// corrupts its list linkage. Drivers that need dedup do it themselves with
+// an interlocked flag, so the model reports a double queue rather than
+// silently tolerating it, which is what would let a broken dedup flag
+// pass.
 //
 VOID IoQueueWorkItem(PIO_WORKITEM IoWorkItem, PIO_WORKITEM_ROUTINE Routine, WORK_QUEUE_TYPE QueueType, PVOID Context)
 {

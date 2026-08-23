@@ -96,8 +96,8 @@ void KmSchedWaitUntil(KM_SCHED_PREDICATE Predicate, void* Context, const char* W
 //
 // Lock-based code interleaves at its lock operations, but a refcount
 // protocol has no locks -- the socket watchdog's whole arbitration is two
-// threads racing an InterlockedDecrement, and the prefetch ring's
-// attachment count is the same shape. Without a scheduling point at the
+// threads racing an InterlockedDecrement, and the node table's pin count
+// is the same shape. Without a scheduling point at the
 // atomic itself the explorer can only run one thread's entire body then
 // the other's, which is the two orderings a hand-written test already
 // covers.

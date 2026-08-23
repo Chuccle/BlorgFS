@@ -130,9 +130,9 @@ jobs:
 
     # The sandbox suites compile the real driver sources against a kernel
     # model and are where most of this project's coverage actually lives --
-    # IRQL and lock-order rules, the node-table pin protocol, prefetch
-    # lifetime and interleavings, dispatch and IOCTL routing, client
-    # scenarios and fuzzing. CI built them and then never ran them, so a
+    # IRQL and lock-order rules, the node-table pin protocol and its
+    # interleavings, dispatch and IOCTL routing, client scenarios and
+    # fuzzing. CI built them and then never ran them, so a
     # green tick meant only that they compiled.
     #
     # Run the binaries directly rather than tools\Invoke-BlorgChecks.ps1
@@ -157,7 +157,6 @@ jobs:
           'ClientSandbox.exe',
           'ClientFuzz.exe',
           'SocketSandbox.exe',
-          'PrefetchSandbox.exe',
           'NodeTableSandbox.exe',
           'DispatchSandbox.exe',
           'TlsHandshakeSandbox.exe'

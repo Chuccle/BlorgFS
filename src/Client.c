@@ -419,8 +419,8 @@ typedef struct _HTTP_CONTEXT
     // QPC stamp taken when the request is built, so HttpComplete can fold
     // metadata requests into their latency counters (Statistics.h). File
     // reads are timed at their own issue sites instead -- the direct-fetch
-    // path off the IRP's DriverContext, the prefetcher off its fetch
-    // context -- because those two want the chunk latency the reader
+    // path off the IRP's DriverContext -- because that wants the chunk
+    // latency the reader
     // actually waits on, which starts before this context exists.
     //
     LONG64 IssueQpc;
@@ -2668,7 +2668,7 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 // PASSIVE_LEVEL only, and still so after the path stopped being formatted
 // as %wZ: UrlEncodePathToAnsi's RtlUnicodeStringToUTF8String is itself
 // paged-code, so no request may ever be issued above PASSIVE. Today every
-// issue path (create/dir-control/read FSP workers, prefetch issuance)
+// issue path (create/dir-control/read FSP workers)
 // already is, and the driver's issuance rule names this conversion as the
 // reason. What changed is only that the format string no longer adds a
 // second reason of its own.

@@ -4,7 +4,7 @@
 // FCB/DCB or reports statically, plus the dispatch-entry device-type
 // routing and buffer-size validation shared across them. Both files were
 // previously 0% -- unlike Create.c/Read.c, neither touches the network,
-// the cache manager, or the prefetcher, so these tests build a bare FCB/DCB
+// or the cache manager, so these tests build a bare FCB/DCB
 // and drive the real dispatch entry points directly.
 //
 

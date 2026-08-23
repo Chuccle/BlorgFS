@@ -249,10 +249,10 @@ unequally is a different system from one that shares.
 
 `Measure-BlorgScaling.ps1` sweeps stream counts and adds scaling efficiency
 against the single-stream result. **It reboots the guest between runs**, which
-is not hygiene: the prefetch chunk pool and the rings still attached to
-cached FCBs are live driver state that a counter reset does not touch, so a
-sweep without a real reset measures the previous run's warmed pool and its
-still-open files from the second row onward. `sc stop` cannot provide that
+is not hygiene: the Windows cache holds the previous run's files, and a
+counter reset does not touch it. A second run against the same files is
+served from RAM at thousands of MB/s with no paging reads at all, so a sweep
+without a real reset measures that from the second row onward. `sc stop` cannot provide that
 reset -- it wedges in `STOP_PENDING` (see `deploy/DEBUGGING.md`).
 
 Workload commands reset the counters first, so the numbers are attributable to

@@ -236,8 +236,8 @@ The actual chain:
    delete never completes, and `DriverUnload` never runs.
 
 Fix direction (not yet implemented): give the volume a real dismount path —
-handle `IRP_MN_DISMOUNT_VOLUME`, tear down the FCB/DCB tree and the prefetch
-rings, clear `VPB_MOUNTED`, and let FltMgr detach. Until then, **a guest
+handle `IRP_MN_DISMOUNT_VOLUME`, tear down the FCB/DCB tree, clear
+`VPB_MOUNTED`, and let FltMgr detach. Until then, **a guest
 reboot between driver deploys is mandatory**, which `Deploy-ToVM.ps1` does
 not currently do on its own.
 

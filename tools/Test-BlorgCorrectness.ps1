@@ -26,7 +26,7 @@
                 fetched over HTTP. Catches corruption, chunk misordering,
                 short reads, and off-by-one at chunk boundaries.
       range     Random offset/length reads match the same byte range fetched
-                with an HTTP Range header. Catches prefetch and ring bugs
+                with an HTTP Range header. Catches read-path and range bugs
                 that only appear on non-sequential access.
       reread    A second read returns identical bytes. Catches cache
                 coherency and node-reuse bugs.

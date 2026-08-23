@@ -275,7 +275,6 @@ VOID FsRtlUninitializeFileLock(PFILE_LOCK F) { (void)F; }
 VOID FsRtlInitializeOplock(POPLOCK O) { (void)O; }
 VOID FsRtlUninitializeOplock(POPLOCK O) { (void)O; }
 
-VOID BlorgPrefetchDetach(struct _FCB* Fcb) { (void)Fcb; }
 void BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO D) { (void)D; }
 
 //

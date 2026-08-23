@@ -47,9 +47,8 @@
 
 .PARAMETER PerfFile
     A file on that volume large enough for a sequential read to be
-    meaningful -- ideally several times PREFETCH_CHUNK x PREFETCH_DEPTH
-    (512 KB x 8 = 4 MB) so the pipeline reaches steady state rather than
-    measuring only its spin-up.
+    meaningful -- comfortably larger than Cc's read-ahead window so the
+    read reaches steady state rather than measuring only its spin-up.
 
 .PARAMETER BaselineDirectory
     Where accepted baselines live. Defaults to tools\baselines.
