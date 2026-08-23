@@ -130,7 +130,6 @@
     <ClCompile Include="SandboxSocket.c" />
     <ClCompile Include="..\..\src\Statistics.c" />
     <ClCompile Include="..\..\src\PathCache.c" />
-    <ClCompile Include="..\..\src\Util.c" />
     <ClCompile Include="..\..\src\FspWorkQueue.c" />
     <ClCompile Include="..\..\src\CacheManager.c" />
     <ClCompile Include="..\..\src\Cleanup.c" />
