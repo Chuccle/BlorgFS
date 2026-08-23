@@ -92,7 +92,7 @@ _When_((PoolType& NonPagedPoolMustSucceed) != 0,
 // a probe fault propagates its exception code (e.g. STATUS_ACCESS_VIOLATION)
 // after tearing the half-built MDL back down.
 //
-inline NTSTATUS BlorgLockUserBuffer(IN OUT PIRP Irp, IN LOCK_OPERATION Operation, IN ULONG BufferLength)
+inline NTSTATUS BlorgLockUserBuffer(PIRP Irp, LOCK_OPERATION Operation, ULONG BufferLength)
 {
     if (Irp->MdlAddress || 0 == BufferLength)
     {
@@ -130,7 +130,7 @@ inline NTSTATUS BlorgLockUserBuffer(IN OUT PIRP Irp, IN LOCK_OPERATION Operation
 // SetFlag'd directly (wrong type/width). Small enough to inline, shared
 // so the cast dance exists in exactly one place.
 //
-inline void BlorgSetIrpContextFlag(IN PIRP Irp, IN ULONG_PTR Flag)
+inline void BlorgSetIrpContextFlag(PIRP Irp, ULONG_PTR Flag)
 {
     ULONG_PTR flags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
     SetFlag(flags, Flag);
@@ -145,7 +145,7 @@ inline void BlorgSetIrpContextFlag(IN PIRP Irp, IN ULONG_PTR Flag)
 // of the IRP -- an oplock break re-queues it through BlorgOplockComplete --
 // cannot act on the flag with the payload already gone.
 //
-inline void BlorgClearIrpContextFlag(IN PIRP Irp, IN ULONG_PTR Flag)
+inline void BlorgClearIrpContextFlag(PIRP Irp, ULONG_PTR Flag)
 {
     ULONG_PTR flags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
     ClearFlag(flags, Flag);
@@ -153,9 +153,9 @@ inline void BlorgClearIrpContextFlag(IN PIRP Irp, IN ULONG_PTR Flag)
 }
 
 inline void BlorgCompleteRequest(
-    IN PIRP Irp OPTIONAL,
-    IN NTSTATUS Status,
-    IN CCHAR PriorityBoost
+    _In_opt_ PIRP Irp,
+    NTSTATUS Status,
+    CCHAR PriorityBoost
 )
 
 /*++
@@ -194,7 +194,7 @@ Return Value:
 }
 
 inline BOOLEAN BlorgIsIrpTopLevel(
-    IN PIRP Irp
+    PIRP Irp
 )
 
 /*++

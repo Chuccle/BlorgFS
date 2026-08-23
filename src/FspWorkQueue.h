@@ -55,13 +55,13 @@ inline void BlorgSetupIrpContext(PIRP Irp, BOOLEAN Wait)
     Irp->Tail.Overlay.DriverContext[0] = C_CAST(PVOID, flags);
 }
 
-NTSTATUS BlorgFsdPostRequest(IN PIRP Irp, IN PIO_STACK_LOCATION IrpSp);
+NTSTATUS BlorgFsdPostRequest(PIRP Irp, PIO_STACK_LOCATION IrpSp);
 
-NTSTATUS BlorgFsdRequeueRequest(IN PIRP Irp);
+NTSTATUS BlorgFsdRequeueRequest(PIRP Irp);
 
-NTSTATUS BlorgPrePostIrp(IN PVOID Context, IN PIRP Irp);
+NTSTATUS BlorgPrePostIrp(PVOID Context, PIRP Irp);
 
-void BlorgOplockPrePostIrp(IN PVOID Context, IN PIRP Irp);
+void BlorgOplockPrePostIrp(PVOID Context, PIRP Irp);
 
 void BlorgOplockComplete(PVOID Context, PIRP Irp);
 

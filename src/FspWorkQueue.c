@@ -288,7 +288,7 @@ Return Value:
 //  strand an IRP its poster already reported as STATUS_PENDING.
 //
 static void AddToWorkqueue(
-    IN PIRP Irp
+    PIRP Irp
 )
 {
     NT_ASSERT(NULL != IoGetCurrentIrpStackLocation(Irp)->FileObject);
@@ -298,8 +298,8 @@ static void AddToWorkqueue(
 }
 
 NTSTATUS BlorgPrePostIrp(
-    IN PVOID Context,
-    IN PIRP Irp
+    PVOID Context,
+    PIRP Irp
 )
 {
 
@@ -377,7 +377,7 @@ NTSTATUS BlorgPrePostIrp(
 //  safely rather than corrupting memory when run in the wrong context.
 //
 
-void BlorgOplockPrePostIrp(IN PVOID Context, IN PIRP Irp)
+void BlorgOplockPrePostIrp(PVOID Context, PIRP Irp)
 {
     BlorgPrePostIrp(Context, Irp);
 
@@ -388,8 +388,8 @@ void BlorgOplockPrePostIrp(IN PVOID Context, IN PIRP Irp)
 }
 
 NTSTATUS BlorgFsdPostRequest(
-    IN PIRP Irp,
-    IN PIO_STACK_LOCATION IrpSp
+    PIRP Irp,
+    PIO_STACK_LOCATION IrpSp
 )
 
 /*++
@@ -441,7 +441,7 @@ Return Value:
 }
 
 NTSTATUS BlorgFsdRequeueRequest(
-    IN PIRP Irp
+    PIRP Irp
 )
 
 /*++
