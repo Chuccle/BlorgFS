@@ -280,7 +280,7 @@ typedef struct _HTTP_CONTEXT
     // (a reused-connection retry may resend it); freed in HttpFreeContext.
     //
     PCHAR RequestBuffer;
-    UNICODE_STRING EncodedPathBuffer; // owns the URL-encoded path memory until request is built
+    ANSI_STRING EncodedPathBuffer;    // owns the URL-encoded path memory until request is built
 
     //
     // TLS-encrypted record wrapping RequestBuffer, sent instead of it
@@ -535,14 +535,22 @@ static BOOLEAN IsCharacterSafeForUrl(UCHAR c)
 }
 
 //
-// Converts a UNICODE_STRING path to UTF-8 then percent-encodes it into a
-// freshly allocated OutputString for use in a request line. Caller must
-// free OutputString->Buffer on success. Allocated NonPagedPoolNx: this
-// buffer lives on the HTTP_CONTEXT and is freed from the WSK completion
-// path (HttpOnSend / HttpFreeContext) at <= DISPATCH_LEVEL, where paged
-// pool may not be freed.
+// Percent-encodes a path into a NUL-terminated ANSI (in practice, UTF-8)
+// string the request formatter can drop straight in.
 //
-static NTSTATUS UrlEncodeUnicodeString(const UNICODE_STRING* InputString, PUNICODE_STRING OutputString)
+// The output is ASCII by construction -- an unreserved byte passes through,
+// anything else becomes '%' plus two hex digits -- which is why it does not
+// go back through UTF-16. It used to build a UNICODE_STRING that
+// HttpBuildRequest then handed to RtlStringCbPrintfA as %wZ, so every
+// character was widened here and narrowed again there: twice the
+// allocation, an extra conversion pass per request, and a %wZ on a path
+// this driver otherwise takes trouble to keep clear of.
+//
+// Caller owns OutputString->Buffer on success and frees it with ExFreePool;
+// on failure the buffer is freed here and nulled, so a failed call leaves
+// nothing to clean up.
+//
+static NTSTATUS UrlEncodePathToAnsi(const UNICODE_STRING* InputString, PANSI_STRING OutputString)
 {
     UTF8_STRING utf8String;
 
@@ -554,25 +562,23 @@ static NTSTATUS UrlEncodeUnicodeString(const UNICODE_STRING* InputString, PUNICO
 
     PUCHAR utf8Buffer = C_CAST(PUCHAR, utf8String.Buffer);
     ULONG utf8Length = utf8String.Length;
-    SIZE_T estimatedLength = 0;
+    SIZE_T encodedLength = 0;
 
     for (ULONG i = 0; i < utf8Length; i++)
     {
         UCHAR c = utf8Buffer[i];
-        estimatedLength += IsCharacterSafeForUrl(c) ? 1 : 3;
+        encodedLength += IsCharacterSafeForUrl(c) ? 1 : 3;
     }
 
-    SIZE_T encodedBytes = estimatedLength * sizeof(WCHAR);
-
-    if (encodedBytes > MAXUSHORT)
+    if (encodedLength + 1 > MAXUSHORT)
     {
         RtlFreeUTF8String(&utf8String);
         return STATUS_NAME_TOO_LONG;
     }
 
-    OutputString->Buffer = C_CAST(PWCHAR, ExAllocatePoolUninitialized(
+    OutputString->Buffer = C_CAST(PCHAR, ExAllocatePoolUninitialized(
         NonPagedPoolNx,
-        encodedBytes,
+        encodedLength + 1,
         'URLE'
     ));
 
@@ -582,7 +588,7 @@ static NTSTATUS UrlEncodeUnicodeString(const UNICODE_STRING* InputString, PUNICO
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    OutputString->MaximumLength = C_CAST(USHORT, encodedBytes);
+    OutputString->MaximumLength = C_CAST(USHORT, encodedLength + 1);
 
     ULONG j = 0;
     status = STATUS_SUCCESS;
@@ -593,29 +599,30 @@ static NTSTATUS UrlEncodeUnicodeString(const UNICODE_STRING* InputString, PUNICO
 
         if (IsCharacterSafeForUrl(c))
         {
-            if (j + 1 > OutputString->MaximumLength / sizeof(WCHAR))
+            if (j + 1 > C_CAST(ULONG, encodedLength))
             {
                 status = STATUS_BUFFER_OVERFLOW;
                 break;
             }
 
-            OutputString->Buffer[j++] = C_CAST(WCHAR, c);
+            OutputString->Buffer[j++] = C_CAST(CHAR, c);
         }
         else
         {
-            if (j + 3 > OutputString->MaximumLength / sizeof(WCHAR))
+            if (j + 3 > C_CAST(ULONG, encodedLength))
             {
                 status = STATUS_BUFFER_OVERFLOW;
                 break;
             }
 
-            OutputString->Buffer[j++] = L'%';
-            OutputString->Buffer[j++] = C_CAST(WCHAR, HEX_TO_CHAR((c >> 4) & 0xF));
-            OutputString->Buffer[j++] = C_CAST(WCHAR, HEX_TO_CHAR(c & 0xF));
+            OutputString->Buffer[j++] = '%';
+            OutputString->Buffer[j++] = C_CAST(CHAR, HEX_TO_CHAR((c >> 4) & 0xF));
+            OutputString->Buffer[j++] = C_CAST(CHAR, HEX_TO_CHAR(c & 0xF));
         }
     }
 
-    OutputString->Length = C_CAST(USHORT, j * sizeof(WCHAR));
+    OutputString->Buffer[j] = '\0';
+    OutputString->Length = C_CAST(USHORT, j);
 
     RtlFreeUTF8String(&utf8String);
 
@@ -2478,15 +2485,22 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 
 //
 // Formats a request line + headers into Ctx->RequestBuffer from a caller
-// -supplied format string. PASSIVE_LEVEL only: the %wZ specifier makes
-// RtlStringCbPrintfA run the same paged-code unicode->ANSI conversion
-// that makes DbgPrint %wZ bugcheck at DISPATCH, so no request may ever be
-// issued above PASSIVE -- today every issue path (create/dir-control/read
-// FSP workers, prefetch issuance) already is. The buffer-size budget
-// counts the format string (whose specifier characters cover their own
-// replacement overhead), the URL-encoded path's byte length (2x its ANSI
-// output), the caller's digit budget, and global.RemoteHostAnsi (bounded
-// by BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES, Driver.h).
+// -supplied format string.
+//
+// PASSIVE_LEVEL only, and still so after the path stopped being formatted
+// as %wZ: UrlEncodePathToAnsi's RtlUnicodeStringToUTF8String is itself
+// paged-code, so no request may ever be issued above PASSIVE. Today every
+// issue path (create/dir-control/read FSP workers, prefetch issuance)
+// already is, and Prefetch.h's issuance rule names this conversion as the
+// reason. What changed is only that the format string no longer adds a
+// second reason of its own.
+//
+// The buffer-size budget counts the format string (whose specifier
+// characters cover their own replacement overhead), the URL-encoded path's
+// length -- now its exact byte count rather than twice it, since the
+// encoder emits the ANSI the formatter consumes -- the caller's digit
+// budget, and global.RemoteHostAnsi (bounded by
+// BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES, Driver.h).
 //
 
 //
@@ -2506,7 +2520,7 @@ static NTSTATUS HttpBuildRequest(
     HTTP_CONTEXT* Ctx
 )
 {
-    NTSTATUS result = UrlEncodeUnicodeString(Path, &Ctx->EncodedPathBuffer);
+    NTSTATUS result = UrlEncodePathToAnsi(Path, &Ctx->EncodedPathBuffer);
 
     if (!NT_SUCCESS(result))
     {
@@ -2519,7 +2533,7 @@ static NTSTATUS HttpBuildRequest(
     if (!NT_SUCCESS(result))
     {
         ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(UNICODE_STRING));
+        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
         return result;
     }
 
@@ -2529,7 +2543,7 @@ static NTSTATUS HttpBuildRequest(
     if (!NT_SUCCESS(result))
     {
         ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(UNICODE_STRING));
+        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
         return result;
     }
 
@@ -2540,17 +2554,17 @@ static NTSTATUS HttpBuildRequest(
     if (!Ctx->RequestBuffer)
     {
         ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(UNICODE_STRING));
+        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     if (IsRangedRequest)
     {
-        result = RtlStringCbPrintfA(Ctx->RequestBuffer, sendBufferSize, FormatString, &Ctx->EncodedPathBuffer, global.RemoteHostAnsi, StartOffset, EndOffsetInclusive);
+        result = RtlStringCbPrintfA(Ctx->RequestBuffer, sendBufferSize, FormatString, Ctx->EncodedPathBuffer.Buffer, global.RemoteHostAnsi, StartOffset, EndOffsetInclusive);
     }
     else
     {
-        result = RtlStringCbPrintfA(Ctx->RequestBuffer, sendBufferSize, FormatString, &Ctx->EncodedPathBuffer, global.RemoteHostAnsi);
+        result = RtlStringCbPrintfA(Ctx->RequestBuffer, sendBufferSize, FormatString, Ctx->EncodedPathBuffer.Buffer, global.RemoteHostAnsi);
     }
 
     if (!NT_SUCCESS(result))
@@ -2558,7 +2572,7 @@ static NTSTATUS HttpBuildRequest(
         ExFreePool(Ctx->RequestBuffer);
         Ctx->RequestBuffer = NULL;
         ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(UNICODE_STRING));
+        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
         return result;
     }
 
@@ -2570,7 +2584,7 @@ static NTSTATUS HttpBuildRequest(
         ExFreePool(Ctx->RequestBuffer);
         Ctx->RequestBuffer = NULL;
         ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(UNICODE_STRING));
+        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
         return result;
     }
 
@@ -2667,7 +2681,7 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
     BLORGFS_STAT_INC(MetaDataDiskReads);
 
     static const char requestFormat[] =
-        "GET /get_dir_info?path=%wZ HTTP/1.1\r\n"
+        "GET /get_dir_info?path=%hs HTTP/1.1\r\n"
         "Host: %hs\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
@@ -2716,7 +2730,7 @@ NTSTATUS BlorgHttpGetFileInformation(
     BLORGFS_STAT_INC(MetaDataDiskReads);
 
     static const char requestFormat[] =
-        "GET /get_dir_entry_info?path=%wZ HTTP/1.1\r\n"
+        "GET /get_dir_entry_info?path=%hs HTTP/1.1\r\n"
         "Host: %hs\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
@@ -2786,7 +2800,7 @@ static NTSTATUS HttpGetFileCommon(
     ctx->ExpectedContentLength = Length;
 
     static const char requestFormat[] =
-        "GET /get_file?path=%wZ HTTP/1.1\r\n"
+        "GET /get_file?path=%hs HTTP/1.1\r\n"
         "Host: %hs\r\n"
         "Connection: keep-alive\r\n"
         "Range: bytes=%zu-%zu\r\n"

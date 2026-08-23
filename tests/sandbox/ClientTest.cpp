@@ -607,6 +607,47 @@ TEST_F(HttpClientTest, RequestLineAndRangeAreWellFormed)
 }
 
 //
+// Non-ASCII in a path, which is where the encoding actually has to be
+// UTF-8 rather than merely "not ASCII-clean". Each of these characters is
+// two UTF-8 bytes, so each becomes two percent-escapes -- a byte-per-byte
+// encoder gets this right and a character-per-character one does not.
+//
+// Worth pinning independently of the space/slash case above because the
+// encoder writes ANSI directly now instead of building UTF-16 for the
+// formatter to narrow again. The wire bytes are the only place that
+// change is observable, and they must not have moved.
+//
+TEST_F(HttpClientTest, NonAsciiPathIsPercentEncodedFromItsUtf8Bytes)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nABCD")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char target[4] = {};
+
+    Mdl = ShimCreateMdl(target, sizeof(target));
+
+    wchar_t path[] = L"/m\u00E9dia/\u00FCn\u00EFcode.bin";
+    UNICODE_STRING pathString = MakePath(path);
+
+    BlorgHttpGetFileMdl(&pathString, 0, sizeof(target), Mdl, OnFileRead, nullptr);
+
+    Drain();
+
+    SIZE_T sentLength = 0;
+    const char* text = (const char*)SandboxLastRequest(&sentLength);
+
+    ASSERT_GT(sentLength, 0u);
+    EXPECT_NE(nullptr, strstr(text, "path=%2Fm%C3%A9dia%2F%C3%BCn%C3%AFcode.bin"))
+        << "multi-byte characters must be escaped one UTF-8 byte at a time";
+
+    FreeMdl();
+}
+
+//
 // The buffer-mode twin of PeerSendingMoreBodyThanContentLength..., and a
 // far worse one: there the over-send is caught before anything is copied,
 // here it is copied first and checked afterwards.

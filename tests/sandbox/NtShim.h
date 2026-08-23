@@ -149,6 +149,9 @@ typedef struct _STRING
     PCHAR  Buffer;
 } STRING, * PSTRING;
 
+typedef STRING ANSI_STRING;
+typedef PSTRING PANSI_STRING;
+
 #ifndef RtlCopyMemory
 #define RtlCopyMemory(d, s, n) memcpy((d), (s), (n))
 #endif
