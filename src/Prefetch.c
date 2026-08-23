@@ -33,30 +33,47 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
 static VOID PrefetchReleaseRing(VOID);
 
 //
-// Driver-wide chunk budget by machine size, the same coarse
-// MmQuerySystemSize tiering fastfat/ntfs use for cache sizing. The tiers
-// are the same 8/16/32 MB of NonPagedPoolNx the old ring cap worked out
-// to at full depth, but denominated in the thing that actually holds the
-// memory, so the ceiling is now a real ceiling rather than a worst case
-// that idle rings reserved and never reached.
+// Driver-wide prefetch budget by machine size, the same coarse
+// MmQuerySystemSize tiering fastfat/ntfs use for cache sizing: 8/16/32 MB
+// of NonPagedPoolNx.
 //
+// Denominated in BYTES and converted to a chunk count, not written as a
+// chunk count directly. PREFETCH_CHUNK is derived from
+// READ_AHEAD_GRANULARITY -- it has to be, since a slot that cannot hold a
+// whole clustered paging read can never serve one -- so a chunk count would
+// make the ring's footprint a side effect of tuning Cc. Raising the
+// granularity from 256 KB to 512 KB, which is worth about 4 MB/s on
+// buffered streaming, would otherwise have silently doubled the ring's
+// non-paged pool from 32 MB to 64 MB.
+//
+#define PREFETCH_BUDGET_SMALL_MB   8
+#define PREFETCH_BUDGET_MEDIUM_MB  16
+#define PREFETCH_BUDGET_LARGE_MB   32
+
 LONG BlorgPrefetchMaxChunks(VOID)
 {
+    ULONG megabytes;
+
     switch (MmQuerySystemSize())
     {
         case MmSmallSystem:
         {
-            return 16;
+            megabytes = PREFETCH_BUDGET_SMALL_MB;
+            break;
         }
         case MmMediumSystem:
         {
-            return 32;
+            megabytes = PREFETCH_BUDGET_MEDIUM_MB;
+            break;
         }
         default:
         {
-            return 64;
+            megabytes = PREFETCH_BUDGET_LARGE_MB;
+            break;
         }
     }
+
+    return C_CAST(LONG, (megabytes * 1024ull * 1024ull) / PREFETCH_CHUNK);
 }
 
 //

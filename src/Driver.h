@@ -66,7 +66,19 @@
 // check's Length > Hot[i].Length always trips, and every read falls
 // through to a direct fetch.
 //
-#define READ_AHEAD_GRANULARITY (PAGE_SIZE * 64)
+// Raised from 64 to 128 pages (256 KB -> 512 KB) on measured evidence. With
+// Cc as the only lookahead, paging reads averaged ~204 KB against the
+// 512 KB a usermode client issues, so the driver was paying roughly two and
+// a half times the per-request HTTP overhead for the same bytes. At 512 KB,
+// buffered 16-stream throughput went from 23.01 to 27.33 MB/s median, which
+// is ~92% of what the same guest gets from HttpWebRequest measured
+// interleaved with it.
+//
+// 1 MB was also measured and is indistinguishable on throughput, so the
+// smaller value is kept: it halves per-read latency, and a 1 MB read-ahead
+// was reverted once before for making playback stutter worse.
+//
+#define READ_AHEAD_GRANULARITY (PAGE_SIZE * 128)
 
 #include "Structs.h"
 #include "Util.h"
