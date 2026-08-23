@@ -463,6 +463,17 @@ typedef struct _HTTP_CONTEXT
     //
     LONG64 SendDoneQpc;
 
+    //
+    // QPC stamp taken once a socket is in hand, splitting the pre-send time
+    // into "getting a connection" and "everything after". On a clean boot
+    // pre-send showed an 18-29 ms mean with a 2.0 SECOND maximum, traced to
+    // roughly three of only eleven fresh connects; on a warm pool it is
+    // 0.3-1.2 ms. Those two shapes call for different fixes -- a connection
+    // establishment problem versus a scheduling one -- and nothing so far
+    // distinguishes them.
+    //
+    LONG64 SocketQpc;
+
 } HTTP_CONTEXT;
 
 static VOID HttpKick(HTTP_CONTEXT* Ctx);
@@ -1451,6 +1462,7 @@ static VOID HttpOnSocket(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID
 
     ctx->Socket = Socket;
     ctx->ConnectionSource = Reused ? HttpConnectionReused : HttpConnectionFresh;
+    ctx->SocketQpc = BlorgStatisticsNow();
 
     if (global.TlsEnabled && TlsHandshakeComplete != Socket->Tls.State)
     {
@@ -2529,6 +2541,26 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
                 &statsBlock->FetchPreSendMaxUs,
                 NULL,
                 Ctx->SendQpc - Ctx->IssueQpc);
+        }
+
+        if (0 != Ctx->SocketQpc)
+        {
+            BlorgStatisticsRecordLatency(
+                &statsBlock->FetchAcquireSumUs,
+                &statsBlock->FetchAcquireMaxUs,
+                NULL,
+                Ctx->SocketQpc - Ctx->IssueQpc);
+
+            if (HttpConnectionFresh == Ctx->ConnectionSource)
+            {
+                statsBlock->FetchFreshConnects++;
+
+                BlorgStatisticsRecordLatency(
+                    &statsBlock->FetchFreshAcquireSumUs,
+                    &statsBlock->FetchFreshAcquireMaxUs,
+                    NULL,
+                    Ctx->SocketQpc - Ctx->IssueQpc);
+            }
         }
 
         if (0 != Ctx->SendDoneQpc && 0 != Ctx->SendQpc)

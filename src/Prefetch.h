@@ -55,6 +55,27 @@
 // the IRP, and with it the FCB and the ring's attachment reference can
 // go away -- the pump must never run after that handoff.
 //
+// A Ready slot serves MANY reads, not one. A hit copies out the bytes it
+// wants and the slot stays Ready until a read consumes through its tail
+// (slotOffset + Length reaching Hot[i].Length), at which point the chunk
+// goes back to the pool.
+//
+// Retiring the slot on the first hit is what it used to do, and it was
+// throwing most of every chunk away: PREFETCH_CHUNK is 512 KB, a clustered
+// paging read is around 128 KB, so roughly three quarters of each fetched
+// chunk was discarded -- and the very next sequential read, whose bytes
+// were sitting in that discarded chunk, missed. Measured at 16 streams:
+// 487 MB prefetched to serve 95 MB (19.5%), with an 81.9% miss rate.
+//
+// The chunk is still detached from its slot for the copy (slot to Empty,
+// Chunks[i] to NULL) rather than copied under the lock, because the copy
+// is ~128 KB at DISPATCH and Ring->Lock is a leaf that must not be held
+// across it. A surviving slot is reinstated afterwards, but only if the
+// slot is still Empty, still owns no chunk, and the generation has not
+// moved -- a re-aim or a pump reservation during the copy wins, and the
+// chunk goes back to the pool instead. That check is what keeps a
+// reinstate from resurrecting a slot the ring has already moved past.
+//
 // Slot lookup is a CONTAINMENT test: a read is served from slot i whenever
 // [Offset, Offset + Length) lies inside [Hot[i].RangeOffset,
 // RangeOffset + Hot[i].Length). It does not have to start on the slot

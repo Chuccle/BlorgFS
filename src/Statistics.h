@@ -274,6 +274,14 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 PrefetchChunkStarvations;
 
     //
+    // Hits that consumed only part of their slot and left it Ready for the
+    // next read. Against PrefetchHits this says how many reads each fetched
+    // chunk is serving: near zero means chunks are still being retired
+    // after one read and most of every fetch is being thrown away.
+    //
+    ULONG64 PrefetchPartialServes;
+
+    //
     // A file-read fetch split at the moment its response headers land:
     // TTFB is issue-to-headers, body is headers-to-last-byte, and Samples
     // counts the fetches that got far enough to contribute both.
@@ -297,6 +305,19 @@ typedef struct _BLORGFS_STATISTICS
     //
     ULONG64 FetchPreSendSumUs;
     ULONG64 FetchPreSendMaxUs;
+
+    //
+    // Issue to socket-in-hand, split out of pre-send, and the same again
+    // counting only the fetches that needed a brand-new connection. A
+    // clean-boot run showed a 2.0 second pre-send maximum across just
+    // eleven fresh connects; these say whether that time is connection
+    // establishment or something after it.
+    //
+    ULONG64 FetchAcquireSumUs;
+    ULONG64 FetchAcquireMaxUs;
+    ULONG64 FetchFreshAcquireSumUs;
+    ULONG64 FetchFreshAcquireMaxUs;
+    ULONG64 FetchFreshConnects;
 
     //
     // Send-start to send-completion, then send-completion to headers. The
@@ -353,7 +374,7 @@ typedef struct _BLORGFS_STATISTICS_GLOBAL
 // Version is checked by the driver so a stale harness fails loudly
 // instead of misreading a struct whose tail moved.
 //
-#define BLORGFS_STATISTICS_VERSION 3
+#define BLORGFS_STATISTICS_VERSION 4
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

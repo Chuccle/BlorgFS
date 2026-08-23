@@ -384,6 +384,7 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    live now              %12lld\n", stats.Gauges.PrefetchRingsLive);
     printf("    chunks live           %12lld\n", stats.Gauges.PrefetchChunksLive);
     printf("    chunk starvations     %12llu  (pump ran shallow; not a refusal)\n", t.PrefetchChunkStarvations);
+    printf("    partial serves        %12llu  (hit left the slot Ready for the next read)\n", t.PrefetchPartialServes);
     printf("    hit                   %12llu  (%.1f%%)\n", t.PrefetchHits, SafeRatio(t.PrefetchHits, served));
     printf("    park                  %12llu  (%.1f%%)\n", t.PrefetchParks, SafeRatio(t.PrefetchParks, served));
     printf("    miss                  %12llu  (%.1f%%)\n", t.PrefetchMisses, SafeRatio(t.PrefetchMisses, served));
@@ -410,6 +411,15 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
 
         if (t.FetchSplitSamples)
         {
+            printf("      acquire mean / max  %12llu / %llu us\n",
+                t.FetchAcquireSumUs / t.FetchSplitSamples, t.FetchAcquireMaxUs);
+            if (t.FetchFreshConnects)
+            {
+                printf("        fresh: n=%llu mean / max %llu / %llu us\n",
+                    t.FetchFreshConnects,
+                    t.FetchFreshAcquireSumUs / t.FetchFreshConnects,
+                    t.FetchFreshAcquireMaxUs);
+            }
             printf("      pre-send mean / max %12llu / %llu us\n",
                 t.FetchPreSendSumUs / t.FetchSplitSamples, t.FetchPreSendMaxUs);
             printf("      send mean / max     %12llu / %llu us\n",

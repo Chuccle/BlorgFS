@@ -538,6 +538,10 @@ static VOID PrefetchPump(PREFETCH_RING* Ring)
     {
         ULONG i = reserved[r];
 
+        BlorgStatisticsGaugeIncrement(
+            &BlorgStatisticsGauges.FetchesActive,
+            &BlorgStatisticsGauges.FetchesActivePeak);
+
         NTSTATUS status = BlorgHttpGetFileMdl(
             &Ring->Path,
             Ring->Hot[i].RangeOffset,
@@ -553,6 +557,8 @@ static VOID PrefetchPump(PREFETCH_RING* Ring)
             BLORGFS_PRINT("PrefetchPump: issue failed: %8lx\n", status);
 
             BLORGFS_STAT_INC(PrefetchFetchesFailed);
+
+            BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.FetchesActive);
 
             KeAcquireSpinLock(&Ring->Lock, &irql);
             PIRP waiter = Ring->Waiters[i];
@@ -666,6 +672,8 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
     ULONG i = ctx->SlotIndex;
 
     ULONG validBytes = (NT_SUCCESS(Status) && FileBuffer) ? C_CAST(ULONG, FileBuffer->BodyBufferSize) : 0;
+
+    BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.FetchesActive);
 
     PBLORGFS_STATISTICS statsBlock = BlorgStatisticsForCurrentProcessor();
 
@@ -1023,6 +1031,12 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
             if (PrefetchSlotReady == ring->Hot[i].State)
             {
                 PREFETCH_CHUNK_BLOCK* chunk = ring->Chunks[i];
+                ULONG generation = ring->Generation;
+                ULONG64 slotBase = ring->Hot[i].RangeOffset;
+                ULONG slotLength = ring->Hot[i].Length;
+
+                BOOLEAN exhausted = (slotOffset + Length >= slotLength);
+
                 ring->Chunks[i] = NULL;
                 ring->Hot[i].State = PrefetchSlotEmpty;
                 ring->LastConsumeClock = serveClock;
@@ -1044,7 +1058,32 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
 
                 if (chunk)
                 {
-                    PrefetchChunkRelease(chunk);
+                    BOOLEAN reinstated = FALSE;
+
+                    if (!exhausted)
+                    {
+                        KeAcquireSpinLock(&ring->Lock, &irql);
+
+                        if (PrefetchSlotEmpty == ring->Hot[i].State &&
+                            !ring->Chunks[i] &&
+                            generation == ring->Generation)
+                        {
+                            ring->Hot[i].RangeOffset = slotBase;
+                            ring->Hot[i].Length = slotLength;
+                            ring->Hot[i].State = PrefetchSlotReady;
+                            ring->Chunks[i] = chunk;
+                            reinstated = TRUE;
+                        }
+
+                        KeReleaseSpinLock(&ring->Lock, irql);
+
+                        BLORGFS_STAT_INC(PrefetchPartialServes);
+                    }
+
+                    if (!reinstated)
+                    {
+                        PrefetchChunkRelease(chunk);
+                    }
                 }
 
                 BLORGFS_PRINT("prefetch hit off=%llx len=%lx\n", Offset, Length);

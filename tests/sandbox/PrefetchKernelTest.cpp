@@ -1237,4 +1237,70 @@ TEST_F(PrefetchKernelTest, ARecycledChunkNeverServesAnotherFilesBytes)
     ShimDrainWorkItems();
 }
 
+//
+// The property the multi-serve change exists for: a read smaller than
+// PREFETCH_CHUNK must leave its slot Ready so the following read, whose
+// bytes are in the same chunk, hits instead of missing.
+//
+// Retiring the slot on the first hit is what the ring used to do, and it
+// threw away roughly three quarters of every 512 KB chunk against ~128 KB
+// clustered paging reads -- then missed on the very next read.
+//
+TEST_F(PrefetchKernelTest, APartialReadLeavesTheSlotReadyForTheNextRead)
+{
+    const ULONG quarter = PREFETCH_CHUNK / 4;
+
+    std::vector<unsigned char> buffer(PREFETCH_CHUNK, 0);
+
+    for (ULONG64 offset = 0; offset < 2 * PREFETCH_CHUNK; offset += PREFETCH_CHUNK)
+    {
+        BlorgPrefetchServeRead(&Fcb, MakeRead(buffer.data(), PREFETCH_CHUNK), offset, PREFETCH_CHUNK);
+    }
+
+    PrefetchModelSettle(STATUS_SUCCESS);
+    ShimDrainWorkItems();
+
+    const ULONG64 hitsBefore = ShimStatistics.PrefetchHits;
+    const ULONG64 missesBefore = ShimStatistics.PrefetchMisses;
+
+    //
+    // Walk one chunk in quarter-sized reads. The first may hit or miss
+    // depending on where the pipeline is aimed; what matters is that the
+    // three that follow it are served from the same slot.
+    //
+    ULONG64 base = 2 * PREFETCH_CHUNK;
+    int served = 0;
+
+    for (ULONG q = 0; q < 4; ++q)
+    {
+        std::vector<unsigned char> got(quarter, 0);
+
+        NTSTATUS status = BlorgPrefetchServeRead(&Fcb, MakeRead(got.data(), quarter),
+            base + (ULONG64)q * quarter, quarter);
+
+        if (STATUS_SUCCESS == status)
+        {
+            ++served;
+        }
+
+        PrefetchModelSettle(STATUS_SUCCESS);
+        ShimDrainWorkItems();
+    }
+
+    const ULONG64 hits = ShimStatistics.PrefetchHits - hitsBefore;
+    const ULONG64 misses = ShimStatistics.PrefetchMisses - missesBefore;
+
+    EXPECT_GE(hits, 2u)
+        << "only " << hits << " of 4 quarter-chunk reads hit (" << misses
+        << " missed), so a slot is still being retired after one partial read "
+           "and the rest of each fetched chunk is being thrown away";
+
+    EXPECT_GT(ShimStatistics.PrefetchPartialServes, 0ull)
+        << "no partial serve was recorded, so no read left its slot Ready -- "
+           "this test is not exercising the path it exists for";
+
+    EXPECT_GT(served, 0)
+        << "no quarter-chunk read was served from the ring at all";
+}
+
 } // namespace
