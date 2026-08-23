@@ -244,7 +244,22 @@ Copy-ToGuest (Join-Path $PSScriptRoot "Install-BlorgFS.ps1") "$GuestDeployDir\In
 # Release specifically, and from the project's own output directory: a
 # solution build and a per-project build write to different places, so the
 # copy at the repo root can be arbitrarily older than this one.
-$harnessPath = Join-Path (Split-Path -Parent $PSScriptRoot) "tests\PerfHarness\x64\Release\PerfHarness.exe"
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$harnessPath = Join-Path $repoRoot "tests\PerfHarness\x64\Release\PerfHarness.exe"
+
+# Built here rather than trusted from disk. The statistics struct is shared
+# source, so a harness older than the .sys beside it fails the size check
+# with ERROR_INSUFFICIENT_BUFFER and the run reports no driver counters at
+# all. That has now happened twice, both times after adding a counter and
+# rebuilding only the Debug harness that Invoke-BlorgChecks builds -- the
+# Release one this stages is a different binary in a different directory.
+$msbuild = & (Join-Path $repoRoot "tools\Get-BlorgMSBuild.ps1")
+if ($msbuild -and (Test-Path $msbuild)) {
+    Write-Step "Building PerfHarness (Release)"
+    & $msbuild (Join-Path $repoRoot "tests\PerfHarness\PerfHarness.vcxproj") `
+        -p:Configuration=Release -p:Platform=x64 -v:quiet -nologo | Out-Null
+}
+
 if (Test-Path $harnessPath) {
     Copy-ToGuest $harnessPath "$GuestDeployDir\PerfHarness.exe"
 } else {

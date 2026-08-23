@@ -390,7 +390,11 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    miss                  %12llu  (%.1f%%)\n", t.PrefetchMisses, SafeRatio(t.PrefetchMisses, served));
     printf("      of which near       %12llu  (%.1f%% of miss, slot covered the range)\n",
         t.PrefetchNearMisses, SafeRatio(t.PrefetchNearMisses, t.PrefetchMisses));
+    printf("      of which straddle   %12llu  (%.1f%% of miss, began in a slot, ran past its end)\n",
+        t.PrefetchStraddleMisses, SafeRatio(t.PrefetchStraddleMisses, t.PrefetchMisses));
     printf("    re-aims               %12llu\n", t.PrefetchReaims);
+    printf("      chunks discarded    %12llu  (fetched data thrown away by a re-aim)\n",
+        t.PrefetchReaimDiscardedChunks);
     printf("      suppressed (in-window) %9llu  (reader had outrun the pipeline; not re-aimed)\n",
         t.PrefetchReaimsSuppressed);
     printf("    depth growths         %12llu\n", t.PrefetchDepthGrowths);

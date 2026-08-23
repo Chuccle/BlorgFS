@@ -282,6 +282,25 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 PrefetchPartialServes;
 
     //
+    // Misses whose range began inside a Ready slot and ran past its end.
+    // The ring held the bytes, split across two slots, and the containment
+    // lookup could not express that -- so the read paid a full round trip
+    // and the tail of the first slot was never read.
+    //
+    ULONG64 PrefetchStraddleMisses;
+
+    //
+    // Chunks that held fetched data and were thrown away by a re-aim.
+    // A re-aim drops every Ready slot, on the reasoning that a seek makes
+    // the coverage useless -- but a small forward jump leaves chunks ahead
+    // of the new aim point that the reader is about to want. At 512 KB a
+    // chunk, this counter times PREFETCH_CHUNK is wire bandwidth spent and
+    // discarded, and it is the largest unexplained term in the fetched vs
+    // delivered gap.
+    //
+    ULONG64 PrefetchReaimDiscardedChunks;
+
+    //
     // A file-read fetch split at the moment its response headers land:
     // TTFB is issue-to-headers, body is headers-to-last-byte, and Samples
     // counts the fetches that got far enough to contribute both.

@@ -902,6 +902,34 @@ static VOID PrefetchCountNearMiss(PREFETCH_RING* Ring, ULONG64 Offset, ULONG Len
         break;
     }
 
+    //
+    // A read that STARTS inside a Ready slot but runs past its end. The
+    // containment test can never serve one from a single slot, so it
+    // misses and fetches directly -- while the bytes it wanted sit split
+    // across two slots the ring already holds, and the tail of the first
+    // slot goes unread.
+    //
+    // Counted separately from PrefetchNearMisses because it is a different
+    // defect with a different fix: near-misses are contention, these are
+    // coverage the lookup cannot express.
+    //
+    for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
+    {
+        if (PrefetchSlotReady != Ring->Hot[i].State)
+        {
+            continue;
+        }
+
+        ULONG64 slotStart = Ring->Hot[i].RangeOffset;
+        ULONG64 slotEnd = slotStart + Ring->Hot[i].Length;
+
+        if (Offset >= slotStart && Offset < slotEnd && (Offset + Length) > slotEnd)
+        {
+            BLORGFS_STAT_INC(PrefetchStraddleMisses);
+            break;
+        }
+    }
+
     KeReleaseSpinLock(&Ring->Lock, irql);
 }
 
@@ -1186,6 +1214,8 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
         {
             PrefetchChunkRelease(reclaimed[r]);
         }
+
+        BLORGFS_STAT_ADD(PrefetchReaimDiscardedChunks, reclaimedCount);
 
         if (suppressed)
         {
