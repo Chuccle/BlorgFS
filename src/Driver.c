@@ -791,6 +791,27 @@ static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
 // costs executable launch from the volume (the kernel needs the
 // mount-manager volume identity to resolve B: during image activation).
 //
+// The HTTP/WSK client comes up before the filesystem is registered, and that
+// order is load bearing rather than tidy.
+//
+// Not because of DO_DEVICE_INITIALIZING -- an ordinary device object
+// receives nothing until the load completes. IoRegisterFileSystem is the one
+// that matters: it puts this FSD on the I/O manager's registration list there
+// and then, and every arriving volume is offered to every registered
+// filesystem from another thread, so a mount can land while DriverEntry is
+// still running. BlorgMountVolume already says so and is written to survive
+// it (FsCtrl.c: "the window DriverEntry opens between IoRegisterFileSystem
+// and the DDO existing").
+//
+// A mount reaches BlorgCreateVolumeDeviceObject and from there the read path,
+// so initialising the client afterwards left a window in which SocketPool and
+// WskProviderNpi were nothing but their zero-initialised storage. Zeroed is
+// not harmless: IsListEmpty tests Flink against the list head, and a zeroed
+// head has Flink NULL, so the pool reads as NOT empty and the next acquire
+// runs RemoveHeadList on a NULL Flink. WskProviderNpi.Dispatch is NULL over
+// the same window, and every early return from there on therefore tears the
+// client back down.
+//
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     ExInitializeDriverRuntime(0);
@@ -852,10 +873,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     BlorgFsFastDispatch.MdlRead = FsRtlMdlReadDev;
     BlorgFsFastDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;
     
-    NTSTATUS result = BlorgInitializeSecurityDescriptor();
+    NTSTATUS result = BlorgInitialiseHttpClient();
 
     if (!NT_SUCCESS(result))
     {
+        return STATUS_FAILED_DRIVER_ENTRY;
+    }
+
+    result = BlorgInitializeSecurityDescriptor();
+
+    if (!NT_SUCCESS(result))
+    {
+        BlorgCleanupHttpClient();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -865,6 +894,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     if (!NT_SUCCESS(result))
     {
         BlorgFreeSecurityDescriptor();
+        BlorgCleanupHttpClient();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -880,25 +910,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
         BlorgFreeSecurityDescriptor();
+        BlorgCleanupHttpClient();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
     ObReferenceObject(diskDeviceObject);
     global.DiskDeviceObject = diskDeviceObject;
-
-    result = BlorgInitialiseHttpClient();
-
-    if (!NT_SUCCESS(result))
-    {
-        ObDereferenceObject(global.FileSystemDeviceObject);
-        DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
-        global.FileSystemDeviceObject = NULL;
-        ObDereferenceObject(global.DiskDeviceObject);
-        DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
-        global.DiskDeviceObject = NULL;
-        BlorgFreeSecurityDescriptor();
-        return STATUS_FAILED_DRIVER_ENTRY;
-    }
 
     WCHAR portBuffer[BLORGFS_REG_PORT_MAX_CHARS];
     UNICODE_STRING portString;

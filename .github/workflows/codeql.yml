@@ -12,7 +12,16 @@ name: "CodeQL Advanced"
 # workflow or its config therefore runs the analysis it is changing, and
 # workflow_dispatch makes a re-scan available on demand rather than on a
 # seven-day wait (a pack bump, or re-triaging after a fix).
+#
+# The push trigger is what makes the Security tab work at all: code scanning
+# only shows alerts for the default branch from an on.push analysis, so
+# without it the schedule produced results that were uploaded and then never
+# surfaced anywhere a person would look. CodeQL itself says so as a workflow
+# warning on every run.
+#
 on:
+  push:
+    branches: [ master ]
   schedule:
     - cron: '41 23 * * 6'
   workflow_dispatch:
@@ -142,7 +151,7 @@ jobs:
 
     - name: Setup Developer Command Prompt
       if: matrix.language == 'c-cpp'
-      uses: ilammy/msvc-dev-cmd@v1
+      uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
       with:
         arch: ${{ matrix.platform }}
 

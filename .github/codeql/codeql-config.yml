@@ -18,3 +18,30 @@ query-filters:
     tags: exclude-from-incremental
 - exclude:
     query path: /external/examples/filters/
+
+# Three style rules that this codebase can never satisfy, excluded so the
+# Security tab stays worth reading. Between them they produced 57 permanent
+# alerts against code that is written the way the project intends, and a
+# list nobody can ever action is a list nobody reads.
+#
+# cpp/commented-out-code reads the prose comment above a function as
+# commented-out code. The convention here is that comments live at top of
+# file, above a function, or beside a struct field and nowhere else, so
+# almost every explanatory block in the driver trips it.
+#
+# cpp/poorly-documented-function measures comments *inside* a function body
+# and wants at least 2%. The rule here is zero comments inside a body, ever,
+# with the whole explanation in the header above it. A 190-line function
+# with a 40-line header comment scores nought. It is precisely inverted.
+#
+# cpp/long-switch fires on the IRP major-function and information-class
+# dispatch tables, which are long because the surface they cover is.
+#
+# Nothing security-tagged is excluded, and neither is anything from the
+# windows-drivers pack -- the IRQL and annotation queries are the reason
+# that pack is pinned here at all.
+- exclude:
+    id:
+      - cpp/commented-out-code
+      - cpp/poorly-documented-function
+      - cpp/long-switch
