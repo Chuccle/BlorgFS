@@ -9,11 +9,11 @@
 // Shared rather than copied per fixture because this encodes the listing's
 // wire layout -- the FilesOffset/SubDirsOffset arithmetic that must agree
 // with what Client.c's HttpDeserializeDirectoryInfo produces and what
-// GetFileEntry/GetSubDirEntry read back. Two hand-maintained copies of that
+// BlorgGetFileEntry/BlorgGetSubDirEntry read back. Two hand-maintained copies of that
 // arithmetic is exactly the drift this avoids: a layout change would fix one
 // caller and quietly leave the other building a structure the driver reads
 // differently. The entries themselves are filled through the real
-// GetFileEntry/GetSubDirEntry accessors for the same reason.
+// BlorgGetFileEntry/BlorgGetSubDirEntry accessors for the same reason.
 //
 
 #include "..\..\src\Driver.h"
@@ -22,7 +22,7 @@
 
 //
 // Counted entries named "file<N>.bin" and "dir<N>", sized 1000+N. Caller
-// owns the result and frees it with FreeHttpDirectoryInfo (or lets the DCB
+// owns the result and frees it with BlorgFreeHttpDirectoryInfo (or lets the DCB
 // that adopts it do so).
 //
 inline PDIRECTORY_INFO BuildSyntheticListing(int FileCount, int SubDirCount)
@@ -46,7 +46,7 @@ inline PDIRECTORY_INFO BuildSyntheticListing(int FileCount, int SubDirCount)
 
     for (int i = 0; i < FileCount; ++i)
     {
-        PDIRECTORY_FILE_METADATA file = GetFileEntry(info, i);
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(info, i);
         std::wstring name = L"file" + std::to_wstring(i) + L".bin";
 
         file->Size = 1000 + i;
@@ -56,7 +56,7 @@ inline PDIRECTORY_INFO BuildSyntheticListing(int FileCount, int SubDirCount)
 
     for (int i = 0; i < SubDirCount; ++i)
     {
-        PDIRECTORY_SUBDIR_METADATA sub = GetSubDirEntry(info, i);
+        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(info, i);
         std::wstring name = L"dir" + std::to_wstring(i);
 
         sub->NameLength = name.size();
@@ -79,12 +79,12 @@ inline PDIRECTORY_INFO BuildSyntheticListingNamed(const wchar_t* FileName, const
         return nullptr;
     }
 
-    PDIRECTORY_FILE_METADATA file = GetFileEntry(info, 0);
+    PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(info, 0);
     file->Size = 2048;
     file->NameLength = wcslen(FileName);
     wcscpy_s(file->Name, MAX_NAME_LEN, FileName);
 
-    PDIRECTORY_SUBDIR_METADATA sub = GetSubDirEntry(info, 0);
+    PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(info, 0);
     sub->NameLength = wcslen(SubDirName);
     wcscpy_s(sub->Name, MAX_NAME_LEN, SubDirName);
 

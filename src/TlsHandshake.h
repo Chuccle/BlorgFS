@@ -8,7 +8,7 @@
 //
 // Drives a full TLS 1.3 handshake (ClientHello through client Finished)
 // over an already-connected KSOCKET, using the same async WSK primitives
-// (SendWskAsync/ReceiveWskAsync) and completion-chain idioms as the HTTP
+// (BlorgSendWskAsync/BlorgReceiveWskAsync) and completion-chain idioms as the HTTP
 // client (Client.c) -- including its stack-safety discipline for
 // synchronous completion chains (see HttpIssueReceive's comment there
 // for why that matters). This is the kernel-specific I/O-driving glue;
@@ -30,7 +30,7 @@ typedef VOID(*PBLORG_TLS_HANDSHAKE_COMPLETION)(NTSTATUS Status, PVOID CallerCont
 // layer. On failure: Socket->Tls.State == TlsHandshakeFailed -- the
 // caller must close this socket, never pool it.
 //
-VOID TlsStartHandshakeAsync(
+VOID BlorgTlsStartHandshakeAsync(
     PKSOCKET Socket,
     PBLORG_TLS_HANDSHAKE_COMPLETION CompletionRoutine,
     PVOID CallerContext);
@@ -45,22 +45,22 @@ VOID TlsStartHandshakeAsync(
 // TlsHandshake.h/.c, not the portable Tls.h/.c, unlike everything else
 // declared above).
 //
-// TlsSetPin: called once at DriverEntry (from a registry read) and again,
+// BlorgTlsSetPin: called once at DriverEntry (from a registry read) and again,
 // any number of times, from the IOCTL_BLORGFS_SET_TLS_PIN handler
 // (DevIoCtrl.c) -- both PASSIVE_LEVEL. Replaces the running pin
 // atomically; a handshake concurrently checking the old pin either
 // finishes checking against it or the new one, never a torn mix.
 //
-// TlsCheckPin: called from TlsHandshakeProcessFlightMessages (also
+// BlorgTlsCheckPin: called from TlsHandshakeProcessFlightMessages (also
 // PASSIVE_LEVEL) once the leaf certificate's SPKI span is known. Fails
 // closed: returns FALSE both on an actual mismatch AND when no pin has
-// ever been configured (TlsSetPin never called) -- a handshake must not
+// ever been configured (BlorgTlsSetPin never called) -- a handshake must not
 // be treated as authenticated just because pinning was never set up.
 //
-// TlsHandshakeGlobalInit: initializes the pin's push lock. Must run before
+// BlorgTlsHandshakeGlobalInit: initializes the pin's push lock. Must run before
 // either of the above -- called once from DriverEntry, ahead of the
-// registry read that may call TlsSetPin.
+// registry read that may call BlorgTlsSetPin.
 //
-VOID TlsHandshakeGlobalInit(VOID);
-NTSTATUS TlsSetPin(const UCHAR Pin[TLS_HASH_LEN]);
-BOOLEAN TlsCheckPin(const UCHAR* Spki, ULONG SpkiLen);
+VOID BlorgTlsHandshakeGlobalInit(VOID);
+NTSTATUS BlorgTlsSetPin(const UCHAR Pin[TLS_HASH_LEN]);
+BOOLEAN BlorgTlsCheckPin(const UCHAR* Spki, ULONG SpkiLen);

@@ -188,7 +188,7 @@ static NTSTATUS BlorgMountVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
     }
 
     PDEVICE_OBJECT volumeDeviceObject;
-    NTSTATUS status = CreateBlorgVolumeDeviceObject(global.DriverObject, &volumeDeviceObject);
+    NTSTATUS status = BlorgCreateVolumeDeviceObject(global.DriverObject, &volumeDeviceObject);
 
     if (!NT_SUCCESS(status))
     {

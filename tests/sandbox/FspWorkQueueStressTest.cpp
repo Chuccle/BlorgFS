@@ -4,7 +4,7 @@
 // producers and consumers -- previously 3.3% covered and, unlike every
 // other file touched this session, entirely untested for concurrency.
 //
-// This is deliberately NOT a KmExploreInterleavings proof. FspDispatch
+// This is deliberately NOT a KmExploreInterleavings proof. BlorgFspDispatch
 // blocks on KeWaitForMultipleObjects, and that shim does a real
 // WaitForSingleObject/SetEvent (see NtShim.c's own comment: "a real wait,
 // because the drain paths under test are genuinely cross-thread") --
@@ -23,9 +23,9 @@
 // hand-written sequential tests cannot.
 //
 // PsCreateSystemThread is a no-op in this sandbox (DispatchModel.c), so
-// CreateWorkQueue() initializes the real CSQ/events/spinlock but starts no
+// BlorgCreateWorkQueue() initializes the real CSQ/events/spinlock but starts no
 // workers of its own -- the worker threads below are spawned directly
-// against the real (non-static) FspDispatch, which is the actual
+// against the real (non-static) BlorgFspDispatch, which is the actual
 // dequeue-and-dispatch loop under test.
 //
 
@@ -39,7 +39,7 @@ extern "C" {
 
 // Not declared in any header -- FspWorkQueue.c's only other caller is
 // PsCreateSystemThread, which is a no-op in this sandbox.
-VOID FspDispatch(PVOID StartContext);
+VOID BlorgFspDispatch(PVOID StartContext);
 }
 
 #include "DeviceKindScope.h"
@@ -69,7 +69,7 @@ struct ProducerArg
 
 DWORD WINAPI WorkerThreadMain(LPVOID)
 {
-    FspDispatch(NULL);
+    BlorgFspDispatch(NULL);
     return 0;
 }
 
@@ -104,11 +104,11 @@ DWORD WINAPI ProducerThreadMain(LPVOID param)
         // the queue's own insert/dispatch/complete mechanics from Read.c's
         // logic, which already has its own coverage.
         //
-        NTSTATUS status = FsdPostRequest(&slot->Irp, &slot->Stack);
+        NTSTATUS status = BlorgFsdPostRequest(&slot->Irp, &slot->Stack);
 
         if (STATUS_PENDING != status)
         {
-            ADD_FAILURE() << "FsdPostRequest returned " << std::hex << status
+            ADD_FAILURE() << "BlorgFsdPostRequest returned " << std::hex << status
                           << " instead of STATUS_PENDING on iteration " << i;
         }
 
@@ -145,7 +145,7 @@ TEST_F(FspWorkQueueStressTest, ConcurrentPostersAndWorkersCompleteEveryIrpExactl
 {
     ShimReset();
 
-    ASSERT_EQ(STATUS_SUCCESS, CreateWorkQueue());
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
 
     const int kWorkers = 8;
     const int kProducers = 8;
@@ -190,7 +190,7 @@ TEST_F(FspWorkQueueStressTest, ConcurrentPostersAndWorkersCompleteEveryIrpExactl
 
     //
     // Poll for every posted IRP to complete before tearing the queue down,
-    // rather than racing DestroyWorkQueue's own drain-and-cancel against
+    // rather than racing BlorgDestroyWorkQueue's own drain-and-cancel against
     // still-active workers -- that race is real but a different, separate
     // question (graceful vs. torn-down shutdown) from the one this test
     // asks (does concurrent post/dispatch lose or duplicate work).
@@ -225,10 +225,10 @@ TEST_F(FspWorkQueueStressTest, ConcurrentPostersAndWorkersCompleteEveryIrpExactl
         SwitchToThread();
     }
 
-    DestroyWorkQueue();
+    BlorgDestroyWorkQueue();
 
     ASSERT_EQ(WAIT_OBJECT_0, WaitForMultipleObjects(kWorkers, workerHandles, TRUE, 30000))
-        << "worker threads did not exit within 30s of DestroyWorkQueue";
+        << "worker threads did not exit within 30s of BlorgDestroyWorkQueue";
 
     for (int i = 0; i < kWorkers; ++i)
     {
@@ -260,22 +260,22 @@ TEST_F(FspWorkQueueStressTest, ConcurrentPostersAndWorkersCompleteEveryIrpExactl
 ///////////////////////////////////////////////////////////////////////////
 
 //
-// FspDispatch declares `result` outside its inner dequeue loop, and the
+// BlorgFspDispatch declares `result` outside its inner dequeue loop, and the
 // switch's default arm does not assign it. So an IRP whose major function
 // has no case inherits whatever the *previous* IRP in the same batch
 // returned -- and if that was STATUS_PENDING, the
 // `if (STATUS_PENDING != result)` guard skips completion entirely and the
 // IRP is stranded: already removed from the CSQ, so not even
-// DestroyWorkQueue's drain-and-cancel can find it. The caller waits
+// BlorgDestroyWorkQueue's drain-and-cancel can find it. The caller waits
 // forever.
 //
 // Not reachable today: every current poster (Create.c, Read.c, DirCtrl.c,
-// and OplockComplete, which only ever carries CREATE and READ -- FsCtrl.c
+// and BlorgOplockComplete, which only ever carries CREATE and READ -- FsCtrl.c
 // uses the 3-arg FsRtlOplockFsctrl, which takes no completion routine) is
 // one of the three majors the switch handles. It is reachable the moment a
 // fourth major is posted without a matching case, which the post path is
-// already built for: PrePostIrp handles IRP_MJ_WRITE, IRP_MJ_QUERY_EA and
-// IRP_MJ_SET_EA, none of which FspDispatch's switch knows about, and the
+// already built for: BlorgPrePostIrp handles IRP_MJ_WRITE, IRP_MJ_QUERY_EA and
+// IRP_MJ_SET_EA, none of which BlorgFspDispatch's switch knows about, and the
 // write path is tracked work rather than a hypothetical.
 //
 // Both IRPs are posted before any worker exists (PsCreateSystemThread is a
@@ -310,11 +310,11 @@ TEST_F(FspWorkQueueStressTest, UnhandledMajorFunctionIsCompletedRatherThanStrand
         BlorgCreateFCB(&fcb, (CSHORT)BLORGFS_FCB_SIGNATURE, &path, volume, 4096));
     InitializeListHead(&fcb->Links);
 
-    ASSERT_EQ(STATUS_SUCCESS, CreateWorkQueue());
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
 
     //
     // A non-cached read the worker will drive to a real (inline-scripted)
-    // fetch. MdlAddress is set up front so PrePostIrp's LockUserBuffer
+    // fetch. MdlAddress is set up front so BlorgPrePostIrp's BlorgLockUserBuffer
     // no-ops on it and this test owns the MDL's lifetime outright.
     //
     unsigned char readBuffer[4] = {};
@@ -342,8 +342,8 @@ TEST_F(FspWorkQueueStressTest, UnhandledMajorFunctionIsCompletedRatherThanStrand
     writeSlot.Stack.Parameters.Write.Length = 0;
     writeSlot.Irp.StackLocation = &writeSlot.Stack;
 
-    ASSERT_EQ(STATUS_PENDING, FsdPostRequest(&readSlot.Irp, &readSlot.Stack));
-    ASSERT_EQ(STATUS_PENDING, FsdPostRequest(&writeSlot.Irp, &writeSlot.Stack));
+    ASSERT_EQ(STATUS_PENDING, BlorgFsdPostRequest(&readSlot.Irp, &readSlot.Stack));
+    ASSERT_EQ(STATUS_PENDING, BlorgFsdPostRequest(&writeSlot.Irp, &writeSlot.Stack));
 
     HANDLE worker = CreateThread(NULL, 0, WorkerThreadMain, NULL, 0, NULL);
     ASSERT_NE((HANDLE)NULL, worker);
@@ -365,14 +365,14 @@ TEST_F(FspWorkQueueStressTest, UnhandledMajorFunctionIsCompletedRatherThanStrand
     EXPECT_EQ(1, readSlot.Irp.CompletionCount)
         << "the preceding read must still complete exactly once";
 
-    DestroyWorkQueue();
+    BlorgDestroyWorkQueue();
 
     ASSERT_EQ(WAIT_OBJECT_0, WaitForSingleObject(worker, 30000));
     CloseHandle(worker);
 
     SandboxDrainCompletions();
     ShimDrainWorkItems();
-    CleanupWskClient();
+    BlorgCleanupWskClient();
 
     IoFreeMdl(readSlot.Irp.MdlAddress);
     BlorgFreeFileContext(fcb, volume);
@@ -387,17 +387,17 @@ TEST_F(FspWorkQueueStressTest, UnhandledMajorFunctionIsCompletedRatherThanStrand
 // consumed at the top of BlorgVolumeCreate's next pass. When that pass
 // never happens the block has no other owner.
 //
-// Driven through FsdRequeueRequest with the same stash-then-flag-then-
+// Driven through BlorgFsdRequeueRequest with the same stash-then-flag-then-
 // requeue sequence BlorgCreateComplete uses, so the IRP arrives in the
 // queue in exactly the shape production leaves it in. No worker runs here
 // (PsCreateSystemThread is a no-op in this sandbox), so the IRP is still
-// queued when DestroyWorkQueue drains it -- which is the scenario: an
+// queued when BlorgDestroyWorkQueue drains it -- which is the scenario: an
 // unload landing between the network result and the pass that would have
 // used it.
 //
 TEST_F(FspWorkQueueStressTest, TeardownDrainFreesTheStashOnAnIrpItCancels)
 {
-    ASSERT_EQ(STATUS_SUCCESS, CreateWorkQueue());
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
 
     StressIrpSlot slot{};
     slot.Stack.MajorFunction = IRP_MJ_CREATE;
@@ -410,11 +410,11 @@ TEST_F(FspWorkQueueStressTest, TeardownDrainFreesTheStashOnAnIrpItCancels)
     ASSERT_NE(nullptr, stash);
 
     slot.Irp.Tail.Overlay.DriverContext[1] = stash;
-    SetIrpContextFlag(&slot.Irp, IRP_CONTEXT_FLAG_NET_DONE);
+    BlorgSetIrpContextFlag(&slot.Irp, IRP_CONTEXT_FLAG_NET_DONE);
 
-    ASSERT_EQ(STATUS_PENDING, FsdRequeueRequest(&slot.Irp));
+    ASSERT_EQ(STATUS_PENDING, BlorgFsdRequeueRequest(&slot.Irp));
 
-    DestroyWorkQueue();
+    BlorgDestroyWorkQueue();
 
     EXPECT_EQ(1u, slot.Irp.CompletionCount) << "a drained IRP must still be completed exactly once";
     EXPECT_EQ(STATUS_CANCELLED, slot.Irp.IoStatus.Status);

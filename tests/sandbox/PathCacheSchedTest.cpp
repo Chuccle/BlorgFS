@@ -46,7 +46,7 @@ void InsertThread(void* Parameter)
 {
     PathCacheProof* proof = (PathCacheProof*)Parameter;
 
-    PathCacheInsertExists(&proof->Inserted, &proof->Meta);
+    BlorgPathCacheInsertExists(&proof->Inserted, &proof->Meta);
 
     InterlockedIncrement(&proof->InsertRan);
 }
@@ -55,7 +55,7 @@ void InvalidateThread(void* Parameter)
 {
     PathCacheProof* proof = (PathCacheProof*)Parameter;
 
-    PathCacheInvalidate(&proof->Invalidated);
+    BlorgPathCacheInvalidate(&proof->Invalidated);
 
     InterlockedIncrement(&proof->InvalidateRan);
 }
@@ -73,7 +73,7 @@ void LookupThread(void* Parameter)
     PathCacheProof* proof = (PathCacheProof*)Parameter;
 
     DIRECTORY_ENTRY_METADATA out = {};
-    PathCacheLookup(&proof->Inserted, &out);
+    BlorgPathCacheLookup(&proof->Inserted, &out);
 
     InterlockedIncrement(&proof->LookupRan);
 }
@@ -83,7 +83,7 @@ void PathCacheProofSetup(void* Parameter)
     PathCacheProof* proof = (PathCacheProof*)Parameter;
 
     ShimReset();
-    PathCacheInit();
+    BlorgPathCacheInit();
 
     proof->InsertRan = 0;
     proof->InvalidateRan = 0;
@@ -108,7 +108,7 @@ void PathCacheProofSetup(void* Parameter)
     // Pre-populate the path the invalidate thread targets, so the race is
     // "invalidate races a concurrent unrelated insert", not "invalidate a
     // path that was never cached to begin with".
-    PathCacheInsertExists(&proof->Invalidated, &proof->Meta);
+    BlorgPathCacheInsertExists(&proof->Invalidated, &proof->Meta);
 
     KmSchedSpawn(InsertThread, proof);
     KmSchedSpawn(InvalidateThread, proof);
@@ -119,7 +119,7 @@ void PathCacheProofTeardown(void* Parameter)
 {
     (void)Parameter;
 
-    PathCacheCleanup();
+    BlorgPathCacheCleanup();
 }
 
 class PathCacheSchedTest : public ::testing::Test

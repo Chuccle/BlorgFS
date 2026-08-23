@@ -9,15 +9,15 @@
 //
 // Blocks until every in-flight HTTP request has finished and refuses any
 // new one. PASSIVE_LEVEL only, called once from DriverUnload before the
-// device objects are torn down. See DrainHttpClient in Client.c.
+// device objects are torn down. See BlorgDrainHttpClient in Client.c.
 //
-VOID DrainHttpClient(void);
+VOID BlorgDrainHttpClient(void);
 
-NTSTATUS InitialiseHttpClient(void);
-void CleanupHttpClient(void);
+NTSTATUS BlorgInitialiseHttpClient(void);
+void BlorgCleanupHttpClient(void);
 
-NTSTATUS GetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo);
-void FreeHttpAddrInfo(PADDRINFOEXW AddrInfo);
+NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo);
+void BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo);
 
 //
 // Completion callback signatures per operation. Exactly one of these is
@@ -46,7 +46,7 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
     PVOID CallerContext
 );
 
-void FreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo);
+void BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo);
 
 NTSTATUS BlorgHttpGetFileInformation(
     const UNICODE_STRING* Path,
@@ -65,10 +65,10 @@ NTSTATUS BlorgHttpGetFile(
 //
 // Zero-copy variant: the response body is received directly into
 // TargetMdl (already-locked pages -- a paging-IO MDL, or one locked via
-// LockUserBuffer), which must describe at least Length writable bytes and
+// BlorgLockUserBuffer), which must describe at least Length writable bytes and
 // stay locked until CompletionRoutine has run. On success the FILE_BUFFER
 // passed to CompletionRoutine carries only the byte count
-// (BodyBuffer/BaseAddress are NULL; FreeHttpFile on it is a no-op) -- the
+// (BodyBuffer/BaseAddress are NULL; BlorgFreeHttpFile on it is a no-op) -- the
 // data is already in place.
 //
 NTSTATUS BlorgHttpGetFileMdl(
@@ -80,4 +80,4 @@ NTSTATUS BlorgHttpGetFileMdl(
     PVOID CallerContext
 );
 
-void FreeHttpFile(PFILE_BUFFER FileBuffer);
+void BlorgFreeHttpFile(PFILE_BUFFER FileBuffer);

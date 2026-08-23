@@ -13,7 +13,7 @@
 //
 
 //
-// Process-wide algorithm provider handles, opened once by TlsGlobalInit
+// Process-wide algorithm provider handles, opened once by BlorgTlsGlobalInit
 // and shared by every connection. Opening a provider is a name-resolution
 // and refcount round trip that a single TLS 1.3 handshake would otherwise
 // pay about thirty times over -- one per transcript hash, one per
@@ -32,12 +32,12 @@ static BCRYPT_ALG_HANDLE TlsEcdhP256Provider = NULL;
 static BCRYPT_ALG_HANDLE TlsEcdsaP256Provider = NULL;
 
 //
-// Yields the shared provider for AlgId when TlsGlobalInit opened one, in
+// Yields the shared provider for AlgId when BlorgTlsGlobalInit opened one, in
 // which case *OwnedOut is FALSE and the caller must not close it; falls
 // back to opening a private one the caller does close. The fallback is
 // what keeps the usermode test harnesses working (this file compiles into
 // them unmodified, see Tls.h, and they have no driver load to call
-// TlsGlobalInit from) -- in the driver the shared handle is always
+// BlorgTlsGlobalInit from) -- in the driver the shared handle is always
 // present and nothing is opened per call.
 //
 static NTSTATUS TlsResolveProvider(
@@ -58,7 +58,7 @@ static NTSTATUS TlsResolveProvider(
     return BCryptOpenAlgorithmProvider(HandleOut, AlgId, NULL, Flags);
 }
 
-NTSTATUS TlsSha256(const UCHAR* TLS_RESTRICT Data, ULONG DataLen, UCHAR Out[TLS_HASH_LEN])
+NTSTATUS BlorgTlsSha256(const UCHAR* TLS_RESTRICT Data, ULONG DataLen, UCHAR Out[TLS_HASH_LEN])
 {
     BCRYPT_ALG_HANDLE algHandle = NULL;
     BCRYPT_HASH_HANDLE hashHandle = NULL;
@@ -106,7 +106,7 @@ cleanup:
     return status;
 }
 
-NTSTATUS TlsHmacSha256(
+NTSTATUS BlorgTlsHmacSha256(
     const UCHAR* TLS_RESTRICT Key, ULONG KeyLen,
     const UCHAR* TLS_RESTRICT Data, ULONG DataLen,
     UCHAR Out[TLS_HASH_LEN])
@@ -159,20 +159,20 @@ cleanup:
 }
 
 // RFC 5869 extract: PRK = HMAC-Hash(salt, IKM), with salt as the HMAC key.
-NTSTATUS TlsHkdfExtract(
+NTSTATUS BlorgTlsHkdfExtract(
     const UCHAR* TLS_RESTRICT Salt, ULONG SaltLen,
     const UCHAR* TLS_RESTRICT Ikm, ULONG IkmLen,
     UCHAR Out[TLS_HASH_LEN])
 {
-    return TlsHmacSha256(Salt, SaltLen, Ikm, IkmLen, Out);
+    return BlorgTlsHmacSha256(Salt, SaltLen, Ikm, IkmLen, Out);
 }
 
 //
 // RFC 5869 expand. scratch holds the previous T (<= TLS_HASH_LEN) + info +
 // a 1-byte counter; 256 bytes is generous headroom for every TLS 1.3 info
-// blob TlsHkdfExpandLabel builds, not a tight fit.
+// blob BlorgTlsHkdfExpandLabel builds, not a tight fit.
 //
-NTSTATUS TlsHkdfExpand(
+NTSTATUS BlorgTlsHkdfExpand(
     const UCHAR* TLS_RESTRICT Prk, ULONG PrkLen,
     const UCHAR* TLS_RESTRICT Info, ULONG InfoLen,
     UCHAR* TLS_RESTRICT Out, ULONG OutLen)
@@ -206,7 +206,7 @@ NTSTATUS TlsHkdfExpand(
         scratch[scratchLen] = counter;
         scratchLen += 1;
 
-        status = TlsHmacSha256(Prk, PrkLen, scratch, scratchLen, t);
+        status = BlorgTlsHmacSha256(Prk, PrkLen, scratch, scratchLen, t);
 
         if (!NT_SUCCESS(status))
         {
@@ -231,7 +231,7 @@ NTSTATUS TlsHkdfExpand(
 // rather than via strlen, keeping this file free of any dependency on
 // which CRT string routines a given build (kernel vs usermode) links.
 //
-NTSTATUS TlsHkdfExpandLabel(
+NTSTATUS BlorgTlsHkdfExpandLabel(
     const UCHAR* TLS_RESTRICT Secret, ULONG SecretLen,
     const char* TLS_RESTRICT Label,
     const UCHAR* TLS_RESTRICT Context, ULONG ContextLen,
@@ -277,7 +277,7 @@ NTSTATUS TlsHkdfExpandLabel(
         infoLen += ContextLen;
     }
 
-    return TlsHkdfExpand(Secret, SecretLen, info, infoLen, Out, Length);
+    return BlorgTlsHkdfExpand(Secret, SecretLen, info, infoLen, Out, Length);
 }
 
 //
@@ -298,7 +298,7 @@ static VOID TlsBuildNonce(const UCHAR StaticIv[TLS_IV_LEN], ULONGLONG SeqNum, UC
     }
 }
 
-NTSTATUS TlsAeadEncrypt(
+NTSTATUS BlorgTlsAeadEncrypt(
     const UCHAR Key[TLS_KEY_LEN], const UCHAR StaticIv[TLS_IV_LEN], ULONGLONG SeqNum,
     const UCHAR* TLS_RESTRICT Aad, ULONG AadLen,
     const UCHAR* TLS_RESTRICT Plaintext, ULONG PlaintextLen,
@@ -365,7 +365,7 @@ cleanup:
     return status;
 }
 
-NTSTATUS TlsAeadDecrypt(
+NTSTATUS BlorgTlsAeadDecrypt(
     const UCHAR Key[TLS_KEY_LEN], const UCHAR StaticIv[TLS_IV_LEN], ULONGLONG SeqNum,
     const UCHAR* TLS_RESTRICT Aad, ULONG AadLen,
     const UCHAR* TLS_RESTRICT Ciphertext, ULONG CiphertextLen, const UCHAR Tag[TLS_TAG_LEN],
@@ -443,16 +443,16 @@ cleanup:
 // close-completion path) and the only one carrying a chaining mode.
 //
 // BCRYPT_PROV_DISPATCH is what makes keys derived from that provider usable
-// at DISPATCH_LEVEL (see TlsImportKeyHandle) -- required in the real driver,
+// at DISPATCH_LEVEL (see BlorgTlsImportKeyHandle) -- required in the real driver,
 // where the record-layer hot path runs there, but usermode CNG rejects it
 // outright (STATUS_INVALID_PARAMETER). The AES-GCM open is retried without
 // the flag on that specific failure, so the usermode test harnesses this
-// file also compiles into (Tls.h) can still exercise TlsImportKeyHandle:
+// file also compiles into (Tls.h) can still exercise BlorgTlsImportKeyHandle:
 // none of them run anything at a real DISPATCH_LEVEL, so a
 // non-DISPATCH-safe handle costs them nothing. In the real driver that
 // retry is never reached -- BCRYPT_PROV_DISPATCH always succeeds there.
 //
-NTSTATUS TlsGlobalInit(VOID)
+NTSTATUS BlorgTlsGlobalInit(VOID)
 {
     NTSTATUS status = BCryptOpenAlgorithmProvider(
         &TlsAesGcmProvider, BCRYPT_AES_ALGORITHM, NULL, BCRYPT_PROV_DISPATCH);
@@ -494,7 +494,7 @@ NTSTATUS TlsGlobalInit(VOID)
 
     if (!NT_SUCCESS(status))
     {
-        TlsGlobalCleanup();
+        BlorgTlsGlobalCleanup();
         return status;
     }
 
@@ -502,11 +502,11 @@ NTSTATUS TlsGlobalInit(VOID)
 }
 
 //
-// Closes the process-wide providers opened by TlsGlobalInit. Also the
-// unwind path for a partially successful TlsGlobalInit, hence the
+// Closes the process-wide providers opened by BlorgTlsGlobalInit. Also the
+// unwind path for a partially successful BlorgTlsGlobalInit, hence the
 // per-handle NULL checks and the NULLing afterwards.
 //
-VOID TlsGlobalCleanup(VOID)
+VOID BlorgTlsGlobalCleanup(VOID)
 {
     BCRYPT_ALG_HANDLE* providers[] =
     {
@@ -532,7 +532,7 @@ VOID TlsGlobalCleanup(VOID)
 // dispatch-safe provider, so the returned handle can be used for
 // encrypt/decrypt from completion routines running at DISPATCH_LEVEL.
 //
-NTSTATUS TlsImportKeyHandle(const UCHAR Key[TLS_KEY_LEN], BCRYPT_KEY_HANDLE* KeyHandleOut)
+NTSTATUS BlorgTlsImportKeyHandle(const UCHAR Key[TLS_KEY_LEN], BCRYPT_KEY_HANDLE* KeyHandleOut)
 {
     if (!TlsAesGcmProvider)
     {
@@ -543,7 +543,7 @@ NTSTATUS TlsImportKeyHandle(const UCHAR Key[TLS_KEY_LEN], BCRYPT_KEY_HANDLE* Key
         TlsAesGcmProvider, KeyHandleOut, NULL, 0, C_CAST(PUCHAR, Key), TLS_KEY_LEN, 0);
 }
 
-NTSTATUS TlsAeadEncryptKeyed(
+NTSTATUS BlorgTlsAeadEncryptKeyed(
     BCRYPT_KEY_HANDLE KeyHandle, const UCHAR StaticIv[TLS_IV_LEN], ULONGLONG SeqNum,
     const UCHAR* TLS_RESTRICT Aad, ULONG AadLen,
     const UCHAR* TLS_RESTRICT Plaintext, ULONG PlaintextLen,
@@ -567,7 +567,7 @@ NTSTATUS TlsAeadEncryptKeyed(
         NULL, 0, CiphertextOut, PlaintextLen, &resultLen, 0);
 }
 
-NTSTATUS TlsAeadDecryptKeyed(
+NTSTATUS BlorgTlsAeadDecryptKeyed(
     BCRYPT_KEY_HANDLE KeyHandle, const UCHAR StaticIv[TLS_IV_LEN], ULONGLONG SeqNum,
     const UCHAR* TLS_RESTRICT Aad, ULONG AadLen,
     const UCHAR* Ciphertext, ULONG CiphertextLen, const UCHAR Tag[TLS_TAG_LEN],
@@ -595,7 +595,7 @@ NTSTATUS TlsAeadDecryptKeyed(
 // Generates an ephemeral ECDH P-256 key pair, exporting the public point in
 // uncompressed X9.62 form (0x04 || X || Y) and the raw private scalar.
 //
-NTSTATUS TlsEcdhGenerateKeyPair(UCHAR PrivateKeyOut[TLS_ECC_COORD_LEN], UCHAR PublicKeyOut[TLS_ECC_PUBKEY_LEN])
+NTSTATUS BlorgTlsEcdhGenerateKeyPair(UCHAR PrivateKeyOut[TLS_ECC_COORD_LEN], UCHAR PublicKeyOut[TLS_ECC_PUBKEY_LEN])
 {
     BCRYPT_ALG_HANDLE algHandle = NULL;
     BCRYPT_KEY_HANDLE keyHandle = NULL;
@@ -660,7 +660,7 @@ cleanup:
 // convention used everywhere else in this module and in TLS, so the result
 // is reversed back before returning.
 //
-NTSTATUS TlsEcdhComputeSharedSecret(
+NTSTATUS BlorgTlsEcdhComputeSharedSecret(
     const UCHAR OwnPrivateKey[TLS_ECC_COORD_LEN],
     const UCHAR OwnPublicKey[TLS_ECC_PUBKEY_LEN],
     const UCHAR PeerPublicKey[TLS_ECC_PUBKEY_LEN],
@@ -760,7 +760,7 @@ cleanup:
     return status;
 }
 
-NTSTATUS TlsEcdsaVerify(
+NTSTATUS BlorgTlsEcdsaVerify(
     const UCHAR PublicKey[TLS_ECC_PUBKEY_LEN],
     const UCHAR* Hash, ULONG HashLen,
     const UCHAR Signature[64])
@@ -816,7 +816,7 @@ cleanup:
 // -- no ASN.1 variable-length integers appear anywhere in a P-256 SPKI, so
 // this is a template fill-in, not a general encoder.
 //
-NTSTATUS TlsEncodeP256SubjectPublicKeyInfo(const UCHAR PublicKey[TLS_ECC_PUBKEY_LEN], UCHAR DerOut[TLS_SPKI_DER_LEN])
+NTSTATUS BlorgTlsEncodeP256SubjectPublicKeyInfo(const UCHAR PublicKey[TLS_ECC_PUBKEY_LEN], UCHAR DerOut[TLS_SPKI_DER_LEN])
 {
     static const UCHAR header[] =
     {
@@ -840,7 +840,7 @@ NTSTATUS TlsEncodeP256SubjectPublicKeyInfo(const UCHAR PublicKey[TLS_ECC_PUBKEY_
 // malformed structure all land here rather than being partially parsed --
 // and rejects any point not in uncompressed (0x04-prefixed) form.
 //
-NTSTATUS TlsDecodeP256SubjectPublicKeyInfo(const UCHAR* Der, ULONG DerLen, UCHAR PublicKeyOut[TLS_ECC_PUBKEY_LEN])
+NTSTATUS BlorgTlsDecodeP256SubjectPublicKeyInfo(const UCHAR* Der, ULONG DerLen, UCHAR PublicKeyOut[TLS_ECC_PUBKEY_LEN])
 {
     static const UCHAR expectedHeader[] =
     {
@@ -920,7 +920,7 @@ static VOID TlsPutUint24(UCHAR* Buffer, ULONG Value)
 // 254 bytes / 127 versions per RFC 8446 4.2.1), not uint16 -- do not
 // "normalize" it to match the others.
 //
-NTSTATUS TlsBuildClientHello(
+NTSTATUS BlorgTlsBuildClientHello(
     const UCHAR Random[TLS_HANDSHAKE_RANDOM_LEN],
     const UCHAR ClientPublicKey[TLS_ECC_PUBKEY_LEN],
     const char* ServerName, ULONG ServerNameLen,
@@ -1042,7 +1042,7 @@ NTSTATUS TlsBuildClientHello(
 // extensions are ignored, not an error -- a ServerHello may legitimately
 // include extensions this driver has no need to act on.
 //
-NTSTATUS TlsParseServerHello(
+NTSTATUS BlorgTlsParseServerHello(
     const UCHAR* Message, ULONG MessageLen,
     UCHAR ServerRandomOut[TLS_HANDSHAKE_RANDOM_LEN],
     UCHAR ServerPublicKeyOut[TLS_ECC_PUBKEY_LEN])
@@ -1158,7 +1158,7 @@ NTSTATUS TlsParseServerHello(
 // DER bytes. Any further chain certs after the leaf are intentionally
 // ignored -- pinning only needs the leaf's key, not the rest of the chain.
 //
-NTSTATUS TlsParseCertificateMessage(
+NTSTATUS BlorgTlsParseCertificateMessage(
     const UCHAR* Message, ULONG MessageLen,
     const UCHAR** LeafCertOut, ULONG* LeafCertLenOut)
 {
@@ -1329,10 +1329,10 @@ static BOOLEAN TlsDerSkipTlv(const UCHAR** Data, const UCHAR* End)
 // subjectPublicKeyInfo, skipping every other field by length only (their
 // content is never interpreted). Returns the SPKI's full TLV span
 // (tag+length+value), not just its value, since
-// TlsDecodeP256SubjectPublicKeyInfo expects to see the leading SEQUENCE tag
+// BlorgTlsDecodeP256SubjectPublicKeyInfo expects to see the leading SEQUENCE tag
 // itself.
 //
-NTSTATUS TlsExtractSpkiFromCertificate(
+NTSTATUS BlorgTlsExtractSpkiFromCertificate(
     const UCHAR* CertDer, ULONG CertDerLen,
     const UCHAR** SpkiOut, ULONG* SpkiLenOut)
 {
@@ -1392,7 +1392,7 @@ NTSTATUS TlsExtractSpkiFromCertificate(
 // byte is stripped, and a shorter-than-32-byte value (leading zero bytes
 // not encoded in DER) is left-zero-padded back out to 32 the other way.
 //
-NTSTATUS TlsParseCertificateVerifyMessage(
+NTSTATUS BlorgTlsParseCertificateVerifyMessage(
     const UCHAR* Message, ULONG MessageLen,
     UCHAR RawSignatureOut[64])
 {
@@ -1480,7 +1480,7 @@ NTSTATUS TlsParseCertificateVerifyMessage(
 // failure if the assembled length doesn't match TLS_CERT_VERIFY_CONTENT_LEN
 // in Tls.h, which would indicate that constant is wrong.
 //
-NTSTATUS TlsBuildServerCertVerifyContent(const UCHAR TranscriptHash[TLS_HASH_LEN], UCHAR ContentOut[TLS_CERT_VERIFY_CONTENT_LEN])
+NTSTATUS BlorgTlsBuildServerCertVerifyContent(const UCHAR TranscriptHash[TLS_HASH_LEN], UCHAR ContentOut[TLS_CERT_VERIFY_CONTENT_LEN])
 {
     static const UCHAR contextString[] =
     {
@@ -1511,7 +1511,7 @@ NTSTATUS TlsBuildServerCertVerifyContent(const UCHAR TranscriptHash[TLS_HASH_LEN
 // comparison time doesn't leak how many leading bytes matched (used for
 // MAC/pin comparisons).
 //
-BOOLEAN TlsConstantTimeEqual(const UCHAR* A, const UCHAR* B, ULONG Len)
+BOOLEAN BlorgTlsConstantTimeEqual(const UCHAR* A, const UCHAR* B, ULONG Len)
 {
     UCHAR diff = 0;
     ULONG i;
@@ -1529,7 +1529,7 @@ BOOLEAN TlsConstantTimeEqual(const UCHAR* A, const UCHAR* B, ULONG Len)
 // byte from a decrypted record (RFC 8446 5.2), returning the content type
 // and the length of the content preceding it.
 //
-BOOLEAN TlsStripInnerPlaintext(const UCHAR* Plaintext, ULONG PlaintextLen, UCHAR* ContentTypeOut, ULONG* ContentLenOut)
+BOOLEAN BlorgTlsStripInnerPlaintext(const UCHAR* Plaintext, ULONG PlaintextLen, UCHAR* ContentTypeOut, ULONG* ContentLenOut)
 {
     ULONG i = PlaintextLen;
 
@@ -1552,7 +1552,7 @@ BOOLEAN TlsStripInnerPlaintext(const UCHAR* Plaintext, ULONG PlaintextLen, UCHAR
 // Zero-initializes a connection's TLS state and sets it to the not-started
 // stage.
 //
-VOID TlsInitializeConnectionState(PTLS_CONNECTION_STATE State)
+VOID BlorgTlsInitializeConnectionState(PTLS_CONNECTION_STATE State)
 {
     RtlZeroMemory(State, sizeof(TLS_CONNECTION_STATE));
     State->State = TlsHandshakeNotStarted;
@@ -1561,11 +1561,11 @@ VOID TlsInitializeConnectionState(PTLS_CONNECTION_STATE State)
 //
 // Releases a connection's AEAD key handles, if any, and zeroes the state.
 // BCryptDestroyKey is DISPATCH-safe here because the handle traces back to
-// TlsAesGcmProvider (TlsGlobalInit), which was opened with
+// TlsAesGcmProvider (BlorgTlsGlobalInit), which was opened with
 // BCRYPT_PROV_DISPATCH -- required because Socket.c calls this from the WSK
 // close-completion path, which runs at DISPATCH_LEVEL.
 //
-VOID TlsDestroyConnectionState(PTLS_CONNECTION_STATE State)
+VOID BlorgTlsDestroyConnectionState(PTLS_CONNECTION_STATE State)
 {
     if (State->WriteKeyHandle)
     {

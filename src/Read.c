@@ -51,7 +51,7 @@ static BOOLEAN BlorgReadIsSequential(const FCB* Fcb, ULONG64 Offset)
 //  completion path at <= DISPATCH_LEVEL, so everything it touches must be
 //  legal there: the source body lives in the NonPagedPoolNx HTTP receive
 //  buffer, and the destination is the user buffer already locked into
-//  Irp->MdlAddress by PrePostIrp when the IRP was posted to the FSP queue.
+//  Irp->MdlAddress by BlorgPrePostIrp when the IRP was posted to the FSP queue.
 //  CallerContext is the PIRP.
 //
 //  This is a zero-copy read (BlorgHttpGetFileMdl): the body was received
@@ -85,7 +85,7 @@ static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID Ca
     {
         BLORGFS_PRINT("BlorgReadComplete: http read failed: %8lx\n", Status);
         BLORGFS_STAT_INC(FetchesFailed);
-        CompleteRequest(irp, Status, IO_DISK_INCREMENT);
+        BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
 
@@ -121,7 +121,7 @@ static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID Ca
         SetFlag(irpSp->FileObject->Flags, FO_FILE_FAST_IO_READ);
     }
 
-    CompleteRequest(irp, STATUS_SUCCESS, IO_DISK_INCREMENT);
+    BlorgCompleteRequest(irp, STATUS_SUCCESS, IO_DISK_INCREMENT);
 }
 
 //
@@ -190,12 +190,12 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // own read completes without needing a second worker; FSP_THREAD_COUNT
 // becomes a pure throughput knob. Non-paging non-cached reads (e.g.
 // FILE_FLAG_NO_BUFFERING) still post: their user buffer must be locked
-// (PrePostIrp) and they need a guaranteed PASSIVE_LEVEL worker context.
+// (BlorgPrePostIrp) and they need a guaranteed PASSIVE_LEVEL worker context.
 // Inline issuance happens when either already on a worker (IN_FSP -- the
 // original post locked the buffer) or this is a paging read at
 // PASSIVE_LEVEL (MM already supplied the MDL, nothing to lock); a paging
 // read at raised IRQL -- rare, but possible -- falls through to the post
-// path, safe because LockUserBuffer no-ops when Irp->MdlAddress is already
+// path, safe because BlorgLockUserBuffer no-ops when Irp->MdlAddress is already
 // set (always true for paging I/O).
 //
 // The sequential prefetcher (Prefetch.h) serves paging reads of a detected
@@ -215,7 +215,7 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // routine that nothing else has marked pending: a paging read bypasses
 // the FSP queue (so it never reaches IoCsqInsertIrp, which does the
 // marking for posted requests) and skips the oplock package (so
-// OplockPrePostIrp never runs either). The prefetcher marks its own
+// BlorgOplockPrePostIrp never runs either). The prefetcher marks its own
 // parked IRP, since it must do so before the waiter is published;
 // the direct fetch is marked here, before the issue rather than after,
 // because a synchronously-completing issue may already have freed the
@@ -227,7 +227,7 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 //
 // The direct async HTTP read returns STATUS_PENDING on success; the client
 // receives the body straight into the locked user MDL (zero-copy -- both
-// arrival paths have one: MM supplies it for paging I/O, PrePostIrp locked
+// arrival paths have one: MM supplies it for paging I/O, BlorgPrePostIrp locked
 // one for posted non-paging reads) and BlorgReadComplete completes the IRP
 // from the WSK completion path, so this function neither blocks nor copies
 // nor completes the IRP itself. If issuing the request fails synchronously,
@@ -335,8 +335,8 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         result = FsRtlCheckOplock(&fcb->Header.Oplock,
             Irp,
             NULL,
-            OplockComplete,
-            OplockPrePostIrp);
+            BlorgOplockComplete,
+            BlorgOplockPrePostIrp);
 
         if (STATUS_SUCCESS != result)
         {
@@ -379,7 +379,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         {
             BLORGFS_PRINT("BlorgVolumeRead: Enqueue to Fsp\n");
             BLORGFS_STAT_INC(ReadsPosted);
-            return FsdPostRequest(Irp, IrpSp);
+            return BlorgFsdPostRequest(Irp, IrpSp);
         }
 
         if (BooleanFlagOn(Irp->Flags, IRP_PAGING_IO))
@@ -475,7 +475,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     Irp->Tail.Overlay.Thread))
                 {
                     BLORGFS_PRINT("Cached Read could not wait\n");
-                    return FsdPostRequest(Irp, IrpSp);
+                    return BlorgFsdPostRequest(Irp, IrpSp);
                 }
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
@@ -542,7 +542,7 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    BOOLEAN topLevel = IsIrpTopLevel(Irp);
+    BOOLEAN topLevel = BlorgIsIrpTopLevel(Irp);
 
     FsRtlEnterFileSystem();
     switch (BlorgDeviceKind(DeviceObject))
@@ -553,18 +553,18 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             result = BlorgVolumeRead(Irp, irpSp);
             if (STATUS_PENDING != result)
             {
-                CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+                BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
             break;
         }
         case BlorgDeviceDisk:
         {
-            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
         case BlorgDeviceFileSystem:
         {
-            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
     }

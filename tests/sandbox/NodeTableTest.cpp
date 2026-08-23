@@ -45,7 +45,7 @@ protected:
         ASSERT_EQ(STATUS_SUCCESS, BlorgNodeTableInit(Volume));
 
         //
-        // Nodes are built through InsertByPath from a root DCB, which is
+        // Nodes are built through BlorgInsertByPath from a root DCB, which is
         // the only way the driver ever builds one. Constructing an FCB
         // directly and freeing it would exercise a shape the driver never
         // produces -- BlorgFreeFileContext unlinks Links unconditionally
@@ -68,8 +68,8 @@ protected:
             BlorgCreateFCB(&Vcb, (CSHORT)BLORGFS_VCB_SIGNATURE, nullptr, Volume, 0));
         ASSERT_NE(nullptr, Vcb);
 
-        GetVolumeDeviceExtension(Volume)->RootDcb = Root;
-        GetVolumeDeviceExtension(Volume)->Vcb = Vcb;
+        BlorgGetVolumeDeviceExtension(Volume)->RootDcb = Root;
+        BlorgGetVolumeDeviceExtension(Volume)->Vcb = Vcb;
     }
 
     void TearDown() override
@@ -122,7 +122,7 @@ protected:
         UNICODE_STRING name = Path(path);
         PCOMMON_CONTEXT node = nullptr;
 
-        EXPECT_EQ(STATUS_SUCCESS, InsertByPath(Root, &name, &meta, Volume, &node));
+        EXPECT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &name, &meta, Volume, &node));
 
         if (node)
         {
@@ -163,7 +163,7 @@ TEST_F(NodeTableTest, UnpublishedNodeIsNotFound)
     UNICODE_STRING name = Path(L"\\a\\b.txt");
     PCOMMON_CONTEXT node = nullptr;
 
-    ASSERT_EQ(STATUS_SUCCESS, InsertByPath(Root, &name, &meta, Volume, &node));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &name, &meta, Volume, &node));
     ASSERT_NE(nullptr, node);
 
     EXPECT_EQ(nullptr, BlorgNodeTableLookupPin(&name))
@@ -335,7 +335,7 @@ TEST_F(NodeTableTest, RepeatedDeferralDoesNotDoubleQueue)
 //
 //   readers    BlorgNodeTableLookupPin / touch / BlorgNodeUnpin, taking
 //              only the bucket lock shared -- the lock-free warm-open path
-//   publisher  cold open: VCB resource exclusive, InsertByPath, publish
+//   publisher  cold open: VCB resource exclusive, BlorgInsertByPath, publish
 //   reaper     drains the work queue, so NodeReapWorker runs and takes the
 //              VCB resource and the bucket lock exclusive
 //
@@ -461,7 +461,7 @@ namespace
 
                 PCOMMON_CONTEXT node = nullptr;
 
-                if (NT_SUCCESS(InsertByPath(state->Root, &name, &meta, state->Volume, &node)) && node)
+                if (NT_SUCCESS(BlorgInsertByPath(state->Root, &name, &meta, state->Volume, &node)) && node)
                 {
                     BlorgNodeTablePublish(node);
 
@@ -618,7 +618,7 @@ static void ShardThread(void* Parameter)
 
         PCOMMON_CONTEXT node = nullptr;
 
-        if (!NT_SUCCESS(InsertByPath(ShardRoot, &name, &meta, ShardVolume, &node)) || !node)
+        if (!NT_SUCCESS(BlorgInsertByPath(ShardRoot, &name, &meta, ShardVolume, &node)) || !node)
         {
             continue;
         }

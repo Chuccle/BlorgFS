@@ -20,7 +20,7 @@
 //
 // FSP_THREAD_COUNT is the ceiling (and the ThreadHandle array size); the
 // pool actually started is min(max(4 x active cores, FSP_THREAD_COUNT_MIN),
-// FSP_THREAD_COUNT), computed once in CreateWorkQueue. The pool exists to
+// FSP_THREAD_COUNT), computed once in BlorgCreateWorkQueue. The pool exists to
 // absorb RTT blocking, which does not scale with core count -- a blocked
 // worker costs no CPU -- so small machines keep a healthy floor for
 // concurrent blocked operations; the core scaling only trims thread
@@ -53,14 +53,14 @@ typedef struct _FSP_QUEUE_STATE
 static FSP_QUEUE_STATE FspQueue;
 
 // IO_CSQ insert callback: appends Irp to the tail of the pending-IRP queue.
-VOID FspCsqInsertIrp(IO_CSQ* Csq, PIRP Irp)
+VOID BlorgFspCsqInsertIrp(IO_CSQ* Csq, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Csq);
     InsertTailList(&FspQueue.IrpQueue, &Irp->Tail.Overlay.ListEntry);
 }
 
 // IO_CSQ remove callback: unlinks Irp from the pending-IRP queue.
-VOID FspCsqRemoveIrp(IO_CSQ* Csq, PIRP Irp)
+VOID BlorgFspCsqRemoveIrp(IO_CSQ* Csq, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Csq);
     RemoveEntryList(&Irp->Tail.Overlay.ListEntry);
@@ -71,7 +71,7 @@ VOID FspCsqRemoveIrp(IO_CSQ* Csq, PIRP Irp)
 // is NULL; NULL if the queue is exhausted. Used by IoCsqRemoveNextIrp and by
 // cancel processing to walk the queue under the CSQ lock.
 //
-PIRP FspCsqPeekNextIrp(IO_CSQ* Csq, PIRP Irp, PVOID PeekContext)
+PIRP BlorgFspCsqPeekNextIrp(IO_CSQ* Csq, PIRP Irp, PVOID PeekContext)
 {
     UNREFERENCED_PARAMETER(Csq);
     UNREFERENCED_PARAMETER(PeekContext);
@@ -98,14 +98,14 @@ PIRP FspCsqPeekNextIrp(IO_CSQ* Csq, PIRP Irp, PVOID PeekContext)
 }
 
 _IRQL_raises_(DISPATCH_LEVEL)
-VOID FspCsqAcquireLock(IO_CSQ* Csq, _At_(*Irql, _IRQL_saves_) PKIRQL Irql)
+VOID BlorgFspCsqAcquireLock(IO_CSQ* Csq, _At_(*Irql, _IRQL_saves_) PKIRQL Irql)
 {
     UNREFERENCED_PARAMETER(Csq);
     KeAcquireSpinLock(&FspQueue.IrpQueueSpinLock, Irql);
 }
 
 _IRQL_requires_(DISPATCH_LEVEL)
-VOID FspCsqReleaseLock(IO_CSQ* Csq, _IRQL_restores_ KIRQL Irql)
+VOID BlorgFspCsqReleaseLock(IO_CSQ* Csq, _IRQL_restores_ KIRQL Irql)
 {
     UNREFERENCED_PARAMETER(Csq);
     KeReleaseSpinLock(&FspQueue.IrpQueueSpinLock, Irql);
@@ -131,7 +131,7 @@ static VOID FspDiscardPendingIrpContext(PIRP Irp)
         return;
     }
 
-    ClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_NET_DONE);
+    BlorgClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_NET_DONE);
 
     PVOID stash = Irp->Tail.Overlay.DriverContext[1];
 
@@ -146,17 +146,17 @@ static VOID FspDiscardPendingIrpContext(PIRP Irp)
 // IO_CSQ cancel callback: completes an IRP that was cancelled while still
 // queued (the CSQ has already removed it by the time this runs).
 //
-VOID FspCsqCompleteCanceledIrp(IO_CSQ* Csq, PIRP Irp)
+VOID BlorgFspCsqCompleteCanceledIrp(IO_CSQ* Csq, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Csq);
 
     FspDiscardPendingIrpContext(Irp);
 
-    CompleteRequest(Irp, STATUS_CANCELLED, IO_NO_INCREMENT);
+    BlorgCompleteRequest(Irp, STATUS_CANCELLED, IO_NO_INCREMENT);
 }
 
 // System threads disable kernel APCs so no need to explicitly disable APCs here.
-VOID FspDispatch(_In_ PVOID StartContext)
+VOID BlorgFspDispatch(_In_ PVOID StartContext)
 
 /*++
 
@@ -171,8 +171,8 @@ Routine Description:
     declaration out of the drain loop instead let an unhandled major
     inherit the previous IRP's status, and a previous STATUS_PENDING then
     skipped completion entirely -- stranding an IRP already removed from
-    the CSQ, where not even DestroyWorkQueue's drain can reach it. Only
-    CREATE/READ/DIRECTORY_CONTROL are posted today, but PrePostIrp already
+    the CSQ, where not even BlorgDestroyWorkQueue's drain can reach it. Only
+    CREATE/READ/DIRECTORY_CONTROL are posted today, but BlorgPrePostIrp already
     prepares WRITE and the EA majors.
 
     Each worker drops its own base priority to 7, one below the system
@@ -231,7 +231,7 @@ Return Value:
 
             PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
 
-            BLORGFS_PRINT("FspDispatch: Irp = %p\n", irp);
+            BLORGFS_PRINT("BlorgFspDispatch: Irp = %p\n", irp);
 
             if (FlagOn(C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_RECURSIVE_CALL))
             {
@@ -268,7 +268,7 @@ Return Value:
 
             if (STATUS_PENDING != result)
             {
-                CompleteRequest(irp, result, IO_DISK_INCREMENT);
+                BlorgCompleteRequest(irp, result, IO_DISK_INCREMENT);
             }
 
             IoSetTopLevelIrp(NULL);
@@ -297,7 +297,7 @@ static void AddToWorkqueue(
     KeSetEvent(&FspQueue.WorkEvent, EVENT_INCREMENT, FALSE);
 }
 
-NTSTATUS PrePostIrp(
+NTSTATUS BlorgPrePostIrp(
     IN PVOID Context,
     IN PIRP Irp
 )
@@ -319,7 +319,7 @@ NTSTATUS PrePostIrp(
         {
             if (!FlagOn(IrpSp->MinorFunction, IRP_MN_MDL))
             {
-                return LockUserBuffer(Irp,
+                return BlorgLockUserBuffer(Irp,
                     (IrpSp->MajorFunction == IRP_MJ_READ) ?
                     IoWriteAccess : IoReadAccess,
                     (IrpSp->MajorFunction == IRP_MJ_READ) ?
@@ -331,7 +331,7 @@ NTSTATUS PrePostIrp(
         {
             if (IRP_MN_QUERY_DIRECTORY == IrpSp->MinorFunction)
             {
-                return LockUserBuffer(Irp,
+                return BlorgLockUserBuffer(Irp,
                     IoWriteAccess,
                     IrpSp->Parameters.QueryDirectory.Length);
             }
@@ -339,13 +339,13 @@ NTSTATUS PrePostIrp(
         }
         case IRP_MJ_QUERY_EA:
         {
-            return LockUserBuffer(Irp,
+            return BlorgLockUserBuffer(Irp,
                 IoWriteAccess,
                 IrpSp->Parameters.QueryEa.Length);
         }
         case IRP_MJ_SET_EA:
         {
-            return LockUserBuffer(Irp,
+            return BlorgLockUserBuffer(Irp,
                 IoReadAccess,
                 IrpSp->Parameters.SetEa.Length);
         }
@@ -363,12 +363,12 @@ NTSTATUS PrePostIrp(
 //  package calls this, then parks the IRP in its own queue -- making it
 //  eligible for asynchronous completion by a break acknowledgement on another
 //  CPU -- before it returns STATUS_PENDING. Nothing else marks the IRP pending
-//  on that path (it never reaches our CSQ until OplockComplete re-queues it),
+//  on that path (it never reaches our CSQ until BlorgOplockComplete re-queues it),
 //  and marking after FsRtlCheckOplock returns would race that completion, so we
-//  must mark here, before the package parks it. The FsdPostRequest path uses
-//  plain PrePostIrp instead and lets IoCsqInsertIrp do the marking.
+//  must mark here, before the package parks it. The BlorgFsdPostRequest path uses
+//  plain BlorgPrePostIrp instead and lets IoCsqInsertIrp do the marking.
 //
-//  Unlike FsdPostRequest, a buffer-lock failure cannot be turned into a
+//  Unlike BlorgFsdPostRequest, a buffer-lock failure cannot be turned into a
 //  fail-fast here: by the time the package invokes this routine it has
 //  already committed to parking the IRP and returning STATUS_PENDING, so
 //  there is no return path to abort on. The lock status is therefore
@@ -377,9 +377,9 @@ NTSTATUS PrePostIrp(
 //  safely rather than corrupting memory when run in the wrong context.
 //
 
-void OplockPrePostIrp(IN PVOID Context, IN PIRP Irp)
+void BlorgOplockPrePostIrp(IN PVOID Context, IN PIRP Irp)
 {
-    PrePostIrp(Context, Irp);
+    BlorgPrePostIrp(Context, Irp);
 
     if (Irp)
     {
@@ -387,7 +387,7 @@ void OplockPrePostIrp(IN PVOID Context, IN PIRP Irp)
     }
 }
 
-NTSTATUS FsdPostRequest(
+NTSTATUS BlorgFsdPostRequest(
     IN PIRP Irp,
     IN PIO_STACK_LOCATION IrpSp
 )
@@ -428,7 +428,7 @@ Return Value:
         return STATUS_DEVICE_REMOVED;
     }
 
-    NTSTATUS prePostStatus = PrePostIrp(NULL, Irp);
+    NTSTATUS prePostStatus = BlorgPrePostIrp(NULL, Irp);
 
     if (!NT_SUCCESS(prePostStatus))
     {
@@ -440,7 +440,7 @@ Return Value:
     return STATUS_PENDING;
 }
 
-NTSTATUS FsdRequeueRequest(
+NTSTATUS BlorgFsdRequeueRequest(
     IN PIRP Irp
 )
 
@@ -452,9 +452,9 @@ Routine Description:
     pass. Used by the async-HTTP completion routines (which run at
     DISPATCH_LEVEL) to hand an IRP back to PASSIVE_LEVEL once the network
     result is ready -- the buffer was already locked by the original
-    FsdPostRequest, so PrePostIrp is intentionally not repeated here.
+    BlorgFsdPostRequest, so BlorgPrePostIrp is intentionally not repeated here.
 
-    The ThreadsActive gate matches FsdPostRequest's: an advisory ReadAcquire,
+    The ThreadsActive gate matches BlorgFsdPostRequest's: an advisory ReadAcquire,
     see the note there.
 
 Arguments:
@@ -484,10 +484,10 @@ Return Value:
 //
 // Oplock-break completion callback: on a granted/acknowledged oplock,
 // re-queues the parked IRP to the FSP workers to resume normal dispatch;
-// otherwise completes it with the failure status. Mirrors OplockPrePostIrp's
+// otherwise completes it with the failure status. Mirrors BlorgOplockPrePostIrp's
 // pending/parking side of the FsRtlCheckOplock contract.
 //
-void OplockComplete(PVOID Context, PIRP Irp)
+void BlorgOplockComplete(PVOID Context, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Context);
 
@@ -497,7 +497,7 @@ void OplockComplete(PVOID Context, PIRP Irp)
     }
     else
     {
-        CompleteRequest(Irp, Irp->IoStatus.Status, IO_DISK_INCREMENT);
+        BlorgCompleteRequest(Irp, Irp->IoStatus.Status, IO_DISK_INCREMENT);
     }
 }
 
@@ -508,11 +508,11 @@ void OplockComplete(PVOID Context, PIRP Irp)
 // threads must exit either way, so the order is immaterial, and the
 // sequential form needs no wait-object/wait-block arrays, leaving this
 // teardown with no allocation-failure path that could strand running
-// threads. The count is a parameter because CreateWorkQueue's
+// threads. The count is a parameter because BlorgCreateWorkQueue's
 // partial-failure unwind reaps only the threads it actually started.
 //
 // NOTE: This is not thread-safe against concurrent calls of 
-// CreateWorkQueue and DestroyWorkQueue.
+// BlorgCreateWorkQueue and BlorgDestroyWorkQueue.
 // 
 // Designed to follow driver lifecycle so is naturally serialized 
 // by the driver load/unload path, but if that changes we internally
@@ -549,18 +549,18 @@ static void StopWorkQueueThreads(ULONG ThreadCount)
 // unwinds the threads already started via StopWorkQueueThreads and fails
 // the whole call -- the pool either comes up complete or not at all.
 // Without that unwind, a partial pool reported as success would leave
-// DestroyWorkQueue trying to reap a NULL handle (early-out, threads
-// never terminated) and the survivors running FspDispatch out of an
+// BlorgDestroyWorkQueue trying to reap a NULL handle (early-out, threads
+// never terminated) and the survivors running BlorgFspDispatch out of an
 // unloaded driver image.
 //
 // NOTE: This is not thread-safe against concurrent calls of 
-// CreateWorkQueue and DestroyWorkQueue.
+// BlorgCreateWorkQueue and BlorgDestroyWorkQueue.
 // 
 // Designed to follow driver lifecycle so is naturally serialized 
 // by the driver load/unload path, but if that changes we internally
 // synchronise.
 //
-NTSTATUS CreateWorkQueue(void)
+NTSTATUS BlorgCreateWorkQueue(void)
 {
     if (InterlockedCompareExchange(&FspQueue.ThreadsActive, TRUE, FALSE))
     {
@@ -574,12 +574,12 @@ NTSTATUS CreateWorkQueue(void)
     KeInitializeEvent(&FspQueue.TerminationEvent, NotificationEvent, FALSE);
 
     NTSTATUS result = IoCsqInitialize(&FspQueue.Csq,
-        FspCsqInsertIrp,
-        FspCsqRemoveIrp,
-        FspCsqPeekNextIrp,
-        FspCsqAcquireLock,
-        FspCsqReleaseLock,
-        FspCsqCompleteCanceledIrp);
+        BlorgFspCsqInsertIrp,
+        BlorgFspCsqRemoveIrp,
+        BlorgFspCsqPeekNextIrp,
+        BlorgFspCsqAcquireLock,
+        BlorgFspCsqReleaseLock,
+        BlorgFspCsqCompleteCanceledIrp);
 
     if (!NT_SUCCESS(result))
     {
@@ -603,11 +603,11 @@ NTSTATUS CreateWorkQueue(void)
 
     for (ULONG i = 0; i < threadCount; ++i)
     {
-        result = PsCreateSystemThread(&FspQueue.ThreadHandle[i], DELETE | SYNCHRONIZE, NULL, NULL, NULL, FspDispatch, NULL);
+        result = PsCreateSystemThread(&FspQueue.ThreadHandle[i], DELETE | SYNCHRONIZE, NULL, NULL, NULL, BlorgFspDispatch, NULL);
 
         if (!NT_SUCCESS(result))
         {
-            BLORGFS_PRINT("CreateWorkQueue: PsCreateSystemThread failed for worker %lu: %8lx\n", i, result);
+            BLORGFS_PRINT("BlorgCreateWorkQueue: PsCreateSystemThread failed for worker %lu: %8lx\n", i, result);
             StopWorkQueueThreads(i);
             return result;
         }
@@ -618,7 +618,7 @@ NTSTATUS CreateWorkQueue(void)
 
 //
 // Stops and reaps every worker thread, then drains and cancels any IRPs
-// still left in the queue. CreateWorkQueue guarantees all-or-nothing
+// still left in the queue. BlorgCreateWorkQueue guarantees all-or-nothing
 // thread creation, so all FspQueue.ThreadCount handles are valid here.
 //
 // Each drained IRP goes through FspDiscardPendingIrpContext first: an IRP
@@ -626,7 +626,7 @@ NTSTATUS CreateWorkQueue(void)
 // result, and cancelling it here is the one path where no handler pass
 // will ever consume it.
 //
-void DestroyWorkQueue(void)
+void BlorgDestroyWorkQueue(void)
 {
     StopWorkQueueThreads(FspQueue.ThreadCount);
 
@@ -636,7 +636,7 @@ void DestroyWorkQueue(void)
     {
         FspDiscardPendingIrpContext(irp);
 
-        CompleteRequest(irp, STATUS_CANCELLED, IO_NO_INCREMENT);
+        BlorgCompleteRequest(irp, STATUS_CANCELLED, IO_NO_INCREMENT);
         irp = IoCsqRemoveNextIrp(&FspQueue.Csq, NULL);
     }
 }

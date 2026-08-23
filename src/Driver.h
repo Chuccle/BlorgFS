@@ -150,7 +150,7 @@ _Dispatch_type_(IRP_MJ_SET_SECURITY)             DRIVER_DISPATCH BlorgSetSecurit
 NTSTATUS BlorgInitializeSecurityDescriptor(void);
 VOID BlorgFreeSecurityDescriptor(void);
 
-NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject);
+NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject);
 
 // Driver-wide global state, one instance for the whole driver load.
 extern struct GLOBAL
@@ -177,7 +177,7 @@ extern struct GLOBAL
     //  DriverEntry alongside RemoteHostAnsi. NULL when TLS is disabled at
     //  load, when the configured host is an IPv4/IPv6 literal (RFC 6066
     //  forbids literals in SNI -- see HostStringIsIpLiteral, Driver.c), or
-    //  on allocation failure; TlsStartHandshakeAsync omits the extension
+    //  on allocation failure; BlorgTlsStartHandshakeAsync omits the extension
     //  in all three cases. NUL-terminated (pool-zero allocated), bounded
     //  by BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES like RemoteHostAnsi.
     //
@@ -207,7 +207,7 @@ extern struct GLOBAL
     //      (REG_DWORD). This also picks the default remote port (443 if
     //      TRUE, 8080 if FALSE, unless Parameters\RemotePort explicitly
     //      overrides it) -- the port is resolved once, at load time, via
-    //      GetHttpAddrInfo.
+    //      BlorgGetHttpAddrInfo.
     //
     //    * The debugger, live, no rebuild or reload needed:
     //
@@ -223,7 +223,7 @@ extern struct GLOBAL
     //      can't parse a ClientHello), but does nothing useful.
     //
     //  A handshake also needs Parameters\TlsPin (REG_BINARY, 32 bytes --
-    //  see TlsSetPin/TlsCheckPin in TlsHandshake.c) or the runtime
+    //  see BlorgTlsSetPin/BlorgTlsCheckPin in TlsHandshake.c) or the runtime
     //  IOCTL_BLORGFS_SET_TLS_PIN (DevIoCtrl.c) configured, or every
     //  handshake fails closed at the Certificate message regardless of
     //  this flag.

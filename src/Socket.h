@@ -87,7 +87,7 @@ typedef struct _KSOCKET
 
     //
     // Address this socket is connected to. Set once at creation time and
-    // never changed; used by AcquireReusableWskSocketAsync to refuse handing
+    // never changed; used by BlorgAcquireReusableWskSocketAsync to refuse handing
     // out a pooled socket connected to a stale/different target.
     //
     SOCKADDR_STORAGE RemoteAddress;
@@ -121,7 +121,7 @@ typedef struct _KSOCKET
     // TlsRecvMdl describes the whole accumulator and is built exactly
     // once (MmBuildMdlForNonPagedPool -- no probe/lock, nothing to
     // unlock at completion) so every bulk ciphertext receive goes
-    // through ReceiveWskAsyncMdl instead of paying a fresh
+    // through BlorgReceiveWskAsyncMdl instead of paying a fresh
     // IoAllocateMdl + MmProbeAndLockPages per receive.
     //
     PUCHAR TlsRecvBuffer;
@@ -149,17 +149,17 @@ extern ULONG SocketTlsRecvCapacity;
 // retries cleanly instead of leaving a half-built accumulator that a
 // later caller would mistake for a complete one.
 //
-NTSTATUS EnsureTlsRecvBuffer(PKSOCKET Socket);
+NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket);
 
-NTSTATUS InitialiseWskClient(void);
-void CleanupWskClient(void);
+NTSTATUS BlorgInitialiseWskClient(void);
+void BlorgCleanupWskClient(void);
 
-NTSTATUS GetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo);
-void FreeWskAddrInfo(PADDRINFOEXW AddrInfo);
+NTSTATUS BlorgGetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo);
+void BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo);
 
-NTSTATUS ReleaseReusableWskSocket(PKSOCKET Socket);
+NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket);
 
-void CleanupWskSocketPool(void);
+void BlorgCleanupWskSocketPool(void);
 
 //
 // Fire-and-forget socket close. Never waits, so it is callable from the
@@ -167,7 +167,7 @@ void CleanupWskSocketPool(void);
 // once the close is issued. Use the synchronous close only for
 // PASSIVE_LEVEL teardown.
 //
-NTSTATUS CloseWskSocketAsync(PKSOCKET Socket);
+NTSTATUS BlorgCloseWskSocketAsync(PKSOCKET Socket);
 
 //
 // Asynchronous send/receive. Returns once the operation is issued (not
@@ -179,21 +179,21 @@ NTSTATUS CloseWskSocketAsync(PKSOCKET Socket);
 // async op on the same KSOCKET until CompletionRoutine for the first has
 // run.
 //
-NTSTATUS SendWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
-NTSTATUS ReceiveWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
-NTSTATUS SendRecvWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, BOOLEAN Send, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
+NTSTATUS BlorgSendWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
+NTSTATUS BlorgReceiveWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
+NTSTATUS BlorgSendRecvWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, BOOLEAN Send, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
 
 //
 // Receive directly into a caller-supplied MDL whose pages are already
-// locked (a paging-IO MDL from MM, or one locked via LockUserBuffer /
+// locked (a paging-IO MDL from MM, or one locked via BlorgLockUserBuffer /
 // MmProbeAndLockPages). Offset/Length select the target window within the
-// memory the MDL describes. Unlike ReceiveWskAsync there is no
+// memory the MDL describes. Unlike BlorgReceiveWskAsync there is no
 // allocate/probe/unlock cycle here at all -- the MDL is borrowed for the
 // duration of the operation and untouched at completion; it must stay
 // valid (and locked) until CompletionRoutine runs. Same single-op-per-
 // socket discipline as above.
 //
-NTSTATUS ReceiveWskAsyncMdl(PKSOCKET Socket, PMDL Mdl, ULONG Offset, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
+NTSTATUS BlorgReceiveWskAsyncMdl(PKSOCKET Socket, PMDL Mdl, ULONG Offset, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
 
 //
 // Reused == TRUE means the socket came from the keep-alive pool (an
@@ -211,7 +211,7 @@ typedef VOID(*PKSOCKET_ACQUIRE_COMPLETION_ROUTINE)(NTSTATUS Status, PKSOCKET Soc
 // Used by the retry path so a retry cannot land on a second stale pooled
 // connection.
 //
-NTSTATUS AcquireReusableWskSocketAsync(
+NTSTATUS BlorgAcquireReusableWskSocketAsync(
     PSOCKADDR RemoteAddress,
     BOOLEAN ForceFresh,
     PKSOCKET_ACQUIRE_COMPLETION_ROUTINE CompletionRoutine,

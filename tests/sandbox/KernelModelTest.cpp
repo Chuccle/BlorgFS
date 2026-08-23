@@ -391,7 +391,7 @@ namespace
         {
             PKSOCKET socket = nullptr;
 
-            AcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, AcquireRecordNoop, &socket);
+            BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, AcquireRecordNoop, &socket);
 
             if (!socket)
             {
@@ -403,7 +403,7 @@ namespace
 
             KmJitter();
 
-            ReleaseReusableWskSocket(socket);
+            BlorgReleaseReusableWskSocket(socket);
         }
     }
 }
@@ -417,7 +417,7 @@ namespace
 //
 TEST_F(KernelModelTest, ConnectionPoolSurvivesConcurrentAcquireRelease)
 {
-    ASSERT_EQ(STATUS_SUCCESS, InitialiseWskClient());
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInitialiseWskClient());
 
     const int kThreads = 4;
     const int kIterations = 250;
@@ -444,7 +444,7 @@ TEST_F(KernelModelTest, ConnectionPoolSurvivesConcurrentAcquireRelease)
     EXPECT_EQ(kThreads * kIterations, context.Acquired) << "an acquire failed under contention";
     EXPECT_EQ(0, context.Failures);
 
-    CleanupWskClient();
+    BlorgCleanupWskClient();
 
     EXPECT_EQ(0, KmObjectsLive(KmObjectSocket)) << "sockets leaked under concurrent use";
 
@@ -459,7 +459,7 @@ TEST_F(KernelModelTest, ConnectionPoolSurvivesConcurrentAcquireRelease)
 //
 TEST_F(KernelModelTest, ConcurrentWatchdogArmAndDisarmIsClean)
 {
-    ASSERT_EQ(STATUS_SUCCESS, InitialiseWskClient());
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInitialiseWskClient());
 
     struct Local
     {
@@ -482,7 +482,7 @@ TEST_F(KernelModelTest, ConcurrentWatchdogArmAndDisarmIsClean)
             {
                 PKSOCKET socket = nullptr;
 
-                AcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, AcquireRecordNoop, &socket);
+                BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, AcquireRecordNoop, &socket);
 
                 if (!socket)
                 {
@@ -491,11 +491,11 @@ TEST_F(KernelModelTest, ConcurrentWatchdogArmAndDisarmIsClean)
 
                 unsigned char buffer[16] = {};
 
-                ReceiveWskAsync(socket, buffer, sizeof(buffer), 0, Completion, (PVOID)completions);
+                BlorgReceiveWskAsync(socket, buffer, sizeof(buffer), 0, Completion, (PVOID)completions);
 
                 KmJitter();
 
-                CloseWskSocketAsync(socket);
+                BlorgCloseWskSocketAsync(socket);
             }
         }
     };
@@ -528,7 +528,7 @@ TEST_F(KernelModelTest, ConcurrentWatchdogArmAndDisarmIsClean)
     //
     EXPECT_EQ(0, KmAdvanceTime(120000)) << "a watchdog outlived its operation";
 
-    CleanupWskClient();
+    BlorgCleanupWskClient();
     KmAssertQuiescent("ConcurrentWatchdogArmAndDisarmIsClean");
 }
 

@@ -165,8 +165,8 @@ TEST_F(DispatchStressTest, ManyThreadsOpenAndCloseWithoutLosingCounts)
     ASSERT_EQ(STATUS_SUCCESS, BlorgCreateDCB(&root, (CSHORT)BLORGFS_ROOT_DCB_SIGNATURE, &rootName, volume));
     ASSERT_EQ(STATUS_SUCCESS, BlorgCreateFCB(&vcb, (CSHORT)BLORGFS_VCB_SIGNATURE, nullptr, volume, 0));
 
-    GetVolumeDeviceExtension(volume)->RootDcb = root;
-    GetVolumeDeviceExtension(volume)->Vcb = vcb;
+    BlorgGetVolumeDeviceExtension(volume)->RootDcb = root;
+    BlorgGetVolumeDeviceExtension(volume)->Vcb = vcb;
 
     wchar_t pathBuffer[] = L"\\media\\stress.bin";
     UNICODE_STRING path;
@@ -178,7 +178,7 @@ TEST_F(DispatchStressTest, ManyThreadsOpenAndCloseWithoutLosingCounts)
     meta.Size = 4096;
 
     PCOMMON_CONTEXT node = nullptr;
-    ASSERT_EQ(STATUS_SUCCESS, InsertByPath(root, &path, &meta, volume, &node));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(root, &path, &meta, volume, &node));
     BlorgNodeTablePublish(node);
 
     StressState state = {};

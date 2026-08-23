@@ -27,8 +27,8 @@
 //
 // Parked reads are completed from a fetch completion at DISPATCH, and
 // completing one twice is the classic bug in a park/publish protocol.
-// The model used to intercept CompleteRequest to count that -- but
-// CompleteRequest is a real inline in Util.h, so intercepting it meant
+// The model used to intercept BlorgCompleteRequest to count that -- but
+// BlorgCompleteRequest is a real inline in Util.h, so intercepting it meant
 // the tests exercised the model's copy instead of the driver's. The
 // counting now lives in the shim's IoCompleteRequest, which is where the
 // invariant actually belongs: an IRP completed twice is an NT-level bug

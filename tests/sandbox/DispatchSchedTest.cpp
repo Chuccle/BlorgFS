@@ -213,8 +213,8 @@ void DispatchProofSetup(void* Parameter)
     BlorgCreateDCB(&proof->Root, (CSHORT)BLORGFS_ROOT_DCB_SIGNATURE, &rootName, proof->Volume);
     BlorgCreateFCB(&proof->Vcb, (CSHORT)BLORGFS_VCB_SIGNATURE, nullptr, proof->Volume, 0);
 
-    GetVolumeDeviceExtension(proof->Volume)->RootDcb = proof->Root;
-    GetVolumeDeviceExtension(proof->Volume)->Vcb = proof->Vcb;
+    BlorgGetVolumeDeviceExtension(proof->Volume)->RootDcb = proof->Root;
+    BlorgGetVolumeDeviceExtension(proof->Volume)->Vcb = proof->Vcb;
 
     wcscpy_s(proof->PathBuffer, L"\\media\\contended.bin");
     proof->Path.Buffer = proof->PathBuffer;
@@ -231,7 +231,7 @@ void DispatchProofSetup(void* Parameter)
     meta.Size = 4096;
 
     PCOMMON_CONTEXT node = nullptr;
-    InsertByPath(proof->Root, &proof->Path, &meta, proof->Volume, &node);
+    BlorgInsertByPath(proof->Root, &proof->Path, &meta, proof->Volume, &node);
     BlorgNodeTablePublish(node);
     proof->Node = node;
 

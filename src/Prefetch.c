@@ -403,7 +403,7 @@ static VOID PrefetchPump(PREFETCH_RING* Ring)
 
             if (waiter)
             {
-                CompleteRequest(waiter, status, IO_DISK_INCREMENT);
+                BlorgCompleteRequest(waiter, status, IO_DISK_INCREMENT);
             }
 
             PrefetchReleaseRef(Ring);
@@ -596,7 +596,7 @@ static VOID PrefetchFetchComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOI
             BLORGFS_PRINT("PrefetchFetchComplete: fetch failed with parked read: %8lx\n", Status);
         }
 
-        CompleteRequest(waiter, waiterStatus, IO_DISK_INCREMENT);
+        BlorgCompleteRequest(waiter, waiterStatus, IO_DISK_INCREMENT);
 
         KeAcquireSpinLock(&ring->Lock, &irql);
         ring->Buffers[i] = buffer;

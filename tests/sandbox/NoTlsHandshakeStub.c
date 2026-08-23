@@ -1,5 +1,5 @@
 //
-// TlsStartHandshakeAsync for targets that do not compile TlsHandshake.c.
+// BlorgTlsStartHandshakeAsync for targets that do not compile TlsHandshake.c.
 //
 // Client.c calls it from HttpKick, so it must resolve; but a target that
 // links the real TlsHandshake.c must not also link this. Same split as
@@ -27,7 +27,7 @@
 // this stub, so nothing here should grow until the peer script can speak
 // records.
 //
-VOID TlsStartHandshakeAsync(
+VOID BlorgTlsStartHandshakeAsync(
     PKSOCKET Socket,
     PBLORG_TLS_HANDSHAKE_COMPLETION CompletionRoutine,
     PVOID CallerContext)

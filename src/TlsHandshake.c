@@ -51,19 +51,19 @@ static TLS_PIN_STATE TlsPin;
 // real hardware, but every other push lock in this driver (PathCache.c,
 // Structs.c) is explicitly initialized before first use, and TlsPin.Lock
 // was the one silent exception. Called once from DriverEntry, ahead of the
-// registry read that may call TlsSetPin.
+// registry read that may call BlorgTlsSetPin.
 //
-VOID TlsHandshakeGlobalInit(VOID)
+VOID BlorgTlsHandshakeGlobalInit(VOID)
 {
     ExInitializePushLock(&TlsPin.Lock);
 }
 
 //
 // Sets the configured certificate pin under exclusive lock so a concurrent
-// reader in TlsCheckPin never observes Configured=TRUE with a partially
+// reader in BlorgTlsCheckPin never observes Configured=TRUE with a partially
 // written Value.
 //
-NTSTATUS TlsSetPin(const UCHAR Pin[TLS_HASH_LEN])
+NTSTATUS BlorgTlsSetPin(const UCHAR Pin[TLS_HASH_LEN])
 {
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&TlsPin.Lock);
@@ -83,11 +83,11 @@ NTSTATUS TlsSetPin(const UCHAR Pin[TLS_HASH_LEN])
 // the explicit Configured check fails closed rather than relying on an
 // all-zero Value never matching a real SHA-256 digest.
 //
-BOOLEAN TlsCheckPin(const UCHAR* Spki, ULONG SpkiLen)
+BOOLEAN BlorgTlsCheckPin(const UCHAR* Spki, ULONG SpkiLen)
 {
     UCHAR computed[TLS_HASH_LEN];
 
-    if (!NT_SUCCESS(TlsSha256(Spki, SpkiLen, computed)))
+    if (!NT_SUCCESS(BlorgTlsSha256(Spki, SpkiLen, computed)))
     {
         return FALSE;
     }
@@ -95,7 +95,7 @@ BOOLEAN TlsCheckPin(const UCHAR* Spki, ULONG SpkiLen)
     KeEnterCriticalRegion();
     ExAcquirePushLockShared(&TlsPin.Lock);
 
-    BOOLEAN match = TlsPin.Configured && TlsConstantTimeEqual(computed, TlsPin.Value, TLS_HASH_LEN);
+    BOOLEAN match = TlsPin.Configured && BlorgTlsConstantTimeEqual(computed, TlsPin.Value, TLS_HASH_LEN);
 
     ExReleasePushLockShared(&TlsPin.Lock);
     KeLeaveCriticalRegion();
@@ -224,7 +224,7 @@ static VOID TlsHandshakeOnSendClientFinished(NTSTATUS Status, ULONG_PTR BytesTra
 // legacy_record_version is fixed at 0x0301, which RFC 8446 requires only
 // for the very first record.
 //
-VOID TlsStartHandshakeAsync(
+VOID BlorgTlsStartHandshakeAsync(
     PKSOCKET Socket,
     PBLORG_TLS_HANDSHAKE_COMPLETION CompletionRoutine,
     PVOID CallerContext)
@@ -259,7 +259,7 @@ VOID TlsStartHandshakeAsync(
     Socket->Tls.State = TlsHandshakeInProgress;
 
     UCHAR clientRandom[TLS_HANDSHAKE_RANDOM_LEN];
-    NTSTATUS status = TlsEcdhGenerateKeyPair(ctx->ClientPrivate, ctx->ClientPublic);
+    NTSTATUS status = BlorgTlsEcdhGenerateKeyPair(ctx->ClientPrivate, ctx->ClientPublic);
 
     if (NT_SUCCESS(status))
     {
@@ -282,7 +282,7 @@ VOID TlsStartHandshakeAsync(
 
         if (NT_SUCCESS(status))
         {
-            status = TlsBuildClientHello(
+            status = BlorgTlsBuildClientHello(
                 clientRandom, ctx->ClientPublic, serverName, serverNameLen,
                 ctx->ClientHelloRecord + 5, C_CAST(ULONG, sizeof(ctx->ClientHelloRecord) - 5), &clientHelloLen);
         }
@@ -303,7 +303,7 @@ VOID TlsStartHandshakeAsync(
     RtlCopyMemory(ctx->Transcript, ctx->ClientHelloRecord + 5, clientHelloLen);
     ctx->TranscriptLen = clientHelloLen;
 
-    NTSTATUS sendStatus = SendWskAsync(
+    NTSTATUS sendStatus = BlorgSendWskAsync(
         Socket,
         ctx->ClientHelloRecord,
         5 + clientHelloLen,
@@ -323,7 +323,7 @@ VOID TlsStartHandshakeAsync(
 // routine with the given status. The context is zeroed before the pool
 // free -- it holds the ephemeral ECDHE private scalar and every
 // handshake secret/traffic key, and freed pool contents are otherwise
-// preserved; same policy as TlsDestroyConnectionState (Tls.c) applies to
+// preserved; same policy as BlorgTlsDestroyConnectionState (Tls.c) applies to
 // the socket's own key material.
 //
 static VOID TlsHandshakeFail(PTLS_HANDSHAKE_CONTEXT Ctx, NTSTATUS Status)
@@ -436,7 +436,7 @@ static VOID TlsHandshakeIssueReceiveRecordHeader(PTLS_HANDSHAKE_CONTEXT Ctx)
 
     PKSOCKET socket = Ctx->Socket;
 
-    NTSTATUS accumulatorStatus = EnsureTlsRecvBuffer(socket);
+    NTSTATUS accumulatorStatus = BlorgEnsureTlsRecvBuffer(socket);
 
     if (!NT_SUCCESS(accumulatorStatus))
     {
@@ -493,7 +493,7 @@ static VOID TlsHandshakeIssueReceiveRecordHeader(PTLS_HANDSHAKE_CONTEXT Ctx)
 
     BLORGFS_STAT_INC(TlsBulkReceives);
 
-    NTSTATUS result = ReceiveWskAsyncMdl(
+    NTSTATUS result = BlorgReceiveWskAsyncMdl(
         socket,
         socket->TlsRecvMdl,
         socket->TlsRecvLength,
@@ -561,10 +561,10 @@ static VOID TlsHandshakeOnReceiveRecordPayloadWorker(PDEVICE_OBJECT DeviceObject
 // next step. Also the PASSIVE bounce point for every CNG call reachable
 // from the rest of the handshake (see the bounce check below).
 //
-// Everything reachable from here -- TlsAeadDecrypt, and (via
+// Everything reachable from here -- BlorgTlsAeadDecrypt, and (via
 // TlsHandshakeOnReceiveServerHello / TlsHandshakeProcessFlightMessages /
-// TlsHandshakeSendClientFinished) TlsEcdhComputeSharedSecret,
-// TlsEcdsaVerify, and every HKDF/HMAC/SHA-256 call in Tls.c -- may call
+// TlsHandshakeSendClientFinished) BlorgTlsEcdhComputeSharedSecret,
+// BlorgTlsEcdsaVerify, and every HKDF/HMAC/SHA-256 call in Tls.c -- may call
 // PASSIVE_LEVEL-only CNG (BCryptSecretAgreement, BCryptVerifySignature,
 // BCryptCreateHash). This completion runs on the WSK completion chain,
 // which carries no IRQL guarantee below DISPATCH_LEVEL -- the IRQL check
@@ -645,7 +645,7 @@ static VOID TlsHandshakeOnReceiveRecordPayload(NTSTATUS Status, ULONG_PTR BytesT
         return;
     }
 
-    NTSTATUS decStatus = TlsAeadDecrypt(
+    NTSTATUS decStatus = BlorgTlsAeadDecrypt(
         ctx->ServerHsKey, ctx->ServerHsIv, ctx->ServerSeq,
         ctx->RecordHeader, 5,
         ctx->RecordPayload, ciphertextLen, ctx->RecordPayload + ciphertextLen,
@@ -662,7 +662,7 @@ static VOID TlsHandshakeOnReceiveRecordPayload(NTSTATUS Status, ULONG_PTR BytesT
     UCHAR contentType;
     ULONG contentLen;
 
-    if (!TlsStripInnerPlaintext(ctx->Flight + ctx->FlightLen, ciphertextLen, &contentType, &contentLen))
+    if (!BlorgTlsStripInnerPlaintext(ctx->Flight + ctx->FlightLen, ciphertextLen, &contentType, &contentLen))
     {
         TlsHandshakeFail(ctx, STATUS_INVALID_PARAMETER);
         return;
@@ -728,7 +728,7 @@ static VOID TlsHandshakeOnReceiveServerHello(PTLS_HANDSHAKE_CONTEXT Ctx)
     Ctx->TranscriptLen += Ctx->RecordPayloadLen;
 
     UCHAR serverRandom[TLS_HANDSHAKE_RANDOM_LEN];
-    NTSTATUS status = TlsParseServerHello(Ctx->RecordPayload + 4, shBodyLen, serverRandom, Ctx->ServerPublic);
+    NTSTATUS status = BlorgTlsParseServerHello(Ctx->RecordPayload + 4, shBodyLen, serverRandom, Ctx->ServerPublic);
 
     if (!NT_SUCCESS(status))
     {
@@ -742,20 +742,20 @@ static VOID TlsHandshakeOnReceiveServerHello(PTLS_HANDSHAKE_CONTEXT Ctx)
     UCHAR emptyHash[TLS_HASH_LEN];
     UCHAR derivedForHandshake[TLS_HASH_LEN];
 
-    status = TlsEcdhComputeSharedSecret(Ctx->ClientPrivate, Ctx->ClientPublic, Ctx->ServerPublic, sharedSecret);
-    if (NT_SUCCESS(status)) status = TlsSha256(Ctx->Transcript, Ctx->TranscriptLen, transcriptHashChSh);
-    if (NT_SUCCESS(status)) status = TlsSha256(NULL, 0, emptyHash);
+    status = BlorgTlsEcdhComputeSharedSecret(Ctx->ClientPrivate, Ctx->ClientPublic, Ctx->ServerPublic, sharedSecret);
+    if (NT_SUCCESS(status)) status = BlorgTlsSha256(Ctx->Transcript, Ctx->TranscriptLen, transcriptHashChSh);
+    if (NT_SUCCESS(status)) status = BlorgTlsSha256(NULL, 0, emptyHash);
 
     UCHAR earlySecret[TLS_HASH_LEN];
-    if (NT_SUCCESS(status)) status = TlsHkdfExtract(zero32, 32, zero32, 32, earlySecret);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(earlySecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForHandshake);
-    if (NT_SUCCESS(status)) status = TlsHkdfExtract(derivedForHandshake, TLS_HASH_LEN, sharedSecret, TLS_ECC_COORD_LEN, Ctx->HandshakeSecret);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(Ctx->HandshakeSecret, TLS_HASH_LEN, "c hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, Ctx->ClientHsTraffic);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(Ctx->HandshakeSecret, TLS_HASH_LEN, "s hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, Ctx->ServerHsTraffic);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(Ctx->ServerHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, Ctx->ServerHsKey);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(Ctx->ServerHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, Ctx->ServerHsIv);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(Ctx->ClientHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, Ctx->ClientHsKey);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(Ctx->ClientHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, Ctx->ClientHsIv);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExtract(zero32, 32, zero32, 32, earlySecret);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(earlySecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForHandshake);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExtract(derivedForHandshake, TLS_HASH_LEN, sharedSecret, TLS_ECC_COORD_LEN, Ctx->HandshakeSecret);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(Ctx->HandshakeSecret, TLS_HASH_LEN, "c hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, Ctx->ClientHsTraffic);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(Ctx->HandshakeSecret, TLS_HASH_LEN, "s hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, Ctx->ServerHsTraffic);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(Ctx->ServerHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, Ctx->ServerHsKey);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(Ctx->ServerHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, Ctx->ServerHsIv);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(Ctx->ClientHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, Ctx->ClientHsKey);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(Ctx->ClientHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, Ctx->ClientHsIv);
 
     if (!NT_SUCCESS(status))
     {
@@ -777,7 +777,7 @@ static VOID TlsHandshakeOnReceiveServerHello(PTLS_HANDSHAKE_CONTEXT Ctx)
 // 0x0B Certificate, 0x0F CertificateVerify, 0x14 Finished; each of the
 // latter three requires the prior one(s) already seen and rejects a
 // duplicate or out-of-order arrival. Any other message type fails the
-// handshake. A pin mismatch on the Certificate message (TlsCheckPin
+// handshake. A pin mismatch on the Certificate message (BlorgTlsCheckPin
 // failing on an otherwise cryptographically well-formed certificate, or
 // no pin configured at all) returns STATUS_BLORGFS_CERT_PIN_MISMATCH, a
 // status distinct from the generic STATUS_INVALID_PARAMETER every other
@@ -786,11 +786,11 @@ static VOID TlsHandshakeOnReceiveServerHello(PTLS_HANDSHAKE_CONTEXT Ctx)
 // SECURITY NOTE: this verifies the server's CertificateVerify signature
 // (proof it holds the private key for the certificate it presented), the
 // Finished MAC (proof of a correctly-completed key exchange), and that
-// the leaf certificate's SPKI matches the configured pin (TlsCheckPin) --
+// the leaf certificate's SPKI matches the configured pin (BlorgTlsCheckPin) --
 // proof it's the *right* key, not just *some* valid key. A handshake
 // completed by this code is authenticated exactly as strongly as
-// whatever pin is currently configured (TlsSetPin) -- if none ever was,
-// TlsCheckPin fails closed and no Certificate message can pass this check.
+// whatever pin is currently configured (BlorgTlsSetPin) -- if none ever was,
+// BlorgTlsCheckPin fails closed and no Certificate message can pass this check.
 //
 static NTSTATUS TlsHandshakeProcessFlightMessages(PTLS_HANDSHAKE_CONTEXT Ctx, BOOLEAN* Done)
 {
@@ -842,17 +842,17 @@ static NTSTATUS TlsHandshakeProcessFlightMessages(PTLS_HANDSHAKE_CONTEXT Ctx, BO
                 return STATUS_INVALID_PARAMETER;
             }
 
-            status = TlsParseCertificateMessage(msgBody, msgBodyLen, &leafCert, &leafCertLen);
-            if (NT_SUCCESS(status)) status = TlsExtractSpkiFromCertificate(leafCert, leafCertLen, &spki, &spkiLen);
+            status = BlorgTlsParseCertificateMessage(msgBody, msgBodyLen, &leafCert, &leafCertLen);
+            if (NT_SUCCESS(status)) status = BlorgTlsExtractSpkiFromCertificate(leafCert, leafCertLen, &spki, &spkiLen);
 
-            if (NT_SUCCESS(status) && !TlsCheckPin(spki, spkiLen))
+            if (NT_SUCCESS(status) && !BlorgTlsCheckPin(spki, spkiLen))
             {
                 BLORGFS_PRINT("TlsHandshakeProcessFlightMessages: certificate pin mismatch, rejecting\n");
                 status = STATUS_BLORGFS_CERT_PIN_MISMATCH;
             }
 
-            if (NT_SUCCESS(status)) status = TlsDecodeP256SubjectPublicKeyInfo(spki, spkiLen, Ctx->ServerLongTermKey);
-            if (NT_SUCCESS(status)) status = TlsSha256(Ctx->Transcript, Ctx->TranscriptLen, Ctx->TranscriptHashThroughCert);
+            if (NT_SUCCESS(status)) status = BlorgTlsDecodeP256SubjectPublicKeyInfo(spki, spkiLen, Ctx->ServerLongTermKey);
+            if (NT_SUCCESS(status)) status = BlorgTlsSha256(Ctx->Transcript, Ctx->TranscriptLen, Ctx->TranscriptHashThroughCert);
 
             if (NT_SUCCESS(status))
             {
@@ -870,11 +870,11 @@ static NTSTATUS TlsHandshakeProcessFlightMessages(PTLS_HANDSHAKE_CONTEXT Ctx, BO
                 return STATUS_INVALID_PARAMETER;
             }
 
-            status = TlsParseCertificateVerifyMessage(msgBody, msgBodyLen, rawSignature);
-            if (NT_SUCCESS(status)) status = TlsBuildServerCertVerifyContent(Ctx->TranscriptHashThroughCert, verifyContent);
-            if (NT_SUCCESS(status)) status = TlsSha256(verifyContent, TLS_CERT_VERIFY_CONTENT_LEN, verifyDigest);
-            if (NT_SUCCESS(status)) status = TlsEcdsaVerify(Ctx->ServerLongTermKey, verifyDigest, TLS_HASH_LEN, rawSignature);
-            if (NT_SUCCESS(status)) status = TlsSha256(Ctx->Transcript, Ctx->TranscriptLen, Ctx->TranscriptHashThroughCertVerify);
+            status = BlorgTlsParseCertificateVerifyMessage(msgBody, msgBodyLen, rawSignature);
+            if (NT_SUCCESS(status)) status = BlorgTlsBuildServerCertVerifyContent(Ctx->TranscriptHashThroughCert, verifyContent);
+            if (NT_SUCCESS(status)) status = BlorgTlsSha256(verifyContent, TLS_CERT_VERIFY_CONTENT_LEN, verifyDigest);
+            if (NT_SUCCESS(status)) status = BlorgTlsEcdsaVerify(Ctx->ServerLongTermKey, verifyDigest, TLS_HASH_LEN, rawSignature);
+            if (NT_SUCCESS(status)) status = BlorgTlsSha256(Ctx->Transcript, Ctx->TranscriptLen, Ctx->TranscriptHashThroughCertVerify);
 
             if (NT_SUCCESS(status))
             {
@@ -891,10 +891,10 @@ static NTSTATUS TlsHandshakeProcessFlightMessages(PTLS_HANDSHAKE_CONTEXT Ctx, BO
                 return STATUS_INVALID_PARAMETER;
             }
 
-            status = TlsHkdfExpandLabel(Ctx->ServerHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, serverFinishedKey);
-            if (NT_SUCCESS(status)) status = TlsHmacSha256(serverFinishedKey, TLS_HASH_LEN, Ctx->TranscriptHashThroughCertVerify, TLS_HASH_LEN, expectedFinishedMac);
+            status = BlorgTlsHkdfExpandLabel(Ctx->ServerHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, serverFinishedKey);
+            if (NT_SUCCESS(status)) status = BlorgTlsHmacSha256(serverFinishedKey, TLS_HASH_LEN, Ctx->TranscriptHashThroughCertVerify, TLS_HASH_LEN, expectedFinishedMac);
 
-            if (NT_SUCCESS(status) && !TlsConstantTimeEqual(expectedFinishedMac, msgBody, TLS_HASH_LEN))
+            if (NT_SUCCESS(status) && !BlorgTlsConstantTimeEqual(expectedFinishedMac, msgBody, TLS_HASH_LEN))
             {
                 status = STATUS_INVALID_PARAMETER;
             }
@@ -946,10 +946,10 @@ static NTSTATUS TlsHandshakeProcessFlightMessages(PTLS_HANDSHAKE_CONTEXT Ctx, BO
 // DISPATCH-usable key handles (WriteKeyHandle/ReadKeyHandle) are cached
 // alongside the raw key bytes right after -- this is what lets the
 // record-layer hot path (ordinary HTTP read/write once this handshake
-// completes) call TlsAeadEncryptKeyed/TlsAeadDecryptKeyed without ever
+// completes) call BlorgTlsAeadEncryptKeyed/BlorgTlsAeadDecryptKeyed without ever
 // needing a PASSIVE bounce. Safe to do here: this whole function only
 // runs within the handshake's own PASSIVE-bounced completion chain (see
-// TlsHandshakeOnReceiveRecordPayload), and TlsImportKeyHandle has no IRQL
+// TlsHandshakeOnReceiveRecordPayload), and BlorgTlsImportKeyHandle has no IRQL
 // restriction of its own.
 //
 // The client Finished plaintext's trailing byte is the inner content
@@ -972,18 +972,18 @@ static VOID TlsHandshakeSendClientFinished(PTLS_HANDSHAKE_CONTEXT Ctx)
     UCHAR clientFinishedMac[TLS_HASH_LEN];
     NTSTATUS status;
 
-    status = TlsSha256(NULL, 0, emptyHash);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(Ctx->HandshakeSecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForMaster);
-    if (NT_SUCCESS(status)) status = TlsHkdfExtract(derivedForMaster, TLS_HASH_LEN, zero32, 32, masterSecret);
-    if (NT_SUCCESS(status)) status = TlsSha256(Ctx->Transcript, Ctx->TranscriptLen, transcriptHashThroughServerFinished);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(masterSecret, TLS_HASH_LEN, "c ap traffic", transcriptHashThroughServerFinished, TLS_HASH_LEN, TLS_HASH_LEN, clientAppTraffic);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(masterSecret, TLS_HASH_LEN, "s ap traffic", transcriptHashThroughServerFinished, TLS_HASH_LEN, TLS_HASH_LEN, serverAppTraffic);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(clientAppTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, clientAppKey);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(clientAppTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, clientAppIv);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(serverAppTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, serverAppKey);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(serverAppTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, serverAppIv);
-    if (NT_SUCCESS(status)) status = TlsHkdfExpandLabel(Ctx->ClientHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, clientFinishedKey);
-    if (NT_SUCCESS(status)) status = TlsHmacSha256(clientFinishedKey, TLS_HASH_LEN, transcriptHashThroughServerFinished, TLS_HASH_LEN, clientFinishedMac);
+    status = BlorgTlsSha256(NULL, 0, emptyHash);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(Ctx->HandshakeSecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForMaster);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExtract(derivedForMaster, TLS_HASH_LEN, zero32, 32, masterSecret);
+    if (NT_SUCCESS(status)) status = BlorgTlsSha256(Ctx->Transcript, Ctx->TranscriptLen, transcriptHashThroughServerFinished);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(masterSecret, TLS_HASH_LEN, "c ap traffic", transcriptHashThroughServerFinished, TLS_HASH_LEN, TLS_HASH_LEN, clientAppTraffic);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(masterSecret, TLS_HASH_LEN, "s ap traffic", transcriptHashThroughServerFinished, TLS_HASH_LEN, TLS_HASH_LEN, serverAppTraffic);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(clientAppTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, clientAppKey);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(clientAppTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, clientAppIv);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(serverAppTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, serverAppKey);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(serverAppTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, serverAppIv);
+    if (NT_SUCCESS(status)) status = BlorgTlsHkdfExpandLabel(Ctx->ClientHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, clientFinishedKey);
+    if (NT_SUCCESS(status)) status = BlorgTlsHmacSha256(clientFinishedKey, TLS_HASH_LEN, transcriptHashThroughServerFinished, TLS_HASH_LEN, clientFinishedMac);
 
     if (!NT_SUCCESS(status))
     {
@@ -999,8 +999,8 @@ static VOID TlsHandshakeSendClientFinished(PTLS_HANDSHAKE_CONTEXT Ctx)
     RtlCopyMemory(Ctx->Socket->Tls.ReadIv, serverAppIv, TLS_IV_LEN);
     Ctx->Socket->Tls.ReadSeq = 0;
 
-    status = TlsImportKeyHandle(clientAppKey, &Ctx->Socket->Tls.WriteKeyHandle);
-    if (NT_SUCCESS(status)) status = TlsImportKeyHandle(serverAppKey, &Ctx->Socket->Tls.ReadKeyHandle);
+    status = BlorgTlsImportKeyHandle(clientAppKey, &Ctx->Socket->Tls.WriteKeyHandle);
+    if (NT_SUCCESS(status)) status = BlorgTlsImportKeyHandle(serverAppKey, &Ctx->Socket->Tls.ReadKeyHandle);
 
     if (!NT_SUCCESS(status))
     {
@@ -1023,7 +1023,7 @@ static VOID TlsHandshakeSendClientFinished(PTLS_HANDSHAKE_CONTEXT Ctx)
     Ctx->ClientFinishedRecord[3] = C_CAST(UCHAR, recordLen >> 8);
     Ctx->ClientFinishedRecord[4] = C_CAST(UCHAR, recordLen & 0xFF);
 
-    status = TlsAeadEncrypt(
+    status = BlorgTlsAeadEncrypt(
         Ctx->ClientHsKey, Ctx->ClientHsIv, 0,
         Ctx->ClientFinishedRecord, 5,
         plaintext, C_CAST(ULONG, sizeof(plaintext)),
@@ -1035,7 +1035,7 @@ static VOID TlsHandshakeSendClientFinished(PTLS_HANDSHAKE_CONTEXT Ctx)
         return;
     }
 
-    NTSTATUS sendStatus = SendWskAsync(
+    NTSTATUS sendStatus = BlorgSendWskAsync(
         Ctx->Socket,
         Ctx->ClientFinishedRecord,
         C_CAST(ULONG, 5 + sizeof(plaintext) + TLS_TAG_LEN),

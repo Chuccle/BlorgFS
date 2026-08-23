@@ -25,7 +25,7 @@ static NTSTATUS BlorgVolumeCleanup(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_O
 {
     PFILE_OBJECT fileObject = IrpSp->FileObject;
     PCOMMON_CONTEXT node = fileObject->FsContext;
-    PBLORGFS_VDO_DEVICE_EXTENSION devExt = GetVolumeDeviceExtension(VolumeDeviceObject);
+    PBLORGFS_VDO_DEVICE_EXTENSION devExt = BlorgGetVolumeDeviceExtension(VolumeDeviceObject);
 
     FsRtlNotifyCleanup(devExt->NotifySync, &devExt->NotifyList, fileObject->FsContext2);
 

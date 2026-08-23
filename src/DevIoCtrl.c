@@ -36,7 +36,7 @@
 
 //
 //  Pushes a new TLS certificate pin (32-byte SHA-256 of the leaf's DER
-//  SubjectPublicKeyInfo -- see TlsSetPin/TlsCheckPin in TlsHandshake.c)
+//  SubjectPublicKeyInfo -- see BlorgTlsSetPin/BlorgTlsCheckPin in TlsHandshake.c)
 //  without a driver reload. 0x800 is the first function code in
 //  Microsoft's reserved-for-vendor-use range. METHOD_BUFFERED: fixed
 //  32-byte payload. FILE_WRITE_ACCESS: this changes what the driver
@@ -93,7 +93,7 @@ static NTSTATUS BlorgFsdoDeviceControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             }
 
             Irp->IoStatus.Information = 0;
-            return TlsSetPin(C_CAST(const UCHAR*, Irp->AssociatedIrp.SystemBuffer));
+            return BlorgTlsSetPin(C_CAST(const UCHAR*, Irp->AssociatedIrp.SystemBuffer));
         }
 
         case IOCTL_BLORGFS_QUERY_STATISTICS:

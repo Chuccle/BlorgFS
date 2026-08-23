@@ -93,8 +93,8 @@ protected:
         ASSERT_EQ(STATUS_SUCCESS,
             BlorgCreateFCB(&Vcb, (CSHORT)BLORGFS_VCB_SIGNATURE, nullptr, Volume, 0));
 
-        GetVolumeDeviceExtension(Volume)->RootDcb = Root;
-        GetVolumeDeviceExtension(Volume)->Vcb = Vcb;
+        BlorgGetVolumeDeviceExtension(Volume)->RootDcb = Root;
+        BlorgGetVolumeDeviceExtension(Volume)->Vcb = Vcb;
     }
 
     void TearDown() override
@@ -118,11 +118,11 @@ protected:
 
         //
         // PathCacheTest.cpp registers a ::testing::Environment that calls
-        // PathCacheInit() once for the whole process -- gtest runs a
+        // BlorgPathCacheInit() once for the whole process -- gtest runs a
         // registered Environment's SetUp/TearDown regardless of
         // --gtest_filter, so PathCache.Ready is TRUE here whether or not
         // PathCacheTest.cpp's own tests are selected. The listing-hit
-        // tests below genuinely call PathCacheInsertExists/InsertNotFound
+        // tests below genuinely call BlorgPathCacheInsertExists/InsertNotFound
         // (Create.c), which is real cache state, not scaffolding -- and it
         // outlives this fixture's own tree, since PathCache is a
         // process-global structure this test doesn't otherwise touch.
@@ -139,7 +139,7 @@ protected:
         // quietly evict another fixture's entries.
         //
         UNICODE_STRING mediaSubtree = Path(L"\\media");
-        PathCacheInvalidatePrefix(&mediaSubtree);
+        BlorgPathCacheInvalidatePrefix(&mediaSubtree);
 
         StructsModelDestroyVolume(Volume);
 
@@ -176,7 +176,7 @@ protected:
 
     //
     // A node built and published the way a completed cold open leaves one
-    // (see InsertByPath/BlorgNodeTablePublish in Create.c).
+    // (see BlorgInsertByPath/BlorgNodeTablePublish in Create.c).
     //
     PCOMMON_CONTEXT MakePublishedNode(const wchar_t* path, BOOLEAN IsDirectory)
     {
@@ -187,7 +187,7 @@ protected:
         UNICODE_STRING name = Path(path);
         PCOMMON_CONTEXT node = nullptr;
 
-        EXPECT_EQ(STATUS_SUCCESS, InsertByPath(Root, &name, &meta, Volume, &node));
+        EXPECT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &name, &meta, Volume, &node));
 
         if (node)
         {
@@ -630,7 +630,7 @@ TEST_F(CreateDirectoryTest, RootRelativeOpenDoesNotDoubleTheSeparator)
 // branch allocates nothing else, so a failed repost must leave the count
 // exactly where it started.
 //
-// STATUS_DEVICE_REMOVED rather than STATUS_PENDING is FsdPostRequest's
+// STATUS_DEVICE_REMOVED rather than STATUS_PENDING is BlorgFsdPostRequest's
 // ThreadsActive gate: DispatchSandbox never starts the real FSP workers
 // (see ReadTest.cpp's CachedReadMissWithWaitReachesFsdPostRequest). The
 // gate fires before the queue insert, so the IRP is still ours and the
@@ -656,7 +656,7 @@ TEST_F(CreateDirectoryTest, RelativeOpenThatRepostsToTheFspFreesItsJoinedPath)
     BlorgCreate(Volume, &missOpener.CreateIrp);
 
     ASSERT_EQ(STATUS_DEVICE_REMOVED, missOpener.CreateIrp.IoStatus.Status)
-        << "this test needs the create to reach FsdPostRequest and be refused there";
+        << "this test needs the create to reach BlorgFsdPostRequest and be refused there";
 
     EXPECT_EQ(before, ShimPoolOutstanding())
         << "the joined path built for the first pass was not freed before reposting";
@@ -665,7 +665,7 @@ TEST_F(CreateDirectoryTest, RelativeOpenThatRepostsToTheFspFreesItsJoinedPath)
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// InsertByPath -- a resident file standing where a directory is expected
+// BlorgInsertByPath -- a resident file standing where a directory is expected
 ///////////////////////////////////////////////////////////////////////////
 
 //
@@ -673,10 +673,10 @@ TEST_F(CreateDirectoryTest, RelativeOpenThatRepostsToTheFspFreesItsJoinedPath)
 // FILE_LOCK. So descending into a resident FILE as though it were the
 // next directory does not fail cleanly -- it walks a list head made of
 // whatever FsRtlInitializeFileLock left there and dereferences the
-// result. SearchByPath rejects this shape; InsertByPath is the other half
+// result. BlorgSearchByPath rejects this shape; BlorgInsertByPath is the other half
 // of the same walk and has to reject it too.
 //
-// Driven through InsertByPath directly, the way MakePublishedNode does:
+// Driven through BlorgInsertByPath directly, the way MakePublishedNode does:
 // reaching it through a real create means the backend has to claim the
 // path exists, and the point here is the tree walk, not the round trip
 // that authorises it. In production that authorisation is ordinary -- a
@@ -698,7 +698,7 @@ TEST_F(CreateDirectoryTest, InsertByPathRejectsAFileStandingInForADirectory)
     UNICODE_STRING throughTheFile = Path(L"\\media\\clip.bin\\inner.bin");
     PCOMMON_CONTEXT inserted = reinterpret_cast<PCOMMON_CONTEXT>(~0ull);
 
-    NTSTATUS status = InsertByPath(Root, &throughTheFile, &meta, Volume, &inserted);
+    NTSTATUS status = BlorgInsertByPath(Root, &throughTheFile, &meta, Volume, &inserted);
 
     EXPECT_EQ(STATUS_OBJECT_PATH_NOT_FOUND, status)
         << "a file cannot be an intermediate path component";
@@ -709,10 +709,10 @@ TEST_F(CreateDirectoryTest, InsertByPathRejectsAFileStandingInForADirectory)
     // its place under \media, and nothing was grafted underneath it.
     //
     UNICODE_STRING filePath = Path(L"\\media\\clip.bin");
-    EXPECT_EQ(file, SearchByPath(Root, &filePath));
+    EXPECT_EQ(file, BlorgSearchByPath(Root, &filePath));
 
     UNICODE_STRING mediaPath = Path(L"\\media");
-    EXPECT_EQ(dir, SearchByPath(Root, &mediaPath));
+    EXPECT_EQ(dir, BlorgSearchByPath(Root, &mediaPath));
 }
 
 //
@@ -735,7 +735,7 @@ TEST_F(CreateDirectoryTest, InsertByPathTreatsAnExistingFileLeafAsAlreadyPresent
     UNICODE_STRING samePath = Path(L"\\media\\clip.bin");
     PCOMMON_CONTEXT inserted = reinterpret_cast<PCOMMON_CONTEXT>(~0ull);
 
-    EXPECT_EQ(STATUS_SUCCESS, InsertByPath(Root, &samePath, &meta, Volume, &inserted));
+    EXPECT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &samePath, &meta, Volume, &inserted));
     EXPECT_EQ(nullptr, inserted) << "nothing new is created for a path that already resolves";
 }
 

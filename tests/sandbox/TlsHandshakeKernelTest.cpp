@@ -2,8 +2,8 @@
 // Kernel-behaviour tests for the real TlsHandshake.c, run against the
 // kernel rule model with a scriptable WSK peer (WskModel.h) -- the same
 // substrate SocketKernelTest.cpp uses, since the handshake drives the
-// exact same async WSK primitives Socket.c exposes (SendWskAsync,
-// ReceiveWskAsyncMdl).
+// exact same async WSK primitives Socket.c exposes (BlorgSendWskAsync,
+// BlorgReceiveWskAsyncMdl).
 //
 // TlsHandshake.c had zero measured coverage before this file existed: the
 // only other project that compiles it is DispatchSandbox (built for
@@ -13,7 +13,7 @@
 // reason (see tools\Invoke-BlorgChecks.ps1).
 //
 // These tests act as the TLS *server* side of a handshake instead of a
-// live peer: TlsStartHandshakeAsync generates its own ephemeral ECDHE key
+// live peer: BlorgTlsStartHandshakeAsync generates its own ephemeral ECDHE key
 // pair and client random internally, so a script can't be built in advance
 // the way SocketKernelTest.cpp's fixed byte payloads can. Instead each test
 // captures the real ClientHello the driver sends (WskModelLastSendBytes),
@@ -23,7 +23,7 @@
 // back through WskModelSetReceiveBehaviour -- the same receive-callback
 // path TlsHandshakeIssueReceiveRecordHeader drains in the driver.
 //
-// TlsCheckPin is the priority: it's the actual security boundary (a
+// BlorgTlsCheckPin is the priority: it's the actual security boundary (a
 // MITM'd certificate -- cryptographically valid, just not the pinned one
 // -- must be rejected) and had no verification that it did anything.
 //
@@ -47,14 +47,14 @@ namespace
 {
 
 ///////////////////////////////////////////////////////////////////////////
-// Minimal DER helpers -- test-only, mirrors what TlsParseCertificateVerifyMessage
+// Minimal DER helpers -- test-only, mirrors what BlorgTlsParseCertificateVerifyMessage
 // (Tls.c) decodes back out.
 ///////////////////////////////////////////////////////////////////////////
 
 // Encodes a 32-byte unsigned big-endian value as a DER INTEGER: strips
 // redundant leading zero bytes, then re-adds exactly one if the remaining
 // high bit is set (DER INTEGERs are signed; a top bit would otherwise read
-// as negative). Mirrors, in reverse, the padding TlsParseCertificateVerifyMessage
+// as negative). Mirrors, in reverse, the padding BlorgTlsParseCertificateVerifyMessage
 // strips when decoding r/s back out of the wire signature.
 ULONG DerEncodeUnsignedInteger(const UCHAR value32[32], UCHAR* out)
 {
@@ -86,7 +86,7 @@ ULONG DerEncodeUnsignedInteger(const UCHAR value32[32], UCHAR* out)
 
 // SEQUENCE { INTEGER r, INTEGER s } from BCryptSignHash's raw r||s (64
 // bytes) -- the wire form CertificateVerify carries and
-// TlsParseCertificateVerifyMessage expects.
+// BlorgTlsParseCertificateVerifyMessage expects.
 ULONG DerEncodeEcdsaSignature(const UCHAR rawSig[64], UCHAR* out)
 {
     UCHAR rEnc[35];
@@ -106,7 +106,7 @@ ULONG DerEncodeEcdsaSignature(const UCHAR rawSig[64], UCHAR* out)
 
 //
 // A fake but structurally valid leaf certificate DER carrying the given
-// P-256 SPKI. TlsExtractSpkiFromCertificate only walks TLV *lengths* to
+// P-256 SPKI. BlorgTlsExtractSpkiFromCertificate only walks TLV *lengths* to
 // reach subjectPublicKeyInfo and never validates the issuing CA's
 // signature -- this driver pins the leaf's SPKI directly, it doesn't
 // verify a chain -- so every field ahead of the SPKI just needs to be a
@@ -214,7 +214,7 @@ struct FakeTlsServer
     // certificate carrying its SPKI.
     bool GenerateKeys()
     {
-        if (!NT_SUCCESS(TlsEcdhGenerateKeyPair(ServerEcdhPrivate, ServerEcdhPublic))) return false;
+        if (!NT_SUCCESS(BlorgTlsEcdhGenerateKeyPair(ServerEcdhPrivate, ServerEcdhPublic))) return false;
         if (!NT_SUCCESS(BCryptGenRandom(NULL, ServerRandom, TLS_HANDSHAKE_RANDOM_LEN, BCRYPT_USE_SYSTEM_PREFERRED_RNG))) return false;
 
         if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&EcdsaAlg, BCRYPT_ECDSA_P256_ALGORITHM, NULL, 0))) return false;
@@ -228,7 +228,7 @@ struct FakeTlsServer
         ServerLongTermPublic[0] = 0x04;
         memcpy(ServerLongTermPublic + 1, pubBlob + sizeof(BCRYPT_ECCKEY_BLOB), 2 * TLS_ECC_COORD_LEN);
 
-        if (!NT_SUCCESS(TlsEncodeP256SubjectPublicKeyInfo(ServerLongTermPublic, Spki))) return false;
+        if (!NT_SUCCESS(BlorgTlsEncodeP256SubjectPublicKeyInfo(ServerLongTermPublic, Spki))) return false;
 
         LeafCertDerLen = BuildFakeLeafCertificate(Spki, LeafCertDer);
         return LeafCertDerLen > 0;
@@ -345,28 +345,28 @@ struct FakeTlsServer
     bool DeriveHandshakeSecrets()
     {
         UCHAR sharedSecret[TLS_ECC_COORD_LEN];
-        if (!NT_SUCCESS(TlsEcdhComputeSharedSecret(ServerEcdhPrivate, ServerEcdhPublic, ClientPublicKey, sharedSecret))) return false;
+        if (!NT_SUCCESS(BlorgTlsEcdhComputeSharedSecret(ServerEcdhPrivate, ServerEcdhPublic, ClientPublicKey, sharedSecret))) return false;
 
         UCHAR transcriptHashChSh[TLS_HASH_LEN];
-        if (!NT_SUCCESS(TlsSha256(Transcript, TranscriptLen, transcriptHashChSh))) return false;
+        if (!NT_SUCCESS(BlorgTlsSha256(Transcript, TranscriptLen, transcriptHashChSh))) return false;
 
         UCHAR emptyHash[TLS_HASH_LEN];
-        TlsSha256(NULL, 0, emptyHash);
+        BlorgTlsSha256(NULL, 0, emptyHash);
 
         UCHAR zero32[32] = { 0 };
         UCHAR earlySecret[TLS_HASH_LEN];
-        TlsHkdfExtract(zero32, 32, zero32, 32, earlySecret);
+        BlorgTlsHkdfExtract(zero32, 32, zero32, 32, earlySecret);
 
         UCHAR derivedForHandshake[TLS_HASH_LEN];
-        TlsHkdfExpandLabel(earlySecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForHandshake);
+        BlorgTlsHkdfExpandLabel(earlySecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForHandshake);
 
-        TlsHkdfExtract(derivedForHandshake, TLS_HASH_LEN, sharedSecret, TLS_ECC_COORD_LEN, HandshakeSecret);
+        BlorgTlsHkdfExtract(derivedForHandshake, TLS_HASH_LEN, sharedSecret, TLS_ECC_COORD_LEN, HandshakeSecret);
 
-        TlsHkdfExpandLabel(HandshakeSecret, TLS_HASH_LEN, "c hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, ClientHsTraffic);
-        TlsHkdfExpandLabel(HandshakeSecret, TLS_HASH_LEN, "s hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, ServerHsTraffic);
+        BlorgTlsHkdfExpandLabel(HandshakeSecret, TLS_HASH_LEN, "c hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, ClientHsTraffic);
+        BlorgTlsHkdfExpandLabel(HandshakeSecret, TLS_HASH_LEN, "s hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, ServerHsTraffic);
 
-        TlsHkdfExpandLabel(ServerHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, ServerHsKey);
-        TlsHkdfExpandLabel(ServerHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, ServerHsIv);
+        BlorgTlsHkdfExpandLabel(ServerHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, ServerHsKey);
+        BlorgTlsHkdfExpandLabel(ServerHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, ServerHsIv);
 
         return true;
     }
@@ -411,12 +411,12 @@ struct FakeTlsServer
         AppendToTranscript(certMsg, certMsgLen);
 
         UCHAR transcriptHashThroughCert[TLS_HASH_LEN];
-        TlsSha256(Transcript, TranscriptLen, transcriptHashThroughCert);
+        BlorgTlsSha256(Transcript, TranscriptLen, transcriptHashThroughCert);
 
         UCHAR verifyContent[TLS_CERT_VERIFY_CONTENT_LEN];
-        TlsBuildServerCertVerifyContent(transcriptHashThroughCert, verifyContent);
+        BlorgTlsBuildServerCertVerifyContent(transcriptHashThroughCert, verifyContent);
         UCHAR verifyDigest[TLS_HASH_LEN];
-        TlsSha256(verifyContent, TLS_CERT_VERIFY_CONTENT_LEN, verifyDigest);
+        BlorgTlsSha256(verifyContent, TLS_CERT_VERIFY_CONTENT_LEN, verifyDigest);
 
         UCHAR rawSig[64];
         ULONG sigResultLen = 0;
@@ -440,12 +440,12 @@ struct FakeTlsServer
         AppendToTranscript(cvMsg, cvMsgLen);
 
         UCHAR transcriptHashThroughCertVerify[TLS_HASH_LEN];
-        TlsSha256(Transcript, TranscriptLen, transcriptHashThroughCertVerify);
+        BlorgTlsSha256(Transcript, TranscriptLen, transcriptHashThroughCertVerify);
 
         UCHAR serverFinishedKey[TLS_HASH_LEN];
-        TlsHkdfExpandLabel(ServerHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, serverFinishedKey);
+        BlorgTlsHkdfExpandLabel(ServerHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, serverFinishedKey);
         UCHAR finishedMac[TLS_HASH_LEN];
-        TlsHmacSha256(serverFinishedKey, TLS_HASH_LEN, transcriptHashThroughCertVerify, TLS_HASH_LEN, finishedMac);
+        BlorgTlsHmacSha256(serverFinishedKey, TLS_HASH_LEN, transcriptHashThroughCertVerify, TLS_HASH_LEN, finishedMac);
 
         if (FlightCorruptFinishedMac == variant)
         {
@@ -479,7 +479,7 @@ struct FakeTlsServer
 
         //
         // Zero padding after the content-type trailer, which RFC 8446 5.4
-        // allows and TlsStripInnerPlaintext scans back over. Grown until the
+        // allows and BlorgTlsStripInnerPlaintext scans back over. Grown until the
         // ciphertext hits exactly the largest a compliant server may emit,
         // so the record's declared length is the real-world maximum rather
         // than an arbitrary large number.
@@ -500,7 +500,7 @@ struct FakeTlsServer
         std::vector<UCHAR> ciphertextBuf(TLS_RECORD_CIPHERTEXT_MAX, 0);
         UCHAR* ciphertext = ciphertextBuf.data();
         UCHAR tag[TLS_TAG_LEN];
-        if (!NT_SUCCESS(TlsAeadEncrypt(ServerHsKey, ServerHsIv, 0, aad, 5, flightPlain, fpo, ciphertext, tag))) return 0;
+        if (!NT_SUCCESS(BlorgTlsAeadEncrypt(ServerHsKey, ServerHsIv, 0, aad, 5, flightPlain, fpo, ciphertext, tag))) return 0;
 
         memcpy(out, aad, 5);
         memcpy(out + 5, ciphertext, fpo);
@@ -521,17 +521,17 @@ protected:
     {
         ShimReset();
         WskModelReset();
-        ASSERT_EQ(STATUS_SUCCESS, InitialiseWskClient());
-        ASSERT_EQ(STATUS_SUCCESS, TlsGlobalInit());
-        TlsHandshakeGlobalInit(); // TlsPin.Lock must be initialized before TlsSetPin/TlsCheckPin -- normally DriverEntry's job
+        ASSERT_EQ(STATUS_SUCCESS, BlorgInitialiseWskClient());
+        ASSERT_EQ(STATUS_SUCCESS, BlorgTlsGlobalInit());
+        BlorgTlsHandshakeGlobalInit(); // TlsPin.Lock must be initialized before BlorgTlsSetPin/BlorgTlsCheckPin -- normally DriverEntry's job
         Result = {};
         AcquireResult = {};
     }
 
     void TearDown() override
     {
-        TlsGlobalCleanup();
-        CleanupWskClient();
+        BlorgTlsGlobalCleanup();
+        BlorgCleanupWskClient();
 
         //
         // Nothing may outlive a test -- same discipline as
@@ -561,7 +561,7 @@ protected:
     }
 
     // ForceFresh=TRUE throughout: these tests never release a socket back
-    // to Socket.c's connection pool (only CloseWskSocketAsync), so there is
+    // to Socket.c's connection pool (only BlorgCloseWskSocketAsync), so there is
     // nothing there for a later test -- in this file or any other sharing
     // the process -- to collide with.
     PKSOCKET AcquireSocket()
@@ -572,7 +572,7 @@ protected:
 
         AcquireResult = {};
 
-        NTSTATUS status = AcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, RecordAcquire, nullptr);
+        NTSTATUS status = BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, RecordAcquire, nullptr);
 
         EXPECT_EQ(STATUS_PENDING, status);
         EXPECT_TRUE(NT_SUCCESS(AcquireResult.Status));
@@ -599,7 +599,7 @@ protected:
     // Starts the handshake with the ClientHello send deliberately
     // WskModelDeferred, so the real bytes the driver generated can be
     // captured (WskModelLastSendBytes) before anything completes --
-    // otherwise TlsStartHandshakeAsync's send completes inline and issues
+    // otherwise BlorgTlsStartHandshakeAsync's send completes inline and issues
     // the ServerHello receive in the same call, leaving no window to
     // script a response that depends on what was just generated.
     //
@@ -613,7 +613,7 @@ protected:
         deferredSend.Status = STATUS_SUCCESS;
         WskModelSetSendBehaviour(&deferredSend);
 
-        TlsStartHandshakeAsync(socket, OnHandshakeDone, nullptr);
+        BlorgTlsStartHandshakeAsync(socket, OnHandshakeDone, nullptr);
 
         EXPECT_TRUE(server->CaptureClientHello());
 
@@ -653,7 +653,7 @@ TlsHandshakeKernelTest::AcquireRecord TlsHandshakeKernelTest::AcquireResult;
 TlsHandshakeKernelTest::HandshakeRecord TlsHandshakeKernelTest::Result;
 
 ///////////////////////////////////////////////////////////////////////////
-// TlsCheckPin -- the priority: this is the actual security boundary
+// BlorgTlsCheckPin -- the priority: this is the actual security boundary
 ///////////////////////////////////////////////////////////////////////////
 
 TEST_F(TlsHandshakeKernelTest, HandshakeSucceedsAndTlsCheckPinAcceptsMatchingCertificate)
@@ -662,8 +662,8 @@ TEST_F(TlsHandshakeKernelTest, HandshakeSucceedsAndTlsCheckPinAcceptsMatchingCer
     ASSERT_TRUE(server.GenerateKeys());
 
     UCHAR pin[TLS_HASH_LEN];
-    ASSERT_EQ(STATUS_SUCCESS, TlsSha256(server.Spki, TLS_SPKI_DER_LEN, pin));
-    ASSERT_EQ(STATUS_SUCCESS, TlsSetPin(pin));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgTlsSha256(server.Spki, TLS_SPKI_DER_LEN, pin));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgTlsSetPin(pin));
 
     PKSOCKET socket = StartAndCaptureClientHello(&server);
 
@@ -679,7 +679,7 @@ TEST_F(TlsHandshakeKernelTest, HandshakeSucceedsAndTlsCheckPinAcceptsMatchingCer
     EXPECT_EQ(STATUS_SUCCESS, Result.Status);
     EXPECT_EQ(TlsHandshakeComplete, socket->Tls.State);
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 //
@@ -706,8 +706,8 @@ TEST_F(TlsHandshakeKernelTest, HandshakeAcceptsAMaximallySizedFlightRecord)
     ASSERT_TRUE(server.GenerateKeys());
 
     UCHAR pin[TLS_HASH_LEN];
-    ASSERT_EQ(STATUS_SUCCESS, TlsSha256(server.Spki, TLS_SPKI_DER_LEN, pin));
-    ASSERT_EQ(STATUS_SUCCESS, TlsSetPin(pin));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgTlsSha256(server.Spki, TLS_SPKI_DER_LEN, pin));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgTlsSetPin(pin));
 
     PKSOCKET socket = StartAndCaptureClientHello(&server);
 
@@ -734,7 +734,7 @@ TEST_F(TlsHandshakeKernelTest, HandshakeAcceptsAMaximallySizedFlightRecord)
            "2^14 plaintext maximum";
     EXPECT_EQ(TlsHandshakeComplete, socket->Tls.State);
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnCertificatePinMismatch)
@@ -754,7 +754,7 @@ TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnCertificatePinMismatch)
 
     UCHAR wrongPin[TLS_HASH_LEN];
     memset(wrongPin, 0xAA, sizeof(wrongPin));
-    ASSERT_EQ(STATUS_SUCCESS, TlsSetPin(wrongPin));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgTlsSetPin(wrongPin));
 
     PKSOCKET socket = StartAndCaptureClientHello(&server);
 
@@ -773,7 +773,7 @@ TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnCertificatePinMismatch)
     EXPECT_EQ(TlsHandshakeFailed, socket->Tls.State)
         << "a socket that failed pin checking must never be reused or pooled";
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -786,8 +786,8 @@ TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnOutOfOrderCertificateVerify)
     ASSERT_TRUE(server.GenerateKeys());
 
     UCHAR pin[TLS_HASH_LEN];
-    TlsSha256(server.Spki, TLS_SPKI_DER_LEN, pin);
-    ASSERT_EQ(STATUS_SUCCESS, TlsSetPin(pin));
+    BlorgTlsSha256(server.Spki, TLS_SPKI_DER_LEN, pin);
+    ASSERT_EQ(STATUS_SUCCESS, BlorgTlsSetPin(pin));
 
     PKSOCKET socket = StartAndCaptureClientHello(&server);
 
@@ -803,7 +803,7 @@ TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnOutOfOrderCertificateVerify)
     EXPECT_FALSE(NT_SUCCESS(Result.Status)) << "CertificateVerify before Certificate must be rejected";
     EXPECT_EQ(TlsHandshakeFailed, socket->Tls.State);
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnCorruptFinishedMac)
@@ -812,8 +812,8 @@ TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnCorruptFinishedMac)
     ASSERT_TRUE(server.GenerateKeys());
 
     UCHAR pin[TLS_HASH_LEN];
-    TlsSha256(server.Spki, TLS_SPKI_DER_LEN, pin);
-    ASSERT_EQ(STATUS_SUCCESS, TlsSetPin(pin));
+    BlorgTlsSha256(server.Spki, TLS_SPKI_DER_LEN, pin);
+    ASSERT_EQ(STATUS_SUCCESS, BlorgTlsSetPin(pin));
 
     PKSOCKET socket = StartAndCaptureClientHello(&server);
 
@@ -829,7 +829,7 @@ TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnCorruptFinishedMac)
     EXPECT_FALSE(NT_SUCCESS(Result.Status)) << "a wrong server Finished MAC must be rejected, not silently accepted";
     EXPECT_EQ(TlsHandshakeFailed, socket->Tls.State);
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnUnsupportedServerHelloCipherSuite)
@@ -849,7 +849,7 @@ TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnUnsupportedServerHelloCipherSuite
     EXPECT_FALSE(NT_SUCCESS(Result.Status));
     EXPECT_EQ(TlsHandshakeFailed, socket->Tls.State);
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 TEST_F(TlsHandshakeKernelTest, HandshakeFailsWhenServerSendsAlertInsteadOfServerHello)
@@ -865,7 +865,7 @@ TEST_F(TlsHandshakeKernelTest, HandshakeFailsWhenServerSendsAlertInsteadOfServer
     EXPECT_FALSE(NT_SUCCESS(Result.Status));
     EXPECT_EQ(TlsHandshakeFailed, socket->Tls.State);
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 } // namespace

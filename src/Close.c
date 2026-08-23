@@ -14,7 +14,7 @@
 static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
 {
     PFILE_OBJECT fileObject = IrpSp->FileObject;
-    PVCB vcb = GetVolumeDeviceExtension(VolumeDeviceObject)->Vcb;
+    PVCB vcb = BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->Vcb;
 
     switch GET_NODE_TYPE(fileObject->FsContext)
     {

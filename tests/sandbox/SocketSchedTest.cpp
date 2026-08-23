@@ -109,7 +109,7 @@ void WatchdogSetup(void* Parameter)
     WskModelReset();
     ShimReset();
 
-    if (!NT_SUCCESS(InitialiseWskClient()))
+    if (!NT_SUCCESS(BlorgInitialiseWskClient()))
     {
         return;
     }
@@ -139,7 +139,7 @@ void WatchdogSetup(void* Parameter)
         }
     };
 
-    AcquireReusableWskSocketAsync((PSOCKADDR)&remote, TRUE, Acquire::Routine, &socket);
+    BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&remote, TRUE, Acquire::Routine, &socket);
 
     if (!socket)
     {
@@ -151,7 +151,7 @@ void WatchdogSetup(void* Parameter)
     WSK_MODEL_BEHAVIOUR deferred = Behaviour(WskModelDeferred, STATUS_SUCCESS, 4);
     WskModelSetReceiveBehaviour(&deferred);
 
-    if (STATUS_PENDING != ReceiveWskAsync(socket, proof->Buffer, sizeof(proof->Buffer), 0, CountCompletion, nullptr))
+    if (STATUS_PENDING != BlorgReceiveWskAsync(socket, proof->Buffer, sizeof(proof->Buffer), 0, CountCompletion, nullptr))
     {
         return;
     }
@@ -174,11 +174,11 @@ void WatchdogTeardown(void* Parameter)
 
     if (proof->Socket)
     {
-        CloseWskSocketAsync(proof->Socket);
+        BlorgCloseWskSocketAsync(proof->Socket);
         proof->Socket = nullptr;
     }
 
-    CleanupWskClient();
+    BlorgCleanupWskClient();
 }
 
 class SocketSchedTest : public ::testing::Test

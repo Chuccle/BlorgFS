@@ -262,10 +262,17 @@ correct drift when you find it.
   line you can tell what came from the caller and what is yours.
   `static VOID PrefetchPump(PREFETCH_RING* Ring)` with `ULONG depthLimit =
   Ring->DepthLimit;` inside.
-- **Functions are `PascalCase` with a module prefix.** File-static helpers
-  take the bare module name (`PrefetchPump`, `HttpFail`, `TlsSetPin`);
-  anything exported across a translation unit takes `Blorg`
-  (`BlorgPrefetchServeRead`, `BlorgVolumeRead`).
+- **Functions are `PascalCase` with a module prefix, and the prefix says
+  whether the name leaves the file.** A file-static helper takes the bare
+  module name (`PrefetchPump`, `HttpFail`, `TlsHandshakeFail`). Anything
+  with external linkage takes `Blorg`, with no exceptions for layer or
+  ancestry -- `BlorgSendWskAsync`, `BlorgTlsSha256`, `BlorgFspDispatch`,
+  `BlorgVolumeRead`. The fastfat-inherited names (`FsdPostRequest`,
+  `PrePostIrp`, `OplockComplete`) were renamed along with everything else;
+  they are this driver's functions now, not the reference implementation's.
+
+  So `grep -n '^[A-Za-z].*Blorg'` is the export list, and a bare module
+  name at file scope is a promise that it is `static`.
 - **File-scope statics are `PascalCase` with the module prefix**
   (`PrefetchRingCount`, `HttpActiveRequests`). Driver-wide mutable state
   lives in the `global` struct rather than as loose globals — prefer adding

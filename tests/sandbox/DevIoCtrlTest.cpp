@@ -48,7 +48,7 @@ namespace
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 //
-// TlsPin.Lock is initialized by TlsHandshakeGlobalInit from DriverEntry,
+// TlsPin.Lock is initialized by BlorgTlsHandshakeGlobalInit from DriverEntry,
 // which no sandbox target runs. Once per process, not per fixture: it
 // mints a lock identity, and re-initializing the same lock every SetUp
 // would both burn the model's fixed lock-id budget and look like a
@@ -60,7 +60,7 @@ void EnsureTlsPinLockInitialized()
 
     if (!initialized)
     {
-        TlsHandshakeGlobalInit();
+        BlorgTlsHandshakeGlobalInit();
         initialized = true;
     }
 }
@@ -629,7 +629,7 @@ TEST_F(ForeignMountTest, MountOfADeviceCarryingAnExtensionIsStillDeclined)
 // device this driver did create must still get past the ownership test.
 //
 // Asserted as "not declined" rather than success because what follows the
-// check -- CreateBlorgVolumeDeviceObject against global.DriverObject --
+// check -- BlorgCreateVolumeDeviceObject against global.DriverObject --
 // is not something this fixture stands up. Reaching it at all is the
 // claim; the mount itself belongs to a target that models the volume.
 //

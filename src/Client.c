@@ -46,7 +46,7 @@
 //
 // The TLS bulk-receive accumulator this file drains lives on the KSOCKET
 // and is sized and allocated by Socket.c (SocketTlsRecvCapacity,
-// EnsureTlsRecvBuffer). It is shared with the handshake, which fills it
+// BlorgEnsureTlsRecvBuffer). It is shared with the handshake, which fills it
 // first: bytes the handshake's last bulk receive pulled in past the
 // server's Finished -- a NewSessionTicket, typically -- stay buffered on
 // the connection and are drained by the first request to use it, rather
@@ -95,7 +95,7 @@ static KEVENT HttpDrainEvent;
 
 //
 // Takes a reference for one request. Returns FALSE once the count has
-// reached zero, which only happens after DrainHttpClient has released the
+// reached zero, which only happens after BlorgDrainHttpClient has released the
 // standing reference -- so a request issued during unload is refused
 // rather than racing the teardown.
 //
@@ -153,7 +153,7 @@ static BOOLEAN HttpCheckedAddSizeT(SIZE_T A, SIZE_T B, PSIZE_T Result)
 // small, constant number of frames.
 //
 // The one loop that still self-iterates (draining a multi-chunk response
-// into a growing buffer) re-issues ReceiveWskAsync from inside
+// into a growing buffer) re-issues BlorgReceiveWskAsync from inside
 // HttpOnReceive; when WSK completes synchronously per chunk (common
 // against a fast/local server) this adds real stack frames with no I/O
 // manager dispatch loop to unwind through. HttpIssueReceive checks
@@ -250,7 +250,7 @@ typedef struct _HTTP_CONTEXT
     // HttpEncryptRequestRecord, sized for one record (requests are always
     // small). TlsSendPlaintext is a separate staging buffer holding
     // RequestBuffer's bytes plus the trailing TLS inner content-type
-    // byte; kept apart from TlsSendRecord because TlsAeadEncryptKeyed's
+    // byte; kept apart from TlsSendRecord because BlorgTlsAeadEncryptKeyed's
     // Plaintext/CiphertextOut parameters are restrict-qualified
     // (non-aliasing).
     //
@@ -669,7 +669,7 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
     dirInfo->FileCount = filesCount;
     dirInfo->SubDirCount = subdirCount;
 
-    PDIRECTORY_FILE_METADATA fileEntries = GetFileEntry(dirInfo, 0);
+    PDIRECTORY_FILE_METADATA fileEntries = BlorgGetFileEntry(dirInfo, 0);
 
     for (size_t i = 0; i < filesCount; ++i)
     {
@@ -714,7 +714,7 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
         fileEntries[i].LastModifiedTime = BlorgMetaFlat_FileEntryMetadata_modified(flatFileEntry);
     }
 
-    PDIRECTORY_SUBDIR_METADATA subdirEntries = GetSubDirEntry(dirInfo, 0);
+    PDIRECTORY_SUBDIR_METADATA subdirEntries = BlorgGetSubDirEntry(dirInfo, 0);
 
     for (size_t i = 0; i < subdirCount; ++i)
     {
@@ -972,7 +972,7 @@ static NTSTATUS HttpEncryptRequestRecord(HTTP_CONTEXT* Ctx, PCHAR* SendBufferOut
     Ctx->TlsSendRecord[3] = C_CAST(UCHAR, recordLen >> 8);
     Ctx->TlsSendRecord[4] = C_CAST(UCHAR, recordLen & 0xFF);
 
-    NTSTATUS status = TlsAeadEncryptKeyed(
+    NTSTATUS status = BlorgTlsAeadEncryptKeyed(
         Ctx->Socket->Tls.WriteKeyHandle, Ctx->Socket->Tls.WriteIv, Ctx->Socket->Tls.WriteSeq,
         C_CAST(PUCHAR, Ctx->TlsSendRecord), 5,
         C_CAST(PUCHAR, Ctx->TlsSendPlaintext), innerLen,
@@ -1057,7 +1057,7 @@ static BOOLEAN HttpNeedsWorkItem(HTTP_OPERATION Operation)
 // (the retry path forced ConnectionSource to Fresh); the initial attempt
 // is free to reuse a pooled connection. HttpStageTlsHandshake bounces to
 // PASSIVE unconditionally (unlike HttpMustBounceToPassive, independent of
-// Ctx->Operation) because TlsStartHandshakeAsync's ECDH key-pair
+// Ctx->Operation) because BlorgTlsStartHandshakeAsync's ECDH key-pair
 // generation is documented PASSIVE_LEVEL-only CNG, while this stage can be
 // entered from a WSK connect completion at <= DISPATCH_LEVEL. In
 // HttpStageSendRequest, WSK_FLAG_NODELAY is used because the request is
@@ -1073,7 +1073,7 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
         {
             BOOLEAN forceFresh = C_CAST(BOOLEAN, Ctx->ConnectionSource == HttpConnectionFresh);
 
-            NTSTATUS result = AcquireReusableWskSocketAsync(
+            NTSTATUS result = BlorgAcquireReusableWskSocketAsync(
                 C_CAST(PSOCKADDR, &Ctx->RemoteAddress),
                 forceFresh,
                 HttpOnSocket,
@@ -1100,7 +1100,7 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
             }
             else
             {
-                TlsStartHandshakeAsync(Ctx->Socket, HttpOnTlsHandshakeComplete, Ctx);
+                BlorgTlsStartHandshakeAsync(Ctx->Socket, HttpOnTlsHandshakeComplete, Ctx);
             }
             break;
         }
@@ -1122,7 +1122,7 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
                 }
             }
 
-            result = SendWskAsync(
+            result = BlorgSendWskAsync(
                 Ctx->Socket,
                 sendBuffer,
                 sendLength,
@@ -1219,7 +1219,7 @@ static BOOLEAN HttpTryRetryReusedConnection(HTTP_CONTEXT* Ctx)
 
     if (Ctx->Socket)
     {
-        CloseWskSocketAsync(Ctx->Socket);
+        BlorgCloseWskSocketAsync(Ctx->Socket);
         Ctx->Socket = NULL;
     }
 
@@ -1298,7 +1298,7 @@ static VOID HttpOnSocket(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID
 }
 
 //
-// Re-entry runs at PASSIVE_LEVEL, so TlsStartHandshakeAsync's PASSIVE-
+// Re-entry runs at PASSIVE_LEVEL, so BlorgTlsStartHandshakeAsync's PASSIVE-
 // only CNG calls (BCryptGenerateKeyPair/BCryptFinalizeKeyPair) are safe
 // here regardless of what IRQL triggered the bounce in HttpKick.
 //
@@ -1307,11 +1307,11 @@ static VOID HttpTlsHandshakeWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
     UNREFERENCED_PARAMETER(DeviceObject);
 
     HTTP_CONTEXT* ctx = C_CAST(HTTP_CONTEXT*, Context);
-    TlsStartHandshakeAsync(ctx->Socket, HttpOnTlsHandshakeComplete, ctx);
+    BlorgTlsStartHandshakeAsync(ctx->Socket, HttpOnTlsHandshakeComplete, ctx);
 }
 
 //
-// Completion for TlsStartHandshakeAsync: advances to sending the request
+// Completion for BlorgTlsStartHandshakeAsync: advances to sending the request
 // on success, otherwise fails the request (never the idle-close retry
 // case -- see the comment in HttpOnSocket).
 //
@@ -1364,7 +1364,7 @@ static VOID HttpOnSend(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID Comple
 // If the peer streams a response in N chunks and WSK completes each
 // receive synchronously (same thread, inline, before WskReceive returns
 // -- common against a fast/local server), each chunk adds real frames to
-// the stack: HttpOnReceive -> HttpIssueReceive -> ReceiveWskAsync -> WSK's
+// the stack: HttpOnReceive -> HttpIssueReceive -> BlorgReceiveWskAsync -> WSK's
 // internal dispatch -> WskReceive -> (inline completion) -> HttpOnReceive
 // again. There is no I/O manager dispatch loop to unwind between chunks
 // when completion is inline -- that loop only exists for genuinely
@@ -1390,7 +1390,7 @@ static VOID HttpOnSend(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID Comple
 //      STATUS_INSUFFICIENT_RESOURCES rather than risk overflow.
 //
 // HTTP_STACK_SAFETY_MARGIN covers one chain link's worst-case usage (this
-// function, HttpOnReceive, ReceiveWskAsync/WskReceive internals, the
+// function, HttpOnReceive, BlorgReceiveWskAsync/WskReceive internals, the
 // completion routine) plus headroom for WSK's own internal usage.
 //
 // HTTP_STACK_EXPAND_SIZE is handed to KeExpandKernelStackAndCalloutEx --
@@ -1500,7 +1500,7 @@ static VOID HttpIssueReceive(HTTP_CONTEXT* Ctx)
             return;
         }
 
-        result = ReceiveWskAsync(
+        result = BlorgReceiveWskAsync(
             Ctx->Socket,
             Ctx->Buffer + Ctx->Length,
             Ctx->Capacity - Ctx->Length,
@@ -1510,7 +1510,7 @@ static VOID HttpIssueReceive(HTTP_CONTEXT* Ctx)
     }
     else if (Ctx->TargetMdl)
     {
-        result = ReceiveWskAsyncMdl(
+        result = BlorgReceiveWskAsyncMdl(
             Ctx->Socket,
             Ctx->TargetMdl,
             Ctx->Length - C_CAST(ULONG, Ctx->BodyOffset),
@@ -1521,7 +1521,7 @@ static VOID HttpIssueReceive(HTTP_CONTEXT* Ctx)
     }
     else
     {
-        result = ReceiveWskAsync(
+        result = BlorgReceiveWskAsync(
             Ctx->Socket,
             Ctx->Buffer + Ctx->Length,
             C_CAST(ULONG, Ctx->BodyEndOffset) - Ctx->Length,
@@ -1645,7 +1645,7 @@ static VOID HttpIssueTlsReceiveExpandedCallout(PVOID Parameter)
 //    overhang the MDL's end (normally the last -- earlier records'
 //    content-type/padding overhang is overwritten by the next record's
 //    plaintext at the same offset), whose real content is then copied.
-//    TlsStripInnerPlaintext finds the inner content type and real length
+//    BlorgTlsStripInnerPlaintext finds the inner content type and real length
 //    by a backward scan, no data movement: Length advances by contentLen
 //    only.
 //
@@ -1704,7 +1704,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
 
     PKSOCKET socket = Ctx->Socket;
 
-    NTSTATUS accumulatorStatus = EnsureTlsRecvBuffer(socket);
+    NTSTATUS accumulatorStatus = BlorgEnsureTlsRecvBuffer(socket);
 
     if (!NT_SUCCESS(accumulatorStatus))
     {
@@ -1803,7 +1803,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
             plaintext = C_CAST(PUCHAR, Ctx->Buffer) + Ctx->Length;
         }
 
-        NTSTATUS decStatus = TlsAeadDecryptKeyed(
+        NTSTATUS decStatus = BlorgTlsAeadDecryptKeyed(
             socket->Tls.ReadKeyHandle, socket->Tls.ReadIv, socket->Tls.ReadSeq,
             record, 5,
             record + 5, innerLen, record + 5 + innerLen,
@@ -1824,7 +1824,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         UCHAR contentType;
         ULONG contentLen;
 
-        if (!TlsStripInnerPlaintext(plaintext, innerLen, &contentType, &contentLen))
+        if (!BlorgTlsStripInnerPlaintext(plaintext, innerLen, &contentType, &contentLen))
         {
             HttpFailOrRetryReusedConnection(Ctx, STATUS_INVALID_PARAMETER);
             return;
@@ -1881,7 +1881,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
 
     BLORGFS_STAT_INC(TlsBulkReceives);
 
-    NTSTATUS result = ReceiveWskAsyncMdl(
+    NTSTATUS result = BlorgReceiveWskAsyncMdl(
         socket,
         socket->TlsRecvMdl,
         socket->TlsRecvLength,
@@ -2103,7 +2103,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
         return;
     }
 
-    ReleaseReusableWskSocket(Ctx->Socket);
+    BlorgReleaseReusableWskSocket(Ctx->Socket);
     Ctx->Socket = NULL;
 
     Ctx->Stage = HttpStageDispatch;
@@ -2195,11 +2195,11 @@ static NTSTATUS HttpParseHeaders(HTTP_CONTEXT* Ctx)
 // Deserializes the response body per Ctx->Operation and fires the caller's
 // completion callback on success, clearing Completion.*.Routine so
 // HttpComplete does not invoke it a second time (dirInfo ownership
-// transfers to the caller, who frees it with FreeHttpDirectoryInfo). Must
+// transfers to the caller, who frees it with BlorgFreeHttpDirectoryInfo). Must
 // run at PASSIVE (see HttpDispatch/HttpMustBounceToPassive) since flatcc
 // and the callbacks require it. For HttpOpFileRead in zero-copy mode, the
 // body is already in the caller's MDL, so there is nothing to hand over --
-// BodyBuffer/BaseAddress are NULL (FreeHttpFile on a NULL BaseAddress is a
+// BodyBuffer/BaseAddress are NULL (BlorgFreeHttpFile on a NULL BaseAddress is a
 // no-op) and only the byte count is meaningful; in buffer mode, ownership
 // of Ctx->Buffer transfers to the caller via BaseAddress (see
 // HttpFreeContext).
@@ -2396,7 +2396,7 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 
         if (Ctx->Socket)
         {
-            CloseWskSocketAsync(Ctx->Socket);
+            BlorgCloseWskSocketAsync(Ctx->Socket);
             Ctx->Socket = NULL;
         }
     }
@@ -2778,7 +2778,7 @@ NTSTATUS BlorgHttpGetFileMdl(
 // Frees a PDIRECTORY_INFO returned via BlorgHttpGetDirectoryInfo's
 // completion callback.
 //
-void FreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
+void BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
 {
     if (DirInfo)
     {
@@ -2790,7 +2790,7 @@ void FreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
 // Frees a FILE_BUFFER's BaseAddress from a buffer-mode BlorgHttpGetFile
 // completion. No-op for zero-copy (MDL) reads, where BaseAddress is NULL.
 //
-void FreeHttpFile(PFILE_BUFFER FileBuffer)
+void BlorgFreeHttpFile(PFILE_BUFFER FileBuffer)
 {
     if (FileBuffer && FileBuffer->BaseAddress)
     {
@@ -2799,29 +2799,29 @@ void FreeHttpFile(PFILE_BUFFER FileBuffer)
 }
 
 //
-// Thin wrapper over GetWskAddrInfo; exposes DNS resolution to callers
+// Thin wrapper over BlorgGetWskAddrInfo; exposes DNS resolution to callers
 // outside Socket.c under the Client-facing naming.
 //
-NTSTATUS GetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo)
+NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo)
 {
-    return GetWskAddrInfo(NodeName, ServiceName, Hints, RemoteAddrInfo);
+    return BlorgGetWskAddrInfo(NodeName, ServiceName, Hints, RemoteAddrInfo);
 }
 
-// Thin wrapper over FreeWskAddrInfo; frees results from GetHttpAddrInfo.
-void FreeHttpAddrInfo(PADDRINFOEXW AddrInfo)
+// Thin wrapper over BlorgFreeWskAddrInfo; frees results from BlorgGetHttpAddrInfo.
+void BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo)
 {
-    FreeWskAddrInfo(AddrInfo);
+    BlorgFreeWskAddrInfo(AddrInfo);
 }
 
 //
-// Thin wrapper over InitialiseWskClient; driver-load-time setup of the WSK
+// Thin wrapper over BlorgInitialiseWskClient; driver-load-time setup of the WSK
 // transport this client runs on.
 //
-NTSTATUS InitialiseHttpClient(void)
+NTSTATUS BlorgInitialiseHttpClient(void)
 {
     KeInitializeEvent(&HttpDrainEvent, NotificationEvent, FALSE);
 
-    return InitialiseWskClient();
+    return BlorgInitialiseWskClient();
 }
 
 //
@@ -2836,7 +2836,7 @@ NTSTATUS InitialiseHttpClient(void)
 // request may still queue an IO work item against
 // global.FileSystemDeviceObject.
 //
-VOID DrainHttpClient(void)
+VOID BlorgDrainHttpClient(void)
 {
     HttpReleaseActive();
 
@@ -2844,10 +2844,10 @@ VOID DrainHttpClient(void)
 }
 
 //
-// Thin wrapper over CleanupWskClient; driver-unload-time teardown of the
+// Thin wrapper over BlorgCleanupWskClient; driver-unload-time teardown of the
 // WSK transport.
 //
-void CleanupHttpClient(void)
+void BlorgCleanupHttpClient(void)
 {
-    CleanupWskClient();
+    BlorgCleanupWskClient();
 }

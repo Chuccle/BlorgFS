@@ -254,7 +254,7 @@ VOID SandboxDrainCompletions(VOID)
 // Accumulator
 ///////////////////////////////////////////////////////////////////////////
 
-NTSTATUS EnsureTlsRecvBuffer(PKSOCKET Socket)
+NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket)
 {
     if (Socket->TlsRecvMdl)
     {
@@ -295,7 +295,7 @@ NTSTATUS EnsureTlsRecvBuffer(PKSOCKET Socket)
 // Send / receive
 ///////////////////////////////////////////////////////////////////////////
 
-NTSTATUS SendWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
+NTSTATUS BlorgSendWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
 {
     (void)Flags;
 
@@ -459,12 +459,12 @@ static NTSTATUS SandboxReceiveCommon(
     return STATUS_PENDING;
 }
 
-NTSTATUS ReceiveWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
+NTSTATUS BlorgReceiveWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
 {
     return SandboxReceiveCommon(Socket, (unsigned char*)Buffer, Length, Flags, CompletionRoutine, CompletionContext);
 }
 
-NTSTATUS ReceiveWskAsyncMdl(PKSOCKET Socket, PMDL Mdl, ULONG Offset, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
+NTSTATUS BlorgReceiveWskAsyncMdl(PKSOCKET Socket, PMDL Mdl, ULONG Offset, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
 {
     if (Offset + Length > Mdl->Length)
     {
@@ -506,7 +506,7 @@ static PKSOCKET SandboxCreateSocket(void)
     SocketState(socket)->Peer->Steps = ScriptSteps;
     SocketState(socket)->Peer->StepCount = ScriptStepCount;
 
-    TlsInitializeConnectionState(&socket->Tls);
+    BlorgTlsInitializeConnectionState(&socket->Tls);
 
     SocketsCreated++;
     SocketsLive++;
@@ -531,7 +531,7 @@ static VOID SandboxDestroySocket(PKSOCKET Socket)
         ExFreePool(Socket->TlsPlaintextScratch);
     }
 
-    TlsDestroyConnectionState(&Socket->Tls);
+    BlorgTlsDestroyConnectionState(&Socket->Tls);
 
     free(SocketState(Socket)->Peer);
     SocketStateForget(Socket);
@@ -540,7 +540,7 @@ static VOID SandboxDestroySocket(PKSOCKET Socket)
     SocketsLive--;
 }
 
-NTSTATUS AcquireReusableWskSocketAsync(
+NTSTATUS BlorgAcquireReusableWskSocketAsync(
     PSOCKADDR RemoteAddress,
     BOOLEAN ForceFresh,
     PKSOCKET_ACQUIRE_COMPLETION_ROUTINE CompletionRoutine,
@@ -577,7 +577,7 @@ NTSTATUS AcquireReusableWskSocketAsync(
     return STATUS_PENDING;
 }
 
-NTSTATUS ReleaseReusableWskSocket(PKSOCKET Socket)
+NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket)
 {
     if (!Socket)
     {
@@ -599,7 +599,7 @@ NTSTATUS ReleaseReusableWskSocket(PKSOCKET Socket)
     return STATUS_SUCCESS;
 }
 
-NTSTATUS CloseWskSocketAsync(PKSOCKET Socket)
+NTSTATUS BlorgCloseWskSocketAsync(PKSOCKET Socket)
 {
     if (!Socket)
     {
@@ -620,12 +620,12 @@ NTSTATUS CloseWskSocketAsync(PKSOCKET Socket)
     return STATUS_PENDING;
 }
 
-NTSTATUS InitialiseWskClient(void)
+NTSTATUS BlorgInitialiseWskClient(void)
 {
     return STATUS_SUCCESS;
 }
 
-void CleanupWskClient(void)
+void BlorgCleanupWskClient(void)
 {
     if (PooledSocket)
     {
@@ -639,7 +639,7 @@ void CleanupWskClient(void)
 // Address resolution is DNS, not driver logic, and the sandbox hands the
 // client a fixed loopback address at init instead.
 //
-NTSTATUS GetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo)
+NTSTATUS BlorgGetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo)
 {
     (void)NodeName;
     (void)ServiceName;
@@ -649,7 +649,7 @@ NTSTATUS GetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* Se
     return STATUS_SUCCESS;
 }
 
-void FreeWskAddrInfo(PADDRINFOEXW AddrInfo)
+void BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo)
 {
     (void)AddrInfo;
 }

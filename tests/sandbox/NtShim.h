@@ -621,7 +621,7 @@ typedef struct _DEVICE_OBJECT DEVICE_OBJECT, * PDEVICE_OBJECT;
 // prefetch ring and the node table, not IRP_MJ dispatch.
 //
 // Only the fields the driver actually reads are here, and DEVICE_OBJECT
-// is real rather than opaque because GetVolumeDeviceExtension reaches
+// is real rather than opaque because BlorgGetVolumeDeviceExtension reaches
 // through it to reach the lookaside lists every node is allocated from.
 //
 struct _DEVICE_OBJECT
@@ -853,7 +853,7 @@ struct _IRP
             // by ListEntry while still carrying IRP_CONTEXT_FLAG_NET_DONE
             // in DriverContext[0] and that completion's result in
             // DriverContext[1]. Overlaying them let the CSQ's list pointers
-            // scribble over both, so the flags FspDispatch read back were
+            // scribble over both, so the flags BlorgFspDispatch read back were
             // whatever RemoveEntryList had left there, and the NET_DONE
             // re-drive -- the whole point of the requeue -- could not be
             // tested at all.

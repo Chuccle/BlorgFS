@@ -103,12 +103,12 @@ protected:
         LastCompletion = {};
         LastAcquire = {};
 
-        ASSERT_EQ(STATUS_SUCCESS, InitialiseWskClient());
+        ASSERT_EQ(STATUS_SUCCESS, BlorgInitialiseWskClient());
     }
 
     void TearDown() override
     {
-        CleanupWskClient();
+        BlorgCleanupWskClient();
 
         //
         // Nothing may outlive a test. An IRP, MDL or pool block still live
@@ -131,7 +131,7 @@ protected:
 
         LastAcquire = {};
 
-        NTSTATUS status = AcquireReusableWskSocketAsync(
+        NTSTATUS status = BlorgAcquireReusableWskSocketAsync(
             (PSOCKADDR)&address, TRUE, RecordAcquire, nullptr);
 
         EXPECT_EQ(STATUS_PENDING, status);
@@ -164,7 +164,7 @@ TEST_F(SocketKernelTest, ReceiveThatNeverCompletesTimesOut)
 
     unsigned char buffer[64] = {};
 
-    NTSTATUS status = ReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr);
+    NTSTATUS status = BlorgReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr);
 
     ASSERT_EQ(STATUS_PENDING, status);
     EXPECT_EQ(0, LastCompletion.Calls) << "an operation that never completed must not have called back";
@@ -187,7 +187,7 @@ TEST_F(SocketKernelTest, ReceiveThatNeverCompletesTimesOut)
            "STATUS_CANCELLED the IRP actually completed with";
     EXPECT_EQ(1u, WskModelCancelled());
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 //
@@ -205,7 +205,7 @@ TEST_F(SocketKernelTest, SendUsesItsOwnTimeout)
 
     unsigned char buffer[16] = {};
 
-    ASSERT_EQ(STATUS_PENDING, SendWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
+    ASSERT_EQ(STATUS_PENDING, BlorgSendWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
 
     KmAdvanceTime(kSendTimeoutMs - 1);
     WskModelPumpCancellations();
@@ -217,7 +217,7 @@ TEST_F(SocketKernelTest, SendUsesItsOwnTimeout)
     EXPECT_EQ(1, LastCompletion.Calls);
     EXPECT_EQ(STATUS_IO_TIMEOUT, LastCompletion.Status);
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 //
@@ -239,7 +239,7 @@ TEST_F(SocketKernelTest, NormalCompletionDisarmsTheWatchdog)
 
     unsigned char buffer[64] = {};
 
-    ASSERT_EQ(STATUS_PENDING, ReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
+    ASSERT_EQ(STATUS_PENDING, BlorgReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
 
     EXPECT_EQ(1, LastCompletion.Calls);
     EXPECT_EQ(STATUS_SUCCESS, LastCompletion.Status);
@@ -254,7 +254,7 @@ TEST_F(SocketKernelTest, NormalCompletionDisarmsTheWatchdog)
     EXPECT_EQ(0, fired) << "a completed operation left its watchdog armed";
     EXPECT_EQ(1, LastCompletion.Calls) << "completion delivered twice";
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -279,7 +279,7 @@ TEST_F(SocketKernelTest, CompletionRacingAnExpiredTimerFreesTheContextOnce)
 
     unsigned char buffer[64] = {};
 
-    ASSERT_EQ(STATUS_PENDING, ReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
+    ASSERT_EQ(STATUS_PENDING, BlorgReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
 
     //
     // Push past the deadline. The timer fires and the DPC runs, cancelling
@@ -301,7 +301,7 @@ TEST_F(SocketKernelTest, CompletionRacingAnExpiredTimerFreesTheContextOnce)
 
     EXPECT_EQ(1, LastCompletion.Calls) << "the cancel produced a second completion";
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 
     //
     // TearDown's quiescence assertion is the other half: if the DPC and the
@@ -325,7 +325,7 @@ TEST_F(SocketKernelTest, CompletionBeforeExpiryOwnsTheFree)
 
     unsigned char buffer[64] = {};
 
-    ASSERT_EQ(STATUS_PENDING, ReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
+    ASSERT_EQ(STATUS_PENDING, BlorgReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
 
     KmAdvanceTime(kReceiveTimeoutMs / 2);
 
@@ -336,7 +336,7 @@ TEST_F(SocketKernelTest, CompletionBeforeExpiryOwnsTheFree)
 
     EXPECT_EQ(0, KmAdvanceTime(kReceiveTimeoutMs * 2)) << "timer was not disarmed by the completion";
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 //
@@ -361,7 +361,7 @@ TEST_F(SocketKernelTest, ConcurrentWatchdogsAreIndependent)
         ASSERT_NE(nullptr, sockets[i]);
 
         ASSERT_EQ(STATUS_PENDING,
-            ReceiveWskAsync(sockets[i], buffers[i], sizeof(buffers[i]), 0, RecordCompletion, nullptr));
+            BlorgReceiveWskAsync(sockets[i], buffers[i], sizeof(buffers[i]), 0, RecordCompletion, nullptr));
     }
 
     EXPECT_EQ(0, LastCompletion.Calls);
@@ -376,7 +376,7 @@ TEST_F(SocketKernelTest, ConcurrentWatchdogsAreIndependent)
 
     for (int i = 0; i < kOperations; ++i)
     {
-        CloseWskSocketAsync(sockets[i]);
+        BlorgCloseWskSocketAsync(sockets[i]);
     }
 }
 
@@ -408,13 +408,13 @@ TEST_F(SocketKernelTest, InlineCompletionsNestWithoutCorruption)
 
     for (int i = 0; i < kDepth; ++i)
     {
-        ASSERT_EQ(STATUS_PENDING, ReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
+        ASSERT_EQ(STATUS_PENDING, BlorgReceiveWskAsync(socket, buffer, sizeof(buffer), 0, RecordCompletion, nullptr));
     }
 
     EXPECT_EQ(kDepth, LastCompletion.Calls);
     EXPECT_EQ(kDepth, (int)WskModelReceives());
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 //
@@ -447,12 +447,12 @@ TEST_F(SocketKernelTest, CompletionsRunAtDispatchLevel)
 
     unsigned char buffer[8] = {};
 
-    ASSERT_EQ(STATUS_PENDING, ReceiveWskAsync(socket, buffer, sizeof(buffer), 0, Local::Completion, nullptr));
+    ASSERT_EQ(STATUS_PENDING, BlorgReceiveWskAsync(socket, buffer, sizeof(buffer), 0, Local::Completion, nullptr));
 
     EXPECT_EQ(DISPATCH_LEVEL, observedIrql);
     EXPECT_EQ(PASSIVE_LEVEL, KmGetIrql()) << "IRQL was not restored after the completion";
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -472,24 +472,24 @@ TEST_F(SocketKernelTest, ReleasedSocketIsHandedBackAsReused)
     address.sin_port = htons(80);
 
     ASSERT_EQ(STATUS_PENDING,
-        AcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, RecordAcquire, nullptr));
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, RecordAcquire, nullptr));
 
     PKSOCKET first = LastAcquire.Socket;
     ASSERT_NE(nullptr, first);
     EXPECT_FALSE(LastAcquire.Reused) << "the first acquire cannot be a reuse";
 
-    ReleaseReusableWskSocket(first);
+    BlorgReleaseReusableWskSocket(first);
 
     LastAcquire = {};
 
     ASSERT_EQ(STATUS_PENDING,
-        AcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, RecordAcquire, nullptr));
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, RecordAcquire, nullptr));
 
     EXPECT_EQ(first, LastAcquire.Socket) << "the pooled connection was not reused";
     EXPECT_TRUE(LastAcquire.Reused);
     EXPECT_EQ(1u, WskModelConnects()) << "a reuse must not open a second connection";
 
-    CloseWskSocketAsync(LastAcquire.Socket);
+    BlorgCloseWskSocketAsync(LastAcquire.Socket);
 }
 
 //
@@ -504,21 +504,21 @@ TEST_F(SocketKernelTest, ForceFreshBypassesThePool)
     address.sin_port = htons(80);
 
     ASSERT_EQ(STATUS_PENDING,
-        AcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, RecordAcquire, nullptr));
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, RecordAcquire, nullptr));
 
     PKSOCKET pooled = LastAcquire.Socket;
-    ReleaseReusableWskSocket(pooled);
+    BlorgReleaseReusableWskSocket(pooled);
 
     LastAcquire = {};
 
     ASSERT_EQ(STATUS_PENDING,
-        AcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, RecordAcquire, nullptr));
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, RecordAcquire, nullptr));
 
     EXPECT_NE(pooled, LastAcquire.Socket);
     EXPECT_FALSE(LastAcquire.Reused);
     EXPECT_EQ(2u, WskModelConnects());
 
-    CloseWskSocketAsync(LastAcquire.Socket);
+    BlorgCloseWskSocketAsync(LastAcquire.Socket);
 
     // The pooled one is still the pool's; teardown drains it.
 }
@@ -538,13 +538,13 @@ TEST_F(SocketKernelTest, CleanupDrainsThePool)
     {
         LastAcquire = {};
         ASSERT_EQ(STATUS_PENDING,
-            AcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, RecordAcquire, nullptr));
-        ReleaseReusableWskSocket(LastAcquire.Socket);
+            BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, RecordAcquire, nullptr));
+        BlorgReleaseReusableWskSocket(LastAcquire.Socket);
     }
 
     EXPECT_GT(KmObjectsLive(KmObjectSocket), 0);
 
-    CleanupWskSocketPool();
+    BlorgCleanupWskSocketPool();
 
     EXPECT_EQ(0, KmObjectsLive(KmObjectSocket)) << "the pool did not drain";
 }
@@ -563,7 +563,7 @@ TEST_F(SocketKernelTest, FailedConnectReportsAndLeaksNothing)
     address.sin_port = htons(80);
 
     ASSERT_EQ(STATUS_PENDING,
-        AcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, RecordAcquire, nullptr));
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, RecordAcquire, nullptr));
 
     EXPECT_EQ(1, LastAcquire.Calls);
     EXPECT_FALSE(NT_SUCCESS(LastAcquire.Status));
@@ -590,7 +590,7 @@ TEST_F(SocketKernelTest, AllocationFailuresAreClean)
 
         LastAcquire = {};
 
-        NTSTATUS status = AcquireReusableWskSocketAsync(
+        NTSTATUS status = BlorgAcquireReusableWskSocketAsync(
             (PSOCKADDR)&address, TRUE, RecordAcquire, nullptr);
 
         ShimPoolFailAt(-1);
@@ -601,7 +601,7 @@ TEST_F(SocketKernelTest, AllocationFailuresAreClean)
 
             if (NT_SUCCESS(LastAcquire.Status) && LastAcquire.Socket)
             {
-                CloseWskSocketAsync(LastAcquire.Socket);
+                BlorgCloseWskSocketAsync(LastAcquire.Socket);
             }
         }
 
@@ -615,7 +615,7 @@ TEST_F(SocketKernelTest, AllocationFailuresAreClean)
 ///////////////////////////////////////////////////////////////////////////
 
 //
-// EnsureTlsRecvBuffer's three resources (TlsRecvBuffer, TlsPlaintextScratch,
+// BlorgEnsureTlsRecvBuffer's three resources (TlsRecvBuffer, TlsPlaintextScratch,
 // TlsRecvMdl) must each be checked against its own allocation, not a
 // neighbour's -- a failure allocating TlsRecvBuffer must be reported as
 // such, not laundered through the TlsPlaintextScratch check, and must
@@ -629,7 +629,7 @@ TEST_F(SocketKernelTest, EnsureTlsRecvBufferFailsResourcesIndependently)
     ASSERT_NE(nullptr, socket);
 
     ShimPoolFailAt(0);
-    EXPECT_EQ(STATUS_INSUFFICIENT_RESOURCES, EnsureTlsRecvBuffer(socket));
+    EXPECT_EQ(STATUS_INSUFFICIENT_RESOURCES, BlorgEnsureTlsRecvBuffer(socket));
     ShimPoolFailAt(-1);
 
     EXPECT_EQ(nullptr, socket->TlsRecvBuffer);
@@ -637,14 +637,14 @@ TEST_F(SocketKernelTest, EnsureTlsRecvBufferFailsResourcesIndependently)
         << "scratch must not be attempted once TlsRecvBuffer itself failed";
 
     ShimPoolFailAt(1);
-    EXPECT_EQ(STATUS_INSUFFICIENT_RESOURCES, EnsureTlsRecvBuffer(socket));
+    EXPECT_EQ(STATUS_INSUFFICIENT_RESOURCES, BlorgEnsureTlsRecvBuffer(socket));
     ShimPoolFailAt(-1);
 
     EXPECT_NE(nullptr, socket->TlsRecvBuffer)
         << "TlsRecvBuffer succeeded on this call and must be kept for the retry";
     EXPECT_EQ(nullptr, socket->TlsPlaintextScratch);
 
-    ASSERT_EQ(STATUS_SUCCESS, EnsureTlsRecvBuffer(socket));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgEnsureTlsRecvBuffer(socket));
     EXPECT_NE(nullptr, socket->TlsRecvBuffer);
     EXPECT_NE(nullptr, socket->TlsPlaintextScratch);
     ASSERT_NE(nullptr, socket->TlsRecvMdl);
@@ -653,13 +653,13 @@ TEST_F(SocketKernelTest, EnsureTlsRecvBufferFailsResourcesIndependently)
     PUCHAR scratch = socket->TlsPlaintextScratch;
     PMDL mdl = socket->TlsRecvMdl;
 
-    EXPECT_EQ(STATUS_SUCCESS, EnsureTlsRecvBuffer(socket))
+    EXPECT_EQ(STATUS_SUCCESS, BlorgEnsureTlsRecvBuffer(socket))
         << "a second call must be a no-op once the MDL already exists";
     EXPECT_EQ(recvBuffer, socket->TlsRecvBuffer);
     EXPECT_EQ(scratch, socket->TlsPlaintextScratch);
     EXPECT_EQ(mdl, socket->TlsRecvMdl);
 
-    CloseWskSocketAsync(socket);
+    BlorgCloseWskSocketAsync(socket);
 }
 
 } // namespace

@@ -144,7 +144,7 @@ static inline NTSTATUS BreakHandleOplockOnSharingViolation(POPLOCK Oplock, PIRP 
         return ShareStatus;
     }
 
-    NTSTATUS breakStatus = FsRtlOplockBreakH(Oplock, Irp, 0, NULL, OplockComplete, OplockPrePostIrp);
+    NTSTATUS breakStatus = FsRtlOplockBreakH(Oplock, Irp, 0, NULL, BlorgOplockComplete, BlorgOplockPrePostIrp);
 
     return (STATUS_SUCCESS == breakStatus) ? ShareStatus : breakStatus;
 }
@@ -161,7 +161,7 @@ static inline NTSTATUS BreakHandleOplockOnSharingViolation(POPLOCK Oplock, PIRP 
 //  protects only the OPLOCK structure, not this open-count invariant.
 //  FsRtlCheckOplock is called unconditionally (it fast-returns SUCCESS with
 //  no oplock). On a pending break it posts the IRP and returns
-//  STATUS_PENDING; OplockComplete re-queues it to the FSP, which re-drives
+//  STATUS_PENDING; BlorgOplockComplete re-queues it to the FSP, which re-drives
 //  this create from the top, releasing the resource so the re-drive starts
 //  from a clean slate. On success wires FsContext/Vpb/SectionObjectPointer
 //  onto the file object.
@@ -174,11 +174,11 @@ static inline NTSTATUS OpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const 
     }
 
     ASSERT((0 < Fcb->PinCount) ||
-           ExIsResourceAcquiredExclusiveLite(GetVolumeDeviceExtension(Fcb->VolumeDeviceObject)->Vcb->Header.Resource));
+           ExIsResourceAcquiredExclusiveLite(BlorgGetVolumeDeviceExtension(Fcb->VolumeDeviceObject)->Vcb->Header.Resource));
 
     ExAcquireResourceExclusiveLite(Fcb->Header.Resource, TRUE);
 
-    NTSTATUS oplockStatus = FsRtlCheckOplock(&Fcb->Header.Oplock, Irp, NULL, OplockComplete, OplockPrePostIrp);
+    NTSTATUS oplockStatus = FsRtlCheckOplock(&Fcb->Header.Oplock, Irp, NULL, BlorgOplockComplete, BlorgOplockPrePostIrp);
 
     if (STATUS_SUCCESS != oplockStatus)
     {
@@ -226,11 +226,11 @@ static inline NTSTATUS OpenExistingDcb(PIRP Irp, PFILE_OBJECT FileObject, const 
     }
 
     ASSERT((0 < Dcb->PinCount) ||
-           ExIsResourceAcquiredExclusiveLite(GetVolumeDeviceExtension(VolumeDeviceObject)->Vcb->Header.Resource));
+           ExIsResourceAcquiredExclusiveLite(BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->Vcb->Header.Resource));
 
     ExAcquireResourceExclusiveLite(Dcb->Header.Resource, TRUE);
 
-    NTSTATUS oplockStatus = FsRtlCheckOplock(&Dcb->Header.Oplock, Irp, NULL, OplockComplete, OplockPrePostIrp);
+    NTSTATUS oplockStatus = FsRtlCheckOplock(&Dcb->Header.Oplock, Irp, NULL, BlorgOplockComplete, BlorgOplockPrePostIrp);
 
     if (STATUS_SUCCESS != oplockStatus)
     {
@@ -324,7 +324,7 @@ static inline NTSTATUS OpenRootDcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCE
 
     ExAcquireResourceExclusiveLite(Dcb->Header.Resource, TRUE);
 
-    NTSTATUS oplockStatus = FsRtlCheckOplock(&Dcb->Header.Oplock, Irp, NULL, OplockComplete, OplockPrePostIrp);
+    NTSTATUS oplockStatus = FsRtlCheckOplock(&Dcb->Header.Oplock, Irp, NULL, BlorgOplockComplete, BlorgOplockPrePostIrp);
 
     if (STATUS_SUCCESS != oplockStatus)
     {
@@ -392,18 +392,18 @@ static VOID BlorgCreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA*
 
         if (STATUS_OBJECT_NAME_NOT_FOUND == Status)
         {
-            PathCacheInsertNotFound(&netCtx->Path);
+            BlorgPathCacheInsertNotFound(&netCtx->Path);
         }
 
         ExFreePool(netCtx->Path.Buffer);
         ExFreePool(netCtx);
-        CompleteRequest(irp, Status, IO_DISK_INCREMENT);
+        BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
 
     BLORGFS_LOG("Create net result OK (dir=%u size=%llu)\n", FileInfo->IsDirectory, FileInfo->Size);
 
-    PathCacheInsertExists(&netCtx->Path, FileInfo);
+    BlorgPathCacheInsertExists(&netCtx->Path, FileInfo);
 
     PDIRECTORY_ENTRY_METADATA stash = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(DIRECTORY_ENTRY_METADATA), 'CRET');
 
@@ -411,16 +411,16 @@ static VOID BlorgCreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA*
     {
         ExFreePool(netCtx->Path.Buffer);
         ExFreePool(netCtx);
-        CompleteRequest(irp, STATUS_INSUFFICIENT_RESOURCES, IO_DISK_INCREMENT);
+        BlorgCompleteRequest(irp, STATUS_INSUFFICIENT_RESOURCES, IO_DISK_INCREMENT);
         return;
     }
 
     *stash = *FileInfo;
     irp->Tail.Overlay.DriverContext[1] = stash;
 
-    SetIrpContextFlag(irp, IRP_CONTEXT_FLAG_NET_DONE);
+    BlorgSetIrpContextFlag(irp, IRP_CONTEXT_FLAG_NET_DONE);
 
-    NTSTATUS requeue = FsdRequeueRequest(irp);
+    NTSTATUS requeue = BlorgFsdRequeueRequest(irp);
 
     ExFreePool(netCtx->Path.Buffer);
     ExFreePool(netCtx);
@@ -429,7 +429,7 @@ static VOID BlorgCreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA*
     {
         ExFreePool(stash);
         irp->Tail.Overlay.DriverContext[1] = NULL;
-        CompleteRequest(irp, requeue, IO_DISK_INCREMENT);
+        BlorgCompleteRequest(irp, requeue, IO_DISK_INCREMENT);
     }
 }
 
@@ -488,7 +488,7 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 {
     for (SIZE_T i = 0; i < Listing->FileCount; i++)
     {
-        PDIRECTORY_FILE_METADATA file = GetFileEntry(Listing, i);
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(Listing, i);
 
         if (!file)
         {
@@ -513,7 +513,7 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 
     for (SIZE_T i = 0; i < Listing->SubDirCount; i++)
     {
-        PDIRECTORY_SUBDIR_METADATA sub = GetSubDirEntry(Listing, i);
+        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(Listing, i);
 
         if (!sub)
         {
@@ -565,8 +565,8 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 //  on the second pass the result is already in hand and this function
 //  falls through to the existence checks and tree insert without another
 //  network round trip. NET_DONE and its stash are consumed together as a
-//  single shot at entry (ClearIrpContextFlag): the same IRP can be
-//  re-driven a third time by an oplock break (OplockComplete re-queues
+//  single shot at entry (BlorgClearIrpContextFlag): the same IRP can be
+//  re-driven a third time by an oplock break (BlorgOplockComplete re-queues
 //  it), and a still-set NET_DONE with the stash already freed would
 //  dereference the NULLed DriverContext[1]. A re-drive after consumption
 //  re-resolves normally -- node table, then the path cache this pass
@@ -623,7 +623,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
     PFILE_OBJECT relatedFileObject = fileObject->RelatedFileObject;
 
     struct OwnedString filePath = { 0 };
-    PDCB parentDcb = GetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb;
+    PDCB parentDcb = BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb;
     ULONG options = IrpSp->Parameters.Create.Options;
     USHORT shareAccess = IrpSp->Parameters.Create.ShareAccess;
     UCHAR createDisposition = (options >> 24) & 0x000000ff;
@@ -635,7 +635,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
     if (BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_NET_DONE))
     {
-        ClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_NET_DONE);
+        BlorgClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_NET_DONE);
         ClearFlag(irpFlags, IRP_CONTEXT_FLAG_NET_DONE);
 
         PDIRECTORY_ENTRY_METADATA stash = Irp->Tail.Overlay.DriverContext[1];
@@ -658,7 +658,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
     {
         if (0 == fileObject->FileName.Length)
         {
-            return OpenVcb(Irp, fileObject, desiredAccess, shareAccess, GetVolumeDeviceExtension(VolumeDeviceObject)->Vcb);
+            return OpenVcb(Irp, fileObject, desiredAccess, shareAccess, BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->Vcb);
         }
         
         filePath.String = fileObject->FileName;
@@ -746,7 +746,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
     BLORGFS_PRINT(" ->NormalisedFileName             = %wZ\n", &filePath.String);
 
-    PVCB vcb = GetVolumeDeviceExtension(VolumeDeviceObject)->Vcb;
+    PVCB vcb = BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->Vcb;
 
     PCOMMON_CONTEXT desiredNode = BlorgNodeTableLookupPin(&filePath.String);
 
@@ -804,7 +804,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
     if (!haveDirEntInfo)
     {
         DIRECTORY_ENTRY_METADATA cached;
-        PATH_CACHE_RESULT pc = PathCacheLookup(&filePath.String, &cached);
+        PATH_CACHE_RESULT pc = BlorgPathCacheLookup(&filePath.String, &cached);
 
         if (PathCacheExists == pc)
         {
@@ -836,7 +836,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
             if (0 == parentPath.Length)
             {
-                parentNode = C_CAST(PCOMMON_CONTEXT, GetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb);
+                parentNode = C_CAST(PCOMMON_CONTEXT, BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb);
                 parentPinned = FALSE;
             }
             else
@@ -856,13 +856,13 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     if (FindEntryByName(listing, &leaf, &dirEntInfo))
                     {
                         BLORGFS_LOG("Create listing HIT (exists): %wZ\n", &filePath.String);
-                        PathCacheInsertExists(&filePath.String, &dirEntInfo);
+                        BlorgPathCacheInsertExists(&filePath.String, &dirEntInfo);
                         haveDirEntInfo = TRUE;
                     }
                     else
                     {
                         BLORGFS_LOG("Create listing HIT (not found): %wZ\n", &filePath.String);
-                        PathCacheInsertNotFound(&filePath.String);
+                        BlorgPathCacheInsertNotFound(&filePath.String);
 
                         if (parentPinned)
                         {
@@ -897,7 +897,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                 ExFreePool(filePath.String.Buffer);
             }
 
-            return FsdPostRequest(Irp, IrpSp);
+            return BlorgFsdPostRequest(Irp, IrpSp);
         }
 
         BLORGFS_LOG("Create cache MISS -> network: %wZ\n", &filePath.String);
@@ -969,7 +969,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
     ExAcquireResourceExclusiveLite(vcb->Header.Resource, TRUE);
 
-    desiredNode = SearchByPath(parentDcb, &filePath.String);
+    desiredNode = BlorgSearchByPath(parentDcb, &filePath.String);
 
     if (desiredNode)
     {
@@ -1046,7 +1046,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         }
     }
 
-    result = InsertByPath(parentDcb, &filePath.String, &dirEntInfo, VolumeDeviceObject, &desiredNode);
+    result = BlorgInsertByPath(parentDcb, &filePath.String, &dirEntInfo, VolumeDeviceObject, &desiredNode);
 
     if (!NT_SUCCESS(result))
     {
@@ -1159,7 +1159,7 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    BOOLEAN topLevel = IsIrpTopLevel(Irp);
+    BOOLEAN topLevel = BlorgIsIrpTopLevel(Irp);
 
     FsRtlEnterFileSystem();
     switch (BlorgDeviceKind(DeviceObject))
@@ -1170,20 +1170,20 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             result = BlorgVolumeCreate(Irp, irpSp, DeviceObject);
             if (STATUS_PENDING != result)
             {
-                CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+                BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
             break;
         }
         case BlorgDeviceDisk:
         {
             result = BlorgDiskCreate(Irp);
-            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
         case BlorgDeviceFileSystem:
         {
             result = BlorgFileSystemCreate(Irp);
-            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
     }

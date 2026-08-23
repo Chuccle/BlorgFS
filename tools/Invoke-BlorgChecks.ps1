@@ -312,7 +312,7 @@ if ($runsBuild) {
         # self-consistent ServerHello and encrypted flight built from the
         # same crypto primitives Tls.c uses, so this needs no live peer
         # and no network. Covers the handshake state machine end to end,
-        # prioritising TlsCheckPin -- the actual security boundary against
+        # prioritising BlorgTlsCheckPin -- the actual security boundary against
         # a MITM'd certificate -- plus several malformed-flight shapes
         # TlsHandshakeTest.cpp's live-server integration test can't easily
         # produce on demand.

@@ -69,7 +69,7 @@ NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, ACCESS_MASK Access, POBJECT_TY
     KPROCESSOR_MODE Mode, PVOID* Object, PVOID HandleInformation);
 NTSTATUS ZwClose(HANDLE Handle);
 
-NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject);
+NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject);
 
 NTSTATUS RtlCreateSecurityDescriptor(PVOID Descriptor, ULONG Revision);
 NTSTATUS RtlSetDaclSecurityDescriptor(PVOID Descriptor, BOOLEAN DaclPresent, PVOID Dacl, BOOLEAN Defaulted);

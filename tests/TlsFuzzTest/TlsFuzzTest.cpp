@@ -159,13 +159,13 @@ int main()
 
     FUZZ_RNG rng = { 0xC0FFEE01 };
 
-    // --- Target: TlsParseServerHello ---
+    // --- Target: BlorgTlsParseServerHello ---
     {
         unsigned long realLen;
         unsigned char* seed = LoadSeed("server_hello_body", &realLen);
         if (seed)
         {
-            printf("Fuzzing TlsParseServerHello...\n");
+            printf("Fuzzing BlorgTlsParseServerHello...\n");
             static unsigned char buf[FUZZ_BUF_CAP];
 
             for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
@@ -177,7 +177,7 @@ int main()
                 // Return value deliberately ignored -- fuzzing only cares
                 // whether the call corrupts memory or hangs, not whether
                 // it accepts or rejects a given mutation.
-                TlsParseServerHello(buf, len, randomOut, pubKeyOut);
+                BlorgTlsParseServerHello(buf, len, randomOut, pubKeyOut);
 
                 if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
             }
@@ -187,13 +187,13 @@ int main()
         }
     }
 
-    // --- Target: TlsParseCertificateMessage ---
+    // --- Target: BlorgTlsParseCertificateMessage ---
     {
         unsigned long realLen;
         unsigned char* seed = LoadSeed("certificate_message_body", &realLen);
         if (seed)
         {
-            printf("Fuzzing TlsParseCertificateMessage...\n");
+            printf("Fuzzing BlorgTlsParseCertificateMessage...\n");
             static unsigned char buf[FUZZ_BUF_CAP];
 
             for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
@@ -202,7 +202,7 @@ int main()
                 const unsigned char* leafCertOut;
                 unsigned long leafCertLenOut;
 
-                TlsParseCertificateMessage(buf, len, &leafCertOut, &leafCertLenOut);
+                BlorgTlsParseCertificateMessage(buf, len, &leafCertOut, &leafCertLenOut);
 
                 if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
             }
@@ -212,13 +212,13 @@ int main()
         }
     }
 
-    // --- Target: TlsExtractSpkiFromCertificate (fed the leaf DER directly) ---
+    // --- Target: BlorgTlsExtractSpkiFromCertificate (fed the leaf DER directly) ---
     {
         unsigned long realLen;
         unsigned char* seed = LoadSeed("leaf_cert_der", &realLen);
         if (seed)
         {
-            printf("Fuzzing TlsExtractSpkiFromCertificate...\n");
+            printf("Fuzzing BlorgTlsExtractSpkiFromCertificate...\n");
             static unsigned char buf[FUZZ_BUF_CAP];
 
             for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
@@ -227,7 +227,7 @@ int main()
                 const unsigned char* spkiOut;
                 unsigned long spkiLenOut;
 
-                TlsExtractSpkiFromCertificate(buf, len, &spkiOut, &spkiLenOut);
+                BlorgTlsExtractSpkiFromCertificate(buf, len, &spkiOut, &spkiLenOut);
 
                 if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
             }
@@ -237,13 +237,13 @@ int main()
         }
     }
 
-    // --- Target: TlsDecodeP256SubjectPublicKeyInfo ---
+    // --- Target: BlorgTlsDecodeP256SubjectPublicKeyInfo ---
     {
         unsigned long realLen;
         unsigned char* seed = LoadSeed("spki_der", &realLen);
         if (seed)
         {
-            printf("Fuzzing TlsDecodeP256SubjectPublicKeyInfo...\n");
+            printf("Fuzzing BlorgTlsDecodeP256SubjectPublicKeyInfo...\n");
             static unsigned char buf[FUZZ_BUF_CAP];
 
             for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
@@ -251,7 +251,7 @@ int main()
                 unsigned long len = Mutate(&rng, seed, realLen, buf);
                 unsigned char pubKeyOut[TLS_ECC_PUBKEY_LEN];
 
-                TlsDecodeP256SubjectPublicKeyInfo(buf, len, pubKeyOut);
+                BlorgTlsDecodeP256SubjectPublicKeyInfo(buf, len, pubKeyOut);
 
                 if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
             }
@@ -261,13 +261,13 @@ int main()
         }
     }
 
-    // --- Target: TlsParseCertificateVerifyMessage ---
+    // --- Target: BlorgTlsParseCertificateVerifyMessage ---
     {
         unsigned long realLen;
         unsigned char* seed = LoadSeed("certificate_verify_message_body", &realLen);
         if (seed)
         {
-            printf("Fuzzing TlsParseCertificateVerifyMessage...\n");
+            printf("Fuzzing BlorgTlsParseCertificateVerifyMessage...\n");
             static unsigned char buf[FUZZ_BUF_CAP];
 
             for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
@@ -275,7 +275,7 @@ int main()
                 unsigned long len = Mutate(&rng, seed, realLen, buf);
                 unsigned char sigOut[64];
 
-                TlsParseCertificateVerifyMessage(buf, len, sigOut);
+                BlorgTlsParseCertificateVerifyMessage(buf, len, sigOut);
 
                 if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
             }
@@ -285,7 +285,7 @@ int main()
         }
     }
 
-    // --- Target: TlsAeadDecrypt -- mutate ciphertext/tag (attacker-
+    // --- Target: BlorgTlsAeadDecrypt -- mutate ciphertext/tag (attacker-
     // controlled wire data), key/iv/aad stay fixed at their real derived
     // values (not attacker-controlled from the client's perspective). ---
     {
@@ -298,7 +298,7 @@ int main()
 
         if (key && iv && aad && ciphertext && tag)
         {
-            printf("Fuzzing TlsAeadDecrypt (ciphertext + tag mutated, key/iv/aad fixed)...\n");
+            printf("Fuzzing BlorgTlsAeadDecrypt (ciphertext + tag mutated, key/iv/aad fixed)...\n");
             static unsigned char ctBuf[FUZZ_BUF_CAP];
             unsigned char tagBuf[TLS_TAG_LEN];
             static unsigned char plaintextOut[FUZZ_BUF_CAP];
@@ -321,7 +321,7 @@ int main()
 
                 if (ctLenMutated > sizeof(plaintextOut)) ctLenMutated = C_CAST(unsigned long, sizeof(plaintextOut));
 
-                TlsAeadDecrypt(key, iv, 0, aad, aadLen, ctBuf, ctLenMutated, tagBuf, plaintextOut);
+                BlorgTlsAeadDecrypt(key, iv, 0, aad, aadLen, ctBuf, ctLenMutated, tagBuf, plaintextOut);
 
                 if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
             }

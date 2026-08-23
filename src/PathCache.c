@@ -70,7 +70,7 @@ typedef struct _PATH_CACHE_STATE
     BOOLEAN           Ready;
 
     //
-    // Bumped by PathCacheInvalidateAll; entries stamped with an older
+    // Bumped by BlorgPathCacheInvalidateAll; entries stamped with an older
     // generation are treated as misses. Only ever updated via
     // InterlockedIncrement, so it doesn't need to be volatile.
     //
@@ -144,7 +144,7 @@ static BOOLEAN PathCacheEntryLive(const PATH_CACHE_ENTRY* Entry, ULONG64 Now, LO
 // Initializes all bucket locks/lists and resets generation/count. Called
 // once at driver load, before any lookups/inserts can occur.
 //
-VOID PathCacheInit(VOID)
+VOID BlorgPathCacheInit(VOID)
 {
     for (ULONG i = 0; i < PATH_CACHE_BUCKETS; i++)
     {
@@ -162,7 +162,7 @@ VOID PathCacheInit(VOID)
 // Frees every entry in every bucket and marks the cache not-ready. Called
 // only at driver unload, after I/O has drained, so it takes no locks.
 //
-VOID PathCacheCleanup(VOID)
+VOID BlorgPathCacheCleanup(VOID)
 {
     if (!PathCache.Ready)
     {
@@ -190,7 +190,7 @@ VOID PathCacheCleanup(VOID)
 // expired/stale-generation entries rather than reclaiming them here --
 // reclamation happens under the exclusive lock in PathCacheInsert instead.
 //
-PATH_CACHE_RESULT PathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta)
+PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta)
 {
     if (!PathCache.Ready || !Path || 0 == Path->Length || !Path->Buffer)
     {
@@ -354,13 +354,13 @@ static VOID PathCacheInsert(const UNICODE_STRING* Path, BOOLEAN Exists, const DI
 }
 
 // Caches a successful path resolution with its metadata.
-VOID PathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta)
+VOID BlorgPathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta)
 {
     PathCacheInsert(Path, TRUE, Meta);
 }
 
 // Caches a failed (not-found) path resolution.
-VOID PathCacheInsertNotFound(const UNICODE_STRING* Path)
+VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path)
 {
     PathCacheInsert(Path, FALSE, NULL);
 }
@@ -369,7 +369,7 @@ VOID PathCacheInsertNotFound(const UNICODE_STRING* Path)
 //  Drop one exact path. Cheap: hashes straight to the owning bucket and walks
 //  only that (short) chain. A no-op if the path is not cached.
 //
-VOID PathCacheInvalidate(const UNICODE_STRING* Path)
+VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path)
 {
     if (!PathCache.Ready || !Path || 0 == Path->Length || !Path->Buffer)
     {
@@ -437,7 +437,7 @@ static BOOLEAN PathCacheIsUnder(const UNICODE_STRING* Dir, const UNICODE_STRING*
 //  unlike the per-probe lookup path. Each bucket is taken and released in
 //  turn, so no two locks are ever held together.
 //
-VOID PathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
+VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
 {
     if (!PathCache.Ready || !Dir || 0 == Dir->Length || !Dir->Buffer)
     {
@@ -477,7 +477,7 @@ VOID PathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
 //  reclaimed lazily rather than eagerly, which is fine -- the bucket cap still
 //  bounds it, and inserts sweep the dead entries as they go.
 //
-VOID PathCacheInvalidateAll(VOID)
+VOID BlorgPathCacheInvalidateAll(VOID)
 {
     InterlockedIncrement(&PathCache.Generation);
 }

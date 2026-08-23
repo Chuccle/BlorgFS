@@ -286,7 +286,7 @@ static NTSTATUS EnumerateDirectoryEntries(
 
         if (isDirectory)
         {
-            PDIRECTORY_SUBDIR_METADATA sub = GetSubDirEntry(Ccb->Entries, index - Ccb->Entries->FileCount);
+            PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(Ccb->Entries, index - Ccb->Entries->FileCount);
 
             if (!sub)
             {
@@ -301,7 +301,7 @@ static NTSTATUS EnumerateDirectoryEntries(
         }
         else
         {
-            PDIRECTORY_FILE_METADATA file = GetFileEntry(Ccb->Entries, index);
+            PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(Ccb->Entries, index);
 
             if (!file)
             {
@@ -406,7 +406,7 @@ static NTSTATUS EnumerateDirectoryEntries(
 //  lapses, since Create consults the path cache before the listing.
 //  Re-resolution re-seeds it locally with no network I/O.
 //
-//  If FsdRequeueRequest fails (FSP threads tearing down), the listing
+//  If BlorgFsdRequeueRequest fails (FSP threads tearing down), the listing
 //  already belongs to the DCB cache (freed at DCB teardown), so the
 //  query is simply failed.
 //
@@ -416,7 +416,7 @@ static VOID BlorgDirComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Cal
 
     if (!NT_SUCCESS(Status))
     {
-        CompleteRequest(irp, Status, IO_DISK_INCREMENT);
+        BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
 
@@ -436,7 +436,7 @@ static VOID BlorgDirComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Cal
     }
     else
     {
-        FreeHttpDirectoryInfo(DirInfo);
+        BlorgFreeHttpDirectoryInfo(DirInfo);
     }
 
     ccb->Entries = dcb->CachedListing;
@@ -446,16 +446,16 @@ static VOID BlorgDirComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Cal
 
     if (published)
     {
-        PathCacheInvalidatePrefix(&dcb->FullPath);
+        BlorgPathCacheInvalidatePrefix(&dcb->FullPath);
     }
 
-    SetIrpContextFlag(irp, IRP_CONTEXT_FLAG_NET_DONE);
+    BlorgSetIrpContextFlag(irp, IRP_CONTEXT_FLAG_NET_DONE);
 
-    NTSTATUS requeue = FsdRequeueRequest(irp);
+    NTSTATUS requeue = BlorgFsdRequeueRequest(irp);
 
     if (STATUS_PENDING != requeue)
     {
-        CompleteRequest(irp, requeue, IO_DISK_INCREMENT);
+        BlorgCompleteRequest(irp, requeue, IO_DISK_INCREMENT);
     }
 }
 
@@ -575,7 +575,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_WAIT)))
                 {
                     BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                    return FsdPostRequest(Irp, IrpSp);
+                    return BlorgFsdPostRequest(Irp, IrpSp);
                 }
 
                 if (ccb->SearchPattern.Buffer || FlagOn(ccb->Flags, CCB_FLAG_MATCH_ALL))
@@ -589,7 +589,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 if (!ExAcquireResourceExclusiveLite(dcb->Header.Resource, BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_WAIT)))
                 {
                     BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                    return FsdPostRequest(Irp, IrpSp);
+                    return BlorgFsdPostRequest(Irp, IrpSp);
                 }
 
                 ccb->CurrentIndex = 0;
@@ -599,7 +599,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 if (!ExAcquireResourceSharedLite(dcb->Header.Resource, BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_WAIT)))
                 {
                     BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                    return FsdPostRequest(Irp, IrpSp);
+                    return BlorgFsdPostRequest(Irp, IrpSp);
                 }
             }
 
@@ -611,7 +611,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     {
                         BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
                         ExReleaseResourceLite(dcb->Header.Resource);
-                        return FsdPostRequest(Irp, IrpSp);
+                        return BlorgFsdPostRequest(Irp, IrpSp);
                     }
 
                     RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
@@ -643,7 +643,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     {
                         BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
                         ExReleaseResourceLite(dcb->Header.Resource);
-                        return FsdPostRequest(Irp, IrpSp);
+                        return BlorgFsdPostRequest(Irp, IrpSp);
                     }
 
                     RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
@@ -855,7 +855,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 break;
             }
 
-            PBLORGFS_VDO_DEVICE_EXTENSION devExt = GetVolumeDeviceExtension(dcb->VolumeDeviceObject);
+            PBLORGFS_VDO_DEVICE_EXTENSION devExt = BlorgGetVolumeDeviceExtension(dcb->VolumeDeviceObject);
 
             FsRtlNotifyFullChangeDirectory(
                 devExt->NotifySync,
@@ -896,7 +896,7 @@ NTSTATUS BlorgDirectoryControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
-    BOOLEAN topLevel = IsIrpTopLevel(Irp);
+    BOOLEAN topLevel = BlorgIsIrpTopLevel(Irp);
 
     FsRtlEnterFileSystem();
     switch (BlorgDeviceKind(DeviceObject))
@@ -908,18 +908,18 @@ NTSTATUS BlorgDirectoryControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             result = BlorgVolumeDirectoryControl(Irp, irpSp);
             if (STATUS_PENDING != result)
             {
-                CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+                BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
             break;
         }
         case BlorgDeviceDisk:
         {
-            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
         case BlorgDeviceFileSystem:
         {
-            CompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
     }

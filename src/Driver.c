@@ -167,7 +167,7 @@ static void DeleteBlorgDiskDeviceObject(PDEVICE_OBJECT DiskDeviceObject)
 // acceptable here since it only runs at driver/volume init as a load
 // failure.
 //
-NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject)
+NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject)
 {
     BLORGFS_PRINT("Entering Volume Creation\n");
     *VolumeDeviceObject = NULL;
@@ -240,7 +240,7 @@ NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
         return result;
     }
 
-    result = CreateWorkQueue();
+    result = BlorgCreateWorkQueue();
 
     if (!NT_SUCCESS(result))
     {
@@ -295,7 +295,7 @@ static void FreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
 // worker (before the tree walk, so no work item can race the frees),
 // releases the VCB, the remaining node tree, and the root DCB, deletes
 // the lookaside lists, and deletes the device -- mirrors the init order
-// in CreateBlorgVolumeDeviceObject in reverse. FsRtlNotifyUninitializeSync
+// in BlorgCreateVolumeDeviceObject in reverse. FsRtlNotifyUninitializeSync
 // completes any still-pending NOTIFY_CHANGE_DIRECTORY IRPs and frees the
 // notify sync object; safe even if no notifies were ever registered.
 //
@@ -303,11 +303,11 @@ static void DeleteBlorgVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
 {
     if (VolumeDeviceObject)
     {
-        PBLORGFS_VDO_DEVICE_EXTENSION pDevExt = GetVolumeDeviceExtension(VolumeDeviceObject);
+        PBLORGFS_VDO_DEVICE_EXTENSION pDevExt = BlorgGetVolumeDeviceExtension(VolumeDeviceObject);
 
         FsRtlNotifyUninitializeSync(&pDevExt->NotifySync);
 
-        DestroyWorkQueue();
+        BlorgDestroyWorkQueue();
         BlorgNodeTableTeardown();
         BlorgFreeFileContext(pDevExt->Vcb, VolumeDeviceObject);
         FreeFileContextTree(pDevExt->RootDcb, VolumeDeviceObject);
@@ -404,11 +404,11 @@ static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObj
 // the HTTP client, path cache, TLS globals, and security descriptor.
 // Mostly the reverse of DriverEntry init order, with two deliberate
 // exceptions around the HTTP client's inputs: RemoteAddressInfo must be
-// freed while WSK is still registered (FreeHttpAddrInfo goes through
-// WskFreeAddressInfo, so it has to precede CleanupHttpClient), while
+// freed while WSK is still registered (BlorgFreeHttpAddrInfo goes through
+// WskFreeAddressInfo, so it has to precede BlorgCleanupHttpClient), while
 // RemoteHostAnsi -- read by HttpBuildRequest on every request-issue
-// path -- and RemoteHostSniAnsi -- read by TlsStartHandshakeAsync on
-// every fresh TLS connection -- are only freed after CleanupHttpClient
+// path -- and RemoteHostSniAnsi -- read by BlorgTlsStartHandshakeAsync on
+// every fresh TLS connection -- are only freed after BlorgCleanupHttpClient
 // has drained the client.
 //
 // Both drains run before anything is torn down. Each gate refuses new work
@@ -423,7 +423,7 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
     UNREFERENCED_PARAMETER(DriverObject);
 
     BlorgPrefetchDrain();
-    DrainHttpClient();
+    BlorgDrainHttpClient();
 
     ObDereferenceObject(global.FileSystemDeviceObject);
     DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
@@ -433,9 +433,9 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
     DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
     global.DiskDeviceObject = NULL;
 
-    FreeHttpAddrInfo(global.RemoteAddressInfo);
+    BlorgFreeHttpAddrInfo(global.RemoteAddressInfo);
 
-    CleanupHttpClient();
+    BlorgCleanupHttpClient();
 
     if (global.RemoteHostAnsi)
     {
@@ -449,9 +449,9 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
         global.RemoteHostSniAnsi = NULL;
     }
 
-    PathCacheCleanup();
+    BlorgPathCacheCleanup();
 
-    TlsGlobalCleanup();
+    BlorgTlsGlobalCleanup();
 
     BlorgStatisticsCleanup();
 
@@ -463,12 +463,12 @@ void DriverUnload(PDRIVER_OBJECT DriverObject)
 //  DriverEntry, so the backend's cert pin (and, if the operator wants,
 //  the remote port) never needs a rebuild to update -- only PortOut is
 //  actually mutated by a missing/absent RemotePort value; TlsEnabledOut
-//  and the pin (via TlsSetPin) simply keep their existing defaults
+//  and the pin (via BlorgTlsSetPin) simply keep their existing defaults
 //  (FALSE / unconfigured) when their registry values are absent.
 //
 //  Every failure path here is silently tolerated (missing Parameters
 //  key entirely, individual values missing or the wrong type/size) --
-//  this must never fail driver load, matching TlsGlobalInit's own
+//  this must never fail driver load, matching BlorgTlsGlobalInit's own
 //  "TLS is opt-in" policy elsewhere in this same function.
 //
 #define BLORGFS_REG_TAG 'GRBT'
@@ -540,7 +540,7 @@ static NTSTATUS ReadBlorgfsRegistryValue(
 // Accepts a registry-supplied RemotePort only if it is all digits and
 // parses to 1..65535. Anything else -- empty, non-numeric, too long, out
 // of range -- is rejected so the caller keeps the scheme-default port: a
-// garbage port fed to GetHttpAddrInfo would otherwise surface only as an
+// garbage port fed to BlorgGetHttpAddrInfo would otherwise surface only as an
 // opaque resolve/connect failure at driver load. The 5-character cap is
 // "65535"'s length, which also keeps the accumulator far from overflow.
 //
@@ -618,7 +618,7 @@ static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNIC
     if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"TlsPin", REG_BINARY, pinValue, sizeof(pinValue), &actualSize))
         && TLS_HASH_LEN == actualSize)
     {
-        TlsSetPin(pinValue);
+        BlorgTlsSetPin(pinValue);
     }
 
     WCHAR portValue[BLORGFS_REG_PORT_MAX_CHARS];
@@ -743,10 +743,10 @@ static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
 // STATUS_FAILED_DRIVER_ENTRY; the final mount-manager notification is
 // best-effort and does not fail the load.
 //
-// TlsGlobalInit is non-fatal: TLS is opt-in (global.TlsEnabled, off by
+// BlorgTlsGlobalInit is non-fatal: TLS is opt-in (global.TlsEnabled, off by
 // default), so a failure here just means it stays unusable if later
 // enabled -- it must not fail the whole driver load, since the plaintext
-// HTTP path doesn't touch this at all. See Tls.h's TlsGlobalInit comment
+// HTTP path doesn't touch this at all. See Tls.h's BlorgTlsGlobalInit comment
 // for why this one-time, driver-lifetime provider handle exists.
 //
 // TLS/port config (TlsEnabled, TlsPin, an optional RemotePort override)
@@ -759,7 +759,7 @@ static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
 // initializer, not a general expression, hence if/else rather than a
 // ternary for picking the default. RemoteHost works the same way --
 // Parameters\RemoteHost if present, else BLORGFS_DEFAULT_REMOTE_HOST --
-// and the same resolved UNICODE_STRING both drives GetHttpAddrInfo and
+// and the same resolved UNICODE_STRING both drives BlorgGetHttpAddrInfo and
 // (via BuildRemoteHostAnsiString) becomes global.RemoteHostAnsi, so the
 // Host header always names whatever address the driver actually
 // resolved/connected to, never a stale literal. The Host header carries
@@ -779,7 +779,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     ExInitializeDriverRuntime(0);
 
-    PathCacheInit();
+    BlorgPathCacheInit();
 
     BlorgPrefetchInitialize();
 
@@ -789,13 +789,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         BLORGFS_LOG("DriverEntry() - BlorgStatisticsInitialize failed: 0x%X (counters unavailable)\n", statisticsInitStatus);
     }
 
-    NTSTATUS tlsInitStatus = TlsGlobalInit();
+    NTSTATUS tlsInitStatus = BlorgTlsGlobalInit();
     if (!NT_SUCCESS(tlsInitStatus))
     {
-        BLORGFS_LOG("DriverEntry() - TlsGlobalInit failed: 0x%X (TLS unavailable if enabled)\n", tlsInitStatus);
+        BLORGFS_LOG("DriverEntry() - BlorgTlsGlobalInit failed: 0x%X (TLS unavailable if enabled)\n", tlsInitStatus);
     }
 
-    TlsHandshakeGlobalInit();
+    BlorgTlsHandshakeGlobalInit();
 
     global.DriverObject = DriverObject;
 
@@ -870,7 +870,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     ObReferenceObject(diskDeviceObject);
     global.DiskDeviceObject = diskDeviceObject;
 
-    result = InitialiseHttpClient();
+    result = BlorgInitialiseHttpClient();
 
     if (!NT_SUCCESS(result))
     {
@@ -920,11 +920,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     ADDRINFOEXW hints = { .ai_flags = AI_CANONNAME, .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
 
-    result = GetHttpAddrInfo(&hostString, &portString, &hints, &global.RemoteAddressInfo);
+    result = BlorgGetHttpAddrInfo(&hostString, &portString, &hints, &global.RemoteAddressInfo);
 
     if (!NT_SUCCESS(result))
     {
-        CleanupHttpClient();
+        BlorgCleanupHttpClient();
         ObDereferenceObject(global.FileSystemDeviceObject);
         DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
@@ -954,8 +954,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     if (!global.RemoteHostAnsi)
     {
-        FreeHttpAddrInfo(global.RemoteAddressInfo);
-        CleanupHttpClient();
+        BlorgFreeHttpAddrInfo(global.RemoteAddressInfo);
+        BlorgCleanupHttpClient();
         ObDereferenceObject(global.FileSystemDeviceObject);
         DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;

@@ -69,7 +69,7 @@ protected:
 
         SandboxDrainCompletions();
         ShimDrainWorkItems();
-        CleanupWskClient();
+        BlorgCleanupWskClient();
 
         BlorgFreeFileContext(Dcb, Volume);
         BlorgFreeFileContext(Ccb, Volume);

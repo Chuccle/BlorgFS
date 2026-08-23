@@ -276,7 +276,7 @@ VOID FsRtlInitializeOplock(POPLOCK O) { (void)O; }
 VOID FsRtlUninitializeOplock(POPLOCK O) { (void)O; }
 
 VOID BlorgPrefetchDetach(struct _FCB* Fcb) { (void)Fcb; }
-void FreeHttpDirectoryInfo(PDIRECTORY_INFO D) { (void)D; }
+void BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO D) { (void)D; }
 
 //
 // One node lives in this proof, so every path hashes to the same bucket

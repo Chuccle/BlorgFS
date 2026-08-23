@@ -59,7 +59,7 @@ VOID FsRtlUninitializeOplock(POPLOCK Oplock)
 
 //
 // Splits "a\b\c" into "a" and "b\c", the way the real one does. This is
-// not inert: InsertByPath walks a path component by component to build
+// not inert: BlorgInsertByPath walks a path component by component to build
 // the DCB chain, so getting the split wrong would build a different tree
 // than the driver does and every structural assertion would be measuring
 // the wrong thing.
@@ -124,13 +124,13 @@ struct GLOBAL global;
 
 //
 // A device object is opaque to the driver except through
-// GetVolumeDeviceExtension, so the model allocates one whose extension is
+// BlorgGetVolumeDeviceExtension, so the model allocates one whose extension is
 // a real BLORGFS_VDO_DEVICE_EXTENSION with real lookaside lists -- the
 // nodes under test come out of those, and their accounting is what proves
 // a reap actually freed something.
 //
 //
-// A device object and the extension it points at. GetVolumeDeviceExtension
+// A device object and the extension it points at. BlorgGetVolumeDeviceExtension
 // reads DeviceObject->DeviceExtension, so the extension has to hang off
 // the object rather than be overlaid on it -- overlaying reads the
 // extension's first eight bytes as the pointer and faults on first use.

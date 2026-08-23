@@ -74,7 +74,7 @@ protected:
 
         //
         // Standalone here (never inserted into a parent DCB's
-        // ChildrenList, unlike CreateDirectoryTest.cpp's InsertByPath
+        // ChildrenList, unlike CreateDirectoryTest.cpp's BlorgInsertByPath
         // nodes) -- Read.c never touches Links, but BlorgFreeFileContext
         // unconditionally RemoveEntryLists it on free, which needs a
         // self-linked head rather than the zeroed one BlorgCreateFCB
@@ -94,7 +94,7 @@ protected:
 
         SandboxDrainCompletions();
         ShimDrainWorkItems();
-        CleanupWskClient();
+        BlorgCleanupWskClient();
 
         for (PIRP irp : Irps)
         {
@@ -436,16 +436,16 @@ TEST_F(ReadTest, CachedMdlReadUsesCcMdlRead)
 //
 // CcCopyReadEx returning FALSE (a would-block miss with Wait=TRUE) is Cc's
 // signal to come back on a thread that can wait -- BlorgVolumeRead answers
-// by reposting to the FSP queue via FsdPostRequest rather than looping or
+// by reposting to the FSP queue via BlorgFsdPostRequest rather than looping or
 // blocking here. This only reaches BlorgRead's Wait=TRUE call to
 // BlorgSetupIrpContext when the file object is marked synchronous.
 //
 // STATUS_DEVICE_REMOVED, not STATUS_PENDING, is the correct result in this
-// harness: FsdPostRequest's first act is checking FspQueue.ThreadsActive,
+// harness: BlorgFsdPostRequest's first act is checking FspQueue.ThreadsActive,
 // and nothing in DispatchSandbox starts the real FSP worker threads
 // (FspWorkQueue.c has no coverage of its own yet -- see the project's
 // coverage-closing plan). That gate firing is still Read.c reaching
-// FsdPostRequest on this branch, which is what this test is about; driving
+// BlorgFsdPostRequest on this branch, which is what this test is about; driving
 // a posted request all the way through a live queue is FspWorkQueue.c's
 // own test to write.
 //
@@ -460,7 +460,7 @@ TEST_F(ReadTest, CachedReadMissWithWaitReachesFsdPostRequest)
     NTSTATUS status = BlorgRead(Volume, &req->Irp);
 
     EXPECT_EQ(STATUS_DEVICE_REMOVED, status)
-        << "reached FsdPostRequest, which refused because the FSP queue isn't running here";
+        << "reached BlorgFsdPostRequest, which refused because the FSP queue isn't running here";
     EXPECT_EQ(0u, SandboxSocketsCreated())
         << "a cache-miss repost must not have gone anywhere near the network";
 

@@ -28,7 +28,7 @@ NTSTATUS BlorgCreateFCB(_Outptr_result_nullonfailure_ FCB** Fcb, CSHORT NodeType
 {
     *Fcb = NULL;
 
-    PNPAGED_LOOKASIDE_LIST nonPagedLookaside = &GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList;
+    PNPAGED_LOOKASIDE_LIST nonPagedLookaside = &BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList;
     PNON_PAGED_NODE nonPaged = ExAllocateFromNPagedLookasideList(nonPagedLookaside);
 
     if (!nonPaged)
@@ -38,11 +38,11 @@ NTSTATUS BlorgCreateFCB(_Outptr_result_nullonfailure_ FCB** Fcb, CSHORT NodeType
 
     RtlZeroMemory(nonPaged, nonPagedLookaside->L.Size);
 
-    PFCB fcb = ExAllocateFromPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList);
+    PFCB fcb = ExAllocateFromPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList);
 
     if (!fcb)
     {
-        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
+        ExFreeToNPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -54,8 +54,8 @@ NTSTATUS BlorgCreateFCB(_Outptr_result_nullonfailure_ FCB** Fcb, CSHORT NodeType
 
         if (!nameBuffer)
         {
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
-            ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
+            ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
+            ExFreeToNPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -74,8 +74,8 @@ NTSTATUS BlorgCreateFCB(_Outptr_result_nullonfailure_ FCB** Fcb, CSHORT NodeType
         {
             ExFreePool(fcb->FullPath.Buffer);
         }
-        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
-        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
+        ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
+        ExFreeToNPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
         return result;
     }
 
@@ -88,8 +88,8 @@ NTSTATUS BlorgCreateFCB(_Outptr_result_nullonfailure_ FCB** Fcb, CSHORT NodeType
         {
             ExFreePool(fcb->FullPath.Buffer);
         }
-        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
-        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
+        ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
+        ExFreeToNPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
         return result;
     }
 
@@ -129,7 +129,7 @@ NTSTATUS BlorgCreateDCB(_Outptr_result_nullonfailure_ DCB** Dcb, CSHORT NodeType
 {
     *Dcb = NULL;
 
-    PNPAGED_LOOKASIDE_LIST nonPagedLookaside = &GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList;
+    PNPAGED_LOOKASIDE_LIST nonPagedLookaside = &BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList;
     PNON_PAGED_NODE nonPaged = ExAllocateFromNPagedLookasideList(nonPagedLookaside);
 
     if (!nonPaged)
@@ -139,11 +139,11 @@ NTSTATUS BlorgCreateDCB(_Outptr_result_nullonfailure_ DCB** Dcb, CSHORT NodeType
 
     RtlZeroMemory(nonPaged, nonPagedLookaside->L.Size);
 
-    PDCB dcb = ExAllocateFromPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList);
+    PDCB dcb = ExAllocateFromPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList);
 
     if (!dcb)
     {
-        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
+        ExFreeToNPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -155,8 +155,8 @@ NTSTATUS BlorgCreateDCB(_Outptr_result_nullonfailure_ DCB** Dcb, CSHORT NodeType
 
     if (!nameBuffer)
     {
-        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
-        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
+        ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
+        ExFreeToNPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -174,8 +174,8 @@ NTSTATUS BlorgCreateDCB(_Outptr_result_nullonfailure_ DCB** Dcb, CSHORT NodeType
         {
             ExFreePool(dcb->FullPath.Buffer);
         }
-        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
-        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
+        ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
+        ExFreeToNPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
         return result;
     }
 
@@ -188,8 +188,8 @@ NTSTATUS BlorgCreateDCB(_Outptr_result_nullonfailure_ DCB** Dcb, CSHORT NodeType
         {
             ExFreePool(dcb->FullPath.Buffer);
         }
-        ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
-        ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
+        ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
+        ExFreeToNPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, nonPaged);
         return result;
     }
 
@@ -224,7 +224,7 @@ NTSTATUS BlorgCreateCCB(_Outptr_result_nullonfailure_ CCB** Ccb, const DEVICE_OB
 {
     *Ccb = NULL;
 
-    PCCB ccb = ExAllocateFromPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->CcbLookasideList);
+    PCCB ccb = ExAllocateFromPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->CcbLookasideList);
 
     if (!ccb)
     {
@@ -249,7 +249,7 @@ do                                                                              
     FsRtlTeardownPerStreamContexts(&commonContext->Header);                                                                          \
     ExDeleteResourceLite(&commonContext->NonPaged->HdrPagingIoResource);                                                             \
     ExDeleteResourceLite(&commonContext->NonPaged->HdrResource);                                                                     \
-    ExFreeToNPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, commonContext->NonPaged);  \
+    ExFreeToNPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->NonPagedNodeLookasideList, commonContext->NonPaged);  \
 }                                                                                                                                    \
 while(0)
 
@@ -274,7 +274,7 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             DEALLOCATE_COMMON_CONTEXT(Context);
             ExFreePool(fcb->FullPath.Buffer);
             RemoveEntryList(&(fcb->Links));
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
+            ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
             break;
         }
         case BLORGFS_DCB_SIGNATURE:
@@ -282,10 +282,10 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             PDCB dcb = Context;
             FsRtlUninitializeOplock(&dcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);
-            FreeHttpDirectoryInfo(dcb->CachedListing);
+            BlorgFreeHttpDirectoryInfo(dcb->CachedListing);
             ExFreePool(dcb->FullPath.Buffer);
             RemoveEntryList(&(dcb->Links));
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
+            ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
             break;
         }
         case BLORGFS_VCB_SIGNATURE:
@@ -294,7 +294,7 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             FsRtlUninitializeFileLock(&vcb->FileLock);
             FsRtlUninitializeOplock(&vcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, vcb);
+            ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, vcb);
             break;
         }
         case BLORGFS_ROOT_DCB_SIGNATURE:
@@ -302,9 +302,9 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             PDCB dcb = Context;
             FsRtlUninitializeOplock(&dcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);
-            FreeHttpDirectoryInfo(dcb->CachedListing);
+            BlorgFreeHttpDirectoryInfo(dcb->CachedListing);
             ExFreePool(dcb->FullPath.Buffer);
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
+            ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
             break;
         }
         case BLORGFS_CCB_SIGNATURE:
@@ -315,7 +315,7 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
                 RtlFreeUnicodeString(&ccb->SearchPattern);
                 RtlZeroMemory(&ccb->SearchPattern, sizeof(UNICODE_STRING));
             }
-            ExFreeToPagedLookasideList(&GetVolumeDeviceExtension(VolumeDeviceObject)->CcbLookasideList, ccb);
+            ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->CcbLookasideList, ccb);
             break;
         }
     }
@@ -440,7 +440,7 @@ static NODE_REAP_STATE NodeReap;
 static IO_WORKITEM_ROUTINE NodeReapWorker;
 
 //
-// Hashes Path (case-insensitive, matching ArePathComponentsEqual's compare)
+// Hashes Path (case-insensitive, matching BlorgArePathComponentsEqual's compare)
 // to its bucket index. Same construction as PathCacheBucketIndex, including
 // the manual fallback for RtlHashUnicodeString's argument-validation
 // failures. Run once per node at creation (the result is stamped into
@@ -664,7 +664,7 @@ VOID BlorgNodeDereference(PCOMMON_CONTEXT Node)
 //
 // Initializes the table buckets and the reap state, and preallocates the
 // worker's IO_WORKITEM against the volume device object so a reap kick can
-// never fail on allocation. Called from CreateBlorgVolumeDeviceObject.
+// never fail on allocation. Called from BlorgCreateVolumeDeviceObject.
 //
 NTSTATUS BlorgNodeTableInit(PDEVICE_OBJECT VolumeDeviceObject)
 {
@@ -735,7 +735,7 @@ VOID BlorgNodeTableTeardown(VOID)
 // already queued to the reap worker (NodeTableTryRetire loses the claim;
 // the worker finishes the job), or the root (whose signature fails the
 // type check). Shared by the reap worker, the failed-create paths
-// (BlorgVolumeCreate / InsertByPath), and teardown -- a failed create
+// (BlorgVolumeCreate / BlorgInsertByPath), and teardown -- a failed create
 // never receives a close, so nothing else reaps its intermediates. Caller
 // must hold the VCB resource exclusive: that is what makes the
 // ChildrenList check and the tree unlink atomic against inserts, while
@@ -783,7 +783,7 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 {
     UNREFERENCED_PARAMETER(Context);
 
-    PVCB vcb = GetVolumeDeviceExtension(DeviceObject)->Vcb;
+    PVCB vcb = BlorgGetVolumeDeviceExtension(DeviceObject)->Vcb;
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&NodeReap.Lock);
@@ -900,7 +900,7 @@ static UNICODE_STRING GetLastComponent(const UNICODE_STRING* Path)
 // Case-insensitive equality check for a single path component. Length
 // check first as a cheap short-circuit before the NT string compare.
 //
-inline static BOOLEAN ArePathComponentsEqual(const UNICODE_STRING* Component1, const UNICODE_STRING* Component2)
+inline static BOOLEAN BlorgArePathComponentsEqual(const UNICODE_STRING* Component1, const UNICODE_STRING* Component2)
 {
     if (Component1->Length != Component2->Length)
     {
@@ -914,7 +914,7 @@ inline static BOOLEAN ArePathComponentsEqual(const UNICODE_STRING* Component1, c
 // Linear scan of ParentDcb's immediate children for one whose last path
 // component matches Name.
 //
-inline static PCOMMON_CONTEXT SearchByName(const DCB* ParentDcb, const UNICODE_STRING* Name)
+inline static PCOMMON_CONTEXT BlorgSearchByName(const DCB* ParentDcb, const UNICODE_STRING* Name)
 {
     PCOMMON_CONTEXT child = NULL;
     UNICODE_STRING lastComponent;
@@ -926,7 +926,7 @@ inline static PCOMMON_CONTEXT SearchByName(const DCB* ParentDcb, const UNICODE_S
         child = CONTAINING_RECORD(entry, COMMON_CONTEXT, Links);
         lastComponent = GetLastComponent(&child->FullPath);
 
-        if (ArePathComponentsEqual(Name, &lastComponent))
+        if (BlorgArePathComponentsEqual(Name, &lastComponent))
         {
             return child;
         }
@@ -941,7 +941,7 @@ inline static PCOMMON_CONTEXT SearchByName(const DCB* ParentDcb, const UNICODE_S
 // component is missing, or if an FCB is reached before the path is
 // exhausted (a file can't have children).
 //
-PCOMMON_CONTEXT SearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Path)
+PCOMMON_CONTEXT BlorgSearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Path)
 {
     const DCB* currentDcb = ParentDcb;
     UNICODE_STRING remainingPath = *Path;
@@ -964,7 +964,7 @@ PCOMMON_CONTEXT SearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Path)
             child = CONTAINING_RECORD(entry, COMMON_CONTEXT, Links);
             lastComponent = GetLastComponent(&child->FullPath);
 
-            if (ArePathComponentsEqual(&component, &lastComponent))
+            if (BlorgArePathComponentsEqual(&component, &lastComponent))
             {
                 matchingChild = child;
                 break;
@@ -1000,7 +1000,7 @@ PCOMMON_CONTEXT SearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Path)
 //
 // An intermediate component that resolves to a resident FILE is rejected
 // with STATUS_OBJECT_PATH_NOT_FOUND rather than descended into -- the
-// same answer SearchByPath gives for the same shape, and the reason that
+// same answer BlorgSearchByPath gives for the same shape, and the reason that
 // check cannot be left to the caller: only DCB has a ChildrenList, so
 // treating an FCB as the next directory walks a list head that overlaps
 // the FCB's FILE_LOCK and dereferences whatever it holds. It is
@@ -1021,7 +1021,7 @@ PCOMMON_CONTEXT SearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Path)
 // suppressed C28182 below, which is that stale alias and not a reachable
 // dereference.
 //
-NTSTATUS InsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out)
+NTSTATUS BlorgInsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out)
 {
     *Out = NULL;
     UNICODE_STRING remainingPath = *Path;
@@ -1034,7 +1034,7 @@ NTSTATUS InsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIRECTOR
         FsRtlDissectName(remainingPath, &firstPart, &remainingPart);
 
         BOOLEAN isLastComponent = (0 == remainingPart.Length);
-        PCOMMON_CONTEXT existing = SearchByName(currentDcb, &firstPart);
+        PCOMMON_CONTEXT existing = BlorgSearchByName(currentDcb, &firstPart);
 
         if (existing)
         {

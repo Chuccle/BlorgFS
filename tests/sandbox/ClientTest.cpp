@@ -94,7 +94,7 @@ protected:
     {
         SandboxDrainCompletions();
         ShimDrainWorkItems();
-        CleanupWskClient();
+        BlorgCleanupWskClient();
 
         EXPECT_EQ(0u, ShimPoolOutstanding()) << "pool allocation(s) leaked";
     }

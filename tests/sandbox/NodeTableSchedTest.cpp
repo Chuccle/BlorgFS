@@ -167,7 +167,7 @@ void PinProofSetup(void* Parameter)
 
     PCOMMON_CONTEXT node = nullptr;
 
-    if (!NT_SUCCESS(InsertByPath(proof->Root, &proof->Path, &meta, proof->Volume, &node)) || !node)
+    if (!NT_SUCCESS(BlorgInsertByPath(proof->Root, &proof->Path, &meta, proof->Volume, &node)) || !node)
     {
         return;
     }
@@ -250,8 +250,8 @@ protected:
         ASSERT_EQ(STATUS_SUCCESS,
             BlorgCreateFCB(&Vcb, (CSHORT)BLORGFS_VCB_SIGNATURE, nullptr, Volume, 0));
 
-        GetVolumeDeviceExtension(Volume)->RootDcb = Root;
-        GetVolumeDeviceExtension(Volume)->Vcb = Vcb;
+        BlorgGetVolumeDeviceExtension(Volume)->RootDcb = Root;
+        BlorgGetVolumeDeviceExtension(Volume)->Vcb = Vcb;
     }
 
     void TearDown() override

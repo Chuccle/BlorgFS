@@ -178,7 +178,7 @@ VOID IoRemoveShareAccess(PFILE_OBJECT FileObject, PSHARE_ACCESS ShareAccess)
 
 //
 // STATUS_PENDING here means the oplock package took ownership of the IRP
-// and will re-drive the caller from OplockComplete -- the single most
+// and will re-drive the caller from BlorgOplockComplete -- the single most
 // dangerous status this file returns, per Create.c's own comment above
 // OpenExistingFcb. An always-SUCCESS stub makes every oplock-pending path
 // in Create.c (three call sites) and Read.c permanently unreachable: not
@@ -303,7 +303,7 @@ PEPROCESS IoGetRequestorProcess(PIRP Irp) { (void)Irp; return PsGetCurrentProces
 VOID IoAcquireVpbSpinLock(PKIRQL Irql) { if (Irql) { *Irql = 0; } }
 VOID IoReleaseVpbSpinLock(KIRQL Irql) { (void)Irql; }
 
-NTSTATUS CreateBlorgVolumeDeviceObject(PDRIVER_OBJECT D, PDEVICE_OBJECT* V)
+NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT D, PDEVICE_OBJECT* V)
 {
     (void)D;
 
@@ -389,7 +389,7 @@ VOID ShimAdvanceInterruptTime(ULONG64 Ticks100ns)
 
 //
 // A real wait, same rationale as KeWaitForSingleObject's (NtShim.c): the
-// signal that satisfies FspWorkQueue.c's FspDispatch loop -- work posted,
+// signal that satisfies FspWorkQueue.c's BlorgFspDispatch loop -- work posted,
 // or shutdown requested -- comes from a genuinely different thread, so a
 // stub that does not actually block cannot distinguish "no work yet" from
 // "terminating" and cannot be driven by a real producer/consumer test.

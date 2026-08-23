@@ -185,7 +185,7 @@ extern "C" int BlorgFuzzOnce(const unsigned char* Data, size_t Size)
     }
 
     ShimFreeMdl(mdl);
-    CleanupWskClient();
+    BlorgCleanupWskClient();
     SandboxCleanup();
 
     if (ShimPoolOutstanding() != 0)

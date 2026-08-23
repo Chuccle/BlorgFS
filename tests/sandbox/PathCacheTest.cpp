@@ -1,7 +1,7 @@
 //
 // Functional tests for PathCache.c: the sharded full-path resolution
-// cache wired into the create path (via PathCacheLookup/InsertExists/
-// InsertNotFound) and into BlorgDirComplete (via PathCacheInvalidatePrefix
+// cache wired into the create path (via BlorgPathCacheLookup/InsertExists/
+// InsertNotFound) and into BlorgDirComplete (via BlorgPathCacheInvalidatePrefix
 // on a listing refresh). Exercised here through its own public API rather
 // than through IRP dispatch -- the cache's state machine (TTL, targeted/
 // prefix invalidation, per-bucket FIFO eviction) is what OpenCppCoverage
@@ -21,7 +21,7 @@ namespace
 {
 
 //
-// PathCacheInit/Cleanup re-initialize all 256 bucket push locks, which is
+// BlorgPathCacheInit/Cleanup re-initialize all 256 bucket push locks, which is
 // only cheap under KmExploreInterleavings' explicit "recycle lock ids for
 // the duration of the exploration" allowance (Scheduler.h). Outside that,
 // recycling is off by default once any sched-test in this binary has run
@@ -35,8 +35,8 @@ namespace
 class PathCacheEnvironment : public ::testing::Environment
 {
 public:
-    void SetUp() override { PathCacheInit(); }
-    void TearDown() override { PathCacheCleanup(); }
+    void SetUp() override { BlorgPathCacheInit(); }
+    void TearDown() override { BlorgPathCacheCleanup(); }
 };
 
 ::testing::Environment* const g_pathCacheEnvironment =
@@ -52,7 +52,7 @@ protected:
         // without touching lock identities. Each test also uses paths no
         // other test uses, so this is a belt-and-braces reset rather than
         // a load-bearing one.
-        PathCacheInvalidateAll();
+        BlorgPathCacheInvalidateAll();
     }
 };
 
@@ -72,10 +72,10 @@ TEST_F(PathCacheTest, InsertExistsThenLookupHitsWithMetadataWithinTtl)
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\media\\movies\\alpha.mkv");
     DIRECTORY_ENTRY_METADATA meta = MakeMeta(123456789ULL, FALSE);
 
-    PathCacheInsertExists(&path, &meta);
+    BlorgPathCacheInsertExists(&path, &meta);
 
     DIRECTORY_ENTRY_METADATA out = {};
-    EXPECT_EQ(PathCacheExists, PathCacheLookup(&path, &out));
+    EXPECT_EQ(PathCacheExists, BlorgPathCacheLookup(&path, &out));
     EXPECT_EQ(meta.Size, out.Size);
     EXPECT_EQ(meta.CreationTime, out.CreationTime);
     EXPECT_EQ(meta.LastAccessedTime, out.LastAccessedTime);
@@ -87,16 +87,16 @@ TEST_F(PathCacheTest, InsertNotFoundThenLookupReturnsNotFoundWithinTtl)
 {
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\media\\movies\\missing.mkv");
 
-    PathCacheInsertNotFound(&path);
+    BlorgPathCacheInsertNotFound(&path);
 
-    EXPECT_EQ(PathCacheNotFound, PathCacheLookup(&path, nullptr));
+    EXPECT_EQ(PathCacheNotFound, BlorgPathCacheLookup(&path, nullptr));
 }
 
 TEST_F(PathCacheTest, LookupOfNeverInsertedPathMisses)
 {
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\media\\movies\\never-inserted.mkv");
 
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&path, nullptr));
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&path, nullptr));
 }
 
 //
@@ -110,11 +110,11 @@ TEST_F(PathCacheTest, ReinsertingACachedPathRefreshesItInPlace)
     DIRECTORY_ENTRY_METADATA first = MakeMeta(111, FALSE);
     DIRECTORY_ENTRY_METADATA second = MakeMeta(222, TRUE);
 
-    PathCacheInsertExists(&path, &first);
-    PathCacheInsertExists(&path, &second);
+    BlorgPathCacheInsertExists(&path, &first);
+    BlorgPathCacheInsertExists(&path, &second);
 
     DIRECTORY_ENTRY_METADATA out = {};
-    EXPECT_EQ(PathCacheExists, PathCacheLookup(&path, &out));
+    EXPECT_EQ(PathCacheExists, BlorgPathCacheLookup(&path, &out));
     EXPECT_EQ(second.Size, out.Size) << "the refresh must overwrite the stale metadata";
     EXPECT_EQ(second.IsDirectory, out.IsDirectory);
 }
@@ -130,14 +130,14 @@ TEST_F(PathCacheTest, LookupAfterTtlExpiryMisses)
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\media\\movies\\beta.mkv");
     DIRECTORY_ENTRY_METADATA meta = MakeMeta(42, FALSE);
 
-    PathCacheInsertExists(&path, &meta);
-    ASSERT_EQ(PathCacheExists, PathCacheLookup(&path, nullptr))
+    BlorgPathCacheInsertExists(&path, &meta);
+    ASSERT_EQ(PathCacheExists, BlorgPathCacheLookup(&path, nullptr))
         << "sanity: the entry must be live before it can prove expiry";
 
     // PATH_CACHE_TTL_100NS is 4 seconds; 60 seconds clears it with margin.
     ShimAdvanceInterruptTime(60ULL * 10ULL * 1000ULL * 1000ULL);
 
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&path, nullptr));
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&path, nullptr));
 }
 
 TEST_F(PathCacheTest, TargetedInvalidationRemovesExactlyThatPath)
@@ -146,13 +146,13 @@ TEST_F(PathCacheTest, TargetedInvalidationRemovesExactlyThatPath)
     UNICODE_STRING bystander = RTL_CONSTANT_STRING(L"\\media\\movies\\delta.mkv");
     DIRECTORY_ENTRY_METADATA meta = MakeMeta(7, FALSE);
 
-    PathCacheInsertExists(&victim, &meta);
-    PathCacheInsertExists(&bystander, &meta);
+    BlorgPathCacheInsertExists(&victim, &meta);
+    BlorgPathCacheInsertExists(&bystander, &meta);
 
-    PathCacheInvalidate(&victim);
+    BlorgPathCacheInvalidate(&victim);
 
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&victim, nullptr));
-    EXPECT_EQ(PathCacheExists, PathCacheLookup(&bystander, nullptr))
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&victim, nullptr));
+    EXPECT_EQ(PathCacheExists, BlorgPathCacheLookup(&bystander, nullptr))
         << "invalidating one path evicted an unrelated one";
 }
 
@@ -160,9 +160,9 @@ TEST_F(PathCacheTest, InvalidatingAnUncachedPathIsANoOp)
 {
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\media\\movies\\never-cached.mkv");
 
-    PathCacheInvalidate(&path);
+    BlorgPathCacheInvalidate(&path);
 
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&path, nullptr));
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&path, nullptr));
 }
 
 //
@@ -182,30 +182,30 @@ TEST_F(PathCacheTest, PrefixInvalidationRemovesSubtreeButNotSiblings)
     DIRECTORY_ENTRY_METADATA meta = MakeMeta(9, FALSE);
     DIRECTORY_ENTRY_METADATA dirMeta = MakeMeta(0, TRUE);
 
-    PathCacheInsertExists(&inDirA, &meta);
-    PathCacheInsertExists(&inDirB, &meta);
-    PathCacheInsertExists(&dirItself, &dirMeta);
-    PathCacheInsertExists(&sibling, &meta);
-    PathCacheInsertExists(&unrelated, &meta);
+    BlorgPathCacheInsertExists(&inDirA, &meta);
+    BlorgPathCacheInsertExists(&inDirB, &meta);
+    BlorgPathCacheInsertExists(&dirItself, &dirMeta);
+    BlorgPathCacheInsertExists(&sibling, &meta);
+    BlorgPathCacheInsertExists(&unrelated, &meta);
 
-    PathCacheInvalidatePrefix(&dir);
+    BlorgPathCacheInvalidatePrefix(&dir);
 
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&inDirA, nullptr));
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&inDirB, nullptr));
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&dirItself, nullptr))
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&inDirA, nullptr));
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&inDirB, nullptr));
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&dirItself, nullptr))
         << "the directory itself is within its own prefix";
 
-    EXPECT_EQ(PathCacheExists, PathCacheLookup(&sibling, nullptr))
+    EXPECT_EQ(PathCacheExists, BlorgPathCacheLookup(&sibling, nullptr))
         << "\\Foobar is not under \\Foo -- a prefix match without the "
            "boundary check would wrongly evict it";
-    EXPECT_EQ(PathCacheExists, PathCacheLookup(&unrelated, nullptr));
+    EXPECT_EQ(PathCacheExists, BlorgPathCacheLookup(&unrelated, nullptr));
 }
 
 //
 // The volume root is a real, reachable value for this API, not a
 // hypothetical: Driver.c creates the root DCB with
 // RTL_CONSTANT_STRING(L"\\"), and BlorgDirComplete invalidates with
-// PathCacheInvalidatePrefix(&dcb->FullPath) on every listing publish --
+// BlorgPathCacheInvalidatePrefix(&dcb->FullPath) on every listing publish --
 // so a refresh of the volume root passes exactly this Dir.
 //
 // PathCacheIsUnder's boundary check reads Path->Buffer[Dir->Length /
@@ -231,19 +231,19 @@ TEST_F(PathCacheTest, RootPrefixInvalidationRemovesItsChildren)
     UNICODE_STRING rootChild = RTL_CONSTANT_STRING(L"\\rootlevel.bin");
     UNICODE_STRING deeperChild = RTL_CONSTANT_STRING(L"\\media\\nested.bin");
 
-    PathCacheInsertNotFound(&rootChild);
-    PathCacheInsertNotFound(&deeperChild);
+    BlorgPathCacheInsertNotFound(&rootChild);
+    BlorgPathCacheInsertNotFound(&deeperChild);
 
-    ASSERT_EQ(PathCacheNotFound, PathCacheLookup(&rootChild, nullptr))
+    ASSERT_EQ(PathCacheNotFound, BlorgPathCacheLookup(&rootChild, nullptr))
         << "sanity: the negative entry must be live before invalidation can prove anything";
 
-    PathCacheInvalidatePrefix(&root);
+    BlorgPathCacheInvalidatePrefix(&root);
 
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&rootChild, nullptr))
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&rootChild, nullptr))
         << "a root listing refresh must drop memoized results for root-level children -- "
            "otherwise a file that has since appeared on the backend stays unopenable "
            "until the TTL lapses, while being visible in the listing";
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&deeperChild, nullptr))
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&deeperChild, nullptr))
         << "the root's subtree is the whole volume, so deeper paths must go too";
 }
 
@@ -258,12 +258,12 @@ TEST_F(PathCacheTest, NonRootPrefixInvalidationRemovesItsChildren)
     UNICODE_STRING dir = RTL_CONSTANT_STRING(L"\\media");
     UNICODE_STRING child = RTL_CONSTANT_STRING(L"\\media\\controlcase.bin");
 
-    PathCacheInsertNotFound(&child);
-    ASSERT_EQ(PathCacheNotFound, PathCacheLookup(&child, nullptr));
+    BlorgPathCacheInsertNotFound(&child);
+    ASSERT_EQ(PathCacheNotFound, BlorgPathCacheLookup(&child, nullptr));
 
-    PathCacheInvalidatePrefix(&dir);
+    BlorgPathCacheInvalidatePrefix(&dir);
 
-    EXPECT_EQ(PathCacheMiss, PathCacheLookup(&child, nullptr));
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&child, nullptr));
 }
 
 //
@@ -292,16 +292,16 @@ TEST_F(PathCacheTest, InsertUnderPressureEvictsRatherThanGrowingUnbounded)
 
     for (int i = 0; i < kPaths; ++i)
     {
-        PathCacheInsertExists(&paths[i], &meta);
+        BlorgPathCacheInsertExists(&paths[i], &meta);
     }
 
-    EXPECT_EQ(PathCacheExists, PathCacheLookup(&paths[kPaths - 1], nullptr))
+    EXPECT_EQ(PathCacheExists, BlorgPathCacheLookup(&paths[kPaths - 1], nullptr))
         << "the most recently inserted entry must survive its own insert";
 
     int hits = 0;
     for (int i = 0; i < kPaths; ++i)
     {
-        if (PathCacheExists == PathCacheLookup(&paths[i], nullptr))
+        if (PathCacheExists == BlorgPathCacheLookup(&paths[i], nullptr))
         {
             hits++;
         }

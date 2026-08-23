@@ -206,15 +206,15 @@ int main()
 
     unsigned char clientPrivate[TLS_ECC_COORD_LEN];
     unsigned char clientPublic[TLS_ECC_PUBKEY_LEN];
-    CheckStatus("TlsEcdhGenerateKeyPair", TlsEcdhGenerateKeyPair(clientPrivate, clientPublic));
+    CheckStatus("BlorgTlsEcdhGenerateKeyPair", BlorgTlsEcdhGenerateKeyPair(clientPrivate, clientPublic));
 
     unsigned char clientRandom[TLS_HANDSHAKE_RANDOM_LEN];
     CheckStatus("BCryptGenRandom(client random)", BCryptGenRandom(NULL, clientRandom, TLS_HANDSHAKE_RANDOM_LEN, BCRYPT_USE_SYSTEM_PREFERRED_RNG));
 
     unsigned char clientHello[TLS_CLIENT_HELLO_MAX_LEN];
     unsigned long clientHelloLen = 0;
-    CheckStatus("TlsBuildClientHello",
-        TlsBuildClientHello(clientRandom, clientPublic, "localhost", 9, clientHello, sizeof(clientHello), &clientHelloLen));
+    CheckStatus("BlorgTlsBuildClientHello",
+        BlorgTlsBuildClientHello(clientRandom, clientPublic, "localhost", 9, clientHello, sizeof(clientHello), &clientHelloLen));
 
     memcpy(transcript + transcriptLen, clientHello, clientHelloLen);
     transcriptLen += clientHelloLen;
@@ -259,44 +259,44 @@ int main()
 
     unsigned char serverRandom[TLS_HANDSHAKE_RANDOM_LEN];
     unsigned char serverPublic[TLS_ECC_PUBKEY_LEN];
-    CheckStatus("TlsParseServerHello", TlsParseServerHello(payload + 4, shBodyLen, serverRandom, serverPublic));
+    CheckStatus("BlorgTlsParseServerHello", BlorgTlsParseServerHello(payload + 4, shBodyLen, serverRandom, serverPublic));
 
     // --- Key schedule through the handshake secret ---
 
     unsigned char zero32[32] = { 0 };
     unsigned char sharedSecret[TLS_ECC_COORD_LEN];
-    CheckStatus("TlsEcdhComputeSharedSecret", TlsEcdhComputeSharedSecret(clientPrivate, clientPublic, serverPublic, sharedSecret));
+    CheckStatus("BlorgTlsEcdhComputeSharedSecret", BlorgTlsEcdhComputeSharedSecret(clientPrivate, clientPublic, serverPublic, sharedSecret));
 
     unsigned char transcriptHashChSh[TLS_HASH_LEN];
-    CheckStatus("TlsSha256(ClientHello||ServerHello)", TlsSha256(transcript, transcriptLen, transcriptHashChSh));
+    CheckStatus("BlorgTlsSha256(ClientHello||ServerHello)", BlorgTlsSha256(transcript, transcriptLen, transcriptHashChSh));
 
     unsigned char emptyHash[TLS_HASH_LEN];
-    CheckStatus("TlsSha256(empty)", TlsSha256(NULL, 0, emptyHash));
+    CheckStatus("BlorgTlsSha256(empty)", BlorgTlsSha256(NULL, 0, emptyHash));
 
     unsigned char earlySecret[TLS_HASH_LEN];
-    CheckStatus("TlsHkdfExtract(early)", TlsHkdfExtract(zero32, 32, zero32, 32, earlySecret));
+    CheckStatus("BlorgTlsHkdfExtract(early)", BlorgTlsHkdfExtract(zero32, 32, zero32, 32, earlySecret));
 
     unsigned char derivedForHandshake[TLS_HASH_LEN];
-    CheckStatus("TlsHkdfExpandLabel(derived)", TlsHkdfExpandLabel(earlySecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForHandshake));
+    CheckStatus("BlorgTlsHkdfExpandLabel(derived)", BlorgTlsHkdfExpandLabel(earlySecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForHandshake));
 
     unsigned char handshakeSecret[TLS_HASH_LEN];
-    CheckStatus("TlsHkdfExtract(handshake)", TlsHkdfExtract(derivedForHandshake, TLS_HASH_LEN, sharedSecret, TLS_ECC_COORD_LEN, handshakeSecret));
+    CheckStatus("BlorgTlsHkdfExtract(handshake)", BlorgTlsHkdfExtract(derivedForHandshake, TLS_HASH_LEN, sharedSecret, TLS_ECC_COORD_LEN, handshakeSecret));
 
     unsigned char clientHsTraffic[TLS_HASH_LEN];
-    CheckStatus("TlsHkdfExpandLabel(c hs traffic)", TlsHkdfExpandLabel(handshakeSecret, TLS_HASH_LEN, "c hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, clientHsTraffic));
+    CheckStatus("BlorgTlsHkdfExpandLabel(c hs traffic)", BlorgTlsHkdfExpandLabel(handshakeSecret, TLS_HASH_LEN, "c hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, clientHsTraffic));
 
     unsigned char serverHsTraffic[TLS_HASH_LEN];
-    CheckStatus("TlsHkdfExpandLabel(s hs traffic)", TlsHkdfExpandLabel(handshakeSecret, TLS_HASH_LEN, "s hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, serverHsTraffic));
+    CheckStatus("BlorgTlsHkdfExpandLabel(s hs traffic)", BlorgTlsHkdfExpandLabel(handshakeSecret, TLS_HASH_LEN, "s hs traffic", transcriptHashChSh, TLS_HASH_LEN, TLS_HASH_LEN, serverHsTraffic));
 
     unsigned char serverHsKey[TLS_KEY_LEN];
     unsigned char serverHsIv[TLS_IV_LEN];
-    CheckStatus("TlsHkdfExpandLabel(server key)", TlsHkdfExpandLabel(serverHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, serverHsKey));
-    CheckStatus("TlsHkdfExpandLabel(server iv)", TlsHkdfExpandLabel(serverHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, serverHsIv));
+    CheckStatus("BlorgTlsHkdfExpandLabel(server key)", BlorgTlsHkdfExpandLabel(serverHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, serverHsKey));
+    CheckStatus("BlorgTlsHkdfExpandLabel(server iv)", BlorgTlsHkdfExpandLabel(serverHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, serverHsIv));
 
     unsigned char clientHsKey[TLS_KEY_LEN];
     unsigned char clientHsIv[TLS_IV_LEN];
-    CheckStatus("TlsHkdfExpandLabel(client key)", TlsHkdfExpandLabel(clientHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, clientHsKey));
-    CheckStatus("TlsHkdfExpandLabel(client iv)", TlsHkdfExpandLabel(clientHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, clientHsIv));
+    CheckStatus("BlorgTlsHkdfExpandLabel(client key)", BlorgTlsHkdfExpandLabel(clientHsTraffic, TLS_HASH_LEN, "key", NULL, 0, TLS_KEY_LEN, clientHsKey));
+    CheckStatus("BlorgTlsHkdfExpandLabel(client iv)", BlorgTlsHkdfExpandLabel(clientHsTraffic, TLS_HASH_LEN, "iv", NULL, 0, TLS_IV_LEN, clientHsIv));
 
     // --- Encrypted flight: EncryptedExtensions, Certificate, CertificateVerify, Finished ---
 
@@ -344,12 +344,12 @@ int main()
             return 1;
         }
 
-        // Ciphertext and tag are passed separately to TlsAeadDecrypt: the
+        // Ciphertext and tag are passed separately to BlorgTlsAeadDecrypt: the
         // tag is the trailing TLS_TAG_LEN bytes of the record payload.
         static unsigned char decrypted[16384];
         unsigned long ciphertextLen = payloadLen - TLS_TAG_LEN;
-        CheckStatus("TlsAeadDecrypt(handshake record)",
-            TlsAeadDecrypt(serverHsKey, serverHsIv, serverSeq, header, 5, payload, ciphertextLen, payload + ciphertextLen, decrypted));
+        CheckStatus("BlorgTlsAeadDecrypt(handshake record)",
+            BlorgTlsAeadDecrypt(serverHsKey, serverHsIv, serverSeq, header, 5, payload, ciphertextLen, payload + ciphertextLen, decrypted));
 
         if (0 == serverSeq) // only need one real record as an AEAD fuzz seed
         {
@@ -410,20 +410,20 @@ int main()
 
                 const unsigned char* leafCert;
                 unsigned long leafCertLen;
-                CheckStatus("TlsParseCertificateMessage", TlsParseCertificateMessage(msgBody, msgBodyLen, &leafCert, &leafCertLen));
+                CheckStatus("BlorgTlsParseCertificateMessage", BlorgTlsParseCertificateMessage(msgBody, msgBodyLen, &leafCert, &leafCertLen));
 
                 DumpSeed("leaf_cert_der", leafCert, leafCertLen);
 
                 const unsigned char* spki;
                 unsigned long spkiLen;
-                CheckStatus("TlsExtractSpkiFromCertificate", TlsExtractSpkiFromCertificate(leafCert, leafCertLen, &spki, &spkiLen));
+                CheckStatus("BlorgTlsExtractSpkiFromCertificate", BlorgTlsExtractSpkiFromCertificate(leafCert, leafCertLen, &spki, &spkiLen));
                 Check("extracted SPKI length == TLS_SPKI_DER_LEN", TLS_SPKI_DER_LEN == spkiLen);
 
                 DumpSeed("spki_der", spki, spkiLen);
 
-                CheckStatus("TlsDecodeP256SubjectPublicKeyInfo", TlsDecodeP256SubjectPublicKeyInfo(spki, spkiLen, serverLongTermKey));
+                CheckStatus("BlorgTlsDecodeP256SubjectPublicKeyInfo", BlorgTlsDecodeP256SubjectPublicKeyInfo(spki, spkiLen, serverLongTermKey));
 
-                CheckStatus("TlsSha256(transcript through Certificate)", TlsSha256(transcript, transcriptLen, transcriptHashThroughCert));
+                CheckStatus("BlorgTlsSha256(transcript through Certificate)", BlorgTlsSha256(transcript, transcriptLen, transcriptHashThroughCert));
                 sawCertificate = true;
             }
             else if (0x0F == msgType) // CertificateVerify
@@ -433,17 +433,17 @@ int main()
                 DumpSeed("certificate_verify_message_body", msgBody, msgBodyLen);
 
                 unsigned char rawSignature[64];
-                CheckStatus("TlsParseCertificateVerifyMessage", TlsParseCertificateVerifyMessage(msgBody, msgBodyLen, rawSignature));
+                CheckStatus("BlorgTlsParseCertificateVerifyMessage", BlorgTlsParseCertificateVerifyMessage(msgBody, msgBodyLen, rawSignature));
 
                 unsigned char verifyContent[TLS_CERT_VERIFY_CONTENT_LEN];
-                CheckStatus("TlsBuildServerCertVerifyContent", TlsBuildServerCertVerifyContent(transcriptHashThroughCert, verifyContent));
+                CheckStatus("BlorgTlsBuildServerCertVerifyContent", BlorgTlsBuildServerCertVerifyContent(transcriptHashThroughCert, verifyContent));
 
                 unsigned char verifyDigest[TLS_HASH_LEN];
-                CheckStatus("TlsSha256(CertVerify content)", TlsSha256(verifyContent, TLS_CERT_VERIFY_CONTENT_LEN, verifyDigest));
+                CheckStatus("BlorgTlsSha256(CertVerify content)", BlorgTlsSha256(verifyContent, TLS_CERT_VERIFY_CONTENT_LEN, verifyDigest));
 
-                CheckStatus("TlsEcdsaVerify(server CertificateVerify)", TlsEcdsaVerify(serverLongTermKey, verifyDigest, TLS_HASH_LEN, rawSignature));
+                CheckStatus("BlorgTlsEcdsaVerify(server CertificateVerify)", BlorgTlsEcdsaVerify(serverLongTermKey, verifyDigest, TLS_HASH_LEN, rawSignature));
 
-                CheckStatus("TlsSha256(transcript through CertificateVerify)", TlsSha256(transcript, transcriptLen, transcriptHashThroughCertVerify));
+                CheckStatus("BlorgTlsSha256(transcript through CertificateVerify)", BlorgTlsSha256(transcript, transcriptLen, transcriptHashThroughCertVerify));
                 sawCertVerify = true;
             }
             else if (0x14 == msgType) // Finished
@@ -452,12 +452,12 @@ int main()
                 Check("Finished body length == 32", 32 == msgBodyLen);
 
                 unsigned char serverFinishedKey[TLS_HASH_LEN];
-                CheckStatus("TlsHkdfExpandLabel(server finished key)", TlsHkdfExpandLabel(serverHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, serverFinishedKey));
+                CheckStatus("BlorgTlsHkdfExpandLabel(server finished key)", BlorgTlsHkdfExpandLabel(serverHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, serverFinishedKey));
 
                 unsigned char expectedFinishedMac[TLS_HASH_LEN];
-                CheckStatus("TlsHmacSha256(expected server finished)", TlsHmacSha256(serverFinishedKey, TLS_HASH_LEN, transcriptHashThroughCertVerify, TLS_HASH_LEN, expectedFinishedMac));
+                CheckStatus("BlorgTlsHmacSha256(expected server finished)", BlorgTlsHmacSha256(serverFinishedKey, TLS_HASH_LEN, transcriptHashThroughCertVerify, TLS_HASH_LEN, expectedFinishedMac));
 
-                Check("server Finished MAC matches", TlsConstantTimeEqual(expectedFinishedMac, msgBody, TLS_HASH_LEN));
+                Check("server Finished MAC matches", BlorgTlsConstantTimeEqual(expectedFinishedMac, msgBody, TLS_HASH_LEN));
 
                 sawFinished = true;
             }
@@ -479,26 +479,26 @@ int main()
     // but derived to confirm the schedule completes correctly end to end) ---
 
     unsigned char derivedForMaster[TLS_HASH_LEN];
-    CheckStatus("TlsHkdfExpandLabel(derived, master)", TlsHkdfExpandLabel(handshakeSecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForMaster));
+    CheckStatus("BlorgTlsHkdfExpandLabel(derived, master)", BlorgTlsHkdfExpandLabel(handshakeSecret, TLS_HASH_LEN, "derived", emptyHash, TLS_HASH_LEN, TLS_HASH_LEN, derivedForMaster));
 
     unsigned char masterSecret[TLS_HASH_LEN];
-    CheckStatus("TlsHkdfExtract(master)", TlsHkdfExtract(derivedForMaster, TLS_HASH_LEN, zero32, 32, masterSecret));
+    CheckStatus("BlorgTlsHkdfExtract(master)", BlorgTlsHkdfExtract(derivedForMaster, TLS_HASH_LEN, zero32, 32, masterSecret));
 
     unsigned char transcriptHashThroughServerFinished[TLS_HASH_LEN];
-    CheckStatus("TlsSha256(transcript through server Finished)", TlsSha256(transcript, transcriptLen, transcriptHashThroughServerFinished));
+    CheckStatus("BlorgTlsSha256(transcript through server Finished)", BlorgTlsSha256(transcript, transcriptLen, transcriptHashThroughServerFinished));
 
     unsigned char clientAppTraffic[TLS_HASH_LEN];
     unsigned char serverAppTraffic[TLS_HASH_LEN];
-    CheckStatus("TlsHkdfExpandLabel(c ap traffic)", TlsHkdfExpandLabel(masterSecret, TLS_HASH_LEN, "c ap traffic", transcriptHashThroughServerFinished, TLS_HASH_LEN, TLS_HASH_LEN, clientAppTraffic));
-    CheckStatus("TlsHkdfExpandLabel(s ap traffic)", TlsHkdfExpandLabel(masterSecret, TLS_HASH_LEN, "s ap traffic", transcriptHashThroughServerFinished, TLS_HASH_LEN, TLS_HASH_LEN, serverAppTraffic));
+    CheckStatus("BlorgTlsHkdfExpandLabel(c ap traffic)", BlorgTlsHkdfExpandLabel(masterSecret, TLS_HASH_LEN, "c ap traffic", transcriptHashThroughServerFinished, TLS_HASH_LEN, TLS_HASH_LEN, clientAppTraffic));
+    CheckStatus("BlorgTlsHkdfExpandLabel(s ap traffic)", BlorgTlsHkdfExpandLabel(masterSecret, TLS_HASH_LEN, "s ap traffic", transcriptHashThroughServerFinished, TLS_HASH_LEN, TLS_HASH_LEN, serverAppTraffic));
 
     // --- Client Finished: send it, encrypted under the client handshake traffic key ---
 
     unsigned char clientFinishedKey[TLS_HASH_LEN];
-    CheckStatus("TlsHkdfExpandLabel(client finished key)", TlsHkdfExpandLabel(clientHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, clientFinishedKey));
+    CheckStatus("BlorgTlsHkdfExpandLabel(client finished key)", BlorgTlsHkdfExpandLabel(clientHsTraffic, TLS_HASH_LEN, "finished", NULL, 0, TLS_HASH_LEN, clientFinishedKey));
 
     unsigned char clientFinishedMac[TLS_HASH_LEN];
-    CheckStatus("TlsHmacSha256(client finished)", TlsHmacSha256(clientFinishedKey, TLS_HASH_LEN, transcriptHashThroughServerFinished, TLS_HASH_LEN, clientFinishedMac));
+    CheckStatus("BlorgTlsHmacSha256(client finished)", BlorgTlsHmacSha256(clientFinishedKey, TLS_HASH_LEN, transcriptHashThroughServerFinished, TLS_HASH_LEN, clientFinishedMac));
 
     {
         unsigned char finishedMsg[4 + TLS_HASH_LEN];
@@ -519,7 +519,7 @@ int main()
 
         unsigned char ciphertext[sizeof(plaintext)];
         unsigned char tag[TLS_TAG_LEN];
-        CheckStatus("TlsAeadEncrypt(client Finished)", TlsAeadEncrypt(clientHsKey, clientHsIv, 0, aad, 5, plaintext, C_CAST(unsigned long, sizeof(plaintext)), ciphertext, tag));
+        CheckStatus("BlorgTlsAeadEncrypt(client Finished)", BlorgTlsAeadEncrypt(clientHsKey, clientHsIv, 0, aad, 5, plaintext, C_CAST(unsigned long, sizeof(plaintext)), ciphertext, tag));
 
         unsigned char record[5 + sizeof(plaintext) + TLS_TAG_LEN];
         memcpy(record, aad, 5);

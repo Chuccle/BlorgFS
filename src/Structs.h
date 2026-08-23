@@ -111,7 +111,7 @@ CHECK_PADDING_END(DIRECTORY_INFO, SubDirCount);
 // Returns a pointer to the Index'th subdirectory entry packed after this
 // DIRECTORY_INFO, or NULL if Index is out of range.
 //
-inline PDIRECTORY_SUBDIR_METADATA GetSubDirEntry(PDIRECTORY_INFO DirInfo, SIZE_T Index)
+inline PDIRECTORY_SUBDIR_METADATA BlorgGetSubDirEntry(PDIRECTORY_INFO DirInfo, SIZE_T Index)
 {
     if (Index >= DirInfo->SubDirCount)
     {
@@ -129,7 +129,7 @@ inline PDIRECTORY_SUBDIR_METADATA GetSubDirEntry(PDIRECTORY_INFO DirInfo, SIZE_T
 // Returns a pointer to the Index'th file entry packed after this
 // DIRECTORY_INFO, or NULL if Index is out of range.
 //
-inline PDIRECTORY_FILE_METADATA GetFileEntry(PDIRECTORY_INFO DirInfo, SIZE_T Index)
+inline PDIRECTORY_FILE_METADATA BlorgGetFileEntry(PDIRECTORY_INFO DirInfo, SIZE_T Index)
 {
     if (Index >= DirInfo->FileCount)
     {
@@ -417,7 +417,7 @@ typedef PFCB PVCB;
 // All three set their out-pointer to NULL on entry and assign it only on
 // the success return, so a caller that checked the status has a non-NULL
 // node without re-testing. Stated in SAL rather than left to the comment:
-// the walk in InsertByPath descends into a freshly created DCB with no
+// the walk in BlorgInsertByPath descends into a freshly created DCB with no
 // further NULL check, and PREfast can only take that as proven from the
 // annotation.
 //
@@ -432,8 +432,8 @@ NTSTATUS BlorgCreateCCB(_Outptr_result_nullonfailure_ CCB** Ccb, const DEVICE_OB
 void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject);
 void BlorgReapEmptyAncestorDcbs(PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject);
 
-PCOMMON_CONTEXT SearchByPath(const DCB* RootDcb, const UNICODE_STRING* Path);
-NTSTATUS InsertByPath(PDCB RootDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out);
+PCOMMON_CONTEXT BlorgSearchByPath(const DCB* RootDcb, const UNICODE_STRING* Path);
+NTSTATUS BlorgInsertByPath(PDCB RootDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out);
 
 //
 //  Node table (Structs.c): sharded push-locked hash keyed by FullPath,
@@ -465,11 +465,11 @@ typedef enum _PATH_CACHE_RESULT
     PathCacheNotFound
 } PATH_CACHE_RESULT;
 
-VOID PathCacheInit(VOID);
-VOID PathCacheCleanup(VOID);
-PATH_CACHE_RESULT PathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta);
-VOID PathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta);
-VOID PathCacheInsertNotFound(const UNICODE_STRING* Path);
+VOID BlorgPathCacheInit(VOID);
+VOID BlorgPathCacheCleanup(VOID);
+PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta);
+VOID BlorgPathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta);
+VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path);
 
 //
 //  Invalidation. TTL keeps us eventually-consistent with the backing store
@@ -478,9 +478,9 @@ VOID PathCacheInsertNotFound(const UNICODE_STRING* Path);
 //  directory-listing refresh once mutating SetInformation lands;
 //  InvalidateAll is the O(1) wholesale flush for backend reconnect / remount.
 //
-VOID PathCacheInvalidate(const UNICODE_STRING* Path);
-VOID PathCacheInvalidatePrefix(const UNICODE_STRING* Dir);
-VOID PathCacheInvalidateAll(VOID);
+VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path);
+VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir);
+VOID BlorgPathCacheInvalidateAll(VOID);
 
 /////////////////////////////////////////////
 ///////DEVICE EXTENSION SECTION//////////////
@@ -525,7 +525,7 @@ CHECK_PADDING_END(BLORGFS_VDO_DEVICE_EXTENSION, NotifyList);
 // Reinterprets a volume device object's DeviceExtension as the VDO
 // extension type. Caller is responsible for the object actually being a VDO.
 //
-inline PBLORGFS_VDO_DEVICE_EXTENSION GetVolumeDeviceExtension(const DEVICE_OBJECT* VolumeDeviceObject)
+inline PBLORGFS_VDO_DEVICE_EXTENSION BlorgGetVolumeDeviceExtension(const DEVICE_OBJECT* VolumeDeviceObject)
 {
     return C_CAST(PBLORGFS_VDO_DEVICE_EXTENSION, VolumeDeviceObject->DeviceExtension);
 }
