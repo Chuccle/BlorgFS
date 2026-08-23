@@ -707,7 +707,7 @@ NTSTATUS BlorgCloseWskSocketAsync(PKSOCKET Socket)
 // the same memory -- this is a kernel-only C TU (no C++ consumers, unlike
 // Tls.h), so plain `restrict` applies directly, no portability macro needed.
 //
-static BOOLEAN SockAddrEqual(PSOCKADDR restrict A, PSOCKADDR restrict B)
+static BOOLEAN SockAddrEqual(const SOCKADDR* restrict A, const SOCKADDR* restrict B)
 {
     if (A->sa_family != B->sa_family)
     {
@@ -807,9 +807,9 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket)
 // just without a wait to make it automatic.
 //
 
-NTSTATUS BlorgSendWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
+NTSTATUS BlorgSendWskAsync(PKSOCKET Socket, const void* Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
 {
-    return BlorgSendRecvWskAsync(Socket, Buffer, Length, Flags, TRUE, CompletionRoutine, CompletionContext);
+    return BlorgSendRecvWskAsync(Socket, C_CAST(PVOID, Buffer), Length, Flags, TRUE, CompletionRoutine, CompletionContext);
 }
 
 //
@@ -1085,7 +1085,7 @@ static NTSTATUS SocketConnectAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject,
 // already-completed (WSK/IoCompletion still guarantees it runs).
 //
 NTSTATUS BlorgAcquireReusableWskSocketAsync(
-    PSOCKADDR RemoteAddress,
+    const SOCKADDR* RemoteAddress,
     BOOLEAN ForceFresh,
     PKSOCKET_ACQUIRE_COMPLETION_ROUTINE CompletionRoutine,
     PVOID CompletionContext
@@ -1110,7 +1110,7 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
             PKSOCKET pooledSocket = CONTAINING_RECORD(listEntry, KSOCKET, PoolEntry);
             RtlZeroMemory(&pooledSocket->PoolEntry, sizeof(pooledSocket->PoolEntry));
 
-            if (SockAddrEqual(C_CAST(PSOCKADDR, &pooledSocket->RemoteAddress), RemoteAddress))
+            if (SockAddrEqual(C_CAST(const SOCKADDR*, &pooledSocket->RemoteAddress), RemoteAddress))
             {
                 BLORGFS_STAT_INC(ConnectionsPooled);
                 CompletionRoutine(STATUS_SUCCESS, pooledSocket, TRUE, CompletionContext);
@@ -1193,7 +1193,7 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
         SOCK_STREAM,
         IPPROTO_TCP,
         C_CAST(PSOCKADDR, &localAddress),
-        RemoteAddress,
+        C_CAST(PSOCKADDR, RemoteAddress),
         0,
         NULL,
         NULL,

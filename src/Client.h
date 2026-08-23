@@ -16,7 +16,7 @@ VOID BlorgDrainHttpClient(void);
 NTSTATUS BlorgInitialiseHttpClient(void);
 void BlorgCleanupHttpClient(void);
 
-NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo);
+NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo);
 void BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo);
 
 //

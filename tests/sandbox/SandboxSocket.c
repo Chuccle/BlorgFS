@@ -295,7 +295,7 @@ NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket)
 // Send / receive
 ///////////////////////////////////////////////////////////////////////////
 
-NTSTATUS BlorgSendWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
+NTSTATUS BlorgSendWskAsync(PKSOCKET Socket, const void* Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
 {
     (void)Flags;
 
@@ -541,7 +541,7 @@ static VOID SandboxDestroySocket(PKSOCKET Socket)
 }
 
 NTSTATUS BlorgAcquireReusableWskSocketAsync(
-    PSOCKADDR RemoteAddress,
+    const SOCKADDR* RemoteAddress,
     BOOLEAN ForceFresh,
     PKSOCKET_ACQUIRE_COMPLETION_ROUTINE CompletionRoutine,
     PVOID CompletionContext)

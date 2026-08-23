@@ -2802,7 +2802,7 @@ void BlorgFreeHttpFile(PFILE_BUFFER FileBuffer)
 // Thin wrapper over BlorgGetWskAddrInfo; exposes DNS resolution to callers
 // outside Socket.c under the Client-facing naming.
 //
-NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, PADDRINFOEXW Hints, PADDRINFOEXW* RemoteAddrInfo)
+NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo)
 {
     return BlorgGetWskAddrInfo(NodeName, ServiceName, Hints, RemoteAddrInfo);
 }

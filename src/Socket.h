@@ -179,7 +179,7 @@ NTSTATUS BlorgCloseWskSocketAsync(PKSOCKET Socket);
 // async op on the same KSOCKET until CompletionRoutine for the first has
 // run.
 //
-NTSTATUS BlorgSendWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
+NTSTATUS BlorgSendWskAsync(PKSOCKET Socket, const void* Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
 NTSTATUS BlorgReceiveWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
 NTSTATUS BlorgSendRecvWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, BOOLEAN Send, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext);
 
@@ -212,7 +212,7 @@ typedef VOID(*PKSOCKET_ACQUIRE_COMPLETION_ROUTINE)(NTSTATUS Status, PKSOCKET Soc
 // connection.
 //
 NTSTATUS BlorgAcquireReusableWskSocketAsync(
-    PSOCKADDR RemoteAddress,
+    const SOCKADDR* RemoteAddress,
     BOOLEAN ForceFresh,
     PKSOCKET_ACQUIRE_COMPLETION_ROUTINE CompletionRoutine,
     PVOID CompletionContext
