@@ -9,6 +9,44 @@
 //
 
 //
+//  The access this read-only volume grants, as one set rather than two
+//  predicates that each restated it.
+//
+//  MAXIMUM_ALLOWED belongs here, not outside. It is not a request for write
+//  access -- it means "grant whatever I am entitled to" -- and the
+//  entitlement is decided before either check below runs: the devices are
+//  FILE_DEVICE_SECURE_OPEN, so the I/O manager resolves MAXIMUM_ALLOWED
+//  against the device security descriptor and sets the handle's granted
+//  access from that. These checks are the second, independent gate.
+//
+//  Note FILE_READ_DATA and FILE_LIST_DIRECTORY are the same bit, as are
+//  FILE_EXECUTE and FILE_TRAVERSE; both spellings are listed because both
+//  are what a caller writes, and neither is redundant to a reader.
+//
+#define BLORGFS_READ_ONLY_ACCESS (DELETE |    \
+    READ_CONTROL |                            \
+    WRITE_OWNER |                             \
+    WRITE_DAC |                               \
+    SYNCHRONIZE |                             \
+    ACCESS_SYSTEM_SECURITY |                  \
+    FILE_READ_DATA |                          \
+    FILE_READ_EA |                            \
+    FILE_WRITE_EA |                           \
+    FILE_READ_ATTRIBUTES |                    \
+    FILE_WRITE_ATTRIBUTES |                   \
+    FILE_EXECUTE |                            \
+    FILE_LIST_DIRECTORY |                     \
+    FILE_TRAVERSE |                           \
+    MAXIMUM_ALLOWED)
+
+//
+//  What a directory grants on top of that: adding or removing a child is a
+//  normal directory operation, not a data write in the file sense. This
+//  difference is the entire reason the two checks below are separate.
+//
+#define BLORGFS_DIRECTORY_CHILD_ACCESS (FILE_ADD_SUBDIRECTORY | FILE_ADD_FILE | FILE_DELETE_CHILD)
+
+//
 //  Rejects a desired-access mask this read-only volume cannot honour.
 //
 //  Deliberately no KdBreakPoint() here or in CheckDirectoryAccess/the
@@ -21,99 +59,41 @@
 //  from VM/VIX flakiness, and the cause of many "frozen VM" incidents.
 //  See deploy/DEBUGGING.md.
 //
-//  MAXIMUM_ALLOWED is inside the read-only mask, not outside it. It is not
-//  a request for write access -- it means "grant whatever I am entitled
-//  to" -- and the entitlement is already decided before this runs: the
-//  devices are FILE_DEVICE_SECURE_OPEN, so the I/O manager resolves
-//  MAXIMUM_ALLOWED against the device security descriptor and sets the
-//  handle's granted access from that. This check is the second, independent
-//  gate, and denying the bit here turned a read handle the caller was
-//  entitled to into ACCESS_DENIED -- which is what applications that open
-//  with MAXIMUM_ALLOWED as a matter of habit were getting. It was in the
-//  first mask (the set this volume understands at all) and missing from the
-//  read-only one, so the rejection was an omission rather than a policy.
+//  Both checks used to run a second, wider mask first -- the set of bits
+//  this volume understands at all -- gated on an IsReadOnly parameter that
+//  every one of the four call sites passed TRUE. That made the wider mask
+//  unreachable in two senses at once: the parameter was never FALSE, and
+//  the read-only set it guarded is a strict subset of it, so no mask could
+//  be rejected by the first test that the second did not reject anyway. It
+//  cost two verbatim copies of a sixteen-flag list whose only job was to be
+//  kept in step with a list that already decided every answer.
 //
-static inline BOOLEAN CheckFileAccess(const ACCESS_MASK* DesiredAccess, BOOLEAN IsReadOnly)
+//  ReadOnlyAccessMaskIsDecidedBitByBit in
+//  tests\sandbox\CreateDirectoryTest.cpp drives all 32 bits through a real
+//  open against the sets above. Both predicates reject on "any bit outside
+//  the permitted set", which is monotone in bits, so deciding every single
+//  bit correctly decides every combination -- that test was written against
+//  the two-mask version and passed unchanged here, which is what says the
+//  collapse changed no answer.
+//
+static inline BOOLEAN CheckFileAccess(const ACCESS_MASK* DesiredAccess)
 {
-    if (FlagOn(*DesiredAccess, ~(DELETE |
-        READ_CONTROL |
-        WRITE_OWNER |
-        WRITE_DAC |
-        SYNCHRONIZE |
-        ACCESS_SYSTEM_SECURITY |
-        FILE_WRITE_DATA |
-        FILE_READ_EA |
-        FILE_WRITE_EA |
-        FILE_READ_ATTRIBUTES |
-        FILE_WRITE_ATTRIBUTES |
-        FILE_LIST_DIRECTORY |
-        FILE_TRAVERSE |
-        FILE_DELETE_CHILD |
-        FILE_APPEND_DATA |
-        MAXIMUM_ALLOWED)))
+    if (FlagOn(*DesiredAccess, ~BLORGFS_READ_ONLY_ACCESS))
     {
         return FALSE;
-    }
-
-    if (IsReadOnly)
-    {
-        ACCESS_MASK AccessMask = DELETE | READ_CONTROL | WRITE_OWNER | WRITE_DAC |
-            SYNCHRONIZE | ACCESS_SYSTEM_SECURITY | FILE_READ_DATA |
-            FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES |
-            FILE_WRITE_ATTRIBUTES | FILE_EXECUTE | FILE_LIST_DIRECTORY |
-            FILE_TRAVERSE | MAXIMUM_ALLOWED;
-
-        if (FlagOn(*DesiredAccess, ~AccessMask))
-        {
-            return FALSE;
-        }
     }
 
     return TRUE;
 }
 
 //
-//  Same flag check as CheckFileAccess, but for directories: the read-only
-//  access mask additionally permits FILE_ADD_SUBDIRECTORY, FILE_ADD_FILE,
-//  and FILE_DELETE_CHILD, since adding/removing children is a normal
-//  directory operation and not a data-write in the file sense.
+//  Same check for directories, widened by the child-mutation bits.
 //
-static inline BOOLEAN CheckDirectoryAccess(const ACCESS_MASK* DesiredAccess, BOOLEAN IsReadOnly)
+static inline BOOLEAN CheckDirectoryAccess(const ACCESS_MASK* DesiredAccess)
 {
-    if (FlagOn(*DesiredAccess, ~(DELETE |
-        READ_CONTROL |
-        WRITE_OWNER |
-        WRITE_DAC |
-        SYNCHRONIZE |
-        ACCESS_SYSTEM_SECURITY |
-        FILE_WRITE_DATA |
-        FILE_READ_EA |
-        FILE_WRITE_EA |
-        FILE_READ_ATTRIBUTES |
-        FILE_WRITE_ATTRIBUTES |
-        FILE_LIST_DIRECTORY |
-        FILE_TRAVERSE |
-        FILE_DELETE_CHILD |
-        FILE_APPEND_DATA |
-        MAXIMUM_ALLOWED)))
+    if (FlagOn(*DesiredAccess, ~(BLORGFS_READ_ONLY_ACCESS | BLORGFS_DIRECTORY_CHILD_ACCESS)))
     {
         return FALSE;
-    }
-
-    if (IsReadOnly)
-    {
-        ACCESS_MASK AccessMask = DELETE | READ_CONTROL | WRITE_OWNER | WRITE_DAC |
-            SYNCHRONIZE | ACCESS_SYSTEM_SECURITY | FILE_READ_DATA |
-            FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES |
-            FILE_WRITE_ATTRIBUTES | FILE_EXECUTE | FILE_LIST_DIRECTORY |
-            FILE_TRAVERSE | MAXIMUM_ALLOWED;
-
-        AccessMask |= FILE_ADD_SUBDIRECTORY | FILE_ADD_FILE | FILE_DELETE_CHILD;
-
-        if (FlagOn(*DesiredAccess, ~AccessMask))
-        {
-            return FALSE;
-        }
     }
 
     return TRUE;
@@ -180,7 +160,7 @@ static inline NTSTATUS BreakHandleOplockOnSharingViolation(POPLOCK Oplock, PIRP 
 //
 static inline NTSTATUS OpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PFCB Fcb)
 {
-    if (!CheckFileAccess(DesiredAccess, TRUE))
+    if (!CheckFileAccess(DesiredAccess))
     {
         return STATUS_ACCESS_DENIED;
     }
@@ -232,7 +212,7 @@ static inline NTSTATUS OpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const 
 //
 static inline NTSTATUS OpenExistingDcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
-    if (!CheckDirectoryAccess(DesiredAccess, TRUE))
+    if (!CheckDirectoryAccess(DesiredAccess))
     {
         return STATUS_ACCESS_DENIED;
     }
@@ -292,7 +272,7 @@ static inline NTSTATUS OpenExistingDcb(PIRP Irp, PFILE_OBJECT FileObject, const 
 //
 static inline NTSTATUS OpenVcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PVCB Vcb)
 {
-    if (!CheckFileAccess(DesiredAccess, TRUE))
+    if (!CheckFileAccess(DesiredAccess))
     {
         return STATUS_ACCESS_DENIED;
     }
@@ -329,7 +309,7 @@ static inline NTSTATUS OpenVcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_M
 //
 static inline NTSTATUS OpenRootDcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
-    if (!CheckDirectoryAccess(DesiredAccess, TRUE))
+    if (!CheckDirectoryAccess(DesiredAccess))
     {
         return STATUS_ACCESS_DENIED;
     }

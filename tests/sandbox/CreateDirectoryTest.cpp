@@ -382,6 +382,82 @@ TEST_F(CreateDirectoryTest, MaximumAllowedIsInsideTheReadOnlyMask)
     CloseOpener(&fileOpener);
 }
 
+//
+// The access-mask policy stated once, as a set, and checked one bit at a
+// time through a real open.
+//
+// Both predicates are "reject if any bit falls outside the permitted set",
+// which is monotone in bits: if every single-bit mask is decided correctly
+// then every combination is too. So driving all 32 bits pins the whole
+// policy, and it pins it against the mask below rather than against
+// whatever the code currently happens to do -- which is what makes it
+// useful either as a regression test or as an equivalence check when the
+// two predicates are restructured.
+//
+// The file and directory sets differ by exactly the three child-mutation
+// bits, and that difference is the only reason two predicates exist.
+//
+TEST_F(CreateDirectoryTest, ReadOnlyAccessMaskIsDecidedBitByBit)
+{
+    const ACCESS_MASK permittedOnAFile =
+        DELETE | READ_CONTROL | WRITE_OWNER | WRITE_DAC | SYNCHRONIZE |
+        ACCESS_SYSTEM_SECURITY | FILE_READ_DATA | FILE_READ_EA | FILE_WRITE_EA |
+        FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_EXECUTE |
+        FILE_LIST_DIRECTORY | FILE_TRAVERSE | MAXIMUM_ALLOWED;
+
+    const ACCESS_MASK permittedOnADirectory =
+        permittedOnAFile | FILE_ADD_SUBDIRECTORY | FILE_ADD_FILE | FILE_DELETE_CHILD;
+
+    PCOMMON_CONTEXT dir = MakePublishedNode(L"\\media", TRUE);
+    ASSERT_NE(nullptr, dir);
+    PCOMMON_CONTEXT file = MakePublishedNode(L"\\clip.bin", FALSE);
+    ASSERT_NE(nullptr, file);
+
+    for (int bit = 0; bit < 32; ++bit)
+    {
+        const ACCESS_MASK mask = (ACCESS_MASK)(1u << bit);
+
+        CreateOpener fileOpener;
+        PrepareOpener(&fileOpener, Path(L"\\clip.bin"), mask, kShareAll, 0);
+        BlorgCreate(Volume, &fileOpener.CreateIrp);
+
+        const NTSTATUS expectedOnAFile =
+            (mask & permittedOnAFile) ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
+
+        EXPECT_EQ(expectedOnAFile, fileOpener.CreateIrp.IoStatus.Status)
+            << "file open with access bit 0x" << std::hex << mask;
+
+        if (NT_SUCCESS(fileOpener.CreateIrp.IoStatus.Status))
+        {
+            CloseOpener(&fileOpener);
+        }
+
+        CreateOpener dirOpener;
+        PrepareOpener(&dirOpener, Path(L"\\media"), mask, kShareAll, 0);
+        BlorgCreate(Volume, &dirOpener.CreateIrp);
+
+        const NTSTATUS expectedOnADirectory =
+            (mask & permittedOnADirectory) ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
+
+        EXPECT_EQ(expectedOnADirectory, dirOpener.CreateIrp.IoStatus.Status)
+            << "directory open with access bit 0x" << std::hex << mask;
+
+        if (NT_SUCCESS(dirOpener.CreateIrp.IoStatus.Status))
+        {
+            CloseOpener(&dirOpener);
+        }
+    }
+
+    CreateOpener wholeMask;
+    PrepareOpener(&wholeMask, Path(L"\\clip.bin"), permittedOnAFile, kShareAll, 0);
+    BlorgCreate(Volume, &wholeMask.CreateIrp);
+
+    EXPECT_EQ(STATUS_SUCCESS, wholeMask.CreateIrp.IoStatus.Status)
+        << "the permitted set must be accepted in full, not only one bit at a time";
+
+    CloseOpener(&wholeMask);
+}
+
 TEST_F(CreateDirectoryTest, OpenExistingDcbDeniesAccessOutsideReadOnlyMask)
 {
     PCOMMON_CONTEXT node = MakePublishedNode(L"\\media", TRUE);
