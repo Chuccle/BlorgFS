@@ -259,6 +259,14 @@ typedef struct _BLORGFS_STATISTICS_GLOBAL
 // Version is checked by the driver so a stale harness fails loudly
 // instead of misreading a struct whose tail moved.
 //
+//
+// Set when the driver was built checked (DBG). A workload measured against
+// one of these is measuring the instrumentation: no optimisation, and
+// BLORGFS_PRINT compiled in as a live global.LogLevel test on the read
+// path rather than as nothing at all.
+//
+#define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
+
 #define BLORGFS_STATISTICS_VERSION 5
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
@@ -266,7 +274,17 @@ typedef struct _BLORGFS_STATISTICS_RESPONSE
     ULONG Version;                       // BLORGFS_STATISTICS_VERSION
     ULONG SizeOfStruct;                  // sizeof(BLORGFS_STATISTICS_RESPONSE)
     ULONG ProcessorCount;                // entries that were summed
-    ULONG Reserved;                      // explicit pad to an 8-byte granule
+
+    //
+    // BLORGFS_STATS_FLAG_*. Occupies what used to be explicit padding, so
+    // the layout is unchanged.
+    //
+    // BLORGFS_STATS_FLAG_CHECKED_BUILD exists because a performance number
+    // taken against a checked driver is not a performance number, and
+    // nothing else in this response reveals which build produced it. The
+    // harness refuses to present workload results without saying so.
+    //
+    ULONG Flags;
 
     //
     // QueryPerformanceCounter frequency, the stamp taken at the last

@@ -68,6 +68,18 @@ param(
     [string]$VmPassword,
     [string]$SnapshotName,
     [switch]$SkipBuild,
+
+    #
+    # Deploy a driver fit to be measured: Release, and Driver Verifier
+    # cleared. Both are required and neither is visible in any harness
+    # output, so this exists to make "I benchmarked it" mean one thing.
+    #
+    # -Configuration still wins if given explicitly, so
+    # `-ForBenchmark -Configuration Debug` is possible -- it just has to be
+    # asked for.
+    #
+    [switch]$ForBenchmark,
+
     [ValidateSet("Debug", "Release")][string]$Configuration = "Debug",
     [ValidateSet("x64")][string]$Platform = "x64",
     [string]$VmrunPath,
@@ -101,8 +113,30 @@ $GuestUser     = Get-Setting $GuestUser     "GuestUser"
 $GuestPassword = Get-Setting $GuestPassword "GuestPassword"
 $VmPassword    = Get-Setting $VmPassword    "VmPassword"
 $SnapshotName  = Get-Setting $SnapshotName  "SnapshotName"
+
 $RemoteHost    = Get-Setting $RemoteHost    "RemoteHost"
 $RemotePort    = Get-Setting $RemotePort    "RemotePort"
+
+#
+# Benchmark mode forces Release unless the caller named a configuration
+# themselves. PSBoundParameters is what distinguishes "asked for Debug" from
+# "took the default".
+#
+if ($ForBenchmark -and -not $PSBoundParameters.ContainsKey('Configuration')) {
+    $Configuration = "Release"
+}
+
+#
+# A snapshot whose guest already has verifier cleared. Reverting to it is the
+# fast path: clearing verifier in-guest costs a full extra reboot cycle, which
+# dominates the deploy.
+#
+$UsingBenchSnapshot = $false
+
+if ($ForBenchmark -and -not $PSBoundParameters.ContainsKey('SnapshotName') -and $BlorgEnv.ContainsKey('BenchSnapshotName') -and $BlorgEnv['BenchSnapshotName']) {
+    $SnapshotName = $BlorgEnv['BenchSnapshotName']
+    $UsingBenchSnapshot = $true
+}
 
 foreach ($required in @("VmxPath", "GuestUser", "GuestPassword")) {
     if (-not (Get-Variable -Name $required -ValueOnly)) {
@@ -310,8 +344,59 @@ if ($installStatus -eq 2) {
     $installStatus = Invoke-InstallInGuest
 }
 
-if ($installStatus -eq 0) {
-    Write-Host "Deployment succeeded." -ForegroundColor Green
-} else {
+if ($installStatus -ne 0) {
     throw "Install-BlorgFS.ps1 in the guest exited with status $installStatus. Check the guest for details."
 }
+
+#
+# Driver Verifier lives in the snapshot this script reverts to, so it comes
+# back on every deploy no matter what was done to the running guest. Clearing
+# it here is what makes -ForBenchmark mean something.
+#
+# Its cost is not subtle -- special pool puts every allocation on its own
+# guarded page and DDI compliance wraps every call -- and it is invisible in
+# every number the harness prints, which is the combination that lets a whole
+# study get measured against it without anyone noticing.
+#
+if ($ForBenchmark -and $UsingBenchSnapshot) {
+    Write-Host "Verifier: using '$SnapshotName', which already has it cleared." -ForegroundColor Yellow
+}
+elseif ($ForBenchmark) {
+    Write-Step "Clearing Driver Verifier for benchmarking (set BenchSnapshotName to skip this reboot)"
+
+    #
+    # `exit 0` is load-bearing: verifier.exe returns non-zero to say "reboot
+    # required", which makes the guest PowerShell exit non-zero, which makes
+    # Invoke-VmrunGuest throw and aborts the deploy after the reset but
+    # before the reboot that applies it -- leaving verifier still on and the
+    # caller believing otherwise.
+    #
+    $verifierCommand = "& verifier.exe /querysettings | Out-File -Encoding ascii '$GuestDeployDirerifier-before.txt'; & verifier.exe /reset | Out-Null; exit 0"
+
+    Invoke-VmrunGuest -CommandArgs @(
+        "runProgramInGuest", $VmxPath, "-activeWindow",
+        "C:\Windows\System32\WindowsPowerShell1.0\powershell.exe",
+        "-ExecutionPolicy", "Bypass", "-NoProfile", "-Command", $verifierCommand
+    ) | Out-Null
+
+    #
+    # A verifier change only takes effect across a boot, so the reset is
+    # worthless without this reboot -- and a benchmark run against the
+    # not-yet-rebooted guest would silently still be verified.
+    #
+    Write-Step "Rebooting to apply the verifier change"
+    Invoke-Vmrun -CommandArgs @("reset", $VmxPath)
+    Wait-ForTools
+
+    Write-Step "Starting BlorgFS after reboot"
+    Invoke-VmrunGuest -CommandArgs @(
+        "runProgramInGuest", $VmxPath, "-activeWindow",
+        "C:\Windows\System32\WindowsPowerShell1.0\powershell.exe",
+        "-ExecutionPolicy", "Bypass", "-NoProfile", "-Command",
+        "sc.exe start BlorgFS *> `$null; Start-Sleep -Seconds 4; exit 0"
+    ) | Out-Null
+
+    Write-Host "Verifier cleared; previous settings saved in the guest at $GuestDeployDirerifier-before.txt" -ForegroundColor Yellow
+}
+
+Write-Host "Deployment succeeded." -ForegroundColor Green

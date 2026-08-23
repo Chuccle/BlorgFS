@@ -255,6 +255,13 @@ VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
     RtlZeroMemory(Out, sizeof(*Out));
 
     Out->Version = BLORGFS_STATISTICS_VERSION;
+
+#if DBG
+    Out->Flags = BLORGFS_STATS_FLAG_CHECKED_BUILD;
+#else
+    Out->Flags = 0;
+#endif
+
     Out->SizeOfStruct = C_CAST(ULONG, sizeof(BLORGFS_STATISTICS_RESPONSE));
     Out->ProcessorCount = BlorgStatisticsProcessorCount;
     Out->QpcFrequency = StatisticsQpcFrequency;

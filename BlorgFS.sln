@@ -21,8 +21,6 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ClientFuzz", "tests\sandbox
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SocketSandbox", "tests\sandbox\SocketSandbox.vcxproj", "{9E4B2A15-7C83-4F61-B0D2-5A6E9C3F8147}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PrefetchSandbox", "tests\sandbox\PrefetchSandbox.vcxproj", "{2D7F6C91-4E38-4B5A-8C02-1F9A3E7D5B60}"
-EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "NodeTableSandbox", "tests\sandbox\NodeTableSandbox.vcxproj", "{E2A5D4C7-0F36-4BE6-8159-83C2E1623622}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DispatchSandbox", "tests\sandbox\DispatchSandbox.vcxproj", "{5a1e9b74-3c26-49df-b8a1-7e4d2c6f0938}"
@@ -99,12 +97,6 @@ Global
 		{9E4B2A15-7C83-4F61-B0D2-5A6E9C3F8147}.Release|ARM64.ActiveCfg = Release|x64
 		{9E4B2A15-7C83-4F61-B0D2-5A6E9C3F8147}.Release|x64.ActiveCfg = Release|x64
 		{9E4B2A15-7C83-4F61-B0D2-5A6E9C3F8147}.Release|x64.Build.0 = Release|x64
-		{2D7F6C91-4E38-4B5A-8C02-1F9A3E7D5B60}.Debug|ARM64.ActiveCfg = Debug|x64
-		{2D7F6C91-4E38-4B5A-8C02-1F9A3E7D5B60}.Debug|x64.ActiveCfg = Debug|x64
-		{2D7F6C91-4E38-4B5A-8C02-1F9A3E7D5B60}.Debug|x64.Build.0 = Debug|x64
-		{2D7F6C91-4E38-4B5A-8C02-1F9A3E7D5B60}.Release|ARM64.ActiveCfg = Release|x64
-		{2D7F6C91-4E38-4B5A-8C02-1F9A3E7D5B60}.Release|x64.ActiveCfg = Release|x64
-		{2D7F6C91-4E38-4B5A-8C02-1F9A3E7D5B60}.Release|x64.Build.0 = Release|x64
 		{E2A5D4C7-0F36-4BE6-8159-83C2E1623622}.Debug|x64.ActiveCfg = Debug|x64
 		{E2A5D4C7-0F36-4BE6-8159-83C2E1623622}.Debug|x64.Build.0 = Debug|x64
 		{E2A5D4C7-0F36-4BE6-8159-83C2E1623622}.Release|x64.ActiveCfg = Release|x64

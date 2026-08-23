@@ -365,6 +365,16 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
 
     printf("\n=== driver counters (window %.3f s, %lu processors) ===\n", windowSeconds, stats.ProcessorCount);
 
+    //
+    // Said before any number, not after, because a reader who has already
+    // read the throughput figure has already been misled.
+    //
+    if (stats.Flags & BLORGFS_STATS_FLAG_CHECKED_BUILD)
+    {
+        printf("\n  *** CHECKED (Debug) DRIVER -- these are not performance numbers ***\n");
+        printf("      Deploy with: Deploy-ToVM.ps1 -Configuration Release\n");
+    }
+
     printf("\n  reads\n");
     printf("    cached                %12llu\n", t.ReadsCached);
     printf("    paging (inline)       %12llu\n", t.ReadsPagingInline);

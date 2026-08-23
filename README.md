@@ -155,11 +155,22 @@ is unoptimised and compiles `BLORGFS_PRINT` in (it is a runtime check on
 `global.LogLevel`, not a no-op), so it is the wrong binary to time:
 
 ```bash
-powershell -File deploy/Deploy-ToVM.ps1 -Configuration Release
+powershell -File deploy/Deploy-ToVM.ps1 -ForBenchmark
 ```
 
+`-ForBenchmark` is the whole answer: it deploys Release and clears Driver
+Verifier, then reboots so the change actually applies. Use it for every
+performance run. `-Configuration` still wins if given explicitly.
+
 Driver Verifier is worse, because it is invisible in every output the
-harness produces. Check before believing a number:
+harness produces -- and because **it lives in the snapshot**. `Deploy-ToVM`
+reverts before deploying, so verifier comes back on every deploy regardless
+of what was done to the running guest. That is why clearing it is part of
+the deploy rather than something to remember.
+
+The driver reports its own build flavour (`BLORGFS_STATS_FLAG_CHECKED_BUILD`),
+so `PerfHarness` refuses to print workload results from a checked driver
+without saying so first. Nothing reports the verifier state, so check it:
 
 ```bash
 verifier.exe /querysettings
@@ -177,7 +188,14 @@ verifier.exe /flags 0x001209bb /driver BlorgFS.sys
 ```
 
 Record the flag word before resetting; the value above is this VM's, not a
-universal one.
+universal one. `-ForBenchmark` saves it to `verifier-before.txt` in the guest
+deploy directory before resetting.
+
+Faster still, set `BenchSnapshotName` in `blorgfs.env` to a snapshot whose
+guest already has verifier cleared, and `-ForBenchmark` reverts to that
+instead -- saving a reboot per run. Take it by hand: boot, `verifier.exe
+/reset`, reboot, power off, snapshot. vmrun cannot snapshot an encrypted VM
+while it is running.
 
 This is not hypothetical. An entire performance investigation was run
 against a Debug driver under that full verifier flag set and compared
