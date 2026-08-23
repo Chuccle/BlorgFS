@@ -248,10 +248,15 @@ extern struct GLOBAL
     volatile BOOLEAN TlsEnabled;  // TRUE to attempt TLS on new connections
 
     //
-    // Set from Parameters\PrefetchEnabled = 0 to bypass the prefetch ring
-    // on buffered reads, leaving Cc's read-ahead as the only lookahead.
-    // Defaults to FALSE, i.e. the ring stays on, so this changes nothing
-    // unless it is asked for.
+    // Parameters\PrefetchEnabled = 1 re-enables the prefetch ring on
+    // buffered reads. It is OFF by default: Cc's read-ahead is the only
+    // lookahead unless the ring is asked for.
+    //
+    // The default flipped once the Cc path was tuned. Interleaved against a
+    // usermode HTTP client -- the same probe immediately before and after
+    // each driver run, because this link drifts 23-32 MB/s over an
+    // afternoon -- Cc alone reaches 1.18x the client at one stream and
+    // parity at sixteen, where the ring configuration managed 0.55x.
     //
     // It exists because the ring does not currently pay for itself on
     // buffered multi-stream reads, and the switch is what lets that be

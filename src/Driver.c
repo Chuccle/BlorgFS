@@ -635,6 +635,10 @@ static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNIC
     {
         global.PrefetchDisabled = (0 == prefetchEnabledValue);
     }
+    else
+    {
+        global.PrefetchDisabled = TRUE;
+    }
 
     UCHAR pinValue[TLS_HASH_LEN];
 
