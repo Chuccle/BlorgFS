@@ -179,6 +179,7 @@
 //
 #define PREFETCH_MIN_DEPTH 2
 
+
 //
 // Derived from READ_AHEAD_GRANULARITY (Driver.h), not a standalone
 // constant: Cc clusters its read-ahead miss into a paging IRP sized at
@@ -296,6 +297,7 @@ struct _PREFETCH_RING
     // them Empty for a later pump if the pool has none to give.
     //
     ULONG      DepthLimit;
+
 
     //
     // Completion-driven pump. A fetch completion that empties a slot

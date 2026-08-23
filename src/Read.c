@@ -466,6 +466,45 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             CcInitializeCacheMap(IrpSp->FileObject, C_CAST(PCC_FILE_SIZES, &fcb->Header.AllocationSize), FALSE, &global.CacheManagerCallbacks, fcb);
 
             CcSetReadAheadGranularity(IrpSp->FileObject, READ_AHEAD_GRANULARITY);
+
+            //
+            // Cc's read-ahead is turned OFF because this driver runs its own
+            // (Prefetch.c), and the two do not compose -- they stack.
+            //
+            // Cc reads ahead of the application; the ring then fetches ahead
+            // of the paging reads Cc issues. The driver therefore pulls
+            // roughly Cc's lookahead PLUS the ring's depth ahead of what the
+            // reader is actually consuming, over the same link the reader is
+            // blocked on. Cc's read-ahead is also issued from its own worker
+            // threads, so paging reads arrive out of order with respect to
+            // the application's position, which breaks the ring's
+            // "starts exactly where the last one ended" streak test and
+            // shows up as re-aims and misses.
+            //
+            // Measured: reading unbuffered -- no Cc, so the ring is the only
+            // prefetcher -- gave 29.95 MB/s with wire traffic equal to bytes
+            // delivered, while the buffered path with both engines gave
+            // 12-20 MB/s and fetched 1.4x what it delivered.
+            //
+            // The ring is the better of the two here because it knows what
+            // this filesystem's fetches cost: a chunk is an HTTP range GET
+            // over a link with a real round trip, not a disk request.
+            //
+            // What this is worth, A/B over three clean-boot runs each at 16
+            // streams: prefetch hit rate 70% -> 76.5% and misses down about
+            // a fifth, with THROUGHPUT UNCHANGED (16.99 vs 17.13 MB/s
+            // median). On this link throughput is bounded by the wire and
+            // fetched-versus-delivered stayed at ~66%, so this buys less
+            // redundant work rather than more bytes. It should matter more
+            // where the link is not the constraint.
+            //
+            // Untested case: BUFFERED random access. Reads that never
+            // establish a streak do not arm the ring, and with Cc's
+            // read-ahead off they now have no lookahead from either engine.
+            // The harness's random workload opens unbuffered, so it does not
+            // cover this and neither does anything else here.
+            //
+            CcSetAdditionalCacheAttributes(IrpSp->FileObject, TRUE, FALSE);
         }
 
         NTSTATUS trimStatus = BlorgTrimReadToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);

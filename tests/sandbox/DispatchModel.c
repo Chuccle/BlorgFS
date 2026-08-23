@@ -45,6 +45,7 @@ BOOLEAN CcUninitializeCacheMap(PFILE_OBJECT F, PLARGE_INTEGER T, PVOID E)
 }
 
 VOID CcSetReadAheadGranularity(PFILE_OBJECT F, ULONG G) { (void)F; (void)G; }
+VOID CcSetAdditionalCacheAttributes(PFILE_OBJECT F, BOOLEAN NoRa, BOOLEAN NoWb) { (void)F; (void)NoRa; (void)NoWb; }
 
 //
 // A cache miss at PASSIVE with Wait=FALSE is what Cc uses to tell the

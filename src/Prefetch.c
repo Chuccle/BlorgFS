@@ -1068,6 +1068,7 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
                 ring->Chunks[i] = NULL;
                 ring->Hot[i].State = PrefetchSlotEmpty;
                 ring->LastConsumeClock = serveClock;
+
                 KeReleaseSpinLock(&ring->Lock, irql);
 
                 NTSTATUS result;
@@ -1188,21 +1189,74 @@ NTSTATUS BlorgPrefetchServeRead(FCB* Fcb, PIRP Irp, ULONG64 Offset, ULONG Length
             {
                 ++ring->Generation;
 
-                for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
-                {
-                    if (PrefetchSlotReady == ring->Hot[i].State)
-                    {
-                        ring->Hot[i].State = PrefetchSlotEmpty;
+                ULONG64 newCursor = Offset + Length;
 
-                        if (ring->Chunks[i])
+                //
+                // A re-aim used to drop every Ready slot. Their bytes are
+                // file content at a known offset, and the generation bump
+                // does not invalidate that -- generation exists to discard
+                // in-flight fetches aimed at the old position, and a slot
+                // that has already landed is aimed at nothing. A reader that
+                // seeked forward a little is about to want exactly those
+                // bytes. Dropping them cost a measured 148 chunks (~74 MB)
+                // per 30 s run, fetched over a saturated link and thrown
+                // away unread.
+                //
+                // Only the CONTIGUOUS run forward of the new cursor is kept,
+                // and the cursor is advanced past it. Keeping a slot the
+                // cursor has not reached would leave the pump free to fetch
+                // that same range again, duplicating the bytes this is
+                // trying to save; walking the run is what keeps every kept
+                // slot in front of the cursor and none of it re-fetched.
+                //
+                for (;;)
+                {
+                    BOOLEAN advanced = FALSE;
+
+                    for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
+                    {
+                        if (PrefetchSlotReady == ring->Hot[i].State &&
+                            ring->Hot[i].RangeOffset == newCursor)
                         {
-                            reclaimed[reclaimedCount++] = ring->Chunks[i];
-                            ring->Chunks[i] = NULL;
+                            newCursor += ring->Hot[i].Length;
+                            advanced = TRUE;
+                            break;
                         }
+                    }
+
+                    if (!advanced)
+                    {
+                        break;
                     }
                 }
 
-                ring->NextFetchOffset = Offset + Length;
+                for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
+                {
+                    if (PrefetchSlotReady != ring->Hot[i].State)
+                    {
+                        continue;
+                    }
+
+                    //
+                    // Inside the kept run: its whole range lies between the
+                    // read that triggered the re-aim and the advanced cursor.
+                    //
+                    if (ring->Hot[i].RangeOffset >= (Offset + Length) &&
+                        (ring->Hot[i].RangeOffset + ring->Hot[i].Length) <= newCursor)
+                    {
+                        continue;
+                    }
+
+                    ring->Hot[i].State = PrefetchSlotEmpty;
+
+                    if (ring->Chunks[i])
+                    {
+                        reclaimed[reclaimedCount++] = ring->Chunks[i];
+                        ring->Chunks[i] = NULL;
+                    }
+                }
+
+                ring->NextFetchOffset = newCursor;
                 ring->LastConsumeClock = serveClock;
                 reaimed = TRUE;
             }

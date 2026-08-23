@@ -1303,4 +1303,91 @@ TEST_F(PrefetchKernelTest, APartialReadLeavesTheSlotReadyForTheNextRead)
         << "no quarter-chunk read was served from the ring at all";
 }
 
+//
+// A re-aim whose new cursor lands just behind the prefetched window must
+// keep that window. Generation invalidates in-flight fetches aimed at the
+// old position; a slot that has already landed holds file bytes at a known
+// offset and is still correct for a reader about to arrive there.
+//
+// The scenario is a reader that has fallen one chunk behind its own
+// pipeline: the ring holds [N, N+2C) Ready, the reader misses at [N-C, N)
+// with a streak, and the re-aim cursor becomes N -- exactly where the kept
+// run starts.
+//
+TEST_F(PrefetchKernelTest, AReaimKeepsTheChunksAheadOfItsNewCursor)
+{
+    const ULONG64 chunk = PREFETCH_CHUNK;
+
+    //
+    // Arm and run forward so the ring fetches ahead and holds Ready slots.
+    //
+    for (ULONG64 offset = 0; offset < 4 * chunk; offset += chunk)
+    {
+        Serve(MakeRead(NewBuffer(PREFETCH_CHUNK), PREFETCH_CHUNK), offset, PREFETCH_CHUNK);
+        PrefetchModelSettle(STATUS_SUCCESS);
+        ShimDrainWorkItems();
+    }
+
+    ASSERT_NE(nullptr, Fcb.PrefetchRing);
+
+    //
+    // Where the Ready run actually starts, taken from the ring rather than
+    // inferred from NextFetchOffset -- Ready slots sit BELOW the cursor, so
+    // guessing from it lands inside the window and hits instead of missing.
+    //
+    ULONG64 readyBase = ~0ull;
+    int readyBefore = 0;
+
+    for (ULONG i = 0; i < PREFETCH_DEPTH; ++i)
+    {
+        if (PrefetchSlotReady == Fcb.PrefetchRing->Hot[i].State)
+        {
+            ++readyBefore;
+
+            if (Fcb.PrefetchRing->Hot[i].RangeOffset < readyBase)
+            {
+                readyBase = Fcb.PrefetchRing->Hot[i].RangeOffset;
+            }
+        }
+    }
+
+    ASSERT_GT(readyBefore, 0) << "test needs Ready slots for a re-aim to discard";
+    ASSERT_GE(readyBase, 2 * chunk) << "need room below the Ready run to miss in";
+
+    //
+    // Idle the ring past the re-aim threshold so a streaked miss re-aims
+    // rather than being suppressed as "reader outran its own pipeline".
+    //
+    for (ULONG i = 0; i < PREFETCH_REAIM_IDLE_SERVES + 2; ++i)
+    {
+        Fcb.StreamClock++;
+    }
+
+    const ULONG64 reaimsBefore = ShimStatistics.PrefetchReaims;
+    const ULONG64 discardedBefore = ShimStatistics.PrefetchReaimDiscardedChunks;
+
+    //
+    // Two contiguous reads in the already-consumed region below the Ready
+    // run, ending exactly where that run begins. Both miss; the second
+    // carries a streak, so it re-aims with a cursor of readyBase -- exactly
+    // where the kept slots start.
+    //
+    Serve(MakeRead(NewBuffer(PREFETCH_CHUNK), PREFETCH_CHUNK), readyBase - 2 * chunk, PREFETCH_CHUNK);
+    Serve(MakeRead(NewBuffer(PREFETCH_CHUNK), PREFETCH_CHUNK), readyBase - chunk, PREFETCH_CHUNK);
+
+    PrefetchModelSettle(STATUS_SUCCESS);
+    ShimDrainWorkItems();
+
+    ASSERT_GT(ShimStatistics.PrefetchReaims, reaimsBefore)
+        << "no re-aim fired, so this test exercised nothing -- it would pass "
+           "against any discard policy at all";
+
+    const ULONG64 discarded = ShimStatistics.PrefetchReaimDiscardedChunks - discardedBefore;
+
+    EXPECT_LT(discarded, static_cast<ULONG64>(readyBefore))
+        << "the re-aim discarded " << discarded << " of " << readyBefore
+        << " Ready chunks -- fetched bytes thrown away that the reader was "
+           "about to arrive at";
+}
+
 } // namespace
