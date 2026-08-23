@@ -146,6 +146,48 @@ systematic scheduler instead (`tests\sandbox\Scheduler.h`).
 
 ## Measuring performance
 
+**Benchmark on an optimised Release build with Driver Verifier disabled.**
+Anything else measures the instrumentation, not the driver, and the two
+mistakes compound.
+
+`deploy\Deploy-ToVM.ps1` defaults to `-Configuration Debug`. A Debug driver
+is unoptimised and compiles `BLORGFS_PRINT` in (it is a runtime check on
+`global.LogLevel`, not a no-op), so it is the wrong binary to time:
+
+```bash
+powershell -File deploy/Deploy-ToVM.ps1 -Configuration Release
+```
+
+Driver Verifier is worse, because it is invisible in every output the
+harness produces. Check before believing a number:
+
+```bash
+verifier.exe /querysettings
+```
+
+If `BlorgFS.sys` is listed, the driver is running under whatever flags are
+shown -- typically special pool, force IRQL checking, pool tracking, I/O
+verification, deadlock detection, DMA checking, security checks and DDI
+compliance checking. Every allocation is on its own guarded page and every
+DDI call is wrapped. Disable it, reboot, measure, and put it back:
+
+```bash
+verifier.exe /reset
+verifier.exe /flags 0x001209bb /driver BlorgFS.sys
+```
+
+Record the flag word before resetting; the value above is this VM's, not a
+universal one.
+
+This is not hypothetical. An entire performance investigation was run
+against a Debug driver under that full verifier flag set and compared
+against an *unverified usermode HTTP client*. The comparison was
+systematically biased against the driver by an unknown but certainly large
+factor, which invalidated a "2.8x the CPU per MB/s" conclusion outright and
+left every ratio in the study unsafe to quote. Verifier belongs on for
+correctness work and off for measurement, and which one is in force must be
+stated alongside the numbers.
+
 Counters are **always on**, including in release builds (`Statistics.h`/`.c`),
 stored per-processor and read two ways:
 
