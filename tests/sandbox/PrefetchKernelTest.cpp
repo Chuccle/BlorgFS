@@ -607,6 +607,96 @@ TEST_F(PrefetchKernelTest, IssueFailureReleasesItsReference)
 }
 
 //
+// A stream that has finished its file must not keep starving the ones after
+// it. This is the sandbox translation of a measurement taken against the
+// live driver, and it fails today.
+//
+// On a 4 GB guest the budget is 8 rings. Reading eleven files in turn, each
+// opened, read and closed before the next, the ninth stream onward was
+// refused a ring and fell back to direct fetches at full network RTT --
+// 60-90 ms per read on the test path, over a second at worst. The budget
+// only came back once the whole workload ended.
+//
+// The reason is visible in the hit path above: serving a hit sets the slot
+// to PrefetchSlotEmpty and then donates the buffer straight back to it, so a
+// ring whose file is finished sits on its entire buffer set with every slot
+// reporting itself unused. The memory is held by slots that say they are
+// holding nothing.
+//
+// Deliberately NOT detached. That models the real case: an FCB whose handle
+// has closed but which the cache manager and MM still hold, because
+// SectionObjectPointers lives on the FCB and paging reads can legitimately
+// still arrive. Releasing on close is not available as a fix -- and is not
+// even sound, since BlorgPrefetchServeRead holds no ring reference for the
+// duration of a serve.
+//
+TEST_F(PrefetchKernelTest, FinishedStreamsStopStarvingLaterOnes)
+{
+    //
+    // Comfortably more than any budget tier, so the test states the property
+    // rather than encoding this machine's tier.
+    //
+    const int kFiles = 16;
+    const ULONG64 kSmallFile = 4 * PREFETCH_CHUNK;
+
+    std::vector<FCB> fcbs(kFiles);
+    std::vector<std::vector<unsigned char>> buffers;
+
+    const ULONG64 refusedBefore = ShimStatistics.PrefetchRingsRefused;
+
+    for (int i = 0; i < kFiles; ++i)
+    {
+        memset(&fcbs[i], 0, sizeof(FCB));
+        fcbs[i].FullPath.Buffer = PathBuffer;
+        fcbs[i].FullPath.Length = Fcb.FullPath.Length;
+        fcbs[i].FullPath.MaximumLength = Fcb.FullPath.Length;
+        fcbs[i].Header.FileSize.QuadPart = (LONGLONG)kSmallFile;
+
+        buffers.emplace_back(PREFETCH_CHUNK, 0);
+
+        //
+        // Two contiguous reads arm the ring, then read the file out to its
+        // end and settle every fetch, which is what a finished stream looks
+        // like: slots drained, nothing in flight, no reader left.
+        //
+        for (ULONG64 offset = 0; offset < kSmallFile; offset += PREFETCH_CHUNK)
+        {
+            BlorgPrefetchServeRead(&fcbs[i], MakeRead(buffers.back().data(), PREFETCH_CHUNK),
+                offset, PREFETCH_CHUNK);
+        }
+
+        PrefetchModelSettle(STATUS_SUCCESS);
+        ShimDrainWorkItems();
+    }
+
+    int armed = 0;
+
+    for (int i = 0; i < kFiles; ++i)
+    {
+        if (fcbs[i].PrefetchRing)
+        {
+            ++armed;
+        }
+    }
+
+    EXPECT_EQ(kFiles, armed)
+        << "only " << armed << " of " << kFiles << " streams got a ring -- a finished "
+           "stream is still holding buffers in slots it has marked empty, so every "
+           "later stream falls back to full-RTT direct fetches";
+
+    EXPECT_EQ(refusedBefore, ShimStatistics.PrefetchRingsRefused)
+        << "a stream was refused a ring while earlier, finished streams held theirs";
+
+    for (int i = 0; i < kFiles; ++i)
+    {
+        BlorgPrefetchDetach(&fcbs[i]);
+    }
+
+    PrefetchModelSettle(STATUS_SUCCESS);
+    ShimDrainWorkItems();
+}
+
+//
 // The driver-wide ring budget. Beyond bounding memory, this is a lifetime
 // path: the budget is claimed before the ring is built and must be
 // released on every failure exit, or the cap ratchets down until no
