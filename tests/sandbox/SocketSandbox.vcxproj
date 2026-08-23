@@ -41,6 +41,41 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <!--
+    Each sandbox target gets its own intermediate directory. They all
+    defaulted to $(Platform)\$(Configuration)\ beside the project, which put
+    seven projects' object files (and, fatally, one shared vc*.pdb) in the
+    same folder. MSBuild warned about it as MSB8028, "can lead to incorrect
+    clean and rebuild behavior", and a parallel build turned that warning
+    into an error: several CL.EXE writing one PDB is error C1041.
+
+    build.yml never hit it because it builds the solution serially, and
+    Invoke-BlorgChecks.ps1 builds one project at a time. codeql.yml passes
+    /m, so it failed every run, including the scheduled ones on master.
+  -->
+  <PropertyGroup>
+    <IntDir>$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+  </PropertyGroup>
+
+  <!--
+    Force synchronous PDB writes for the same reason, one level down. Every
+    sandbox target mixes C and C++ sources, and MSBuild compiles the two
+    groups in separate CL.EXE invocations because their command lines differ.
+    Both write the project PDB, so without /FS they race each other and one
+    loses with C1041, exactly as above but within a single project rather
+    than across several.
+
+    Incremental builds hide it: the race needs two language groups compiling
+    at once, which usually only happens on a full rebuild. That is why this
+    surfaced on CI and on a fresh worktree while the everyday incremental
+    build in a warm tree stayed green.
+  -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <ForceSynchronousPDBWrites>true</ForceSynchronousPDBWrites>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
