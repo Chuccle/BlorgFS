@@ -454,3 +454,11 @@ VOID BlorgPrefetchReleaseChunkPool(VOID);
 // Read by the statistics snapshot; see BlorgPrefetchChunksLive.
 //
 LONG BlorgPrefetchChunksLive(VOID);
+
+//
+// The driver-wide chunk budget for this machine size. Exposed because it
+// bounds concurrent prefetch fetches, which is what the keep-alive socket
+// pool has to be able to hold warm (Socket.c) -- sizing the two
+// independently is how the pool ended up below peak concurrency.
+//
+LONG BlorgPrefetchMaxChunks(VOID);

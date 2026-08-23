@@ -40,7 +40,7 @@ static VOID PrefetchReleaseRing(VOID);
 // memory, so the ceiling is now a real ceiling rather than a worst case
 // that idle rings reserved and never reached.
 //
-static LONG PrefetchMaxChunks(VOID)
+LONG BlorgPrefetchMaxChunks(VOID)
 {
     switch (MmQuerySystemSize())
     {
@@ -102,7 +102,7 @@ static PREFETCH_CHUNK_BLOCK* PrefetchChunkAcquire(VOID)
         return CONTAINING_RECORD(entry, PREFETCH_CHUNK_BLOCK, Link);
     }
 
-    LONG maxChunks = PrefetchMaxChunks();
+    LONG maxChunks = BlorgPrefetchMaxChunks();
     LONG current = ReadNoFence(&PrefetchChunkCount);
 
     while (current < maxChunks)

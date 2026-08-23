@@ -34,17 +34,34 @@ typedef struct _SOCKET_POOL_STATE
 static SOCKET_POOL_STATE SocketPool;
 
 //
-// Keep-alive pool depth. Sized so a burst of concurrent reads (e.g. a
-// media seek fanning out into several range reads) can reuse warm
-// connections instead of paying a fresh TCP handshake each time -- and,
-// with TLS enabled, a full ECDH handshake, which makes an evicted warm
-// connection far more expensive to replace. Sized above the prefetch
-// pipeline depth plus concurrent metadata traffic so sustained streaming
-// doesn't overflow the pool and churn handshakes. Peer idle-close of
-// pooled connections is handled by the reused-connection retry in the
-// HTTP client, so this is tunable purely for throughput.
+// Keep-alive pool depth: how many warm connections the driver is willing
+// to hold idle. Reusing one costs a list pop; replacing one costs a TCP
+// handshake and, with TLS enabled, a full ECDH handshake.
 //
-static const ULONG MAX_SOCKET_POOL_SIZE = 32;
+// This must be at least the driver's PEAK CONCURRENT request count, not
+// its average, and that is a stronger requirement than it sounds. The cap
+// bites on release: once more sockets exist than the cap allows, the
+// surplus is closed rather than pooled, so the pool can never accumulate
+// past it. A workload that regularly runs N requests in flight with a cap
+// below N therefore never builds N warm connections -- it re-establishes
+// the difference forever.
+//
+// It was a flat 32, on a comment reasoning about "the prefetch pipeline
+// depth", which was written when one stream at PREFETCH_DEPTH was the
+// whole picture. Sixteen streams put 51-62 fetches in flight, and the
+// measured result was 35-47 fresh connects per 25 s run averaging 473-660
+// ms each, with a 2.5 s worst case -- SYN loss under a connection burst.
+// Those stalls dominated the latency tail (p99 635-704 ms) and collapsed
+// fairness to 0.23.
+//
+// So it tracks the prefetch chunk budget, which is what actually bounds
+// concurrent fetches, plus headroom for the direct-fetch and metadata
+// traffic that shares the pool. Peer idle-close of pooled connections is
+// handled by the reused-connection retry in the HTTP client.
+//
+#define SOCKET_POOL_HEADROOM 32
+
+ULONG SocketMaxPoolSize = 64 + SOCKET_POOL_HEADROOM;
 
 //
 // TLS ciphertext accumulator sizing (see Socket.h). Ciphertext is
@@ -56,8 +73,10 @@ static const ULONG MAX_SOCKET_POOL_SIZE = 32;
 //
 // Tiered by machine size, the same coarse MmQuerySystemSize tiering the
 // prefetch chunk budget uses: the worst case is this times
-// MAX_SOCKET_POOL_SIZE of NonPagedPoolNx, 8 MB at the large tier, and a
-// small machine has no business reserving that to save receive IRPs.
+// SocketMaxPoolSize of NonPagedPoolNx, and a small machine has no
+// business reserving that to save receive IRPs. Only sockets that
+// actually carry TLS ever allocate one (BlorgEnsureTlsRecvBuffer), so a
+// plaintext deployment pays none of it.
 //
 #define SOCKET_TLS_RECV_RECORDS_LARGE  16
 #define SOCKET_TLS_RECV_RECORDS_MEDIUM 8
@@ -489,6 +508,8 @@ NTSTATUS BlorgInitialiseWskClient(void)
 
     SocketTlsRecvCapacity = tlsRecvRecords * SOCKET_TLS_RECORD_MAX_BYTES;
 
+    SocketMaxPoolSize = C_CAST(ULONG, BlorgPrefetchMaxChunks()) + SOCKET_POOL_HEADROOM;
+
     return STATUS_SUCCESS;
 }
 
@@ -780,7 +801,7 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket)
     KIRQL oldIrql;
     KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
 
-    if (SocketPool.Count >= MAX_SOCKET_POOL_SIZE)
+    if (SocketPool.Count >= SocketMaxPoolSize)
     {
         KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
         BLORGFS_STAT_INC(ConnectionsClosedPoolFull);
