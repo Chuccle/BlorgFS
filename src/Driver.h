@@ -235,6 +235,36 @@ extern struct GLOBAL
     //
     volatile BOOLEAN TlsEnabled;  // TRUE to attempt TLS on new connections
 
+    //
+    // Set from Parameters\PrefetchEnabled = 0 to bypass the prefetch ring
+    // on buffered reads, leaving Cc's read-ahead as the only lookahead.
+    // Defaults to FALSE, i.e. the ring stays on, so this changes nothing
+    // unless it is asked for.
+    //
+    // It exists because the ring does not currently pay for itself on
+    // buffered multi-stream reads, and the switch is what lets that be
+    // re-measured rather than argued. Three clean-boot runs each at 16
+    // streams, 30 s:
+    //
+    //                      ring + Cc        Cc alone
+    //   throughput         16.99 median     23.01 median
+    //   fetched/delivered  ~66%             ~95%
+    //   p99                630-1090 ms      169-238 ms
+    //   fairness           0.23-0.50        0.51-0.83
+    //   in flight peak     51-62            22
+    //
+    // At one stream, where hiding a round trip is the ring's whole purpose,
+    // it is worth about 8% of median throughput (15.05 vs 13.97) -- inside
+    // this rig's run-to-run variance -- while Cc alone moved exactly as many
+    // bytes over the wire as it delivered.
+    //
+    // Cc's read-ahead already pipelines (4 concurrent fetches at one stream,
+    // 22 at sixteen), issues demand-driven so it throttles itself, and lands
+    // straight in the paging IRP's MDL with no copy. The ring duplicates
+    // that with an extra copy and 1.5x the wire traffic.
+    //
+    volatile BOOLEAN PrefetchDisabled;
+
 #ifdef DBG
     ULONG LogLevel;  // BLORGFS_PRINT verbosity; see macro above
 #endif

@@ -629,6 +629,13 @@ static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNIC
         global.TlsEnabled = (0 != tlsEnabledValue);
     }
 
+    ULONG prefetchEnabledValue = 0;
+
+    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"PrefetchEnabled", REG_DWORD, &prefetchEnabledValue, sizeof(prefetchEnabledValue), &actualSize)))
+    {
+        global.PrefetchDisabled = (0 == prefetchEnabledValue);
+    }
+
     UCHAR pinValue[TLS_HASH_LEN];
 
     if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"TlsPin", REG_BINARY, pinValue, sizeof(pinValue), &actualSize))
@@ -873,6 +880,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     BlorgFsFastDispatch.MdlRead = FsRtlMdlReadDev;
     BlorgFsFastDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;
     
+
     NTSTATUS result = BlorgInitialiseHttpClient();
 
     if (!NT_SUCCESS(result))

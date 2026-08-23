@@ -415,11 +415,13 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 BLORGFS_STAT_INC(ReadsSequential);
             }
 
-            NTSTATUS prefetchResult = BlorgPrefetchServeRead(
-                fcb,
-                Irp,
-                C_CAST(ULONG64, startingByte.QuadPart),
-                realLength);
+            NTSTATUS prefetchResult = global.PrefetchDisabled
+                ? STATUS_NOT_FOUND
+                : BlorgPrefetchServeRead(
+                    fcb,
+                    Irp,
+                    C_CAST(ULONG64, startingByte.QuadPart),
+                    realLength);
 
             if (STATUS_NOT_FOUND != prefetchResult)
             {
@@ -504,7 +506,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             // The harness's random workload opens unbuffered, so it does not
             // cover this and neither does anything else here.
             //
-            CcSetAdditionalCacheAttributes(IrpSp->FileObject, TRUE, FALSE);
+            CcSetAdditionalCacheAttributes(IrpSp->FileObject, global.PrefetchDisabled ? FALSE : TRUE, FALSE);
         }
 
         NTSTATUS trimStatus = BlorgTrimReadToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);
