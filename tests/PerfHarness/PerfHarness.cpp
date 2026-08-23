@@ -379,6 +379,7 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
 
     printf("\n  prefetch ring\n");
     printf("    armed / refused       %12llu / %llu\n", t.PrefetchRingsArmed, t.PrefetchRingsRefused);
+    printf("    detached / freed      %12llu / %llu\n", t.PrefetchRingsDetached, t.PrefetchRingsFreed);
     printf("    live now              %12lld\n", stats.Gauges.PrefetchRingsLive);
     printf("    hit                   %12llu  (%.1f%%)\n", t.PrefetchHits, SafeRatio(t.PrefetchHits, served));
     printf("    park                  %12llu  (%.1f%%)\n", t.PrefetchParks, SafeRatio(t.PrefetchParks, served));
@@ -860,6 +861,8 @@ static bool WriteReport(
 
     fprintf(f, "PrefetchRingsArmed=%llu\n", t.PrefetchRingsArmed);
     fprintf(f, "PrefetchRingsRefused=%llu\n", t.PrefetchRingsRefused);
+    fprintf(f, "PrefetchRingsDetached=%llu\n", t.PrefetchRingsDetached);
+    fprintf(f, "PrefetchRingsFreed=%llu\n", t.PrefetchRingsFreed);
     fprintf(f, "PrefetchHits=%llu\n", t.PrefetchHits);
     fprintf(f, "PrefetchParks=%llu\n", t.PrefetchParks);
     fprintf(f, "PrefetchMisses=%llu\n", t.PrefetchMisses);

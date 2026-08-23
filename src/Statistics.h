@@ -239,6 +239,25 @@ typedef struct _BLORGFS_STATISTICS
     //
     ULONG64 PrefetchReaimsSuppressed;
 
+    //
+    // Ring lifetime. Detached counts rings whose attachment reference was
+    // dropped; Freed counts rings whose reference count then reached zero
+    // and handed a slot back to the driver-wide budget.
+    //
+    // They exist because the budget was observed sitting at its cap while
+    // every later stream was refused, and no existing counter could say
+    // whether rings were never released or merely released late. They are
+    // released late: the answer only showed up as Detached and Freed rising
+    // together once a workload finished, because a ring outlives the handle
+    // by however long the cache manager and MM keep the file object.
+    //
+    // Read them against PrefetchRingsArmed and the live gauge. Armed well
+    // ahead of Freed with the gauge pinned at the cap is budget starvation,
+    // and it is invisible without these two.
+    //
+    ULONG64 PrefetchRingsDetached;
+    ULONG64 PrefetchRingsFreed;
+
 } BLORGFS_STATISTICS, * PBLORGFS_STATISTICS;
 
 //

@@ -93,6 +93,7 @@ static VOID PrefetchFreeRing(PREFETCH_RING* Ring)
     ExFreePool(Ring);
 
     BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.PrefetchRingsLive);
+    BLORGFS_STAT_INC(PrefetchRingsFreed);
 
     PrefetchReleaseRing();
 }
@@ -1004,6 +1005,8 @@ VOID BlorgPrefetchDetach(FCB* Fcb)
     }
 
     Fcb->PrefetchRing = NULL;
+
+    BLORGFS_STAT_INC(PrefetchRingsDetached);
 
     KIRQL irql;
     KeAcquireSpinLock(&ring->Lock, &irql);
