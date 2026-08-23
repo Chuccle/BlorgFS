@@ -425,6 +425,44 @@ typedef struct _HTTP_CONTEXT
     //
     LONG64 IssueQpc;
 
+    //
+    // QPC stamp taken the moment the response headers finish parsing, i.e.
+    // the driver's equivalent of time-to-first-byte. Recorded for file
+    // reads specifically, because it is what separates "the server and
+    // network are slow to answer" from "we are slow to take delivery" --
+    // one number for issue-to-completion cannot tell those apart, and a
+    // measured 5x gap between this driver and a plain usermode range GET
+    // in the same guest is exactly the ambiguity that has to be resolved.
+    //
+    // Zero until the headers land, so a request that fails before that
+    // contributes no TTFB sample rather than a bogus one.
+    //
+    LONG64 HeadersQpc;
+
+    //
+    // QPC stamp taken as the request send begins, so the pre-first-byte
+    // time splits again: IssueQpc to here is everything before the request
+    // is on the wire (socket acquisition from the pool, any connect, any
+    // PASSIVE bounce to build the request), and here to HeadersQpc is the
+    // part a usermode client's TTFB actually covers.
+    //
+    // Measured need: TTFB came out at 35 ms mean against 5.4 ms for the
+    // same request from usermode in the same guest, on a pooled
+    // connection. That 30 ms is either spent getting a socket and getting
+    // to PASSIVE, or waiting on the peer, and those call for opposite
+    // fixes.
+    //
+    LONG64 SendQpc;
+
+    //
+    // QPC stamp taken when the send completion fires, splitting the
+    // pre-first-byte time once more: SendQpc to here is the request going
+    // out and WSK telling us so, here to HeadersQpc is genuine wait on the
+    // peer. A usermode client's TTFB is the second of those, so only the
+    // second is a like-for-like comparison.
+    //
+    LONG64 SendDoneQpc;
+
 } HTTP_CONTEXT;
 
 static VOID HttpKick(HTTP_CONTEXT* Ctx);
@@ -1231,6 +1269,11 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
 
         case HttpStageSendRequest:
         {
+            if (0 == Ctx->SendQpc)
+            {
+                Ctx->SendQpc = BlorgStatisticsNow();
+            }
+
             PCHAR sendBuffer = Ctx->RequestBuffer;
             ULONG sendLength = Ctx->RequestLength;
             NTSTATUS result;
@@ -1477,6 +1520,7 @@ static VOID HttpOnSend(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID Comple
         return;
     }
 
+    ctx->SendDoneQpc = BlorgStatisticsNow();
     ctx->Stage = HttpStageReceive;
     HttpKick(ctx);
 }
@@ -2145,6 +2189,8 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
             HttpFail(Ctx, STATUS_INVALID_PARAMETER);
             return;
         }
+
+        Ctx->HeadersQpc = BlorgStatisticsNow();
     }
 
     if (Ctx->Length > Ctx->BodyEndOffset)
@@ -2473,6 +2519,47 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
     }
 
     PBLORGFS_STATISTICS statsBlock = BlorgStatisticsForCurrentProcessor();
+
+    if (statsBlock && HttpOpFileRead == Ctx->Operation && 0 != Ctx->HeadersQpc)
+    {
+        if (0 != Ctx->SendQpc)
+        {
+            BlorgStatisticsRecordLatency(
+                &statsBlock->FetchPreSendSumUs,
+                &statsBlock->FetchPreSendMaxUs,
+                NULL,
+                Ctx->SendQpc - Ctx->IssueQpc);
+        }
+
+        if (0 != Ctx->SendDoneQpc && 0 != Ctx->SendQpc)
+        {
+            BlorgStatisticsRecordLatency(
+                &statsBlock->FetchSendSumUs,
+                &statsBlock->FetchSendMaxUs,
+                NULL,
+                Ctx->SendDoneQpc - Ctx->SendQpc);
+
+            BlorgStatisticsRecordLatency(
+                &statsBlock->FetchWaitSumUs,
+                &statsBlock->FetchWaitMaxUs,
+                NULL,
+                Ctx->HeadersQpc - Ctx->SendDoneQpc);
+        }
+
+        BlorgStatisticsRecordLatency(
+            &statsBlock->FetchTtfbSumUs,
+            &statsBlock->FetchTtfbMaxUs,
+            NULL,
+            Ctx->HeadersQpc - Ctx->IssueQpc);
+
+        BlorgStatisticsRecordLatency(
+            &statsBlock->FetchBodySumUs,
+            &statsBlock->FetchBodyMaxUs,
+            NULL,
+            BlorgStatisticsNow() - Ctx->HeadersQpc);
+
+        statsBlock->FetchSplitSamples++;
+    }
 
     if (statsBlock && HttpOpFileRead != Ctx->Operation)
     {

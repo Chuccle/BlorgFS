@@ -273,6 +273,47 @@ typedef struct _BLORGFS_STATISTICS
     //
     ULONG64 PrefetchChunkStarvations;
 
+    //
+    // A file-read fetch split at the moment its response headers land:
+    // TTFB is issue-to-headers, body is headers-to-last-byte, and Samples
+    // counts the fetches that got far enough to contribute both.
+    //
+    // One issue-to-completion number cannot distinguish a server that is
+    // slow to answer from a driver that is slow to take delivery, and that
+    // ambiguity is currently the largest open question in this driver: a
+    // 512 KB range GET measures ~20 ms end to end from usermode inside the
+    // same guest, against ~98 ms here, with only two fetches in flight and
+    // no contention to explain it. These two counters say which half.
+    //
+    // Compare against the usermode probe's split for the same request:
+    // TTFB p50 5.4 ms, body p50 14 ms from the guest.
+    //
+    //
+    // Issue-to-send-start: socket acquisition from the pool, any connect,
+    // and any bounce to PASSIVE to build the request -- everything before
+    // the request reaches the wire. A usermode client's TTFB does not
+    // include this, so it is the first thing to subtract before comparing
+    // the two.
+    //
+    ULONG64 FetchPreSendSumUs;
+    ULONG64 FetchPreSendMaxUs;
+
+    //
+    // Send-start to send-completion, then send-completion to headers. The
+    // second is the only piece directly comparable to a usermode client's
+    // TTFB; the first is ours alone.
+    //
+    ULONG64 FetchSendSumUs;
+    ULONG64 FetchSendMaxUs;
+    ULONG64 FetchWaitSumUs;
+    ULONG64 FetchWaitMaxUs;
+
+    ULONG64 FetchTtfbSumUs;
+    ULONG64 FetchTtfbMaxUs;
+    ULONG64 FetchBodySumUs;
+    ULONG64 FetchBodyMaxUs;
+    ULONG64 FetchSplitSamples;
+
 } BLORGFS_STATISTICS, * PBLORGFS_STATISTICS;
 
 //
@@ -312,7 +353,7 @@ typedef struct _BLORGFS_STATISTICS_GLOBAL
 // Version is checked by the driver so a stale harness fails loudly
 // instead of misreading a struct whose tail moved.
 //
-#define BLORGFS_STATISTICS_VERSION 2
+#define BLORGFS_STATISTICS_VERSION 3
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

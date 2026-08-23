@@ -407,6 +407,21 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     if (t.FetchesCompleted > 0)
     {
         printf("    mean latency          %12llu us\n", t.FetchLatencySumUs / t.FetchesCompleted);
+
+        if (t.FetchSplitSamples)
+        {
+            printf("      pre-send mean / max %12llu / %llu us\n",
+                t.FetchPreSendSumUs / t.FetchSplitSamples, t.FetchPreSendMaxUs);
+            printf("      send mean / max     %12llu / %llu us\n",
+                t.FetchSendSumUs / t.FetchSplitSamples, t.FetchSendMaxUs);
+            printf("      wait mean / max     %12llu / %llu us\n",
+                t.FetchWaitSumUs / t.FetchSplitSamples, t.FetchWaitMaxUs);
+            printf("      ttfb mean / max     %12llu / %llu us\n",
+                t.FetchTtfbSumUs / t.FetchSplitSamples, t.FetchTtfbMaxUs);
+            printf("      body mean / max     %12llu / %llu us\n",
+                t.FetchBodySumUs / t.FetchSplitSamples, t.FetchBodyMaxUs);
+            printf("      split samples       %12llu\n", t.FetchSplitSamples);
+        }
     }
 
     printf("    max latency           %12llu us\n", t.FetchLatencyMaxUs);
