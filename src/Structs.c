@@ -268,7 +268,6 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
         case BLORGFS_FCB_SIGNATURE:
         {
             PFCB fcb = Context;
-            BlorgPrefetchDetach(fcb);
             FsRtlUninitializeFileLock(&fcb->FileLock);
             FsRtlUninitializeOplock(&fcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);

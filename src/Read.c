@@ -2,9 +2,8 @@
 
 //
 //  This file implements the volume read dispatch path: cached reads
-//  (via Cc) and non-cached/paging reads (direct async HTTP fetch or
-//  served from the sequential prefetcher), plus their completions and
-//  the end-of-file trim shared by both paths.
+//  (via Cc) and non-cached/paging reads (direct async HTTP fetch), plus
+//  their completions and the end-of-file trim shared by both paths.
 //
 
 //
@@ -14,18 +13,15 @@
 //  unset, Cc under-fetches relative to what one Range GET can profitably
 //  return. 256 KB matches HTTP_FILE_INITIAL_RECV_CAPACITY (Client.c) so a
 //  read-ahead-sized fetch doesn't immediately trigger a buffer regrow on
-//  the first response. Larger granularities make the serialized miss
-//  bigger and hurt streaming latency, so this is not increased.
-//  Also the basis for PREFETCH_CHUNK (Prefetch.h) -- see there for why
-//  it's derived rather than a second hardcoded constant.
+//  the first response. See Driver.h for why it now sits at 512 KB and why
+//  larger values were measured and rejected.
 //
 
 //
-//  Whether a read at Offset continues any tracked stream -- the same
-//  contiguity test BlorgPrefetchServeRead applies internally, evaluated
-//  against the tracker array before the serve call updates it. Read-only
-//  with respect to prefetcher state. Unrolled by the compiler over one
-//  cache line; the OR-accumulate keeps it branch-free.
+//  Whether a read at Offset continues any tracked stream, evaluated
+//  against the tracker array before ReadTrackStream advances it. Unrolled
+//  by the compiler over one cache line; the OR-accumulate keeps it
+//  branch-free.
 //
 //  This is all that remains of the old DBG-only read-pattern block. The
 //  window it used to print every 256 reads -- sequential share, mean/min/max
@@ -44,6 +40,48 @@ static BOOLEAN BlorgReadIsSequential(const FCB* Fcb, ULONG64 Offset)
     }
 
     return sequential;
+}
+
+//
+// Finds the tracker whose last read ended exactly at Offset -- this
+// reader's own trail -- or claims the coldest tracker for a new or seeked
+// stream. One unconditional pass over the FCB's single-cache-line tracker
+// array: the match test and the coldest scan share the loop, with no early
+// exit to mispredict.
+//
+static READ_STREAM_TRACKER* ReadClaimStream(FCB* Fcb, ULONG64 Offset)
+{
+    READ_STREAM_TRACKER* match = NULL;
+    READ_STREAM_TRACKER* coldest = &Fcb->Streams[0];
+
+    for (ULONG i = 0; i < READ_STREAM_TRACKER_COUNT; ++i)
+    {
+        READ_STREAM_TRACKER* tracker = &Fcb->Streams[i];
+
+        match = (Offset == tracker->End) ? tracker : match;
+        coldest = (tracker->Streak < coldest->Streak) ? tracker : coldest;
+    }
+
+    return match ? match : coldest;
+}
+
+//
+// Advances this reader's tracker past the read being dispatched. Moved
+// here when the prefetch ring was removed: the ring was the original
+// consumer of the streak, but ReadsSequential is measured from these
+// trackers and an on-disk hot cache will want the same signal to decide
+// what to admit.
+//
+// PASSIVE_LEVEL only (the FCB is paged), and deliberately unlocked --
+// concurrent readers of one file can lose an update here, which costs
+// detection accuracy and nothing else.
+//
+static VOID ReadTrackStream(FCB* Fcb, ULONG64 Offset, ULONG Length)
+{
+    READ_STREAM_TRACKER* stream = ReadClaimStream(Fcb, Offset);
+
+    stream->Streak = (Offset == stream->End) ? stream->Streak + 1 : 1;
+    stream->End = Offset + Length;
 }
 
 //
@@ -166,8 +204,8 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 
 //
 // Volume IRP_MJ_READ handler: validates the node/request, then dispatches to
-// either the non-cached path (paging reads served inline, possibly via the
-// sequential prefetcher, else a direct async HTTP fetch) or the cached path
+// either the non-cached path (paging reads served inline by a direct async
+// HTTP fetch) or the cached path
 // (CcCopyReadEx / CcMdlRead, initializing the cache map on first use). Both
 // paths share end-of-file trimming and post-read bookkeeping (file position,
 // fast-IO flag) for non-paging requests.
@@ -181,12 +219,13 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // catch it either: BlorgTrimReadToFileSize's two comparisons are both
 // false for a negative offset (it is neither >= FileSize nor does adding
 // the length exceed it), so the read passes through untrimmed and is then
-// widened to ULONG64, turning -4096 into 2^64-4096. Under that value the
-// prefetcher's containment test is the memory-safety boundary, so it is
-// written to be overflow-proof independently (PrefetchSlotCovers,
-// Prefetch.c) rather than relying on this check -- but the read is
-// meaningless regardless, and failing it here is what makes the answer a
-// clean error instead of a short read from wherever the arithmetic landed.
+// widened to ULONG64, turning -4096 into 2^64-4096. Nothing downstream
+// treats that as a memory-safety boundary any more -- the prefetch ring
+// whose containment test used to backstop it is gone -- so this check is
+// now the only thing standing between a negative offset and a range GET
+// for a nonsensical part of the file. The read is meaningless regardless,
+// and failing it here makes the answer a clean error instead of a short
+// read from wherever the arithmetic landed.
 //
 // For non-paging requests, FsRtlCheckOplock's result must be returned as-is
 // without completing the IRP when it is cancelled or pending. A non-error
@@ -214,26 +253,22 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // path, safe because BlorgLockUserBuffer no-ops when Irp->MdlAddress is already
 // set (always true for paging I/O).
 //
-// The sequential prefetcher (Prefetch.h) serves paging reads of a detected
-// sequential stream from (or parks them on) chunks already fetched ahead
-// of the reader, hiding the per-chunk HTTP RTT that otherwise bounds
-// streaming throughput. STATUS_NOT_FOUND means no coverage -- fall through
-// to the direct fetch below, which also keeps the prefetch pipeline topped
-// up on misses. This applies to paging reads only: they carry none of the
+// Paging reads advance this reader's stream tracker and then go straight
+// to a direct fetch. Lookahead is Cc's alone: it reads ahead of the
+// application, issues demand-driven so it paces itself against the link,
+// and lands in the paging IRP's MDL with no copy. Tracking applies to
+// paging reads only: they carry none of the
 // post-read bookkeeping (file-position advance, fast-IO flag) that
 // non-paging reads get in BlorgReadComplete. The BlorgReadIsSequential
-// sample there is taken before BlorgPrefetchServeRead updates the stream
-// trackers, using the same contiguity test the prefetcher uses
-// internally -- read characterization, not prefetcher behavior.
+// sample is taken before ReadTrackStream advances the trackers, so it
+// characterizes the read against the stream's prior position.
 //
-// Both async outcomes of this path -- the prefetcher parking the read and
-// the direct fetch below -- return STATUS_PENDING out of a dispatch
+// The direct fetch below returns STATUS_PENDING out of a dispatch
 // routine that nothing else has marked pending: a paging read bypasses
 // the FSP queue (so it never reaches IoCsqInsertIrp, which does the
 // marking for posted requests) and skips the oplock package (so
-// BlorgOplockPrePostIrp never runs either). The prefetcher marks its own
-// parked IRP, since it must do so before the waiter is published;
-// the direct fetch is marked here, before the issue rather than after,
+// BlorgOplockPrePostIrp never runs either). The fetch is marked here,
+// before the issue rather than after,
 // because a synchronously-completing issue may already have freed the
 // IRP by the time the call returns. Marking an IRP whose issue then
 // fails synchronously is harmless -- BlorgRead completes it with that
@@ -254,10 +289,9 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // direct-fetch issue site for every non-cached read (paging misses and
 // posted non-paging reads alike), so it is where FetchesIssued and the
 // in-flight gauge are raised, paired with the completion accounting in
-// BlorgReadComplete. The prefetcher's own in-flight fetches are counted
-// separately as PrefetchFetchesIssued (Prefetch.c) and deliberately do
-// not land in these two, so the direct-fetch rate stays readable as
-// "what the prefetcher failed to cover".
+// BlorgReadComplete. With the prefetch ring gone these count every fetch
+// the driver makes, so FetchesIssued is now simply the request rate against
+// the backend.
 //
 // Both counters are raised before the issue, because a synchronously
 // completing issue runs BlorgReadComplete -- and its matching decrement --
@@ -270,7 +304,6 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // reports only as a note about fetches "in flight at sample time" -- and,
 // worse, the FetchesActive gauge ratchets up permanently, taking
 // FetchesActivePeak with it, since a gauge has nothing to reset it.
-// PrefetchPump settles its own equivalent failure the same way.
 //
 // The NonCachedReads/NonCachedReadBytes pair is counted only on an IRP's
 // first pass through here, gated on IRP_CONTEXT_FLAG_IN_FSP. A read that
@@ -415,20 +448,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 BLORGFS_STAT_INC(ReadsSequential);
             }
 
-            NTSTATUS prefetchResult = global.PrefetchDisabled
-                ? STATUS_NOT_FOUND
-                : BlorgPrefetchServeRead(
-                    fcb,
-                    Irp,
-                    C_CAST(ULONG64, startingByte.QuadPart),
-                    realLength);
-
-            if (STATUS_NOT_FOUND != prefetchResult)
-            {
-                return prefetchResult;
-            }
-
-            BLORGFS_STAT_INC(PrefetchMisses);
+            ReadTrackStream(fcb, C_CAST(ULONG64, startingByte.QuadPart), realLength);
         }
 
         Irp->Tail.Overlay.DriverContext[2] =
@@ -468,45 +488,6 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             CcInitializeCacheMap(IrpSp->FileObject, C_CAST(PCC_FILE_SIZES, &fcb->Header.AllocationSize), FALSE, &global.CacheManagerCallbacks, fcb);
 
             CcSetReadAheadGranularity(IrpSp->FileObject, READ_AHEAD_GRANULARITY);
-
-            //
-            // Cc's read-ahead is turned OFF because this driver runs its own
-            // (Prefetch.c), and the two do not compose -- they stack.
-            //
-            // Cc reads ahead of the application; the ring then fetches ahead
-            // of the paging reads Cc issues. The driver therefore pulls
-            // roughly Cc's lookahead PLUS the ring's depth ahead of what the
-            // reader is actually consuming, over the same link the reader is
-            // blocked on. Cc's read-ahead is also issued from its own worker
-            // threads, so paging reads arrive out of order with respect to
-            // the application's position, which breaks the ring's
-            // "starts exactly where the last one ended" streak test and
-            // shows up as re-aims and misses.
-            //
-            // Measured: reading unbuffered -- no Cc, so the ring is the only
-            // prefetcher -- gave 29.95 MB/s with wire traffic equal to bytes
-            // delivered, while the buffered path with both engines gave
-            // 12-20 MB/s and fetched 1.4x what it delivered.
-            //
-            // The ring is the better of the two here because it knows what
-            // this filesystem's fetches cost: a chunk is an HTTP range GET
-            // over a link with a real round trip, not a disk request.
-            //
-            // What this is worth, A/B over three clean-boot runs each at 16
-            // streams: prefetch hit rate 70% -> 76.5% and misses down about
-            // a fifth, with THROUGHPUT UNCHANGED (16.99 vs 17.13 MB/s
-            // median). On this link throughput is bounded by the wire and
-            // fetched-versus-delivered stayed at ~66%, so this buys less
-            // redundant work rather than more bytes. It should matter more
-            // where the link is not the constraint.
-            //
-            // Untested case: BUFFERED random access. Reads that never
-            // establish a streak do not arm the ring, and with Cc's
-            // read-ahead off they now have no lookahead from either engine.
-            // The harness's random workload opens unbuffered, so it does not
-            // cover this and neither does anything else here.
-            //
-            CcSetAdditionalCacheAttributes(IrpSp->FileObject, global.PrefetchDisabled ? FALSE : TRUE, FALSE);
         }
 
         NTSTATUS trimStatus = BlorgTrimReadToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);

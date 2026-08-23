@@ -268,16 +268,14 @@ VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
 
     Out->Gauges.FetchesActive = ReadNoFence64(&BlorgStatisticsGauges.FetchesActive);
     Out->Gauges.FetchesActivePeak = ReadNoFence64(&BlorgStatisticsGauges.FetchesActivePeak);
-    Out->Gauges.PrefetchRingsLive = ReadNoFence64(&BlorgStatisticsGauges.PrefetchRingsLive);
-    Out->Gauges.PrefetchChunksLive = BlorgPrefetchChunksLive();
 }
 
 //
-// FetchesActive and PrefetchRingsLive are deliberately NOT zeroed: they
-// are gauges, and a reset that clears them would make the driver report
-// fewer in-flight fetches than there are, permanently, once the
-// outstanding ones complete and decrement. Only the peak -- a
-// window-scoped high-water mark -- is restarted, from the current depth.
+// FetchesActive is deliberately NOT zeroed: it is a gauge, and a reset
+// that cleared it would make the driver report fewer in-flight fetches
+// than there are, permanently, once the outstanding ones complete and
+// decrement. Only the peak -- a window-scoped high-water mark -- is
+// restarted, from the current depth.
 //
 VOID BlorgStatisticsReset(VOID)
 {

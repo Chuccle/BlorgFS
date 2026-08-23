@@ -57,33 +57,28 @@
 #include "Tls.h"
 
 //
-// Cc's read-ahead granularity for cached reads (Read.c). Also the basis
-// for PREFETCH_CHUNK (Prefetch.h): Cc clusters read-ahead into a paging
-// IRP sized at a multiple of this granularity (observed 2x), so the
-// prefetcher's slot size is derived from this constant rather than
-// duplicated. If PREFETCH_CHUNK drifts out of step with the actual
-// paging-read size, every slot's Length is too small, the hit/park
-// check's Length > Hot[i].Length always trips, and every read falls
-// through to a direct fetch.
+// Cc's read-ahead granularity for cached reads (Read.c), and now the only
+// lookahead this driver has -- the prefetch ring that used to derive its
+// slot size from this constant is gone.
 //
-// Raised from 64 to 128 pages (256 KB -> 512 KB) on measured evidence. With
-// Cc as the only lookahead, paging reads averaged ~204 KB against the
-// 512 KB a usermode client issues, so the driver was paying roughly two and
-// a half times the per-request HTTP overhead for the same bytes. At 512 KB,
-// buffered 16-stream throughput went from 23.01 to 27.33 MB/s median, which
-// is ~92% of what the same guest gets from HttpWebRequest measured
-// interleaved with it.
+// Raised from 64 to 128 pages (256 KB -> 512 KB) on measured evidence.
+// Paging reads had been averaging ~204 KB against the 512 KB a usermode
+// client issues, so the driver was paying roughly two and a half times the
+// per-request HTTP overhead for the same bytes. At 512 KB, buffered
+// 16-stream throughput went from 23.01 to 27.33 MB/s median.
 //
-// 1 MB was also measured and is indistinguishable on throughput, so the
-// smaller value is kept: it halves per-read latency, and a 1 MB read-ahead
-// was reverted once before for making playback stutter worse.
+// Both 1 MB and 2 MB were also measured and are indistinguishable on
+// throughput -- Cc's paging reads only grew from ~281 KB to ~284-314 KB,
+// so it will not issue larger IRPs and the knob is exhausted past this
+// point. The smallest value that gets the throughput is kept: it halves
+// per-read latency against 1 MB, and a 1 MB read-ahead was reverted once
+// before for making playback stutter worse.
 //
 #define READ_AHEAD_GRANULARITY (PAGE_SIZE * 128)
 
 #include "Structs.h"
 #include "Util.h"
 #include "Client.h"
-#include "Prefetch.h"
 #include "Statistics.h"
 #include "CacheManager.h"
 #include "FspWorkQueue.h"
@@ -247,40 +242,6 @@ extern struct GLOBAL
     //
     volatile BOOLEAN TlsEnabled;  // TRUE to attempt TLS on new connections
 
-    //
-    // Parameters\PrefetchEnabled = 1 re-enables the prefetch ring on
-    // buffered reads. It is OFF by default: Cc's read-ahead is the only
-    // lookahead unless the ring is asked for.
-    //
-    // The default flipped once the Cc path was tuned. Interleaved against a
-    // usermode HTTP client -- the same probe immediately before and after
-    // each driver run, because this link drifts 23-32 MB/s over an
-    // afternoon -- Cc alone reaches 1.18x the client at one stream and
-    // parity at sixteen, where the ring configuration managed 0.55x.
-    //
-    // It exists because the ring does not currently pay for itself on
-    // buffered multi-stream reads, and the switch is what lets that be
-    // re-measured rather than argued. Three clean-boot runs each at 16
-    // streams, 30 s:
-    //
-    //                      ring + Cc        Cc alone
-    //   throughput         16.99 median     23.01 median
-    //   fetched/delivered  ~66%             ~95%
-    //   p99                630-1090 ms      169-238 ms
-    //   fairness           0.23-0.50        0.51-0.83
-    //   in flight peak     51-62            22
-    //
-    // At one stream, where hiding a round trip is the ring's whole purpose,
-    // it is worth about 8% of median throughput (15.05 vs 13.97) -- inside
-    // this rig's run-to-run variance -- while Cc alone moved exactly as many
-    // bytes over the wire as it delivered.
-    //
-    // Cc's read-ahead already pipelines (4 concurrent fetches at one stream,
-    // 22 at sixteen), issues demand-driven so it throttles itself, and lands
-    // straight in the paging IRP's MDL with no copy. The ring duplicates
-    // that with an extra copy and 1.5x the wire traffic.
-    //
-    volatile BOOLEAN PrefetchDisabled;
 
 #ifdef DBG
     ULONG LogLevel;  // BLORGFS_PRINT verbosity; see macro above

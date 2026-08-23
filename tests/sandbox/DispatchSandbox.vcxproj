@@ -149,7 +149,6 @@
     <ClCompile Include="..\..\src\Write.c" />
     <ClCompile Include="..\..\src\TlsHandshake.c" />
     <ClCompile Include="..\..\src\Structs.c" />
-    <ClCompile Include="..\..\src\Prefetch.c" />
     <ClCompile Include="..\..\src\Client.c" />
     <ClCompile Include="..\..\src\Tls.c" />
     <ClCompile Include="..\..\third_party\picohttpparser\picohttpparser.c" />

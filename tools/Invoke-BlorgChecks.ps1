@@ -234,7 +234,6 @@ if ($runsBuild) {
         @('tests\sandbox\ClientSandbox.vcxproj', 'build:ClientSandbox'),
         @('tests\sandbox\ClientFuzz.vcxproj', 'build:ClientFuzz'),
         @('tests\sandbox\SocketSandbox.vcxproj', 'build:SocketSandbox'),
-        @('tests\sandbox\PrefetchSandbox.vcxproj', 'build:PrefetchSandbox'),
         @('tests\sandbox\NodeTableSandbox.vcxproj', 'build:NodeTableSandbox'),
         @('tests\sandbox\DispatchSandbox.vcxproj', 'build:DispatchSandbox'),
         @('tests\sandbox\TlsHandshakeSandbox.vcxproj', 'build:TlsHandshakeSandbox'),
@@ -276,14 +275,6 @@ if ($runsBuild) {
         $ok = (Invoke-TestExe 'SocketSandbox.exe' 'test:kernel-socket' 300 '' 'build:SocketSandbox') -and $ok
 
         #
-        # The real Prefetch.c against the same model. The ring is the
-        # driver's most concurrency-critical code -- a spin lock, a
-        # refcount deciding who frees it, a park-before-publish ordering
-        # Prefetch.h calls a lifetime invariant -- and these drive it with
-        # completions landing from another thread while a reader walks the
-        # stream, plus detach racing in-flight fetches.
-        #
-        $ok = (Invoke-TestExe 'PrefetchSandbox.exe' 'test:kernel-prefetch' 300 '' 'build:PrefetchSandbox') -and $ok
 
         #
         # FCB/DCB lifetime: the claim that a node handed back by

@@ -109,9 +109,6 @@
     <ClCompile Include="PathCache.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Prefetch.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Structs.h">
@@ -151,9 +148,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="TlsHandshake.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="Prefetch.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

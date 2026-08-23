@@ -1,20 +1,10 @@
 //
 // Coverage for the real Read.c: BlorgRead/BlorgVolumeRead's dispatch of a
-// paging read into the prefetcher/direct-fetch path, the cached (Cc) path,
+// paging read into the direct-fetch path, the cached (Cc) path,
 // BlorgTrimReadToFileSize's end-of-file clamp shared by both, and
 // BlorgReadComplete's completion bookkeeping.
 //
-// Prefetch.c itself has thorough coverage through PrefetchKernelTest.cpp,
-// but that suite calls BlorgPrefetchServeRead directly -- deliberately
-// bypassing Read.c, per its own file-header comment -- so the dispatch
-// entry that actually wires an IRP_MJ_READ into the ring was untested
-// before this file. A single paging read here does not arm the ring
-// (PREFETCH_ARM_STREAK requires a second contiguous read), so
-// BlorgPrefetchServeRead returns STATUS_NOT_FOUND and BlorgVolumeRead
-// falls through to the direct-fetch path.
-//
-// Unlike PrefetchSandbox, DispatchSandbox links the real Client.c rather
-// than PrefetchModel.c's simplified fetch queue, so the direct-fetch tests
+// DispatchSandbox links the real Client.c, so the direct-fetch tests
 // here script a real peer through SandboxSocket.h -- the same mechanism
 // ClientTest.cpp (ClientSandbox) uses -- rather than completing a mocked
 // fetch directly. That is deliberate: it proves BlorgVolumeRead builds the
@@ -89,8 +79,6 @@ protected:
     void TearDown() override
     {
         global.VolumeDeviceObject = nullptr;
-
-        BlorgPrefetchDetach(Fcb);
 
         SandboxDrainCompletions();
         ShimDrainWorkItems();
@@ -250,7 +238,7 @@ TEST_F(ReadTest, NonVolumeDeviceObjectReturnsInvalidDeviceRequest)
 // own IRP and fills in Parameters.Read.ByteOffset itself. Nothing
 // downstream would have caught it -- the end-of-file trim's comparisons
 // are both false for a negative offset -- and it reaches the prefetcher
-// widened to ULONG64, which is why Prefetch.c's containment test is
+// widened to ULONG64, which is why the offset check in Read.c is
 // independently overflow-proof (WrappingOffsetIsNeverServedFromASlot).
 //
 TEST_F(ReadTest, NegativeByteOffsetIsRejectedBeforeAnyFetch)
@@ -318,17 +306,15 @@ TEST_F(ReadTest, PagingReadStraddlingEndOfFileIsTrimmedBeforeTheFetch)
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// Paging path: prefetch miss falls through to the direct fetch
+// Paging path: inline direct fetch
 ///////////////////////////////////////////////////////////////////////////
 
 //
-// One read does not arm the ring (PrefetchKernelTest.cpp proves that
-// directly), so BlorgPrefetchServeRead returns STATUS_NOT_FOUND here and
-// BlorgVolumeRead falls through to BlorgHttpGetFileMdl -- the "load-bearing,
+// A paging read goes straight to BlorgHttpGetFileMdl -- the "load-bearing,
 // not just an optimisation" inline-issue path the file's header comment
 // describes: nothing posts this to the FSP queue.
 //
-TEST_F(ReadTest, PagingReadMissesThePrefetcherAndIssuesADirectFetch)
+TEST_F(ReadTest, PagingReadIssuesADirectFetchInline)
 {
     static const SANDBOX_STEP script[] =
     {
@@ -511,9 +497,7 @@ TEST_F(ReadTest, CachedReadMissWithWaitReachesFsdPostRequest)
 //
 // A NOCACHE paging read with no MDL is the deterministic way to reach a
 // synchronous failure: BlorgHttpGetFileMdl refuses a null TargetMdl
-// outright, no pool-failure injection needed. PrefetchPump settles the
-// same case for its own counters, which is what makes this the odd one
-// out rather than a judgement call.
+// outright, no pool-failure injection needed.
 //
 TEST_F(ReadTest, DirectFetchThatFailsToIssueSettlesItsOwnAccounting)
 {

@@ -118,7 +118,6 @@
     <ClCompile Include="StructsModel.c" />
     <ClCompile Include="NoStatisticsStub.c" />
     <ClCompile Include="NoTlsHandshakeStub.c" />
-    <ClCompile Include="NoPrefetchStub.c" />
     <ClCompile Include="NoClientStub.c" />
     <ClCompile Include="..\..\src\Structs.c" />
     <ClCompile Include="..\..\src\Tls.c" />

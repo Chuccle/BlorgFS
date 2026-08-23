@@ -24,7 +24,6 @@ namespace
 {
 
 //
-// PrefetchKernelTest.cpp, and any other suite in this binary, calls
 // BlorgStatisticsForCurrentProcessor() with no NULL check -- Statistics.h's
 // "every accessor tolerates that" promise covers the counter macros, not
 // call sites written that way. Bracketing the whole process with one
@@ -76,7 +75,6 @@ protected:
         BlorgStatisticsReset();
         InterlockedExchange64(&BlorgStatisticsGauges.FetchesActive, 0);
         InterlockedExchange64(&BlorgStatisticsGauges.FetchesActivePeak, 0);
-        InterlockedExchange64(&BlorgStatisticsGauges.PrefetchRingsLive, 0);
 
         Block = BlorgStatisticsForCurrentProcessor();
         ASSERT_NE(nullptr, Block);
@@ -98,7 +96,6 @@ TEST(StatisticsLifecycleTest, CleanupThenInitializeRoundTrips)
     ASSERT_EQ(STATUS_SUCCESS, BlorgStatisticsInitialize());
     PBLORGFS_STATISTICS block = BlorgStatisticsForCurrentProcessor();
     ASSERT_NE(nullptr, block);
-    EXPECT_EQ(0u, block->PrefetchHits) << "a freshly allocated table must start zeroed";
 
     // DriverUnload calls Cleanup once, but nothing in the contract limits
     // callers to exactly one call -- a second call must not double-free.
@@ -182,8 +179,6 @@ TEST_F(StatisticsTest, ForCurrentProcessorReturnsNullWhenIndexIsOutOfRange)
 
 TEST_F(StatisticsTest, QueryReflectsDirectCounterIncrements)
 {
-    BLORGFS_STAT_INC(PrefetchHits);
-    BLORGFS_STAT_INC(PrefetchHits);
     BLORGFS_STAT_ADD(FetchBytes, 4096);
     BLORGFS_STAT_INC(CreateHits);
 
@@ -196,24 +191,20 @@ TEST_F(StatisticsTest, QueryReflectsDirectCounterIncrements)
     EXPECT_GT(response.QpcFrequency, 0);
     EXPECT_GE(response.NowQpc, response.EpochQpc);
 
-    EXPECT_EQ(2u, response.Totals.PrefetchHits);
     EXPECT_EQ(4096u, response.Totals.FetchBytes);
     EXPECT_EQ(1u, response.Totals.CreateHits);
-    EXPECT_EQ(0u, response.Totals.PrefetchMisses) << "an untouched counter must read zero, not garbage";
 }
 
 TEST_F(StatisticsTest, QueryReportsGaugesDirectlyRatherThanSummingThem)
 {
     BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.FetchesActive, &BlorgStatisticsGauges.FetchesActivePeak);
     BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.FetchesActive, &BlorgStatisticsGauges.FetchesActivePeak);
-    BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.PrefetchRingsLive, nullptr);
 
     BLORGFS_STATISTICS_RESPONSE response;
     BlorgStatisticsQuery(&response);
 
     EXPECT_EQ(2, response.Gauges.FetchesActive);
     EXPECT_EQ(2, response.Gauges.FetchesActivePeak);
-    EXPECT_EQ(1, response.Gauges.PrefetchRingsLive);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -222,7 +213,6 @@ TEST_F(StatisticsTest, QueryReportsGaugesDirectlyRatherThanSummingThem)
 
 TEST_F(StatisticsTest, ResetZeroesCountersButPreservesLiveGauges)
 {
-    BLORGFS_STAT_INC(PrefetchHits);
     BLORGFS_STAT_ADD(FetchBytes, 999);
 
     BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.FetchesActive, &BlorgStatisticsGauges.FetchesActivePeak);
@@ -232,7 +222,6 @@ TEST_F(StatisticsTest, ResetZeroesCountersButPreservesLiveGauges)
 
     BLORGFS_STATISTICS_RESPONSE before;
     BlorgStatisticsQuery(&before);
-    ASSERT_EQ(1u, before.Totals.PrefetchHits);
     ASSERT_EQ(999u, before.Totals.FetchBytes);
     ASSERT_EQ(2, before.Gauges.FetchesActive);
     ASSERT_EQ(3, before.Gauges.FetchesActivePeak);
@@ -242,7 +231,6 @@ TEST_F(StatisticsTest, ResetZeroesCountersButPreservesLiveGauges)
     BLORGFS_STATISTICS_RESPONSE after;
     BlorgStatisticsQuery(&after);
 
-    EXPECT_EQ(0u, after.Totals.PrefetchHits) << "Reset must zero per-processor counters";
     EXPECT_EQ(0u, after.Totals.FetchBytes);
     EXPECT_EQ(2, after.Gauges.FetchesActive)
         << "FetchesActive is a live in-flight gauge -- Reset must not clear it";

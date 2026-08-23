@@ -54,14 +54,19 @@ static SOCKET_POOL_STATE SocketPool;
 // Those stalls dominated the latency tail (p99 635-704 ms) and collapsed
 // fairness to 0.23.
 //
-// So it tracks the prefetch chunk budget, which is what actually bounds
-// concurrent fetches, plus headroom for the direct-fetch and metadata
-// traffic that shares the pool. Peer idle-close of pooled connections is
-// handled by the reused-connection retry in the HTTP client.
+// Sized from measured peak concurrency rather than from any internal
+// pipeline depth. With Cc's read-ahead as the only lookahead, sixteen
+// concurrent streams put 21-28 fetches in flight; a single stream puts 4.
+// 64 leaves better than a 2x margin over the worst of that, which is the
+// right side to err on: an over-large pool costs idle sockets, while an
+// under-sized one closes warm connections and pays a fresh handshake --
+// and, with TLS, a full ECDH -- to get them back.
 //
-#define SOCKET_POOL_HEADROOM 32
-
-ULONG SocketMaxPoolSize = 64 + SOCKET_POOL_HEADROOM;
+// This used to be derived from the prefetch chunk budget, which is gone
+// along with the ring. Peer idle-close of pooled connections is handled by
+// the reused-connection retry in the HTTP client.
+//
+ULONG SocketMaxPoolSize = 64;
 
 //
 // TLS ciphertext accumulator sizing (see Socket.h). Ciphertext is
@@ -71,8 +76,8 @@ ULONG SocketMaxPoolSize = 64 + SOCKET_POOL_HEADROOM;
 // must exceed one max-size record or a drain loop could never make
 // progress on a full buffer.
 //
-// Tiered by machine size, the same coarse MmQuerySystemSize tiering the
-// prefetch chunk budget uses: the worst case is this times
+// Tiered by machine size, the same coarse MmQuerySystemSize tiering
+// fastfat and ntfs use for cache sizing: the worst case is this times
 // SocketMaxPoolSize of NonPagedPoolNx, and a small machine has no
 // business reserving that to save receive IRPs. Only sockets that
 // actually carry TLS ever allocate one (BlorgEnsureTlsRecvBuffer), so a
@@ -508,7 +513,6 @@ NTSTATUS BlorgInitialiseWskClient(void)
 
     SocketTlsRecvCapacity = tlsRecvRecords * SOCKET_TLS_RECORD_MAX_BYTES;
 
-    SocketMaxPoolSize = C_CAST(ULONG, BlorgPrefetchMaxChunks()) + SOCKET_POOL_HEADROOM;
 
     return STATUS_SUCCESS;
 }

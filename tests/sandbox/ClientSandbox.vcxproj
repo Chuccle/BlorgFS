@@ -116,7 +116,6 @@
     <ClCompile Include="StructsModel.c" />
     <ClCompile Include="NoStatisticsStub.c" />
     <ClCompile Include="NoTlsHandshakeStub.c" />
-    <ClCompile Include="NoPrefetchStub.c" />
     <ClCompile Include="SandboxSocket.c" />
     <ClCompile Include="..\..\src\Client.c" />
     <ClCompile Include="..\..\src\Tls.c" />

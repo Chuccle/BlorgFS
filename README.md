@@ -2,7 +2,7 @@
 
 Kernel-mode Windows filesystem driver presenting an HTTP backend as a mounted
 volume (B:). Read-only. Async WSK networking, an optional hand-rolled TLS 1.3
-client, a sequential-read prefetcher, and a keep-alive connection pool.
+client and a keep-alive connection pool.
 
 ## Layout
 
@@ -151,23 +151,20 @@ stored per-processor and read two ways:
 
 - `fsutil fsinfo statistics B:` — the standard `FILESYSTEM_STATISTICS` /
   `FAT_STATISTICS` surface, via `FSCTL_FILESYSTEM_GET_STATISTICS(_EX)`.
-- `PerfHarness.exe` — the driver-specific counters (prefetch
-  hit/park/miss/near-miss, chunk-fetch latency histogram, connection pool,
-  TLS) over `IOCTL_BLORGFS_QUERY_STATISTICS` on `\\.\BlorgFS`.
+- `PerfHarness.exe` — the driver-specific counters (read dispatch mix,
+  chunk-fetch latency histogram, connection pool, TLS) over `IOCTL_BLORGFS_QUERY_STATISTICS` on `\\.\BlorgFS`.
 
-Two things to know before reading prefetch numbers:
+Two things to know before reading read numbers:
 
-- **Measure media with `seq <file> buffered`.** The unbuffered default never
-  reaches the prefetcher at all — `BlorgPrefetchServeRead` is only called
-  from the paging path, so only cache-manager reads exercise the ring.
-  Unbuffered measures the no-pipelining floor, not playback.
-- **"of which near"** no longer means what its name says. It counted misses a
-  containment test would have served and an exact-offset one would not -- and
-  then the lookup *became* a containment test, retiring that case. What it
-  finds now is a slot that covered the range but was already spoken for: one
-  waiter per slot, so a second concurrent reader of the same chunk falls
-  through to a direct fetch. Read it as a contention counter against
-  `PrefetchParks`, not a coverage one (`PrefetchCountNearMiss`, `Prefetch.c`).
+- **Buffered and unbuffered measure different systems.** Buffered goes
+  through Cc, which supplies all of this driver's read-ahead, and is what
+  playback looks like. `streams <dir> <n> <secs> unbuffered` bypasses Cc so
+  every read reaches the driver, which is what to use when comparing the
+  transport against a usermode HTTP client.
+- **Warm runs are not measurements.** A second run against the same files is
+  served from the Windows cache at thousands of MB/s with zero paging reads.
+  Reboot the guest between points, and check that `paging reads` is non-zero
+  before believing a number.
 
 ```bash
 PerfHarness.exe seq B:\media\big.mkv --report run.txt
@@ -201,7 +198,7 @@ reset -- it wedges in `STOP_PENDING` (see `deploy/DEBUGGING.md`).
 Workload commands reset the counters first, so the numbers are attributable to
 the workload. `--report` writes flat `key=value` metrics for
 `tools\Compare-BlorgMetrics.ps1`, which checks both correctness invariants
-(prefetch outcomes must sum to paging reads; fetch issues must balance
+(every inline paging read must have a fetch; fetch issues must balance
 terminations) and perf deltas against a baseline in `tools\baselines\`.
 
 Accept new numbers deliberately, never silently:
@@ -213,6 +210,163 @@ powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Perf -PerfFile B:\media\big.
 The driver runs in a VM for testing — `deploy\Deploy-ToVM.ps1` builds, copies,
 and installs it via vmrun. Run the `Perf` tier inside the guest, where the
 volume is mounted.
+
+## TODO: on-disk hot cache
+
+The prefetch ring was removed rather than replaced. What follows is the
+design seam for its replacement, which is **not an in-memory prefetcher** --
+that experiment is finished and its evidence is in git history. Nothing in
+this section is implemented.
+
+### Why this, and not more lookahead
+
+Measured on the reference rig, 16 concurrent streams, 512 KB range GETs,
+interleaved against a usermode HTTP client:
+
+| | throughput |
+| --- | --- |
+| network path ceiling, cold or warm | ~30 MB/s |
+| driver, cold | 27-30 MB/s (0.93-1.01x the usermode client) |
+| driver, warm in the Windows cache | **4800-6800 MB/s** |
+| local guest disk, write / read | **601 MB/s / 4.3 GB/s** |
+
+Cold reads already sit at the link ceiling, so nothing on the fetch path can
+add throughput: every delivered byte has to cross a ~30 MB/s wire. The only
+way past it is to **not cross the wire**. RAM caching already demonstrates
+the payoff and is bounded by RAM -- at four concurrent streams the working
+set stopped fitting and a re-read fell from 6677 MB/s to 131 MB/s. Local
+disk is ~20x the network on write, ~140x on read, with ~100x the capacity of
+RAM.
+
+### Architecture
+
+A block store in **one ordinary file on an ordinary live volume**, plus a
+separate index. Location and maximum size configurable through the registry,
+alongside `RemoteHost`/`RemotePort` in `Parameters`.
+
+- **Block-granular, not whole-file.** A 6 GB film watched for ten minutes
+  must not admit 6 GB. Fixed-size blocks with a per-file present-bitmap;
+  evict blocks, not files.
+- **No contiguity assumptions.** The store is addressed by block index
+  through the filesystem, never by cluster or LCN, so it must survive being
+  fragmented, extended, or moved.
+- **Asynchronous both ways, never on the foreground path.** A miss issues
+  the HTTP fetch immediately and completes the read from it; the write-behind
+  into the store happens afterwards, and its failure is invisible to the
+  reader. A hit reads asynchronously and, on any error or timeout, abandons
+  the cache and falls back to the network.
+- **Advisory only.** Corruption, truncation, eviction, a missing file, a full
+  volume or an unreadable index all degrade to the authoritative path. There
+  must be no state in which the cache can make a read fail that would
+  otherwise have succeeded.
+
+**The re-entrancy hazard is the main design risk**, and it is why this is a
+seam rather than an implementation. The driver would be calling into another
+filesystem from inside its own `IRP_MJ_READ`; synchronous cache I/O on that
+path can recurse through memory pressure back into this driver. Two ways out,
+to be chosen before any code is written:
+
+1. A kernel-side store with strictly asynchronous, non-blocking I/O and a
+   hard rule that no foreground read ever waits on it.
+2. A usermode helper service owning the store, with the driver querying it.
+   This removes the cross-filesystem hazard entirely, at the cost of an IPC
+   round trip per lookup -- which, against a ~30 ms network fetch, is noise.
+
+Option 2 looks better on risk against benefit and should be the working
+assumption until something argues otherwise.
+
+### Cluster pinning: not worth it
+
+`FSCTL_MARK_HANDLE` with `MARK_HANDLE_PROTECT_CLUSTERS` marks a file so the
+defragmenter will not move it. **The conclusion is not to use it.** The
+intuition that this is over-engineering is right, and for reasons stronger
+than "SSDs do not care about seeks":
+
+- It solves a problem this design does not have. Protection matters when
+  something maps a file by LCN and needs that mapping to stay valid --
+  hibernation files, page files, block-level VM disks. This store is
+  addressed through the filesystem by offset, so a moved extent is
+  transparent.
+- It is NTFS-only and volume-specific, and the cache is meant to live
+  wherever the user points it.
+- Marking a large file unmovable is antisocial: it permanently constrains the
+  volume's own defragmenter on behalf of a cache that is by definition
+  disposable.
+- The cost it avoids is seek cost, which on SSD is near zero and on spinning
+  media is still small against the ~30 ms network fetch it is competing with.
+
+Revisit only if profiling ever shows extent-map lookup -- not seek time --
+dominating cache reads, which would be a surprise.
+
+### Security model
+
+**Cache integrity is a security boundary.** A process that can write the
+store can inject bytes this filesystem then serves as authoritative file
+content: a straightforward data-poisoning primitive against every reader of
+the share.
+
+- **ACL the store to SYSTEM and Administrators only**, deny everyone else,
+  and create it with an explicit security descriptor rather than inheriting
+  the parent directory's. A cache under a user-writable path with inherited
+  ACLs is the default-insecure outcome to avoid.
+- **Refuse a store whose ownership or ACL is not what was expected**, at
+  open, rather than repairing it -- repairing races the attacker.
+- **ACLs alone are not sufficient.** They do not cover an offline attack
+  (booting another OS, mounting the volume elsewhere), an administrator-level
+  compromise, or ordinary corruption. Blocks must carry their own integrity
+  check.
+- **Per-block keyed integrity, verified before use.** Each block records a
+  MAC over (file identity, block index, backend validator, contents). A
+  mismatch discards the block and falls back to the network. The key is
+  generated per store instance and kept somewhere the store is not --
+  otherwise an attacker who can rewrite blocks can recompute the tags. A
+  plain checksum detects corruption but not tampering, and the threat here
+  is tampering.
+- **Bind blocks to a backend validator.** `server-rs` returns `etag` and
+  `last_modified`; a block whose validator does not match the current
+  response is stale and must not be served. Without this the cache serves
+  yesterday's bytes for a file that changed.
+- **Tampering, truncation or wholesale replacement** must be
+  indistinguishable in effect from a cold cache: verification fails, blocks
+  are discarded, reads go to the network.
+
+The bar is explicit: **the cached path must not be weaker than the uncached
+path.** A design step that cannot meet that does not ship.
+
+### Admission and eviction: start small
+
+The literature is consistent that the largest wins come from **admission**
+control rather than clever eviction, and that the specific thing to avoid is
+caching one-hit-wonders -- for a disk-backed store that is wasted write
+bandwidth and, on SSD, wasted endurance.
+
+- **Admit on second miss, not first.** This is the CDN answer to one-hit
+  wonders, costs a few bytes of state per candidate, and is the single
+  highest-value policy decision available.
+- **Prefer sequential streams.** The `READ_STREAM_TRACKER` array on the FCB
+  (`Structs.h`) already carries the streak -- it survived the prefetch
+  removal partly for this. A streaked reader is exactly the case where the
+  following blocks are worth having.
+- **Evict with segmented LRU.** Cheap, well understood, and resistant to one
+  large scan flushing the whole store.
+- **Do not start with TinyLFU/W-TinyLFU or ARC.** W-TinyLFU is the strongest
+  general result in the literature and is the right thing to *grow into* if
+  measurement justifies it; its frequency sketch costs about a page. But it
+  earns its keep on skewed, high-cardinality, small-object workloads -- CDN
+  edges, key-value caches -- and this workload is a handful of very large,
+  sequentially-read files. Second-hit admission plus SLRU captures most of
+  the benefit at a fraction of the complexity, and the counters will show
+  whether anything more is warranted.
+
+Measure hit rate, bytes served from cache, and write amplification before
+tuning any of it.
+
+Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),
+[size-aware admission for CDN memory caches (CMU)](http://reports-archive.adm.cs.cmu.edu/anon/2016/CMU-CS-16-120.pdf),
+[CacheSack: admission optimization for Google datacenter caches (USENIX ATC 22)](https://www.usenix.org/system/files/atc22-yang-tzu-wei.pdf),
+[FSCTL_MARK_HANDLE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ni-ntifs-fsctl_mark_handle),
+[Defragmenting Files](https://learn.microsoft.com/en-us/windows/win32/fileio/defragmenting-files).
+
 
 ## Deploying to the VM
 
@@ -327,11 +481,11 @@ correct drift when you find it.
 - **Parameters are `PascalCase`; locals are `camelCase`.** This is the one
   people get wrong most often, and it is load-bearing for readability: at any
   line you can tell what came from the caller and what is yours.
-  `static VOID PrefetchPump(PREFETCH_RING* Ring)` with `ULONG depthLimit =
-  Ring->DepthLimit;` inside.
+  `static NTSTATUS HttpParseHeaders(HTTP_CONTEXT* Ctx)` with
+  `SIZE_T bodyOffset = Ctx->BodyOffset;` inside.
 - **Functions are `PascalCase` with a module prefix, and the prefix says
   whether the name leaves the file.** A file-static helper takes the bare
-  module name (`PrefetchPump`, `HttpFail`, `TlsHandshakeFail`). Anything
+  module name (`ReadClaimStream`, `HttpFail`, `TlsHandshakeFail`). Anything
   with external linkage takes `Blorg`, with no exceptions for layer or
   ancestry -- `BlorgSendWskAsync`, `BlorgTlsSha256`, `BlorgFspDispatch`,
   `BlorgVolumeRead`. The fastfat-inherited names (`FsdPostRequest`,
@@ -341,11 +495,11 @@ correct drift when you find it.
   So `grep -n '^[A-Za-z].*Blorg'` is the export list, and a bare module
   name at file scope is a promise that it is `static`.
 - **File-scope statics are `PascalCase` with the module prefix**
-  (`PrefetchRingCount`, `HttpActiveRequests`). Driver-wide mutable state
+  (`SocketMaxPoolSize`, `HttpActiveRequests`). Driver-wide mutable state
   lives in the `global` struct rather than as loose globals — prefer adding
   a field there to introducing a new one.
 - **Struct fields are `PascalCase`; macros and constants are
-  `SCREAMING_SNAKE`** (`PREFETCH_DEPTH`, `SOCKET_CONNECT_TIMEOUT_MS`).
+  `SCREAMING_SNAKE`** (`READ_AHEAD_GRANULARITY`, `SOCKET_CONNECT_TIMEOUT_MS`).
 - **Empty parameter lists are `(VOID)`, never `()`.**
 - **Allman braces**, including on `switch` cases, which get their own braced
   block. Every `if` gets braces, even single-statement ones.
@@ -373,7 +527,7 @@ correct drift when you find it.
   `Blorg*Complete`) or in anything one can call. It is fine, and used
   freely, on the PASSIVE-only dispatch paths.
 - IRQL is load-bearing throughout the async paths; the file-header comments in
-  `Client.c`, `Prefetch.h`, and `Socket.h` state each path's contract. Read
+  `Client.c` and `Socket.h` state each path's contract. Read
   them before changing anything on a completion chain.
 - **Data-oriented design.** Lay data out for how it is actually traversed —
   hot fields together, per-processor where contended, arrays over

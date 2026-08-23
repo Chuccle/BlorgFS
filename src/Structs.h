@@ -281,7 +281,12 @@ CHECK_PADDING_END(COMMON_CONTEXT, TableBucketIndex);
 // how many contiguous reads in a row it has issued. An FCB carries a small
 // fixed array of these so interleaved readers (two streams on one file)
 // each keep their own streak instead of resetting a single shared one --
-// see BlorgPrefetchServeRead (Prefetch.c) for the claim/replace policy.
+// see ReadClaimStream (Read.c) for the claim/replace policy.
+//
+// These outlived the prefetch ring they were built for. They feed the
+// ReadsSequential statistic, which is what established that this driver's
+// paging reads are ~100% sequential, and an on-disk hot cache will want the
+// same signal to decide what to admit (see the design note in README.md).
 //
 typedef struct _READ_STREAM_TRACKER
 {
@@ -294,14 +299,14 @@ CHECK_PADDING_END(READ_STREAM_TRACKER, Streak);
 
 //
 // Sized so the whole tracker array is a single cache line: the per-read
-// scan in BlorgPrefetchServeRead touches exactly one line whichever
-// tracker it lands on.
+// scan in ReadClaimStream touches exactly one line whichever tracker it
+// lands on.
 //
 #define READ_STREAM_TRACKER_COUNT 4
 
 //
 // Per-file context node. Extends COMMON_CONTEXT with file locking and
-// sequential-read prefetch state.
+// read-pattern tracking.
 //
 typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
 {
@@ -310,18 +315,13 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     PVOID           LazyWriteThread;// Thread performing lazy write, if any
 
     //
-    // Sequential-read prefetcher (Prefetch.h). PrefetchRing is
-    // NonPagedPoolNx (touched at DISPATCH_LEVEL by fetch completions);
-    // StreamClock/Streams are touched only at PASSIVE_LEVEL from the
+    // Read-pattern trackers, touched only at PASSIVE_LEVEL from the
     // paging-read dispatch path. A read starting where a tracker's last
     // read ended extends that tracker's streak; anything else claims the
-    // coldest tracker for a new/seeked stream. StreamClock counts serve
-    // calls and feeds the ring's re-aim recency test (Prefetch.h);
-    // concurrent readers race these plain fields harmlessly -- a lost
-    // update costs detection accuracy, never correctness.
+    // coldest tracker for a new or seeked stream. Concurrent readers race
+    // these plain fields harmlessly -- a lost update costs detection
+    // accuracy, never correctness, which is why they carry no lock.
     //
-    struct _PREFETCH_RING* PrefetchRing; // Prefetch ring for this file
-    ULONG64 StreamClock; // Serve-call counter for re-aim recency
     READ_STREAM_TRACKER Streams[READ_STREAM_TRACKER_COUNT]; // Per-stream sequentiality state
 } FCB, * PFCB;
 
@@ -342,9 +342,7 @@ CHECK_PADDING_BETWEEN(FCB, RefCount, OnReapList);
 CHECK_PADDING_BETWEEN(FCB, OnReapList, TableBucketIndex);
 CHECK_PADDING_BETWEEN(FCB, TableBucketIndex, FileLock);
 CHECK_PADDING_BETWEEN(FCB, FileLock, LazyWriteThread);
-CHECK_PADDING_BETWEEN(FCB, LazyWriteThread, PrefetchRing);
-CHECK_PADDING_BETWEEN(FCB, PrefetchRing, StreamClock);
-CHECK_PADDING_BETWEEN(FCB, StreamClock, Streams);
+CHECK_PADDING_BETWEEN(FCB, LazyWriteThread, Streams);
 CHECK_PADDING_END(FCB, Streams);
 
 //

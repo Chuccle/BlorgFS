@@ -15,9 +15,9 @@
 //    create/non-cached-read counters map cleanly onto what it does.
 //
 //  - The driver-specific one. IOCTL_BLORGFS_QUERY_STATISTICS, carrying
-//    the counters no standard type has a field for: prefetch ring
-//    hit/park/miss, chunk-fetch latency distribution, connection pool
-//    behaviour, TLS record throughput. This is what turns "playback
+//    the counters no standard type has a field for: read dispatch mix,
+//    chunk-fetch latency distribution, connection pool behaviour, TLS
+//    record throughput. This is what turns "playback
 //    stutters" into a number, and what the perf harness samples.
 //
 // Storage, and why it is shaped this way
@@ -145,21 +145,8 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ReadsSequential;             // started exactly where a previous read ended
     ULONG64 ReadsEndOfFile;              // rejected at or past EOF
 
-    // --- prefetch ring -------------------------------------------------
-    ULONG64 PrefetchRingsArmed;
-    ULONG64 PrefetchRingsRefused;        // arm refused; only the unload drain does this now, so a nonzero value means an arm raced dismount
-    ULONG64 PrefetchHits;                // chunk already resident, copy only
-    ULONG64 PrefetchParks;               // chunk in flight, read parked on it
-    ULONG64 PrefetchMisses;              // no coverage, caller fetches directly
-    ULONG64 PrefetchReaims;              // pipeline re-pointed after a seek
-    ULONG64 PrefetchDepthGrowths;        // a park admitted one more slot
-    ULONG64 PrefetchFetchesIssued;
-    ULONG64 PrefetchFetchesFailed;
-    ULONG64 PrefetchStaleDiscards;       // completed under a superseded generation
-    ULONG64 PrefetchBytesServed;         // delivered out of ring buffers
-
     // --- HTTP chunk fetches --------------------------------------------
-    ULONG64 FetchesIssued;               // direct (non-prefetch) chunk fetches
+    ULONG64 FetchesIssued;               // every range GET the driver makes
     ULONG64 FetchesCompleted;
     ULONG64 FetchesFailed;
     ULONG64 FetchBytes;
@@ -197,108 +184,6 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 TlsRecordsDecrypted;
     ULONG64 TlsBytesDecrypted;
     ULONG64 TlsBulkReceives;             // wire receives feeding the accumulator
-
-    //
-    // Appended out of its topical group on purpose: this block is
-    // append-only (see the query handler in DevIoCtrl.c), so a new counter
-    // goes at the end even when it belongs with the prefetch counters
-    // above.
-    //
-    // Reads that missed the ring while some slot's range did cover them.
-    // The name predates the lookup becoming a containment test and now
-    // overstates what it finds: the miss scan and the serve scan share
-    // PrefetchSlotCovers, so a covered-but-unserved read is almost always
-    // one thing -- the slot is in flight and another reader is already
-    // parked on it, one waiter per slot.
-    //
-    // That makes this a contention counter, not a coverage one: two
-    // readers on the same file chasing the same chunk, the second paying a
-    // full round trip for bytes already on the wire. Read it against
-    // PrefetchParks. See PrefetchCountNearMiss in Prefetch.c.
-    //
-    ULONG64 PrefetchNearMisses;
-
-    //
-    // Re-aims the idle test asked for and the pipeline-window test vetoed,
-    // because the read being served still fell inside the range the ring
-    // was actively fetching. Re-aiming there is pure loss: it bumps
-    // Generation, discards in-flight chunks, and so makes the next reads
-    // miss as well.
-    //
-    // The idle test alone cannot see this. It is gated on
-    // streak >= PREFETCH_ARM_STREAK and a real seek resets the streak to 1,
-    // so every re-aim fires on a currently-sequential stream -- either the
-    // second read after a seek, where the ring genuinely points elsewhere,
-    // or a reader that merely outran its own pipeline. Measured against the
-    // live backend before the window test existed, 234 of 234 re-aims were
-    // the second kind.
-    //
-    // This counts the fix doing its job, so it is expected to be nonzero;
-    // what must stay at zero is wasted work, which shows up as
-    // PrefetchStaleDiscards and as fetched bytes exceeding file size.
-    //
-    ULONG64 PrefetchReaimsSuppressed;
-
-    //
-    // Ring lifetime. Detached counts rings whose attachment reference was
-    // dropped; Freed counts rings whose reference count then reached zero
-    // and handed a slot back to the driver-wide budget.
-    //
-    // They exist because the budget was observed sitting at its cap while
-    // every later stream was refused, and no existing counter could say
-    // whether rings were never released or merely released late. They are
-    // released late: the answer only showed up as Detached and Freed rising
-    // together once a workload finished, because a ring outlives the handle
-    // by however long the cache manager and MM keep the file object.
-    //
-    // Read them against PrefetchRingsArmed and the live gauge. Armed well
-    // ahead of Freed with the gauge pinned at the cap is budget starvation,
-    // and it is invisible without these two.
-    //
-    ULONG64 PrefetchRingsDetached;
-    ULONG64 PrefetchRingsFreed;
-
-    //
-    // Times a pump asked the chunk pool for transfer memory and the
-    // driver-wide chunk budget had none left to give.
-    //
-    // This is the counter that replaces PrefetchRingsRefused as the
-    // pressure signal, and it means something materially different. A
-    // refusal cost a stream its whole pipeline; a starvation costs one
-    // slot of depth on one pump pass, and the next pass retries. So a
-    // nonzero value here is not a fault -- it is the budget doing its job
-    // -- and only a rate high enough to keep rings pinned near
-    // PREFETCH_MIN_DEPTH indicates the cap is genuinely too low for the
-    // offered concurrency.
-    //
-    ULONG64 PrefetchChunkStarvations;
-
-    //
-    // Hits that consumed only part of their slot and left it Ready for the
-    // next read. Against PrefetchHits this says how many reads each fetched
-    // chunk is serving: near zero means chunks are still being retired
-    // after one read and most of every fetch is being thrown away.
-    //
-    ULONG64 PrefetchPartialServes;
-
-    //
-    // Misses whose range began inside a Ready slot and ran past its end.
-    // The ring held the bytes, split across two slots, and the containment
-    // lookup could not express that -- so the read paid a full round trip
-    // and the tail of the first slot was never read.
-    //
-    ULONG64 PrefetchStraddleMisses;
-
-    //
-    // Chunks that held fetched data and were thrown away by a re-aim.
-    // A re-aim drops every Ready slot, on the reasoning that a seek makes
-    // the coverage useless -- but a small forward jump leaves chunks ahead
-    // of the new aim point that the reader is about to want. At 512 KB a
-    // chunk, this counter times PREFETCH_CHUNK is wire bandwidth spent and
-    // discarded, and it is the largest unexplained term in the fetched vs
-    // delivered gap.
-    //
-    ULONG64 PrefetchReaimDiscardedChunks;
 
     //
     // A file-read fetch split at the moment its response headers land:
@@ -365,26 +250,7 @@ typedef struct _BLORGFS_STATISTICS_GLOBAL
 {
     LONG64 FetchesActive;
     LONG64 FetchesActivePeak;
-    LONG64 PrefetchRingsLive;
 
-    //
-    // Chunks the prefetcher has committed, owned and pooled alike -- its
-    // actual transfer footprint, capped by PrefetchMaxChunks.
-    // PrefetchRingsLive no longer implies a footprint (an idle ring holds
-    // no chunks), so this is the number to read for memory, and the two
-    // together say how widely the pool is being shared out.
-    //
-    // NOT maintained here like the gauges around it, and reading it off
-    // BlorgStatisticsGauges in driver or test code gets a permanent zero.
-    // The prefetcher already counts chunks to enforce its budget, so this
-    // is filled from that counter at snapshot time; call
-    // BlorgPrefetchChunksLive() for a live value.
-    //
-    // Left as the prefetcher's own counter rather than folded in here
-    // because it is an allocation budget, not a statistic: a statistics
-    // reset must not be able to corrupt it.
-    //
-    LONG64 PrefetchChunksLive;
 } BLORGFS_STATISTICS_GLOBAL, * PBLORGFS_STATISTICS_GLOBAL;
 
 //
@@ -393,7 +259,7 @@ typedef struct _BLORGFS_STATISTICS_GLOBAL
 // Version is checked by the driver so a stale harness fails loudly
 // instead of misreading a struct whose tail moved.
 //
-#define BLORGFS_STATISTICS_VERSION 4
+#define BLORGFS_STATISTICS_VERSION 5
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {
@@ -466,7 +332,7 @@ PBLORGFS_STATISTICS BlorgStatisticsForCurrentProcessor(VOID);
 //
 // Bumps one counter on the current processor's block by Value. The
 // Field argument is the BLORGFS_STATISTICS member name, so a site reads
-// as BLORGFS_STAT_ADD(PrefetchHits, 1) with no pointer bookkeeping and
+// as BLORGFS_STAT_ADD(FetchBytes, n) with no pointer bookkeeping and
 // no cost when the table failed to allocate.
 //
 #define BLORGFS_STAT_ADD(Field, Value)                            \

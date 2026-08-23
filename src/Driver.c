@@ -431,8 +431,6 @@ static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObj
 void DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
-
-    BlorgPrefetchDrain();
     BlorgDrainHttpClient();
 
     ObDereferenceObject(global.FileSystemDeviceObject);
@@ -629,16 +627,6 @@ static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNIC
         global.TlsEnabled = (0 != tlsEnabledValue);
     }
 
-    ULONG prefetchEnabledValue = 0;
-
-    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"PrefetchEnabled", REG_DWORD, &prefetchEnabledValue, sizeof(prefetchEnabledValue), &actualSize)))
-    {
-        global.PrefetchDisabled = (0 == prefetchEnabledValue);
-    }
-    else
-    {
-        global.PrefetchDisabled = TRUE;
-    }
 
     UCHAR pinValue[TLS_HASH_LEN];
 
@@ -828,8 +816,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     ExInitializeDriverRuntime(0);
 
     BlorgPathCacheInit();
-
-    BlorgPrefetchInitialize();
 
     NTSTATUS statisticsInitStatus = BlorgStatisticsInitialize();
     if (!NT_SUCCESS(statisticsInitStatus))

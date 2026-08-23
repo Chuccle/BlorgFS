@@ -1183,7 +1183,7 @@ static NTSTATUS HttpEncryptRequestRecord(HTTP_CONTEXT* Ctx, PCHAR* SendBufferOut
 // HttpDispatch (success) and HttpComplete (failure/teardown).
 //
 //  - HttpOpFileRead never bounces: no deserialize step, and its
-//    callbacks (BlorgReadComplete, PrefetchFetchComplete) are contracted
+//    callbacks (BlorgReadComplete) are contracted
 //    DISPATCH-safe. This is the read hot path -- no work-item queue, no
 //    context switch per chunk.
 //
@@ -2669,7 +2669,7 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 // as %wZ: UrlEncodePathToAnsi's RtlUnicodeStringToUTF8String is itself
 // paged-code, so no request may ever be issued above PASSIVE. Today every
 // issue path (create/dir-control/read FSP workers, prefetch issuance)
-// already is, and Prefetch.h's issuance rule names this conversion as the
+// already is, and the driver's issuance rule names this conversion as the
 // reason. What changed is only that the format string no longer adds a
 // second reason of its own.
 //

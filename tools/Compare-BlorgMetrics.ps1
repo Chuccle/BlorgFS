@@ -10,7 +10,7 @@
       Invariants (correctness). Relationships between counters that must
       hold in any healthy run, checked on the CURRENT report alone -- no
       baseline needed. These catch accounting bugs and lost work that a
-      throughput number would never reveal: a prefetch outcome that is
+      throughput number would never reveal: a read outcome that is
       neither hit, park, nor miss means a read went somewhere unaccounted
       for, and a fetch that was issued but never completed or failed means
       one is stuck or was dropped.
@@ -44,7 +44,7 @@
     number here would be false precision.
 
 .PARAMETER RateTolerancePoints
-    Allowed drop in a percentage-valued metric (prefetch hit rate,
+    Allowed drop in a percentage-valued metric (connection reuse rate,
     connection reuse rate, path cache hit rate), in percentage points.
 
 .EXAMPLE
@@ -107,25 +107,19 @@ Write-Host "workload: $($cur['Workload'])" -ForegroundColor Cyan
 # ---------------------------------------------------------------- invariants
 
 #
-# Every paging read served inline must land in exactly one prefetch
-# outcome. The driver counts hits and parks inside the prefetcher and the
-# miss at the single fallback site in BlorgVolumeRead, so the three are
-# built to sum to ReadsPagingInline; if they do not, a read took a path
-# nobody is accounting for.
+# Every inline paging read issues exactly one direct fetch now that the
+# prefetch ring is gone, so ReadsPagingInline can never exceed FetchesIssued.
+# The reverse is allowed: posted non-paging reads issue fetches too.
 #
 $paging = Get-Num $cur 'ReadsPagingInline'
-$hits = Get-Num $cur 'PrefetchHits'
-$parks = Get-Num $cur 'PrefetchParks'
-$misses = Get-Num $cur 'PrefetchMisses'
+$issuedForPaging = Get-Num $cur 'FetchesIssued'
 
-if ($null -ne $paging -and $null -ne $hits -and $null -ne $parks -and $null -ne $misses) {
-    $sum = $hits + $parks + $misses
-
-    if ($paging -gt 0 -and $sum -ne $paging) {
-        $failures.Add("INVARIANT prefetch outcomes $sum != ReadsPagingInline $paging (unaccounted reads)")
+if ($null -ne $paging -and $null -ne $issuedForPaging) {
+    if ($paging -gt $issuedForPaging) {
+        $failures.Add("INVARIANT ReadsPagingInline $paging exceeds FetchesIssued $issuedForPaging (a paging read fetched nothing)")
     }
     else {
-        $notes.Add("invariant ok: prefetch outcomes sum to ReadsPagingInline ($paging)")
+        $notes.Add("invariant ok: every inline paging read has a fetch ($paging <= $issuedForPaging)")
     }
 }
 
@@ -138,22 +132,13 @@ if ($null -ne $paging -and $null -ne $hits -and $null -ne $parks -and $null -ne 
 $issued = Get-Num $cur 'FetchesIssued'
 $completed = Get-Num $cur 'FetchesCompleted'
 $failed = Get-Num $cur 'FetchesFailed'
-$prefetchIssued = Get-Num $cur 'PrefetchFetchesIssued'
-$prefetchFailed = Get-Num $cur 'PrefetchFetchesFailed'
-
 if ($null -ne $issued -and $null -ne $completed -and $null -ne $failed) {
     #
-    # FetchesCompleted is raised by both the direct path and the prefetch
-    # path, so the accounting closes across both issuers.
+    # One issuer since the prefetch ring was removed, so the accounting is
+    # a straight comparison.
     #
-    $prefetchIssuedValue = 0.0
-    if ($null -ne $prefetchIssued) { $prefetchIssuedValue = $prefetchIssued }
-
-    $prefetchFailedValue = 0.0
-    if ($null -ne $prefetchFailed) { $prefetchFailedValue = $prefetchFailed }
-
-    $totalIssued = $issued + $prefetchIssuedValue
-    $totalDone = $completed + $failed + $prefetchFailedValue
+    $totalIssued = $issued
+    $totalDone = $completed + $failed
 
     if ($totalDone -gt $totalIssued) {
         $failures.Add("INVARIANT fetch completions $totalDone exceed issues $totalIssued (double-counted completion)")
@@ -173,7 +158,6 @@ if ($null -ne $issued -and $null -ne $completed -and $null -ne $failed) {
 #
 $errorCounters = @(
     'FetchesFailed',
-    'PrefetchFetchesFailed',
     'DirInfoFailures',
     'FileInfoFailures',
     'ConnectionsFailed',
@@ -219,7 +203,7 @@ else {
     }
 
     # Higher is better, already a percentage -- compared in points.
-    foreach ($metric in @('PrefetchHitRate', 'ConnectionReuseRate', 'PathCacheHitRate')) {
+    foreach ($metric in @('ConnectionReuseRate', 'PathCacheHitRate')) {
         $b = Get-Num $base $metric
         $c = Get-Num $cur $metric
 

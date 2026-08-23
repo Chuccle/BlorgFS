@@ -116,7 +116,6 @@
     <ClCompile Include="WskModel.c" />
     <ClCompile Include="StructsModel.c" />
     <ClCompile Include="NoStatisticsStub.c" />
-    <ClCompile Include="NoPrefetchStub.c" />
     <ClCompile Include="NoClientStub.c" />
     <ClCompile Include="..\..\src\Socket.c" />
     <ClCompile Include="..\..\src\Tls.c" />

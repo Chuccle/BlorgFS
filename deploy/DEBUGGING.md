@@ -207,14 +207,13 @@ Live KD state while wedged:
                                    AttachedDevice (Upper) ... \FileSystem\FltMgr
 !devobj <BlorgDrive DO>         -> RefCount 0, DOE_UNLOAD_PENDING
 dt nt!_VPB <vpb>                -> Flags 1 (VPB_MOUNTED), ReferenceCount 0
-x BlorgFS!PrefetchRingCount     -> 0n1     (standing reference, never released)
 x BlorgFS!HttpActiveRequests    -> 0n1     (standing reference, never released)
 ```
 
 Both drain gates still reading their initial standing reference of 1 proves
 `DriverUnload` **was never entered** — each drain releases that reference as
 its first action. That rules out the two unbounded `KeWaitForSingleObject`
-drains in `Prefetch.c`/`Client.c`, which are the intuitive suspects and the
+drains in `Client.c`, which is the intuitive suspect and the
 wrong ones.
 
 The actual chain:

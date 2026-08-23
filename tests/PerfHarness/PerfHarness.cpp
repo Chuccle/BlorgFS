@@ -5,8 +5,8 @@
 // the driver's own counters say happened underneath it (Statistics.h).
 // The point is to replace "playback stutters" and "that felt faster" with
 // numbers that identify *which* stage is the bottleneck -- a workload
-// timer alone cannot tell a slow backend from a prefetch pipeline that
-// never armed, and those two want opposite fixes.
+// timer alone cannot tell a slow backend from a read path that never
+// reached it, and those two want opposite fixes.
 //
 // Two surfaces are read:
 //  - The standard FSCTL_FILESYSTEM_GET_STATISTICS_EX on the volume
@@ -41,10 +41,9 @@
 #include "..\..\src\Statistics.h"
 
 //
-// Workload read size. Deliberately not PREFETCH_CHUNK: the harness issues
-// what an application issues and lets Cc cluster it into whatever paging
-// reads the driver actually sees, because pinning the request size to the
-// driver's internal chunk would measure a path no real reader takes.
+// Workload read size. Deliberately what an application issues, letting Cc
+// cluster it into whatever paging reads the driver actually sees -- pinning
+// it to any internal size would measure a path no real reader takes.
 //
 static const DWORD kWorkloadReadSize = 64 * 1024;
 
@@ -375,32 +374,6 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    end-of-file           %12llu\n", t.ReadsEndOfFile);
     printf("    user bytes            %12llu\n", t.UserFileReadBytes);
     printf("    non-cached bytes      %12llu\n", t.NonCachedReadBytes);
-
-    const unsigned long long served = t.PrefetchHits + t.PrefetchParks + t.PrefetchMisses;
-
-    printf("\n  prefetch ring\n");
-    printf("    armed / refused       %12llu / %llu\n", t.PrefetchRingsArmed, t.PrefetchRingsRefused);
-    printf("    detached / freed      %12llu / %llu\n", t.PrefetchRingsDetached, t.PrefetchRingsFreed);
-    printf("    live now              %12lld\n", stats.Gauges.PrefetchRingsLive);
-    printf("    chunks live           %12lld\n", stats.Gauges.PrefetchChunksLive);
-    printf("    chunk starvations     %12llu  (pump ran shallow; not a refusal)\n", t.PrefetchChunkStarvations);
-    printf("    partial serves        %12llu  (hit left the slot Ready for the next read)\n", t.PrefetchPartialServes);
-    printf("    hit                   %12llu  (%.1f%%)\n", t.PrefetchHits, SafeRatio(t.PrefetchHits, served));
-    printf("    park                  %12llu  (%.1f%%)\n", t.PrefetchParks, SafeRatio(t.PrefetchParks, served));
-    printf("    miss                  %12llu  (%.1f%%)\n", t.PrefetchMisses, SafeRatio(t.PrefetchMisses, served));
-    printf("      of which near       %12llu  (%.1f%% of miss, slot covered the range)\n",
-        t.PrefetchNearMisses, SafeRatio(t.PrefetchNearMisses, t.PrefetchMisses));
-    printf("      of which straddle   %12llu  (%.1f%% of miss, began in a slot, ran past its end)\n",
-        t.PrefetchStraddleMisses, SafeRatio(t.PrefetchStraddleMisses, t.PrefetchMisses));
-    printf("    re-aims               %12llu\n", t.PrefetchReaims);
-    printf("      chunks discarded    %12llu  (fetched data thrown away by a re-aim)\n",
-        t.PrefetchReaimDiscardedChunks);
-    printf("      suppressed (in-window) %9llu  (reader had outrun the pipeline; not re-aimed)\n",
-        t.PrefetchReaimsSuppressed);
-    printf("    depth growths         %12llu\n", t.PrefetchDepthGrowths);
-    printf("    fetches issued/failed %12llu / %llu\n", t.PrefetchFetchesIssued, t.PrefetchFetchesFailed);
-    printf("    stale discards        %12llu\n", t.PrefetchStaleDiscards);
-    printf("    bytes served          %12llu\n", t.PrefetchBytesServed);
 
     printf("\n  chunk fetches\n");
     printf("    direct issued         %12llu\n", t.FetchesIssued);
@@ -1192,7 +1165,6 @@ static bool WriteReport(
     const BLORGFS_STATISTICS& t = stats.Totals;
 
     const double megabytes = static_cast<double>(bytes) / (1024.0 * 1024.0);
-    const unsigned long long served = t.PrefetchHits + t.PrefetchParks + t.PrefetchMisses;
     const unsigned long long acquires = t.ConnectionsPooled + t.ConnectionsFresh;
 
     LatencyPercentiles p = ComputePercentiles(t.FetchLatencyBuckets);
@@ -1214,25 +1186,6 @@ static bool WriteReport(
     fprintf(f, "NonCachedReads=%llu\n", t.NonCachedReads);
     fprintf(f, "NonCachedReadBytes=%llu\n", t.NonCachedReadBytes);
 
-    fprintf(f, "PrefetchRingsArmed=%llu\n", t.PrefetchRingsArmed);
-    fprintf(f, "PrefetchRingsRefused=%llu\n", t.PrefetchRingsRefused);
-    fprintf(f, "PrefetchRingsDetached=%llu\n", t.PrefetchRingsDetached);
-    fprintf(f, "PrefetchRingsFreed=%llu\n", t.PrefetchRingsFreed);
-    fprintf(f, "PrefetchHits=%llu\n", t.PrefetchHits);
-    fprintf(f, "PrefetchParks=%llu\n", t.PrefetchParks);
-    fprintf(f, "PrefetchMisses=%llu\n", t.PrefetchMisses);
-    fprintf(f, "PrefetchServed=%llu\n", served);
-    fprintf(f, "PrefetchHitRate=%.4f\n", SafeRatio(t.PrefetchHits, served));
-    fprintf(f, "PrefetchParkRate=%.4f\n", SafeRatio(t.PrefetchParks, served));
-    fprintf(f, "PrefetchMissRate=%.4f\n", SafeRatio(t.PrefetchMisses, served));
-    fprintf(f, "PrefetchNearMisses=%llu\n", t.PrefetchNearMisses);
-    fprintf(f, "PrefetchReaims=%llu\n", t.PrefetchReaims);
-    fprintf(f, "PrefetchReaimsSuppressed=%llu\n", t.PrefetchReaimsSuppressed);
-    fprintf(f, "PrefetchDepthGrowths=%llu\n", t.PrefetchDepthGrowths);
-    fprintf(f, "PrefetchFetchesIssued=%llu\n", t.PrefetchFetchesIssued);
-    fprintf(f, "PrefetchFetchesFailed=%llu\n", t.PrefetchFetchesFailed);
-    fprintf(f, "PrefetchStaleDiscards=%llu\n", t.PrefetchStaleDiscards);
-    fprintf(f, "PrefetchBytesServed=%llu\n", t.PrefetchBytesServed);
 
     fprintf(f, "FetchesIssued=%llu\n", t.FetchesIssued);
     fprintf(f, "FetchesCompleted=%llu\n", t.FetchesCompleted);
