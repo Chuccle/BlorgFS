@@ -269,7 +269,7 @@ VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
     Out->Gauges.FetchesActive = ReadNoFence64(&BlorgStatisticsGauges.FetchesActive);
     Out->Gauges.FetchesActivePeak = ReadNoFence64(&BlorgStatisticsGauges.FetchesActivePeak);
     Out->Gauges.PrefetchRingsLive = ReadNoFence64(&BlorgStatisticsGauges.PrefetchRingsLive);
-    Out->Gauges.PrefetchChunksLive = ReadNoFence64(&BlorgStatisticsGauges.PrefetchChunksLive);
+    Out->Gauges.PrefetchChunksLive = BlorgPrefetchChunksLive();
 }
 
 //

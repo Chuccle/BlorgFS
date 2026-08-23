@@ -44,7 +44,6 @@ int  PrefetchModelCompleteNextFetch(NTSTATUS Status);
 int  PrefetchModelCompleteAllFetches(NTSTATUS Status);
 int  PrefetchModelSettle(NTSTATUS Status);
 VOID PrefetchModelReset(VOID);
-VOID PrefetchModelSetFillByte(unsigned char Value);
 
 //
 // The single counter block these targets use in place of the driver's
@@ -1127,8 +1126,8 @@ TEST_F(PrefetchKernelTest, EveryStreamStillArmsWhenTheChunkPoolIsExhausted)
         << "the pool was never actually exhausted, so this test proved nothing -- "
            "raise kFiles above the largest budget tier";
 
-    EXPECT_LE(BlorgStatisticsGauges.PrefetchChunksLive, kLargestTier)
-        << "chunks live reached " << BlorgStatisticsGauges.PrefetchChunksLive
+    EXPECT_LE(BlorgPrefetchChunksLive(), kLargestTier)
+        << "chunks live reached " << BlorgPrefetchChunksLive()
         << " with " << kFiles << " streams demanding at once, above the largest "
            "budget tier (" << kLargestTier << ") -- the budget is not bounding "
            "allocation, so concurrency translates directly into non-paged pool";

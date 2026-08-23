@@ -55,7 +55,7 @@ static const ULONG MAX_SOCKET_POOL_SIZE = 32;
 // progress on a full buffer.
 //
 // Tiered by machine size, the same coarse MmQuerySystemSize tiering the
-// prefetch ring budget uses: the worst case is this times
+// prefetch chunk budget uses: the worst case is this times
 // MAX_SOCKET_POOL_SIZE of NonPagedPoolNx, 8 MB at the large tier, and a
 // small machine has no business reserving that to save receive IRPs.
 //

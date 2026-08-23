@@ -137,7 +137,6 @@ static PREFETCH_CHUNK_BLOCK* PrefetchChunkAcquire(VOID)
             {
                 MmBuildMdlForNonPagedPool(chunk->Mdl);
 
-                BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.PrefetchChunksLive, NULL);
                 return chunk;
             }
 
@@ -196,8 +195,21 @@ VOID BlorgPrefetchReleaseChunkPool(VOID)
         ExFreePool(chunk);
 
         InterlockedDecrement(&PrefetchChunkCount);
-        BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.PrefetchChunksLive);
     }
+}
+
+//
+// Chunks in existence, owned and pooled alike -- the driver's prefetch
+// transfer footprint, for the statistics snapshot.
+//
+// Read off the budget counter rather than maintained as a separate gauge.
+// The two would be counting the same quantity by two mechanisms, which is
+// a thing to keep in sync at every allocation and every free and a thing
+// to be wrong about exactly when the number matters.
+//
+LONG BlorgPrefetchChunksLive(VOID)
+{
+    return ReadNoFence(&PrefetchChunkCount);
 }
 
 //

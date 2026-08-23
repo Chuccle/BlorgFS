@@ -82,9 +82,10 @@ function Invoke-GuestPowerShell([string]$Command) {
 # A guest reboot, not a service restart, and not just a counter reset.
 #
 # PerfHarness resets the statistics at the start of every workload, but the
-# ring budget is live driver state that a statistics reset does not touch --
-# so without a real reset each run inherits the previous run's exhausted
-# budget and every number after the first measures starvation rather than the
+# chunk pool and the rings still attached to cached FCBs are live driver state
+# that a statistics reset does not touch -- so without a real reset each run
+# inherits the previous run's warmed pool and its still-open files, and every
+# number after the first measures that inheritance rather than the
 # configuration under test.
 #
 # `sc stop` cannot provide that reset: it wedges in STOP_PENDING because

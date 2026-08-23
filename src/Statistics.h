@@ -287,12 +287,21 @@ typedef struct _BLORGFS_STATISTICS_GLOBAL
     LONG64 PrefetchRingsLive;
 
     //
-    // Chunks allocated from the system and not yet returned to it, owned
-    // and pooled alike -- the driver's actual prefetch transfer footprint,
-    // capped by PrefetchMaxChunks. PrefetchRingsLive no longer implies a
-    // footprint (an idle ring holds no chunks), so this is the gauge to
-    // read for memory, and the two together are the read for how far the
-    // pool is being shared out.
+    // Chunks the prefetcher has committed, owned and pooled alike -- its
+    // actual transfer footprint, capped by PrefetchMaxChunks.
+    // PrefetchRingsLive no longer implies a footprint (an idle ring holds
+    // no chunks), so this is the number to read for memory, and the two
+    // together say how widely the pool is being shared out.
+    //
+    // NOT maintained here like the gauges around it, and reading it off
+    // BlorgStatisticsGauges in driver or test code gets a permanent zero.
+    // The prefetcher already counts chunks to enforce its budget, so this
+    // is filled from that counter at snapshot time; call
+    // BlorgPrefetchChunksLive() for a live value.
+    //
+    // Left as the prefetcher's own counter rather than folded in here
+    // because it is an allocation budget, not a statistic: a statistics
+    // reset must not be able to corrupt it.
     //
     LONG64 PrefetchChunksLive;
 } BLORGFS_STATISTICS_GLOBAL, * PBLORGFS_STATISTICS_GLOBAL;

@@ -427,3 +427,9 @@ VOID BlorgPrefetchDrain(VOID);
 // point, since it reclaims only chunks no slot owns.
 //
 VOID BlorgPrefetchReleaseChunkPool(VOID);
+
+//
+// Chunks the prefetcher currently has committed, owned and pooled alike.
+// Read by the statistics snapshot; see BlorgPrefetchChunksLive.
+//
+LONG BlorgPrefetchChunksLive(VOID);
