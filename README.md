@@ -291,11 +291,13 @@ experiment is finished and its evidence is in git history. Nothing in this
 section is implemented yet.
 
 **It lives in the driver, as a module.** A usermode helper owning the store
-was the other candidate, and it was attractive for exactly one reason: it
-makes the re-entrancy problem disappear by construction rather than by
-discipline. The decision is to keep it in kernel, so that problem has to be
-answered directly, and the section below answers it. Anything that cannot
-meet those rules does not go in.
+was the other candidate, on the argument that it removed a re-entrancy
+problem by construction. That argument was weaker than it looked: keeping
+the store off this volume removes the recursion just as completely, since
+nothing in NTFS's completion path calls back into this driver. What is left
+is deadlock through the memory manager, which is a discipline problem the
+helper would not have solved either -- it is the same problem every
+filesystem has when it touches another one.
 
 ### Why this, and not more lookahead
 
@@ -351,34 +353,49 @@ returns `STATUS_PENDING` and is completed later from a network completion
 The reader never waits on the cache in either direction. A miss costs
 nothing it did not already cost, and a write-behind failure is invisible.
 
-### Re-entrancy: the hazard this design has to answer
+### What the store being off-volume does, and does not, buy
 
-The driver calls into **another filesystem from inside its own read path**.
-That is the part to get right, and it is why the usermode-helper alternative
-was on the table at all.
+**The store must not live on this volume**, checked at open by comparing the
+target's volume device object with ours. That single rule is what removes
+*recursion*: with the store on NTFS, nothing in the completion path of a
+`ZwReadFile` calls back into BlorgFS. There is no cycle in the call graph,
+and the usermode-helper alternative bought nothing here that this check does
+not.
 
-- **No cache I/O on the calling thread, ever.** All `ZwReadFile`/
-  `ZwWriteFile` happen on the module's own PASSIVE workers. The dispatch
-  path only ever enqueues.
-- **Open the store `FILE_NO_INTERMEDIATE_BUFFERING`.** Without it the store
-  goes through Cc, and cache-manager pressure from *our* store can drive
-  trimming that re-enters this driver through the cache callbacks. It also
-  stops double-caching data Cc already holds for our volume. The cost is
-  sector alignment, which a fixed-block store gives for free.
-- **Never hold an FCB resource across a cache call.** Enqueue, release,
-  return pending.
-- **The store must not live on this volume.** Enforced at open by rejecting
-  a path whose volume device object is ours.
-- **Recursion is bounded even when it happens**, because this volume is
-  read-only: MM never writes back to us, so the worst it can do is trim our
-  pages through the cache callbacks, which are already wired
-  (`CacheManager.c`).
+What is left is not recursion, and calling it that obscures the actual
+risks. Two remain, both mediated by memory manager:
 
-**IRQL discipline** mirrors the removed prefetcher's, which is the one thing
-worth keeping from it: `ZwReadFile`/`ZwWriteFile` are PASSIVE-only, network
-completions run at `<= DISPATCH`, so an admit queued from a completion goes
-through a work item to reach PASSIVE. That rule was load-bearing before and
-is load-bearing again.
+- **Deadlock through MM, not a nested call.** If a thread holds an FCB
+  resource and, inside a cache read, memory pressure makes MM trim that
+  file's pages, MM calls this driver's `AcquireForLazyWrite` and blocks on
+  the resource the thread is still holding. So: **never hold an FCB resource
+  across a cache call.** Enqueue, release, return pending.
+- **The paging path is the dangerous one.** A paging read can originate from
+  MM while it is already short of memory. Dependent I/O issued from that
+  thread can wait on the reclaim that is waiting on us. So: **no cache I/O
+  on the calling thread** -- all `ZwReadFile`/`ZwWriteFile` happen on the
+  module's own PASSIVE workers, and the dispatch path only ever enqueues.
+
+That second rule costs nothing the design was not already paying. The IRP is
+completed asynchronously either way, so moving the I/O to a worker changes
+which thread finishes it and nothing else.
+
+**IRQL** is a hard constraint rather than a judgement call: `ZwReadFile` and
+`ZwWriteFile` are PASSIVE-only, while network completions run at
+`<= DISPATCH`, so an admit queued from a completion reaches PASSIVE through
+a work item. That is the same rule the removed prefetcher lived by, and the
+one thing from it worth keeping.
+
+**Open the store `FILE_NO_INTERMEDIATE_BUFFERING`**, for two reasons that
+are worth stating accurately. It avoids double-caching bytes Cc already
+holds for this volume, and it keeps the store from adding cache-manager
+memory pressure at exactly the moment the driver is serving a paging read.
+The cost is sector alignment, which a fixed-block store gives for free.
+
+An earlier draft of this section justified the flag by claiming that
+cache-manager pressure from our own store could re-enter this driver through
+its own cache callbacks. That is not true for a store on another volume, and
+the flag is worth setting anyway for the two reasons above.
 
 ### Store layout, index and recovery
 
