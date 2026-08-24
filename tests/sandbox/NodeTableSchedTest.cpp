@@ -320,6 +320,16 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
     // true lock-granularity space is larger than the 7535 first reported;
     // this is the scheduler becoming more correct; the cap follows.
     //
+    // Corrected again 2026-08-24, in the other direction: 53676 down to
+    // 26718. The model's ERESOURCE acquire claimed the resource on the
+    // strength of its wait having returned, without re-testing, so two
+    // threads could leave the wait both believing they held it
+    // (NtShimSync.c). Roughly half the schedules counted here were reached
+    // only through that, and the kernel cannot produce them. Nothing valid
+    // was lost -- the re-test blocks a thread only when the resource is
+    // genuinely held, which is what the kernel does -- so this is a smaller
+    // but honest space. The cap stays where it is; it is a safety net.
+    //
     KM_SCHED_RESULT result =
         KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 100000);
 
@@ -406,6 +416,317 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNodeAtomicSample)
 
     printf("[  sched   ] (atomic sample, NOT exhaustive) %d interleavings, max depth %d\n",
         result.Schedules, result.MaxDepth);
+}
+
+//
+// Revival: the second way a node is lifted off zero, and the one with no
+// pin anywhere in it.
+//
+// The proof above covers the warm path, where BlorgNodeTableLookupPin
+// hands back a pinned node and the pin is what the worker checks. The cold
+// path does not go through the table at all. BlorgVolumeCreate takes the
+// VCB resource exclusive, finds a node with BlorgSearchByPath, and opens
+// it -- and if that node is idle, the open is what takes RefCount from 0
+// to 1 (Create.c, the firstOpen tests). Nothing holds a pin at any point.
+//
+// So a different thing has to be doing the work here, and the claim is
+// that it is the VCB resource: NodeReapWorker acquires it before it
+// touches any node and holds it across every free in the batch, so a
+// reviver holding it exclusive cannot be racing a free. That is an
+// argument about a lock the worker takes for an unrelated reason
+// (batching), which makes it exactly the kind of load-bearing-by-accident
+// invariant worth machine-checking rather than re-reading.
+//
+struct RevivalProof
+{
+    PDEVICE_OBJECT Volume;
+    PDCB Root;
+    PFCB Vcb;
+
+    PCOMMON_CONTEXT Node;
+    UNICODE_STRING Path;
+
+    volatile long HandleHeld;
+    volatile LONG Freed;
+    volatile long Violations;
+
+    volatile long RevivalsObserved;
+    volatile long RevivedWhileQueued;
+    volatile long RetiresObserved;
+    volatile long LeftBehind;
+};
+
+//
+// The cold-open path, reduced to the part that touches lifetime. Same
+// bail-out-on-detection discipline as PinningThread: once the node is
+// gone, reading it walks poison and takes the exploration down with it.
+//
+void RevivingThread(void* Parameter)
+{
+    RevivalProof* proof = (RevivalProof*)Parameter;
+
+    FsRtlEnterFileSystem();
+    ExAcquireResourceExclusiveLite(proof->Vcb->Header.Resource, TRUE);
+
+    PCOMMON_CONTEXT found = BlorgSearchByPath(proof->Root, &proof->Path);
+
+    if (!found)
+    {
+        ExReleaseResourceLite(proof->Vcb->Header.Resource);
+        FsRtlExitFileSystem();
+        return;
+    }
+
+    if (ReadNoFence(&proof->Freed))
+    {
+        InterlockedIncrement(&proof->Violations);
+        ExReleaseResourceLite(proof->Vcb->Header.Resource);
+        FsRtlExitFileSystem();
+        return;
+    }
+
+    //
+    // Coverage, not behaviour: a schedule that revives a node the worker
+    // has not been told about yet proves nothing about the hand-off. The
+    // case this test exists for is the one where the claim is already
+    // taken and the worker is on its way.
+    //
+    if (ReadNoFence(&found->OnReapList))
+    {
+        InterlockedIncrement(&proof->RevivedWhileQueued);
+    }
+
+    InterlockedIncrement64(&found->RefCount);
+    InterlockedExchange(&proof->HandleHeld, 1);
+    InterlockedIncrement(&proof->RevivalsObserved);
+
+    BlorgNodeTablePublish(found);
+
+    ExReleaseResourceLite(proof->Vcb->Header.Resource);
+    FsRtlExitFileSystem();
+
+    KmSchedYield();
+
+    if (ReadNoFence(&proof->Freed))
+    {
+        InterlockedIncrement(&proof->Violations);
+        InterlockedExchange(&proof->HandleHeld, 0);
+        return;
+    }
+
+    //
+    // Read through the reference. A freed node reads back the guarded
+    // pool's poison, which is negative.
+    //
+    if (found->RefCount <= 0)
+    {
+        InterlockedIncrement(&proof->Violations);
+        InterlockedExchange(&proof->HandleHeld, 0);
+        return;
+    }
+
+    InterlockedExchange(&proof->HandleHeld, 0);
+
+    BlorgNodeDereference(found);
+}
+
+void RevivalRetiringThread(void* Parameter)
+{
+    RevivalProof* proof = (RevivalProof*)Parameter;
+
+    BlorgNodeDeferReap(proof->Node);
+
+    ShimDrainWorkItems();
+
+    if (ReadNoFence(&proof->Freed))
+    {
+        InterlockedIncrement(&proof->RetiresObserved);
+
+        if (ReadNoFence(&proof->HandleHeld))
+        {
+            InterlockedIncrement(&proof->Violations);
+        }
+    }
+}
+
+//
+// Unlike the pin proof above, this one builds its own volume, root and VCB
+// every replay instead of borrowing the fixture's.
+//
+// It has to, because it is the first node-table proof in which a spawned
+// thread takes the VCB resource. An ERESOURCE carries lock identity in the
+// kernel model, and a replay that ends with any residue on a resource
+// shared across replays hands the next replay a different program: the
+// reviver blocks at its first acquire where the recorded schedule says it
+// should have proceeded, and the explorer reports that -- correctly -- as
+// replay divergence rather than as the state leak it is. The pin proof
+// never noticed because nothing on its pinning side touched the resource
+// at all. This is the same per-replay ownership DispatchSchedTest uses,
+// and for the same reason.
+//
+void RevivalProofSetup(void* Parameter)
+{
+    RevivalProof* proof = (RevivalProof*)Parameter;
+
+    ShimReset();
+
+    proof->HandleHeld = 0;
+    proof->Freed = 0;
+
+    proof->Volume = StructsModelCreateVolume();
+
+    if (!proof->Volume || !NT_SUCCESS(BlorgNodeTableInit(proof->Volume)))
+    {
+        return;
+    }
+
+    UNICODE_STRING rootName = MakePath(L"\\");
+
+    BlorgCreateDCB(&proof->Root, (CSHORT)BLORGFS_ROOT_DCB_SIGNATURE, &rootName, proof->Volume);
+    BlorgCreateFCB(&proof->Vcb, (CSHORT)BLORGFS_VCB_SIGNATURE, nullptr, proof->Volume, 0);
+
+    if (!proof->Root || !proof->Vcb)
+    {
+        return;
+    }
+
+    BlorgGetVolumeDeviceExtension(proof->Volume)->RootDcb = proof->Root;
+    BlorgGetVolumeDeviceExtension(proof->Volume)->Vcb = proof->Vcb;
+
+    DIRECTORY_ENTRY_METADATA meta = {};
+    meta.Size = 4096;
+
+    PCOMMON_CONTEXT node = nullptr;
+
+    if (!NT_SUCCESS(BlorgInsertByPath(proof->Root, &proof->Path, &meta, proof->Volume, &node)) || !node)
+    {
+        return;
+    }
+
+    BlorgNodeTablePublish(node);
+
+    proof->Node = node;
+
+    ShimWatchFree(node, &proof->Freed);
+
+    KmSchedSpawn(RevivingThread, proof);
+    KmSchedSpawn(RevivalRetiringThread, proof);
+}
+
+void RevivalProofTeardown(void* Parameter)
+{
+    RevivalProof* proof = (RevivalProof*)Parameter;
+
+    ShimWatchFree(nullptr, nullptr);
+
+    if (proof->Node && !proof->Freed)
+    {
+        BlorgNodeDeferReap(proof->Node);
+    }
+
+    while (ShimDrainWorkItems() > 0)
+    {
+    }
+
+    //
+    // Asked of the tree rather than of the table, deliberately. The pin
+    // proof asks BlorgNodeTableLookupPin because its table outlives every
+    // replay and a node left in a bucket changes the next replay's program.
+    // This one builds a fresh table per replay, so the same question --
+    // did every schedule end with the node actually reaped -- is the tree's
+    // to answer, and asking it here avoids a lookup into a table that is
+    // about to be torn down anyway.
+    //
+    if (proof->Root && !IsListEmpty(&proof->Root->ChildrenList))
+    {
+        InterlockedIncrement(&proof->LeftBehind);
+    }
+
+    BlorgNodeTableTeardown();
+
+    //
+    // A schedule that declined the reap leaves the node linked under Root,
+    // and freeing Root with a child still on it would take the exploration
+    // down before LeftBehind could report it.
+    //
+    if (proof->Root)
+    {
+        while (!IsListEmpty(&proof->Root->ChildrenList))
+        {
+            PCOMMON_CONTEXT child =
+                CONTAINING_RECORD(proof->Root->ChildrenList.Flink, COMMON_CONTEXT, Links);
+
+            BlorgFreeFileContext(child, proof->Volume);
+        }
+
+        BlorgFreeFileContext(proof->Root, proof->Volume);
+        proof->Root = nullptr;
+    }
+
+    if (proof->Vcb)
+    {
+        BlorgFreeFileContext(proof->Vcb, proof->Volume);
+        proof->Vcb = nullptr;
+    }
+
+    if (proof->Volume)
+    {
+        StructsModelDestroyVolume(proof->Volume);
+        proof->Volume = nullptr;
+    }
+
+    proof->Node = nullptr;
+}
+
+class NodeTableRevivalSchedTest : public ::testing::Test
+{
+protected:
+    void TearDown() override
+    {
+        KmAssertQuiescent("NodeTableRevivalSchedTest teardown");
+    }
+};
+
+TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
+{
+    const wchar_t* path = L"\\revived.bin";
+
+    static RevivalProof proof;
+
+    proof = {};
+    proof.Path = MakePath(path);
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 200000);
+
+    EXPECT_EQ(0, proof.Violations)
+        << "an interleaving exists in which a revived node was freed under its opener";
+
+    EXPECT_EQ(0, result.Deadlocks) << "a schedule deadlocked";
+
+    EXPECT_EQ(0, result.Truncated)
+        << "a schedule hit the depth cap, so the space was not fully explored";
+
+    EXPECT_LT(result.Schedules, 200000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+
+    EXPECT_GT(proof.RevivalsObserved, 0) << "no schedule ever revived the node";
+    EXPECT_GT(proof.RetiresObserved, 0) << "no schedule ever retired the node";
+
+    //
+    // Without this the run is vacuous in the exact way this project has
+    // been caught by twice: every schedule could have revived a node the
+    // reap worker had never been told about, which is not the race.
+    //
+    EXPECT_GT(proof.RevivedWhileQueued, 0)
+        << "no schedule revived a node that was already claimed for reap";
+
+    EXPECT_EQ(0, proof.LeftBehind)
+        << "replays left nodes in the table; the next replay is a different program";
+
+    printf("[  sched   ] %d interleavings, max depth %d, %ld revivals (%ld while queued), %ld retires\n",
+        result.Schedules, result.MaxDepth, proof.RevivalsObserved,
+        proof.RevivedWhileQueued, proof.RetiresObserved);
 }
 
 } // namespace
