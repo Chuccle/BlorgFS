@@ -85,6 +85,7 @@ static int Depth = 0;
 static int RecordedDepth = 0;
 static int Truncated = 0;
 static int Deadlocked = 0;
+static int DeadlockReported = 0;
 
 static DWORD SelfSlot = TLS_OUT_OF_INDEXES;
 
@@ -165,6 +166,36 @@ static int ChooseNext(void)
         {
             if (Threads[i].State == KmSchedBlocked)
             {
+                //
+                // A deadlock count on its own says a schedule ended with
+                // every thread blocked, which is not enough to tell a real
+                // lock cycle from a modelling artifact. Report what each
+                // thread was waiting on the first time it happens; the
+                // count still carries the frequency.
+                //
+                if (!Deadlocked && !DeadlockReported)
+                {
+                    DeadlockReported = 1;
+
+                    fprintf(stderr, "\n[sched] DEADLOCK at depth %d\n", Depth);
+
+                    for (int t = 0; t < ThreadCount; ++t)
+                    {
+                        fprintf(stderr, "[sched]   thread %d state=%d waiting=%s\n",
+                            t, (int)Threads[t].State,
+                            Threads[t].Waiting ? Threads[t].Waiting : "-");
+                    }
+
+                    fprintf(stderr, "[sched]   prefix:");
+
+                    for (int d = 0; d <= Depth && d < 40; ++d)
+                    {
+                        fprintf(stderr, " %d/%d", Choice[d], Options[d]);
+                    }
+
+                    fprintf(stderr, "\n\n");
+                }
+
                 Deadlocked = 1;
                 break;
             }

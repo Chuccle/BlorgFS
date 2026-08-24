@@ -234,7 +234,30 @@ BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE Resource, BOOLEAN Wait)
 
     if (KmSchedActive())
     {
-        KmSchedWaitUntil(EresourceFreePredicate, Resource, "eresource exclusive");
+        //
+        // Re-test after waking, rather than claiming the resource on the
+        // strength of the wait having returned.
+        //
+        // KmSchedWaitUntil returns once the scheduler has marked this
+        // thread runnable, which RefreshRunnable does the moment the
+        // predicate holds -- not at the moment this thread is next
+        // scheduled. Anything else runnable can therefore run in between,
+        // and if that includes another acquirer of this resource, both
+        // threads leave the wait believing they hold it. The releases then
+        // disagree with ExclusiveOwner, SchedState settles on a value no
+        // release will return to zero, and every later exclusive waiter
+        // blocks against a resource nobody owns. That presents as a
+        // deadlock in a thread whose partner has already finished.
+        //
+        // Looping is sound here precisely because the scheduler runs one
+        // thread at a time: nothing can run between the test below and the
+        // claim that follows it.
+        //
+        while (!EresourceFreePredicate(Resource))
+        {
+            KmSchedWaitUntil(EresourceFreePredicate, Resource, "eresource exclusive");
+        }
+
         Resource->SchedState = -1;
     }
     else
@@ -257,7 +280,17 @@ BOOLEAN ExAcquireResourceSharedLite(PERESOURCE Resource, BOOLEAN Wait)
 
     if (KmSchedActive())
     {
-        KmSchedWaitUntil(EresourceSharablePredicate, Resource, "eresource shared");
+        //
+        // Same re-test as the exclusive path, for the same reason: an
+        // exclusive acquirer can run between this wait returning and the
+        // count below, and a shared count taken on top of an exclusive
+        // hold corrupts the state both sides release against.
+        //
+        while (!EresourceSharablePredicate(Resource))
+        {
+            KmSchedWaitUntil(EresourceSharablePredicate, Resource, "eresource shared");
+        }
+
         Resource->SchedState++;
     }
     else
