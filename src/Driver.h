@@ -61,18 +61,27 @@
 // lookahead this driver has -- the prefetch ring that used to derive its
 // slot size from this constant is gone.
 //
-// Raised from 64 to 128 pages (256 KB -> 512 KB) on measured evidence.
-// Paging reads had been averaging ~204 KB against the 512 KB a usermode
-// client issues, so the driver was paying roughly two and a half times the
-// per-request HTTP overhead for the same bytes. At 512 KB, buffered
-// 16-stream throughput went from 23.01 to 27.33 MB/s median.
+// 128 pages, i.e. 512 KB. Re-measured on a Release driver with Driver
+// Verifier off, 8 concurrent streams, each run bracketed by a usermode HTTP
+// client immediately before and after so network drift cannot be mistaken
+// for a result:
 //
-// Both 1 MB and 2 MB were also measured and are indistinguishable on
-// throughput -- Cc's paging reads only grew from ~281 KB to ~284-314 KB,
-// so it will not issue larger IRPs and the knob is exhausted past this
-// point. The smallest value that gets the throughput is kept: it halves
-// per-read latency against 1 MB, and a 1 MB read-ahead was reverted once
-// before for making playback stutter worse.
+//   granularity   ratio to usermode   avg paging read   p99
+//     256 KB           0.96               254 KB        165 ms
+//     512 KB           1.06               390 KB        208 ms
+//       1 MB           1.07               546 KB        365 ms
+//
+// 256 KB is plainly worse: the reads stay small and the driver pays the
+// per-request HTTP overhead more often for the same bytes. 1 MB matches
+// 512 KB on throughput and costs 76% on the latency tail, which for media
+// playback is the wrong trade -- a stall is what a viewer notices, and the
+// aggregate they never see.
+//
+// The earlier version of this comment reached the same conclusion from a
+// measurement taken under Debug + full Driver Verifier, where Cc clustered
+// very differently (204-281 KB where this environment gives 390-546 KB).
+// The instrumentation was not a constant tax; it changed the I/O shape. The
+// answer survived re-measurement, the reasoning behind it did not.
 //
 #define READ_AHEAD_GRANULARITY (PAGE_SIZE * 128)
 
