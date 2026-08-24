@@ -72,12 +72,14 @@ not a substitute for running `Fast` yourself.)
   directory from the MSBuild process's own architecture; the 32-bit one selects
   an x86 directory where those tools are missing, silently losing the static
   analysis. `Invoke-BlorgChecks.ps1` already resolves the right one.
-- **`inf2cat` "postdated DriverVer" is the clock, not your change.** `BlorgFS.inf`
-  leaves `DriverVer` empty, so stampinf fills it from local time while inf2cat
-  validates against UTC. Between local midnight and the UTC offset they
-  disagree and catalog generation fails on a tree that compiled fine. The check
-  script reports this as `CLOCK`, not `FAIL`. Confirm with
-  `Inf2Cat.exe /driver:x64\Debug\BlorgFS /os:10_x64 /uselocaltime`.
+- **`inf2cat` "postdated DriverVer" -- fixed, but know the shape.** `BlorgFS.inf`
+  leaves `DriverVer` empty, so stampinf fills it from local time. inf2cat used
+  to validate against UTC, so between local midnight and the UTC offset the
+  two disagreed and catalog generation failed on a tree that compiled fine
+  (`inf2cat.exe exited with code -2`). `Inf2CatUseLocalTime` in
+  `BlorgFS.vcxproj` now points the validator at the same clock the stamp came
+  from. If it ever returns, that mismatch is where to look; the check script
+  reports it as `CLOCK`, not `FAIL`.
 
 ## Continuous integration
 
