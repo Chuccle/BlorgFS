@@ -286,9 +286,16 @@ volume is mounted.
 ## TODO: on-disk hot cache
 
 The prefetch ring was removed rather than replaced. What follows is the
-design seam for its replacement, which is **not an in-memory prefetcher** --
-that experiment is finished and its evidence is in git history. Nothing in
-this section is implemented.
+design for its replacement, which is **not an in-memory prefetcher** -- that
+experiment is finished and its evidence is in git history. Nothing in this
+section is implemented yet.
+
+**It lives in the driver, as a module.** A usermode helper owning the store
+was the other candidate, and it was attractive for exactly one reason: it
+makes the re-entrancy problem disappear by construction rather than by
+discipline. The decision is to keep it in kernel, so that problem has to be
+answered directly, and the section below answers it. Anything that cannot
+meet those rules does not go in.
 
 ### Why this, and not more lookahead
 
@@ -310,42 +317,96 @@ set stopped fitting and a re-read fell from 6677 MB/s to 131 MB/s. Local
 disk is ~20x the network on write, ~140x on read, with ~100x the capacity of
 RAM.
 
-### Architecture
+### Architecture: a driver module
 
-A block store in **one ordinary file on an ordinary live volume**, plus a
-separate index. Location and maximum size configurable through the registry,
-alongside `RemoteHost`/`RemotePort` in `Parameters`.
+`src/DiskCache.c` / `DiskCache.h`, owning a block store in **one ordinary
+file on an ordinary live volume**. Location and maximum size configurable
+through the registry alongside `RemoteHost`/`RemotePort` in `Parameters`.
 
-- **Block-granular, not whole-file.** A 6 GB film watched for ten minutes
-  must not admit 6 GB. Fixed-size blocks with a per-file present-bitmap;
-  evict blocks, not files.
-- **No contiguity assumptions.** The store is addressed by block index
-  through the filesystem, never by cluster or LCN, so it must survive being
-  fragmented, extended, or moved.
-- **Asynchronous both ways, never on the foreground path.** A miss issues
-  the HTTP fetch immediately and completes the read from it; the write-behind
-  into the store happens afterwards, and its failure is invisible to the
-  reader. A hit reads asynchronously and, on any error or timeout, abandons
-  the cache and falls back to the network.
-- **Advisory only.** Corruption, truncation, eviction, a missing file, a full
-  volume or an unreadable index all degrade to the authoritative path. There
-  must be no state in which the cache can make a read fail that would
-  otherwise have succeeded.
+The module boundary is deliberately narrow, and every entry point is either
+pure memory or explicitly asynchronous:
 
-**The re-entrancy hazard is the main design risk**, and it is why this is a
-seam rather than an implementation. The driver would be calling into another
-filesystem from inside its own `IRP_MJ_READ`; synchronous cache I/O on that
-path can recurse through memory pressure back into this driver. Two ways out,
-to be chosen before any code is written:
+```
+BlorgDiskCacheInitialize / BlorgDiskCacheDrain   startup, unload
+BlorgDiskCacheLookup(FileId, BlockIndex)         IN MEMORY ONLY, no I/O
+BlorgDiskCacheReadAsync(Slot, Mdl, Completion)   serves a hit
+BlorgDiskCacheAdmitAsync(FileId, Block, Mdl)     fire-and-forget write-behind
+BlorgDiskCacheInvalidate(FileId)                 validator changed
+```
 
-1. A kernel-side store with strictly asynchronous, non-blocking I/O and a
-   hard rule that no foreground read ever waits on it.
-2. A usermode helper service owning the store, with the driver querying it.
-   This removes the cross-filesystem hazard entirely, at the cost of an IPC
-   round trip per lookup -- which, against a ~30 ms network fetch, is noise.
+`BlorgDiskCacheLookup` touching no I/O is what makes the rest safe: the read
+dispatch path can ask "is this cached?" while holding whatever it holds, and
+only then decide which asynchronous path to take.
 
-Option 2 looks better on risk against benefit and should be the working
-assumption until something argues otherwise.
+**The read path keeps the shape it already has.** A paging read today
+returns `STATUS_PENDING` and is completed later from a network completion
+(`Read.c`). A cache hit is the same shape with a different source:
+
+1. `BlorgDiskCacheLookup` — in-memory index, no I/O, no blocking.
+2. **Hit**: queue a cache read; a worker fills `Irp->MdlAddress` and
+   completes the IRP.
+3. **Miss**: issue the HTTP fetch exactly as now. On completion, complete the
+   IRP *first*, then queue the write-behind from the buffer already in hand.
+
+The reader never waits on the cache in either direction. A miss costs
+nothing it did not already cost, and a write-behind failure is invisible.
+
+### Re-entrancy: the hazard this design has to answer
+
+The driver calls into **another filesystem from inside its own read path**.
+That is the part to get right, and it is why the usermode-helper alternative
+was on the table at all.
+
+- **No cache I/O on the calling thread, ever.** All `ZwReadFile`/
+  `ZwWriteFile` happen on the module's own PASSIVE workers. The dispatch
+  path only ever enqueues.
+- **Open the store `FILE_NO_INTERMEDIATE_BUFFERING`.** Without it the store
+  goes through Cc, and cache-manager pressure from *our* store can drive
+  trimming that re-enters this driver through the cache callbacks. It also
+  stops double-caching data Cc already holds for our volume. The cost is
+  sector alignment, which a fixed-block store gives for free.
+- **Never hold an FCB resource across a cache call.** Enqueue, release,
+  return pending.
+- **The store must not live on this volume.** Enforced at open by rejecting
+  a path whose volume device object is ours.
+- **Recursion is bounded even when it happens**, because this volume is
+  read-only: MM never writes back to us, so the worst it can do is trim our
+  pages through the cache callbacks, which are already wired
+  (`CacheManager.c`).
+
+**IRQL discipline** mirrors the removed prefetcher's, which is the one thing
+worth keeping from it: `ZwReadFile`/`ZwWriteFile` are PASSIVE-only, network
+completions run at `<= DISPATCH`, so an admit queued from a completion goes
+through a work item to reach PASSIVE. That rule was load-bearing before and
+is load-bearing again.
+
+### Store layout, index and recovery
+
+Fixed-size blocks, each preceded by its own header: magic, file-identity
+hash, block index, backend validator, byte length, and the MAC below. Slots
+are addressed by index, never by cluster or LCN, so fragmentation, extension
+and defragmentation are all transparent.
+
+**The index is rebuilt from the block headers at startup, not persisted.**
+A separate index file is faster to load and introduces a whole failure class
+this does not need — an index that disagrees with the store, torn across a
+crash, and confidently wrong. Header scan cannot desync because the headers
+*are* the store. At 512 KB blocks a 30 GB store is ~61k headers; reading
+only the header of each is a few hundred MB against a local disk measured at
+4.3 GB/s, so a second or so of startup, off the mount path.
+
+Persisting an index is a later optimisation, and only worth it if that
+startup cost ever shows up as a complaint.
+
+### Concurrency
+
+- Slot allocation from a free list under a leaf lock; nothing else is
+  acquired under it.
+- Per-slot reference count so eviction cannot reclaim a slot with a read in
+  flight -- the same protocol the node table already uses, and the one the
+  systematic scheduler is set up to explore.
+- A per-block "fetch in flight" marker so two readers missing the same block
+  do not both fetch it and both write it.
 
 ### Cluster pinning: not worth it
 
@@ -389,11 +450,23 @@ the share.
   check.
 - **Per-block keyed integrity, verified before use.** Each block records a
   MAC over (file identity, block index, backend validator, contents). A
-  mismatch discards the block and falls back to the network. The key is
-  generated per store instance and kept somewhere the store is not --
-  otherwise an attacker who can rewrite blocks can recompute the tags. A
-  plain checksum detects corruption but not tampering, and the threat here
-  is tampering.
+  mismatch discards the block and falls back to the network. A plain
+  checksum detects corruption but not tampering, and the threat here is
+  tampering.
+
+  The key has to persist for the cache to survive a reboot, and it has to
+  live somewhere the store does not -- otherwise an attacker who can rewrite
+  blocks can recompute the tags and the MAC proves nothing. The service's
+  own registry key is the natural home: same trust boundary as the driver's
+  configuration, already SYSTEM-only, and already what `TlsPin` uses
+  (`Driver.c`). Generate it on first use, never log it, and treat a missing
+  key as an empty cache rather than an error.
+
+  Running in kernel does not change the threat model here. The attacker of
+  interest is a process that can write the file, not one that can call the
+  driver -- and MAC verification happens on the module's worker before any
+  cached byte reaches an IRP, so a forged block is discarded on the same
+  path that would have discarded a corrupt one.
 - **Bind blocks to a backend validator.** `server-rs` returns `etag` and
   `last_modified`; a block whose validator does not match the current
   response is stale and must not be served. Without this the cache serves
