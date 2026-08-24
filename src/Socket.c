@@ -771,6 +771,96 @@ static BOOLEAN SockAddrEqual(const SOCKADDR* restrict A, const SOCKADDR* restric
 }
 
 //
+// Completion for a pre-warm connect. The socket is not wanted by anyone --
+// it exists to be in the pool -- so success releases it straight there and
+// failure drops it. Either way nothing is reported: a pre-warm that fails
+// leaves exactly the behaviour that existed before pre-warming.
+//
+static VOID SocketPrewarmComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
+{
+    UNREFERENCED_PARAMETER(Reused);
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (NT_SUCCESS(Status) && Socket)
+    {
+        BlorgReleaseReusableWskSocket(Socket);
+    }
+}
+
+//
+// Opens connections into the pool ahead of anyone needing them.
+//
+// The pool fills only from released sockets, so it starts empty and the
+// first burst of concurrent reads each pay a TCP connect while a reader
+// waits on them. Measured, those connects cost about 1.02 SECONDS each --
+// mean 1,023,109 us across a run, max 1,075,165, a five percent spread
+// around a flat second. Network variance does not cluster that tightly; a
+// retransmit timer does. That is a dropped SYN, and the burst of
+// simultaneous connects at stream startup is what drops it.
+//
+// The cost lands entirely in the latency tail rather than in throughput:
+// fourteen one-second stalls across thirteen thousand reads moved the
+// aggregate not at all, and moved the worst-case read from ~500 ms to
+// 1438 ms. For a volume that should feel local, the tail is the experience.
+//
+// Deliberately fire-and-forget, and deliberately not all at once: each
+// connect is issued only after the previous one has completed, so
+// pre-warming cannot itself create the SYN burst it exists to avoid.
+// Nothing waits on any of this -- the caller returns immediately and the
+// pool fills behind it.
+//
+static VOID SocketPrewarmNext(VOID);
+
+static volatile LONG SocketPrewarmRemaining;
+
+static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
+{
+    SocketPrewarmComplete(Status, Socket, Reused, CompletionContext);
+
+    if (InterlockedDecrement(&SocketPrewarmRemaining) > 0)
+    {
+        SocketPrewarmNext();
+    }
+}
+
+static SOCKADDR_STORAGE SocketPrewarmAddress;
+
+static VOID SocketPrewarmNext(VOID)
+{
+    NTSTATUS status = BlorgAcquireReusableWskSocketAsync(
+        C_CAST(const SOCKADDR*, &SocketPrewarmAddress),
+        TRUE,
+        SocketPrewarmStepComplete,
+        NULL);
+
+    if (STATUS_PENDING != status)
+    {
+        InterlockedExchange(&SocketPrewarmRemaining, 0);
+    }
+}
+
+//
+// Starts filling the pool. Safe to call more than once: a second call
+// while a fill is in flight is ignored rather than doubling the rate.
+//
+VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
+{
+    if (!RemoteAddress || 0 == Count)
+    {
+        return;
+    }
+
+    if (0 != InterlockedCompareExchange(&SocketPrewarmRemaining, C_CAST(LONG, Count), 0))
+    {
+        return;
+    }
+
+    RtlCopyMemory(&SocketPrewarmAddress, RemoteAddress, sizeof(SocketPrewarmAddress));
+
+    SocketPrewarmNext();
+}
+
+//
 // Pool ownership model: a KSOCKET handed out by BlorgAcquireReusableWskSocketAsync
 // belongs exclusively to that caller until it is passed back to
 // BlorgReleaseReusableWskSocket (or closed on failure). It should not be used

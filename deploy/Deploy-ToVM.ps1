@@ -375,7 +375,7 @@ elseif ($ForBenchmark) {
 
     Invoke-VmrunGuest -CommandArgs @(
         "runProgramInGuest", $VmxPath, "-activeWindow",
-        "C:\Windows\System32\WindowsPowerShell1.0\powershell.exe",
+        "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
         "-ExecutionPolicy", "Bypass", "-NoProfile", "-Command", $verifierCommand
     ) | Out-Null
 
@@ -391,7 +391,7 @@ elseif ($ForBenchmark) {
     Write-Step "Starting BlorgFS after reboot"
     Invoke-VmrunGuest -CommandArgs @(
         "runProgramInGuest", $VmxPath, "-activeWindow",
-        "C:\Windows\System32\WindowsPowerShell1.0\powershell.exe",
+        "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
         "-ExecutionPolicy", "Bypass", "-NoProfile", "-Command",
         "sc.exe start BlorgFS *> `$null; Start-Sleep -Seconds 4; exit 0"
     ) | Out-Null
@@ -412,7 +412,7 @@ if ($ForBenchmark) {
 
     Invoke-VmrunGuest -CommandArgs @(
         "runProgramInGuest", $VmxPath, "-activeWindow",
-        "C:\Windows\System32\WindowsPowerShell1.0\powershell.exe",
+        "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
         "-ExecutionPolicy", "Bypass", "-NoProfile", "-File",
         "$GuestDeployDir\Wait-GuestIdle.ps1"
     ) | Out-Null

@@ -1009,6 +1009,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         }
     }
 
+    //
+    // Fill the keep-alive pool before anything asks for it. The address is
+    // resolved by this point and the filesystem is already registered, so
+    // the first reads may arrive at any moment -- and without this they
+    // would each open their own connection while a reader waits, at a
+    // measured ~1.02 seconds per connect. See BlorgPrewarmSocketPool.
+    //
+    // Fire-and-forget by construction: it returns immediately, fills one
+    // connection at a time behind the caller, and a failure leaves the
+    // driver exactly as it behaved before. DriverEntry must not wait on the
+    // network, and does not.
+    //
+    BlorgPrewarmSocketPool(
+        C_CAST(const SOCKADDR*, global.RemoteAddressInfo->ai_addr),
+        BLORGFS_SOCKET_PREWARM_COUNT);
+
     {
         UNICODE_STRING diskDeviceName = RTL_CONSTANT_STRING(BLORGFS_DDO_STRING);
         NTSTATUS mountMgrStatus = BlorgNotifyMountManagerVolumeArrival(&diskDeviceName);

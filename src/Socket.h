@@ -159,6 +159,38 @@ void BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo);
 
 NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket);
 
+//
+// Opens Count connections into the keep-alive pool ahead of demand, one at
+// a time, and returns immediately -- nothing waits on the result.
+//
+// The pool fills only from released sockets, so without this the first
+// burst of concurrent reads each pay a TCP connect while a reader is
+// blocked on it. Measured, those connects cost ~1.02 s apiece (a dropped
+// SYN and its retransmit, caused by the burst itself), and they are what
+// puts a 1438 ms worst case on a volume whose median read is 0.005 ms.
+//
+// Idempotent: a call made while a fill is already running is ignored.
+//
+//
+// Connections opened ahead of demand at driver start.
+//
+// Sized to cover PEAK concurrency, not average. Measured in-flight fetches
+// peak at 14-16 with eight concurrent streams and 21-28 with sixteen, and
+// anything past the pre-warmed count opens its connection with a reader
+// waiting on it. Eight was tried first and left exactly the shortfall
+// visible in the counters: in-flight peaked at 15, and the run reported
+// seven fresh connects -- 15 minus the 8 that were ready.
+//
+// 32 covers the sixteen-stream peak with headroom and is half the pool cap,
+// so pre-warming cannot itself evict anything. The fill is serialised and
+// off the read path, so the cost of over-provisioning is a few connects
+// nobody needed; the cost of under-provisioning is a reader waiting a
+// second for a SYN.
+//
+#define BLORGFS_SOCKET_PREWARM_COUNT 32
+
+VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count);
+
 void BlorgCleanupWskSocketPool(void);
 
 //
