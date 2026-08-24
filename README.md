@@ -158,9 +158,19 @@ is unoptimised and compiles `BLORGFS_PRINT` in (it is a runtime check on
 powershell -File deploy/Deploy-ToVM.ps1 -ForBenchmark
 ```
 
-`-ForBenchmark` is the whole answer: it deploys Release and clears Driver
-Verifier, then reboots so the change actually applies. Use it for every
-performance run. `-Configuration` still wins if given explicitly.
+`-ForBenchmark` is the whole answer: it deploys Release, clears Driver
+Verifier, reboots so the change actually applies, and then **waits for the
+guest to go idle** before reporting success. Use it for every performance
+run. `-Configuration` still wins if given explicitly.
+
+That last step is not politeness. A freshly booted Windows guest runs
+Defender, SearchIndexer, Windows Update and TiWorker for minutes, which on a
+2-vCPU guest is both cores saturated -- it steals the CPU the driver needs
+*and* makes `vmrun` calls slow enough to look wedged. A run taken inside that
+window measured its usermode control at 25.63 MB/s before the driver and
+14.04 MB/s after: a 45% collapse in one cycle. Bracket every driver
+measurement with the control run immediately before and after it, and throw
+the point away when the two disagree.
 
 Driver Verifier is worse, because it is invisible in every output the
 harness produces -- and because **it lives in the snapshot**. `Deploy-ToVM`

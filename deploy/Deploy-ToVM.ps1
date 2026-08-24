@@ -399,4 +399,23 @@ elseif ($ForBenchmark) {
     Write-Host "Verifier cleared; previous settings saved in the guest at $GuestDeployDirerifier-before.txt" -ForegroundColor Yellow
 }
 
+#
+# A benchmark deploy is not finished when the driver is installed -- it is
+# finished when the guest is quiet enough to measure. See
+# Wait-GuestIdle.ps1 for what a freshly booted guest is otherwise doing to
+# the numbers.
+#
+if ($ForBenchmark) {
+    Write-Step "Waiting for the guest to go idle before measuring"
+
+    Copy-ToGuest (Join-Path $PSScriptRoot "Wait-GuestIdle.ps1") "$GuestDeployDir\Wait-GuestIdle.ps1"
+
+    Invoke-VmrunGuest -CommandArgs @(
+        "runProgramInGuest", $VmxPath, "-activeWindow",
+        "C:\Windows\System32\WindowsPowerShell1.0\powershell.exe",
+        "-ExecutionPolicy", "Bypass", "-NoProfile", "-File",
+        "$GuestDeployDir\Wait-GuestIdle.ps1"
+    ) | Out-Null
+}
+
 Write-Host "Deployment succeeded." -ForegroundColor Green
