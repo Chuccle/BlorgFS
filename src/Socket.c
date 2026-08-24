@@ -809,33 +809,98 @@ static VOID SocketPrewarmComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reus
 // Nothing waits on any of this -- the caller returns immediately and the
 // pool fills behind it.
 //
-static VOID SocketPrewarmNext(VOID);
+static VOID SocketPrewarmPump(VOID);
 
-static volatile LONG SocketPrewarmRemaining;
+//
+// Steps still owed. Only ever updated via interlocked ops, so it doesn't
+// need to be volatile.
+//
+static LONG SocketPrewarmRemaining;
 
+//
+// Pump-loop gate and its work token. PumpGate is held by whichever caller
+// is running the issue loop; PumpWanted records that a step is owed and is
+// consumed by that loop. Both interlocked, so neither is volatile.
+//
+static LONG SocketPrewarmPumpGate;
+static LONG SocketPrewarmPumpWanted;
+
+static SOCKADDR_STORAGE SocketPrewarmAddress;
+
+//
+// A completed step owes the next one to the pump rather than issuing it.
+// Calling the issuer from here would nest a WSK dispatch frame inside the
+// one that completed, because BlorgAcquireReusableWskSocketAsync runs the
+// completion routine inline on every path that finishes synchronously (see
+// SocketPrewarmPump).
+//
 static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
 {
     SocketPrewarmComplete(Status, Socket, Reused, CompletionContext);
 
     if (InterlockedDecrement(&SocketPrewarmRemaining) > 0)
     {
-        SocketPrewarmNext();
+        SocketPrewarmPump();
     }
 }
 
-static SOCKADDR_STORAGE SocketPrewarmAddress;
-
-static VOID SocketPrewarmNext(VOID)
+//
+// Issues pre-warm steps, one at a time, from a single loop.
+//
+// Every path in BlorgAcquireReusableWskSocketAsync that starts an operation
+// returns STATUS_PENDING, including the ones that finish it synchronously
+// and call the completion routine inline. WskSocketConnect completes its
+// IRP inline whenever the connect fails immediately -- an unreachable host,
+// or a provider that is not ready -- and the completion routine is armed
+// InvokeOnError, so on that path the completion runs on the issuing
+// thread's own stack. A completion that issued the next step directly would
+// therefore nest one WSK dispatch frame inside the previous one,
+// BLORGFS_SOCKET_PREWARM_COUNT deep. Driver load against an unreachable
+// backend is exactly the case where every step fails that way, so the
+// recursion was reachable precisely when it ran to full depth.
+//
+// So a completion sets the work token and calls this; if a loop is already
+// running -- on this stack or on another processor -- the gate turns that
+// call into a return, and the running loop takes the step instead. Stack
+// depth is constant no matter how the connects complete, and the "one
+// connect at a time" property the SYN-burst avoidance depends on is
+// unchanged: the token is consumed inside the gate, so only the gate holder
+// ever has a step outstanding.
+//
+// The gate-clear/recheck tail is the reap worker's (Structs.c), for the
+// same reason and with the same proof: a completion that finds the gate
+// held has already published its token, and the clear is a full barrier, so
+// the recheck after it cannot be satisfied from before it. Either the
+// completion takes the gate itself or this recheck sees its token. No step
+// can be dropped by both.
+//
+static VOID SocketPrewarmPump(VOID)
 {
-    NTSTATUS status = BlorgAcquireReusableWskSocketAsync(
-        C_CAST(const SOCKADDR*, &SocketPrewarmAddress),
-        TRUE,
-        SocketPrewarmStepComplete,
-        NULL);
+    InterlockedExchange(&SocketPrewarmPumpWanted, TRUE);
 
-    if (STATUS_PENDING != status)
+    while (!InterlockedCompareExchange(&SocketPrewarmPumpGate, TRUE, FALSE))
     {
-        InterlockedExchange(&SocketPrewarmRemaining, 0);
+        while (InterlockedExchange(&SocketPrewarmPumpWanted, FALSE))
+        {
+            NTSTATUS status = BlorgAcquireReusableWskSocketAsync(
+                C_CAST(const SOCKADDR*, &SocketPrewarmAddress),
+                TRUE,
+                SocketPrewarmStepComplete,
+                NULL);
+
+            if (STATUS_PENDING != status)
+            {
+                InterlockedExchange(&SocketPrewarmRemaining, 0);
+                break;
+            }
+        }
+
+        InterlockedExchange(&SocketPrewarmPumpGate, FALSE);
+
+        if (!ReadNoFence(&SocketPrewarmPumpWanted))
+        {
+            break;
+        }
     }
 }
 
@@ -857,7 +922,7 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 
     RtlCopyMemory(&SocketPrewarmAddress, RemoteAddress, sizeof(SocketPrewarmAddress));
 
-    SocketPrewarmNext();
+    SocketPrewarmPump();
 }
 
 //
