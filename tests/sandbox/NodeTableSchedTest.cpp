@@ -329,6 +329,18 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
     // was lost -- the re-test blocks a thread only when the resource is
     // genuinely held, which is what the kernel does -- so this is a smaller
     // but honest space. The cap stays where it is; it is a safety net.
+//
+// Corrected a third time, 2026-08-24, upward: 26718 to 41330 here,
+// 55890 to 149769 for the revival proof. The claim-carrying wait API
+// (Scheduler.h) moved the acquire's claim from after the wait's final
+// yield to before it, under the baton. One consequence is that a
+// contender meeting a just-claimed lock now genuinely BLOCKS, and every
+// block and resume is a recorded scheduling point -- where the old shape
+// let it sail through the still-unclaimed window without waiting. The
+// larger space is the honest cost of mutual exclusion made visible;
+// both proofs remain exhaustive under their caps with zero divergence,
+// deadlock and violation, and SchedulerAudit pins the underlying
+// invariants directly.
     //
     KM_SCHED_RESULT result =
         KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 100000);
@@ -336,7 +348,11 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a pinned node was retired";
 
-    EXPECT_EQ(0, result.Deadlocks) << "a schedule deadlocked";
+    //
+// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+// assertion after this one would run against corrupted state.
+//
+ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
@@ -400,16 +416,22 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNodeAtomicSample)
     proof.Path = MakePath(path);
 
     KmSchedSetAtomicYields(1);
+    KmSchedSetRaceDetection(1);
 
     KM_SCHED_RESULT result =
         KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 200);
 
     KmSchedSetAtomicYields(0);
+    KmSchedSetRaceDetection(0);
 
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a pinned node was retired";
 
-    EXPECT_EQ(0, result.Deadlocks) << "a schedule deadlocked";
+    //
+// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+// assertion after this one would run against corrupted state.
+//
+ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_GT(proof.PinsObserved, 0);
     EXPECT_GT(proof.RetiresObserved, 0);
@@ -702,7 +724,11 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a revived node was freed under its opener";
 
-    EXPECT_EQ(0, result.Deadlocks) << "a schedule deadlocked";
+    //
+// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+// assertion after this one would run against corrupted state.
+//
+ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
@@ -727,6 +753,778 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
     printf("[  sched   ] %d interleavings, max depth %d, %ld revivals (%ld while queued), %ld retires\n",
         result.Schedules, result.MaxDepth, proof.RevivalsObserved,
         proof.RevivedWhileQueued, proof.RetiresObserved);
+}
+
+//
+// Atomic-granularity soaks. DISABLED_, so they are run deliberately
+// (--gtest_also_run_disabled_tests) and never by the gate: these take
+// tens of minutes, where the lock-granularity proofs above take seconds.
+//
+// What they add over those proofs is scheduling points at every
+// interlocked operation, not just around locks. That is strictly stronger
+// -- it is the granularity at which a protocol's own counters can be
+// observed mid-update -- and for the revival path it is the granularity
+// that matters, because the thing being revived is an InterlockedIncrement64
+// on a counter the worker reads to decide whether to free.
+//
+// They are SAMPLES unless the schedule count comes back under the cap.
+// This scheduler does no partial-order reduction, so depth-first
+// enumeration replays ever-longer shared prefixes as the cheap shallow
+// branches are exhausted, and the atomic space for a two-thread body is
+// large. Read the printed count before calling either of these a proof.
+//
+// Scheduler.h records that atomic granularity on the node-table proof
+// reported replay divergence at depth 17, and that it had not been tracked
+// down. These runs are what re-tests that claim now that the model's
+// ERESOURCE no longer hands two threads the same exclusive hold.
+//
+TEST_F(NodeTableSchedTest, DISABLED_AtomicPinSoak)
+{
+    const wchar_t* path = L"\\media\\contended.bin";
+
+    PinProof proof = {};
+    proof.Volume = Volume;
+    proof.Root = Root;
+    proof.Vcb = Vcb;
+    proof.Path = MakePath(path);
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetRaceDetection(1);
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 2000000);
+
+    KmSchedSetAtomicYields(0);
+    KmSchedSetRaceDetection(0);
+
+    EXPECT_EQ(0, proof.Violations)
+        << "an interleaving exists in which a pinned node was retired";
+
+    //
+// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+// assertion after this one would run against corrupted state.
+//
+ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes in the table";
+
+    EXPECT_GT(proof.PinsObserved, 0);
+    EXPECT_GT(proof.RetiresObserved, 0);
+
+    printf("[  sched   ] atomic pin soak: %d interleavings, max depth %d, "
+           "%ld pins, %ld retires, exhausted=%s\n",
+        result.Schedules, result.MaxDepth, proof.PinsObserved, proof.RetiresObserved,
+        (result.Schedules < 2000000) ? "YES" : "NO (sampled)");
+}
+
+//
+
+// Positive control for the happens-before race detector. Two threads
+
+// increment a plain long with no lock and no interlocked op, registering
+
+// the accesses manually; the detector must flag the overlap. Without
+
+// this test, silence elsewhere proves nothing -- a detector that never
+
+// fires is indistinguishable from one that never works.
+
+//
+
+namespace {
+
+
+
+struct RaceControlProof
+
+{
+
+    long Value;
+
+};
+
+
+
+void RacyWriter(void* Parameter)
+
+{
+
+    RaceControlProof* proof = (RaceControlProof*)Parameter;
+
+
+
+    for (int i = 0; i < 3; ++i)
+
+    {
+
+        KmSchedNoteAccess(&proof->Value, 1);
+
+        proof->Value++;
+
+        KmSchedYield();
+
+    }
+
+}
+
+
+
+void RaceControlSetup(void* Parameter)
+
+{
+
+    KmSchedSpawn(RacyWriter, Parameter);
+
+    KmSchedSpawn(RacyWriter, Parameter);
+
+}
+
+
+
+void RaceControlTeardown(void* Parameter)
+
+{
+
+    (void)Parameter;
+
+}
+
+
+
+}  // namespace
+
+
+
+TEST(SchedulerAudit, RaceDetectorFlagsUnsynchronizedAccess)
+
+{
+
+    RaceControlProof proof = {};
+
+    proof.Value = 0;
+
+
+
+    KmSchedSetRaceDetection(1);
+    KmExpectViolation(KmViolationLifetime);
+
+    KmExploreInterleavings(RaceControlSetup, RaceControlTeardown, &proof, 20);
+
+    KmSchedSetRaceDetection(0);
+
+
+
+    EXPECT_GT(KmSchedRaceCount(), 0)
+
+        << "the race detector never fired on a deliberately racy body";
+    EXPECT_EQ(KmViolationLifetime, KmTakeViolation())
+        << "the detector fired but the model did not record the violation";
+
+}
+
+
+
+//
+// A random sample through the atomic-granularity space of the pin body.
+// The DISABLED_ soak below enumerates that space; this one exists for the
+// gate, where a few seconds of breadth catches gross granularity
+// regressions -- a shim atomic silently ceasing to be a scheduling
+// point, say -- without paying for enumeration. Seeded, so a failure
+// reproduces exactly; on a hit, raise the count and re-run before
+// believing the seed was lucky.
+//
+TEST_F(NodeTableSchedTest, RandomAtomicPinSmoke)
+{
+    const wchar_t* path = L"\\media\\contended.bin";
+
+    PinProof proof = {};
+    proof.Volume = Volume;
+    proof.Root = Root;
+    proof.Vcb = Vcb;
+    proof.Path = MakePath(path);
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetRaceDetection(1);
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavingsSeeded(PinProofSetup, PinProofTeardown, &proof, 50000, 0x5DEECE66u);
+
+    KmSchedSetAtomicYields(0);
+    KmSchedSetRaceDetection(0);
+
+    EXPECT_EQ(0, proof.Violations)
+        << "a sampled interleaving retired a pinned node";
+
+    //
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so
+    // any assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a sampled schedule deadlocked;";
+    EXPECT_EQ((long)0, KmSchedRaceCount())
+        << "the race detector fired on the pin body";
+    EXPECT_EQ(0, result.Truncated) << "a sampled schedule hit the depth cap";
+
+    EXPECT_GT(proof.PinsObserved, 0);
+    EXPECT_GT(proof.RetiresObserved, 0);
+
+    printf("[  sched   ] atomic pin random smoke: %d interleavings, max depth %d\n",
+        result.Schedules, result.MaxDepth);
+}
+
+TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
+{
+    const wchar_t* path = L"\\revived.bin";
+
+    static RevivalProof proof;
+
+    proof = {};
+    proof.Path = MakePath(path);
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetRaceDetection(1);
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000);
+
+    KmSchedSetAtomicYields(0);
+    KmSchedSetRaceDetection(0);
+
+    EXPECT_EQ(0, proof.Violations)
+        << "an interleaving exists in which a revived node was freed under its opener";
+
+    //
+// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+// assertion after this one would run against corrupted state.
+//
+ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes linked under the root";
+
+    EXPECT_GT(proof.RevivalsObserved, 0);
+    EXPECT_GT(proof.RetiresObserved, 0);
+    EXPECT_GT(proof.RevivedWhileQueued, 0)
+        << "no schedule revived a node that was already claimed for reap";
+
+    printf("[  sched   ] atomic revival soak: %d interleavings, max depth %d, "
+           "%ld revivals (%ld while queued), %ld retires, exhausted=%s\n",
+        result.Schedules, result.MaxDepth, proof.RevivalsObserved,
+        proof.RevivedWhileQueued, proof.RetiresObserved,
+        (result.Schedules < 2000000) ? "YES" : "NO (sampled)");
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Scheduler audit repros. Two minimal bodies that isolate defects in the
+// scheduler/shim machinery itself, away from the node table whose proofs
+// normally exercise it. Each is small enough to explore exhaustively in
+// well under a second, so a failure is attributable to a specific
+// interleaving rather than to a soak sample.
+//
+// Both defects below were proven against the code as it stood; both are
+// predicate test and THEN yields the baton once more before returning, so
+// a caller that claimed without re-testing -- KmAcquireLock was the only
+// one -- has a scheduling point sitting between its last check and its
+// claim. Two threads could both pass the check while the lock was free and
+// both claim afterwards. This is the same promotion-is-not-running class
+// as the ERESOURCE defect, surviving in the one primitive whose caller
+// was not given an outer re-test loop.
+//
+// Repro 2 defends unwind liveness: when a schedule deadlocked, every parked
+// thread was woken with Current == -1 and KmSchedWaitUntil returned early.
+// A shim whose acquire looped on the predicate re-tested, found it false,
+// and waited again -- forever, because nothing would ever run. RunOnce's
+// five-second join expires, the handle is closed on a live thread, and
+// the zombie keeps driving scheduler state into the next replay. The
+// assertion is wall-clock: a correct unwind lets eight all-deadlock
+// replays finish in milliseconds; the defect costs at least five seconds
+// per deadlocked schedule and usually diverges outright.
+///////////////////////////////////////////////////////////////////////////
+
+struct SpinGrantAudit
+{
+    KM_LOCK Lock;
+    volatile long Holders;
+    volatile long MaxHolders;
+    volatile long DoubleGrants;
+};
+
+void SpinGrantThread(void* Parameter)
+{
+    SpinGrantAudit* audit = (SpinGrantAudit*)Parameter;
+
+    unsigned char oldIrql = KmAcquireLock(&audit->Lock);
+
+    long now = InterlockedIncrement(&audit->Holders);
+
+    long seen = ReadNoFence(&audit->MaxHolders);
+
+    while (now > seen &&
+           InterlockedCompareExchange(&audit->MaxHolders, now, seen) != seen)
+    {
+        seen = ReadNoFence(&audit->MaxHolders);
+    }
+
+    //
+    // Bail without releasing once the invariant is broken, in EITHER
+    // direction. A second claim overwrites ExclusiveOwner, so the FIRST
+    // holder's release would fail the model's owner check and abort the
+    // process -- which reports "something aborted" rather than "two
+    // threads held the lock". Recording here and refusing every further
+    // release keeps the failure attributable to the acquisition itself.
+    //
+    if (ReadNoFence(&audit->MaxHolders) > 1)
+    {
+        InterlockedIncrement(&audit->DoubleGrants);
+        return;
+    }
+
+    KmSchedYield();
+
+    InterlockedDecrement(&audit->Holders);
+
+    if (audit->Lock.OwnerThread != KmSchedThreadId())
+    {
+        //
+        // Our grant was stolen while we yielded: the concurrent-holders
+        // count above caught it, and releasing now would be the model's
+        // abort, not ours to make.
+        //
+        InterlockedIncrement(&audit->DoubleGrants);
+        return;
+    }
+
+    KmReleaseLock(&audit->Lock, oldIrql);
+}
+
+void SpinGrantSetup(void* Parameter)
+{
+    SpinGrantAudit* audit = (SpinGrantAudit*)Parameter;
+
+    audit->Holders = 0;
+    KmInitializeLock(&audit->Lock, "spin-grant-audit");
+
+    KmSchedSpawn(SpinGrantThread, audit);
+    KmSchedSpawn(SpinGrantThread, audit);
+}
+
+TEST(SchedulerAudit, NoInterleavingDoubleGrantsTheSpinLock)
+{
+    static SpinGrantAudit audit;
+
+    audit.MaxHolders = 0;
+    audit.DoubleGrants = 0;
+
+    KmExploreInterleavings(SpinGrantSetup, nullptr, &audit, 20000);
+
+    EXPECT_EQ(0, ReadNoFence(&audit.DoubleGrants))
+        << "an interleaving exists in which two threads held the spin lock "
+           "-- claim-after-yield TOCTOU in KmAcquireLock";
+}
+
+struct UnwindAudit
+{
+    ERESOURCE Resource;
+};
+
+void UnwindHolderAndVanish(void* Parameter)
+{
+    UnwindAudit* audit = (UnwindAudit*)Parameter;
+
+    ExAcquireResourceExclusiveLite(&audit->Resource, TRUE);
+
+    //
+    // Deliberately never releases. The resource ends up exclusively held
+    // by a thread that has finished -- the exact "held by nobody" state
+    // the original double-grant left behind, and the shape the soak
+    // reported ("thread 1 waiting=eresource exclusive", partner Done).
+    //
+}
+
+void UnwindWaiter(void* Parameter)
+{
+    UnwindAudit* audit = (UnwindAudit*)Parameter;
+
+    //
+    // Unreachable in any correct world: the only possible owner has
+    // finished, so the predicate can never hold again.
+    //
+    ExAcquireResourceExclusiveLite(&audit->Resource, TRUE);
+}
+
+void UnwindSetup(void* Parameter)
+{
+    UnwindAudit* audit = (UnwindAudit*)Parameter;
+
+    ExInitializeResourceLite(&audit->Resource);
+
+    KmSchedSpawn(UnwindHolderAndVanish, audit);
+    KmSchedSpawn(UnwindWaiter, audit);
+}
+
+TEST(SchedulerAudit, DeadlockedScheduleUnwindsPromptly)
+{
+    static UnwindAudit audit;
+
+    ULONGLONG started = GetTickCount64();
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(UnwindSetup, nullptr, &audit, 8);
+
+    ULONGLONG elapsedMs = GetTickCount64() - started;
+
+    EXPECT_GT(result.Deadlocks, 0)
+        << "the engineered deadlock never happened -- the repro proves nothing";
+
+    EXPECT_LT(elapsedMs, 3000)
+        << "eight all-deadlock replays took " << elapsedMs << "ms: a waiter "
+           "spins between block and unwind-wake instead of exiting, the join "
+           "times out, and the abandoned thread corrupts later replays";
+
+    printf("[  sched   ] unwind liveness: %d schedules, %d deadlocks, %llu ms\n",
+        result.Schedules, result.Deadlocks, elapsedMs);
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Regression: a wait issued from SETUP or TEARDOWN -- on the exploring
+// fiber itself -- used to spin forever when its predicate could not hold,
+// because HandOff cannot park the explorer and no worker runs between two
+// predicate tests. A replay that ends holding state (the
+// UnwindHolderAndVanish shape above) plus a teardown that touches that
+// state hung the whole suite silently instead of reporting. The scheduler
+// now reports a violation and grants under the baton, exactly as the
+// abandoned drain does. This test pins BOTH halves: the run must finish
+// promptly AND the violation must be recorded. On the unfixed scheduler
+// this test does not fail -- it hangs, which is the defect.
+///////////////////////////////////////////////////////////////////////////
+
+struct LeakAudit
+{
+    volatile long Grant;
+};
+
+static int LeakFreePredicate(void* Context)
+{
+    return 0 == ReadNoFence(&((LeakAudit*)Context)->Grant);
+}
+
+static void LeakTakeClaim(void* Context)
+{
+    InterlockedExchange(&((LeakAudit*)Context)->Grant, 1);
+}
+
+static void LeakHolderAndVanish(void* Parameter)
+{
+    LeakAudit* audit = (LeakAudit*)Parameter;
+
+    KmSchedWaitUntilClaim(LeakFreePredicate, audit, LeakTakeClaim, audit,
+        "leak-audit grant");
+
+    //
+    // Deliberately never released: the replay ends cleanly -- every thread
+    // Done, nobody Blocked, so no deadlock is detected and Abandoned stays
+    // clear -- with the grant still held.
+    //
+}
+
+static void LeakSetup(void* Parameter)
+{
+    LeakAudit* audit = (LeakAudit*)Parameter;
+
+    audit->Grant = 0;
+
+    KmSchedSpawn(LeakHolderAndVanish, audit);
+}
+
+static void LeakWaitingTeardown(void* Parameter)
+{
+    LeakAudit* audit = (LeakAudit*)Parameter;
+
+    KmSchedWaitUntilClaim(LeakFreePredicate, audit, LeakTakeClaim, audit,
+        "leak-audit teardown");
+}
+
+TEST(SchedulerAudit, TeardownWaitOnAReplayLeftHoldFailsLoudly)
+{
+    static LeakAudit audit;
+
+    ULONGLONG started = GetTickCount64();
+
+    KmExpectViolation(KmViolationLifetime);
+
+    //
+    // One schedule is the point: exactly one teardown wait, so exactly one
+    // expected violation is consumed. More replays would fire the guard a
+    // second time with the expectation already taken, aborting the process.
+    //
+    KmExploreInterleavings(LeakSetup, LeakWaitingTeardown, &audit, 1);
+
+    ULONGLONG elapsedMs = GetTickCount64() - started;
+
+    EXPECT_LT(elapsedMs, 3000)
+        << "a teardown wait on state a replay left held took " << elapsedMs
+        << "ms: the explorer is spinning on a predicate nothing can satisfy";
+
+    EXPECT_EQ(KmViolationLifetime, KmTakeViolation())
+        << "the unsatisfiable teardown wait neither failed loudly nor "
+           "completed -- replay-left-behind state went unreported";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Regression: an unmatched SHARED release used to decrement SchedState
+// blind, driving it negative. Every later sharable waiter then blocked
+// against a count no release would ever bring back to zero -- a spurious
+// deadlock attributed to the driver when the bug is the unmatched release.
+// Both primitives now reject the release at the offending call.
+///////////////////////////////////////////////////////////////////////////
+
+static EX_PUSH_LOCK UnmatchedPushLock;
+static ERESOURCE UnmatchedResource;
+
+static void UnmatchedPushReleaseSetup(void* Parameter)
+{
+    (void)Parameter;
+
+    //
+    // Runs on the exploring fiber with the exploration active, so this
+    // takes the modelled counter path rather than the SRWLOCK path.
+    //
+    ExReleasePushLockShared(&UnmatchedPushLock);
+}
+
+TEST(SchedulerAudit, UnmatchedSharedPushLockReleaseIsRejected)
+{
+    ExInitializePushLock(&UnmatchedPushLock);
+
+    KmExpectViolation(KmViolationLockOwner);
+
+    KmExploreInterleavings(UnmatchedPushReleaseSetup, nullptr, nullptr, 1);
+
+    EXPECT_EQ(KmViolationLockOwner, KmTakeViolation())
+        << "releasing a push lock shared without holding it went unreported";
+
+    EXPECT_EQ(0, UnmatchedPushLock.SchedState)
+        << "the rejected release still drove the shared count off zero";
+}
+
+static void UnmatchedResourceReleaseSetup(void* Parameter)
+{
+    (void)Parameter;
+
+    ExReleaseResourceLite(&UnmatchedResource);
+}
+
+TEST(SchedulerAudit, UnmatchedSharedResourceReleaseIsRejected)
+{
+    ASSERT_EQ(STATUS_SUCCESS, ExInitializeResourceLite(&UnmatchedResource));
+
+    KmExpectViolation(KmViolationLockOwner);
+
+    KmExploreInterleavings(UnmatchedResourceReleaseSetup, nullptr, nullptr, 1);
+
+    EXPECT_EQ(KmViolationLockOwner, KmTakeViolation())
+        << "releasing a resource without holding it went unreported";
+
+    EXPECT_EQ(0, UnmatchedResource.SchedState)
+        << "the rejected release still drove the shared count off zero";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Regression: KmAcquireLockShared took its CRITICAL_SECTION even under
+// systematic exploration. One reader yielding while holding it parked the
+// host thread on the second reader's enter -- an instant, silent hang.
+// The shared path now goes through the same claim-under-the-baton
+// machinery as every other primitive, so readers genuinely interleave and
+// genuinely share. This pins both: the exploration must exhaust (no hang,
+// no deadlock) and some schedule must observe both readers inside at once
+// -- which the old serialising CS path could never produce even when it
+// did not hang.
+///////////////////////////////////////////////////////////////////////////
+
+struct SharedLockAudit
+{
+    KM_LOCK Lock;
+    volatile long Holders;
+    volatile long MaxHolders;
+};
+
+static void SharedReader(void* Parameter)
+{
+    SharedLockAudit* audit = (SharedLockAudit*)Parameter;
+
+    KmAcquireLockShared(&audit->Lock);
+
+    long now = InterlockedIncrement(&audit->Holders);
+
+    long seen = ReadNoFence(&audit->MaxHolders);
+
+    while (now > seen &&
+           InterlockedCompareExchange(&audit->MaxHolders, now, seen) != seen)
+    {
+        seen = ReadNoFence(&audit->MaxHolders);
+    }
+
+    //
+    // Still holding across this yield. Under the old CRITICAL_SECTION
+    // path this is where the second reader's acquire wedged the host
+    // thread; under the cooperative path it is a scheduling point the
+    // explorer can use to run the second reader into the lock.
+    //
+    KmSchedYield();
+
+    InterlockedDecrement(&audit->Holders);
+
+    KmReleaseLockShared(&audit->Lock);
+}
+
+static void SharedReaderSetup(void* Parameter)
+{
+    SharedLockAudit* audit = (SharedLockAudit*)Parameter;
+
+    audit->Holders = 0;
+    KmInitializeLock(&audit->Lock, "shared-reader-audit");
+
+    KmSchedSpawn(SharedReader, audit);
+    KmSchedSpawn(SharedReader, audit);
+}
+
+TEST(SchedulerAudit, SharedAcquiresInterleaveCooperatively)
+{
+    static SharedLockAudit audit;
+
+    audit.MaxHolders = 0;
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(SharedReaderSetup, nullptr, &audit, 20000);
+
+    EXPECT_EQ(0, result.Deadlocks) << "a shared-only workload deadlocked";
+    EXPECT_EQ(0, result.Truncated) << "the shared-reader space hit the depth cap";
+    EXPECT_LT(result.Schedules, 20000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+
+    EXPECT_EQ(2, ReadNoFence(&audit.MaxHolders))
+        << "no schedule ever held the lock by both readers at once -- the "
+           "cooperative shared path is serialising, not sharing";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Regression: replay divergence was checked against the runnable COUNT
+// alone. Two replays whose per-thread states differ at a recorded depth
+// pass that check whenever the runnable sets happen to agree in size --
+// and they also pass a runnable-SET check when the difference is between
+// Done and Blocked, because a finished thread appears in neither set.
+// The explorer now compares every thread's full scheduler state at each
+// recorded depth.
+//
+// The body below crosses, on every second replay, which of two movers
+// opens which of two gates. What differs between variants is WHICH worker
+// each promotion wakes -- the same leak shape as a state leak that
+// redirects which thread proceeds. Some schedules make that difference
+// count-visible (a worker that proceeds in one variant and blocks in the
+// other changes the next point's runnable count), and the count-only
+// check catches those; but many divergences here are equal-count
+// identity swaps -- the diagnostics show "2 runnable, state 0x0024,
+// expected 0x0021" -- which only the full state-vector comparison sees.
+// Alternating the pairing per replay guarantees some replay always walks
+// a prefix recorded under the opposite pairing, whichever subtree the
+// depth-first search is in.
+///////////////////////////////////////////////////////////////////////////
+
+struct DivergenceAudit
+{
+    volatile long GateForZero;
+    volatile long GateForOne;
+    int Crossed;
+};
+
+static int GateForZeroIsOpen(void* Context)
+{
+    return 1 == ReadNoFence(&((DivergenceAudit*)Context)->GateForZero);
+}
+
+static int GateForOneIsOpen(void* Context)
+{
+    return 1 == ReadNoFence(&((DivergenceAudit*)Context)->GateForOne);
+}
+
+static void GrantAndProceed(void* Context)
+{
+    (void)Context;
+}
+
+static void GatedWorkerZero(void* Parameter)
+{
+    DivergenceAudit* audit = (DivergenceAudit*)Parameter;
+
+    KmSchedWaitUntilClaim(GateForZeroIsOpen, audit, GrantAndProceed, audit,
+        "divergence gate zero");
+}
+
+static void GatedWorkerOne(void* Parameter)
+{
+    DivergenceAudit* audit = (DivergenceAudit*)Parameter;
+
+    KmSchedWaitUntilClaim(GateForOneIsOpen, audit, GrantAndProceed, audit,
+        "divergence gate one");
+}
+
+static void MoverZero(void* Parameter)
+{
+    DivergenceAudit* audit = (DivergenceAudit*)Parameter;
+
+    //
+    // Straight pairing opens this mover's own gate; crossed pairing opens
+    // the other worker's. Either way exactly one gate opens here, so the
+    // runnable COUNT after this point is identical across variants -- only
+    // the identity of the promoted worker differs.
+    //
+    volatile long* gate = audit->Crossed ? &audit->GateForOne : &audit->GateForZero;
+
+    InterlockedExchange(gate, 1);
+}
+
+static void MoverOne(void* Parameter)
+{
+    DivergenceAudit* audit = (DivergenceAudit*)Parameter;
+
+    volatile long* gate = audit->Crossed ? &audit->GateForZero : &audit->GateForOne;
+
+    InterlockedExchange(gate, 1);
+}
+
+static int DivergenceReplays = 0;
+
+static void DivergenceSetup(void* Parameter)
+{
+    DivergenceAudit* audit = (DivergenceAudit*)Parameter;
+
+    ++DivergenceReplays;
+
+    audit->Crossed = (0 != (DivergenceReplays % 2));
+    audit->GateForZero = 0;
+    audit->GateForOne = 0;
+
+    KmSchedSpawn(GatedWorkerZero, audit);
+    KmSchedSpawn(GatedWorkerOne, audit);
+    KmSchedSpawn(MoverZero, audit);
+    KmSchedSpawn(MoverOne, audit);
+}
+
+TEST(SchedulerAudit, ReplayDivergenceInThreadStateIsCaught)
+{
+    DivergenceAudit audit = {};
+    DivergenceReplays = 0;
+
+    KmExpectViolation(KmViolationLifetime);
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(DivergenceSetup, nullptr, &audit, 5000);
+
+    EXPECT_EQ(KmViolationLifetime, KmTakeViolation())
+        << "a body whose per-thread states changed across replays -- equal "
+           "runnable counts by construction -- went undetected: replay "
+           "isolation is not fully checked";
+
+    EXPECT_GT(result.Schedules, 1)
+        << "the diverging replay never ran -- the repro proves nothing";
+    EXPECT_LT(result.Schedules, 5000)
+        << "hit the schedule cap before exhausting the space";
 }
 
 } // namespace

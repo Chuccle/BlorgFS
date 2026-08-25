@@ -59,10 +59,13 @@ VOID ExInitializePushLock(PEX_PUSH_LOCK Lock)
 }
 
 //
-// Push locks are APC_LEVEL-or-below and must be held inside a critical
-// region -- an APC delivered while one is held can deadlock the system.
-// Both are checked, because "we always call KeEnterCriticalRegion first"
-// is exactly the kind of claim that quietly stops being true.
+// Push locks are APC_LEVEL-or-below. The IRQL half of that contract is
+// checked on every acquire; the critical-region half is NOT tracked --
+// KeEnterCriticalRegion records nothing, so a push lock taken outside
+// FsRtlEnterFileSystem is invisible here. That is a stated boundary: the
+// dispatch paths all enter the file system first, and tracking the
+// region would flag every sandbox body that calls into the table
+// directly rather than through a dispatch entry.
 //
 //
 // Under systematic exploration a push lock is a counter rather than an
@@ -86,12 +89,42 @@ static int PushLockSharablePredicate(void* Context)
     return ((PEX_PUSH_LOCK)Context)->SchedState >= 0;
 }
 
+//
+// Both claims run inside KmSchedWaitUntilClaim while the caller still
+// holds the baton, immediately after the predicate that justified them.
+// That adjacency is the whole mutual-exclusion argument: no scheduling
+// point exists between test and claim, so nothing can invalidate the test
+// in between. An earlier repair reached the same guarantee with re-test
+// loops at each call site, which was correct but made lock safety a
+// per-caller convention -- and one caller (the spin lock) did not follow
+// it, and double-granted. Claiming through the scheduler makes the
+// guarantee structural instead.
+//
+static void PushLockExclusiveClaim(void* Context)
+{
+    PEX_PUSH_LOCK lock = (PEX_PUSH_LOCK)Context;
+
+    KmSchedNoteAcquire(lock);
+
+    lock->SchedState = -1;
+    lock->ExclusiveOwner = KmSchedThreadId();
+}
+
+static void PushLockSharedClaim(void* Context)
+{
+    PEX_PUSH_LOCK lock = (PEX_PUSH_LOCK)Context;
+
+    KmSchedNoteAcquire(lock);
+
+    lock->SchedState++;
+}
+
 VOID ExAcquirePushLockExclusive(PEX_PUSH_LOCK Lock)
 {
     EnsurePushLockInitialized(Lock);
     KmRequireIrqlAtMost(APC_LEVEL, "ExAcquirePushLockExclusive");
 
-    if (Lock->ExclusiveOwner == GetCurrentThreadId())
+    if (Lock->ExclusiveOwner == KmSchedThreadId())
     {
         KmReportViolation(KmViolationLockRecursion,
             "recursive exclusive acquisition of a push lock -- self-deadlock");
@@ -102,20 +135,19 @@ VOID ExAcquirePushLockExclusive(PEX_PUSH_LOCK Lock)
 
     if (KmSchedActive())
     {
-        KmSchedWaitUntil(PushLockFreePredicate, Lock, "push lock exclusive");
-        Lock->SchedState = -1;
-        Lock->ExclusiveOwner = GetCurrentThreadId();
+        KmSchedWaitUntilClaim(PushLockFreePredicate, Lock,
+            PushLockExclusiveClaim, Lock, "push lock exclusive");
         return;
     }
 
     AcquireSRWLockExclusive(&Lock->Lock);
 
-    Lock->ExclusiveOwner = GetCurrentThreadId();
+    Lock->ExclusiveOwner = KmSchedThreadId();
 }
 
 VOID ExReleasePushLockExclusive(PEX_PUSH_LOCK Lock)
 {
-    if (Lock->ExclusiveOwner != GetCurrentThreadId())
+    if (Lock->ExclusiveOwner != KmSchedThreadId())
     {
         KmReportViolation(KmViolationLockOwner,
             "push lock released exclusive by a thread that does not hold it");
@@ -128,6 +160,7 @@ VOID ExReleasePushLockExclusive(PEX_PUSH_LOCK Lock)
     {
         Lock->SchedState = 0;
         KmNoteLockRelease(Lock->Id);
+        KmSchedNoteRelease(Lock);
         KmSchedYield();
         return;
     }
@@ -146,8 +179,15 @@ VOID ExAcquirePushLockShared(PEX_PUSH_LOCK Lock)
 
     if (KmSchedActive())
     {
-        KmSchedWaitUntil(PushLockSharablePredicate, Lock, "push lock shared");
-        Lock->SchedState++;
+        //
+        // Same claim-under-the-baton as the exclusive path. A shared count
+        // taken on top of an exclusive hold is the node table's worst
+        // case: lookups take the bucket shared and only retirement takes
+        // it exclusive, so this is exactly the pairing the table's whole
+        // design rests on.
+        //
+        KmSchedWaitUntilClaim(PushLockSharablePredicate, Lock,
+            PushLockSharedClaim, Lock, "push lock shared");
         return;
     }
 
@@ -158,8 +198,22 @@ VOID ExReleasePushLockShared(PEX_PUSH_LOCK Lock)
 {
     if (KmSchedActive())
     {
+        //
+        // An unmatched shared release drives SchedState negative, which
+        // makes the sharable predicate permanently false and surfaces
+        // later as a spurious deadlock attributed to the wrong cause.
+        // Rejecting it here puts the diagnostic on the offending call.
+        //
+        if (Lock->SchedState <= 0)
+        {
+            KmReportViolation(KmViolationLockOwner,
+                "push lock released shared without a shared hold");
+            return;
+        }
+
         Lock->SchedState--;
         KmNoteLockRelease(Lock->Id);
+        KmSchedNoteRelease(Lock);
         KmSchedYield();
         return;
     }
@@ -199,6 +253,41 @@ static int EresourceSharablePredicate(void* Context)
     return ((PERESOURCE)Context)->SchedState >= 0;
 }
 
+//
+// Both claims run inside KmSchedWaitUntilClaim while the caller still
+// holds the baton, immediately after the predicate that justified them.
+//
+// This is the site of the original double-grant: the acquire used to
+// claim on the strength of its wait having returned. KmSchedWaitUntil
+// returned once RefreshRunnable had marked the thread runnable -- which
+// happens the moment the predicate holds, not when the thread is next
+// scheduled -- so anything runnable in between could re-acquire and leave
+// two threads believing they held the resource. Releases then disagreed
+// with ExclusiveOwner, SchedState settled on a value no release would
+// return to zero, and every later exclusive waiter blocked against a
+// resource nobody owned: a deadlock in a thread whose partner had already
+// finished. A re-test loop at this call site fixed it locally; claiming
+// under the baton fixes it for every primitive at once.
+//
+static void EresourceExclusiveClaim(void* Context)
+{
+    PERESOURCE resource = (PERESOURCE)Context;
+
+    KmSchedNoteAcquire(resource);
+
+    resource->SchedState = -1;
+    resource->ExclusiveOwner = KmSchedThreadId();
+}
+
+static void EresourceSharedClaim(void* Context)
+{
+    PERESOURCE resource = (PERESOURCE)Context;
+
+    KmSchedNoteAcquire(resource);
+
+    resource->SchedState++;
+}
+
 NTSTATUS ExDeleteResourceLite(PERESOURCE Resource)
 {
     if (Resource->ExclusiveOwner != 0)
@@ -220,7 +309,7 @@ BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE Resource, BOOLEAN Wait)
 
     KmRequireIrqlAtMost(APC_LEVEL, "ExAcquireResourceExclusiveLite");
 
-    if (Resource->ExclusiveOwner == GetCurrentThreadId())
+    if (Resource->ExclusiveOwner == KmSchedThreadId())
     {
         KmReportViolation(KmViolationLockRecursion,
             "recursive exclusive acquisition of an ERESOURCE in the model "
@@ -234,38 +323,15 @@ BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE Resource, BOOLEAN Wait)
 
     if (KmSchedActive())
     {
-        //
-        // Re-test after waking, rather than claiming the resource on the
-        // strength of the wait having returned.
-        //
-        // KmSchedWaitUntil returns once the scheduler has marked this
-        // thread runnable, which RefreshRunnable does the moment the
-        // predicate holds -- not at the moment this thread is next
-        // scheduled. Anything else runnable can therefore run in between,
-        // and if that includes another acquirer of this resource, both
-        // threads leave the wait believing they hold it. The releases then
-        // disagree with ExclusiveOwner, SchedState settles on a value no
-        // release will return to zero, and every later exclusive waiter
-        // blocks against a resource nobody owns. That presents as a
-        // deadlock in a thread whose partner has already finished.
-        //
-        // Looping is sound here precisely because the scheduler runs one
-        // thread at a time: nothing can run between the test below and the
-        // claim that follows it.
-        //
-        while (!EresourceFreePredicate(Resource))
-        {
-            KmSchedWaitUntil(EresourceFreePredicate, Resource, "eresource exclusive");
-        }
-
-        Resource->SchedState = -1;
+        KmSchedWaitUntilClaim(EresourceFreePredicate, Resource,
+            EresourceExclusiveClaim, Resource, "eresource exclusive");
     }
     else
     {
         AcquireSRWLockExclusive(&Resource->Lock);
     }
 
-    Resource->ExclusiveOwner = GetCurrentThreadId();
+    Resource->ExclusiveOwner = KmSchedThreadId();
 
     return TRUE;
 }
@@ -281,17 +347,12 @@ BOOLEAN ExAcquireResourceSharedLite(PERESOURCE Resource, BOOLEAN Wait)
     if (KmSchedActive())
     {
         //
-        // Same re-test as the exclusive path, for the same reason: an
-        // exclusive acquirer can run between this wait returning and the
-        // count below, and a shared count taken on top of an exclusive
-        // hold corrupts the state both sides release against.
+        // Same claim-under-the-baton as the exclusive path: an exclusive
+        // acquirer running between this wait returning and the count below
+        // would corrupt the state both sides release against.
         //
-        while (!EresourceSharablePredicate(Resource))
-        {
-            KmSchedWaitUntil(EresourceSharablePredicate, Resource, "eresource shared");
-        }
-
-        Resource->SchedState++;
+        KmSchedWaitUntilClaim(EresourceSharablePredicate, Resource,
+            EresourceSharedClaim, Resource, "eresource shared");
     }
     else
     {
@@ -303,7 +364,7 @@ BOOLEAN ExAcquireResourceSharedLite(PERESOURCE Resource, BOOLEAN Wait)
 
 VOID ExReleaseResourceLite(PERESOURCE Resource)
 {
-    const BOOLEAN wasExclusive = (Resource->ExclusiveOwner == GetCurrentThreadId());
+    const BOOLEAN wasExclusive = (Resource->ExclusiveOwner == KmSchedThreadId());
 
     if (wasExclusive)
     {
@@ -312,8 +373,22 @@ VOID ExReleaseResourceLite(PERESOURCE Resource)
 
     if (KmSchedActive())
     {
+        //
+        // Same unmatched-release guard as ExReleasePushLockShared: a
+        // blind decrement below zero wedges every later sharable waiter,
+        // and the failure must be attributed to this call, not to a
+        // mystery deadlock several schedules later.
+        //
+        if (!wasExclusive && Resource->SchedState <= 0)
+        {
+            KmReportViolation(KmViolationLockOwner,
+                "resource released shared without a hold");
+            return;
+        }
+
         Resource->SchedState = wasExclusive ? 0 : Resource->SchedState - 1;
         KmNoteLockRelease(Resource->Id);
+        KmSchedNoteRelease(Resource);
         KmSchedYield();
         return;
     }
@@ -513,6 +588,19 @@ NTSTATUS KeDelayExecutionThread(KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLA
 
     LONGLONG hundredNs = Interval ? -Interval->QuadPart : 0;
     DWORD milliseconds = (DWORD)(hundredNs / 10000);
+
+    if (KmSchedActive())
+    {
+        //
+        // A delay is precisely when the kernel may run anyone, so under
+        // the executor it is a scheduling point: hand another modelled
+        // thread the baton. Virtual time makes the duration irrelevant,
+        // and the drain above already ran whatever the waiter needed.
+        //
+        (void)milliseconds;
+        KmSchedYield();
+        return STATUS_SUCCESS;
+    }
 
     Sleep(milliseconds ? milliseconds : 1);
 

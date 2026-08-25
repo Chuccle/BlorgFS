@@ -1,4 +1,4 @@
-﻿//
+//
 // Implementation of the kernel rule model. See KernelModel.h for what it
 // enforces and why each rule is worth enforcing.
 //
@@ -32,13 +32,43 @@ typedef struct _KM_THREAD_STATE
     unsigned char Irql;
     int HeldLocks[KM_MAX_HELD];
     int HeldCount;
+
+    //
+    // Generic per-modelled-thread slots for shim state that NT keeps
+    // per thread (the top-level IRP). Follows whatever identity scheme
+    // is active -- see KmThreadState.
+    //
+    void* Scratch[2];
 } KM_THREAD_STATE;
 
-static DWORD ThreadStateSlot = TLS_OUT_OF_INDEXES;
+//
+// volatile because the init handshake below spins on it from other
+// threads with nothing but Sleep(0) in the loop, and its address never
+// escapes -- a release optimizer is entitled to hoist that load out of
+// the loop and turn a rare race into an infinite spin. Debug builds
+// mask this; release builds would hang.
+//
+static volatile DWORD ThreadStateSlot = TLS_OUT_OF_INDEXES;
 static long ThreadStateSlotInit = 0;
+
+//
+// Under the fiber executor every modelled thread -- including the
+// explorer itself during Setup and Teardown -- has a slot in this plain
+// array, keyed by logical index. Fibers share one OS thread, so TLS
+// would alias them all onto a single state; see Scheduler.c's identity
+// notes. Slot KM_SCHED_MAX_THREADS is the explorer's own.
+//
+static KM_THREAD_STATE SchedThreadStates[KM_SCHED_MAX_THREADS + 1];
 
 static KM_THREAD_STATE* KmThreadState(void)
 {
+    if (KmSchedActive())
+    {
+        const int me = KmSchedSelfIndex();
+        return &SchedThreadStates[(me >= 0) ? me : KM_SCHED_MAX_THREADS];
+    }
+
+    // Real-thread tests: one state per OS thread via TLS, as before.
     if (0 == InterlockedCompareExchange(&ThreadStateSlotInit, 1, 0))
     {
         ThreadStateSlot = TlsAlloc();
@@ -59,6 +89,26 @@ static KM_THREAD_STATE* KmThreadState(void)
     }
 
     return state;
+}
+
+void* KmGetThreadScratch(int Slot)
+{
+    return KmThreadState()->Scratch[Slot];
+}
+
+void KmSetThreadScratch(int Slot, void* Value)
+{
+    KmThreadState()->Scratch[Slot] = Value;
+}
+
+void KmResetPerThreadModelState(void)
+{
+    //
+    // Fibers are pooled across replays, so their state must be zeroed
+    // at each replay boundary. Real-thread TLS state belongs to live
+    // threads in non-exploration tests and is deliberately untouched.
+    //
+    ZeroMemory(SchedThreadStates, sizeof(SchedThreadStates));
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -414,13 +464,45 @@ static int KmLockFreePredicate(void* Context)
     return ((KM_LOCK*)Context)->SchedState == 0;
 }
 
+static int KmLockSharablePredicate(void* Context)
+{
+    return ((KM_LOCK*)Context)->SchedState >= 0;
+}
+
+//
+// Runs inside KmSchedWaitUntilClaim while the caller still holds the
+// baton, so no other modelled thread can run between the free-check and
+// this claim. Claiming anywhere else -- in particular on return from a
+// wait that has already yielded the baton -- is how two threads ended up
+// holding one spin lock.
+//
+static void KmSpinLockClaim(void* Context)
+{
+    KM_LOCK* lock = (KM_LOCK*)Context;
+
+    lock->SchedState = 1;
+    lock->OwnerThread = KmSchedThreadId();
+}
+
+//
+// Runs inside KmSchedWaitUntilClaim under the baton, same argument as
+// KmSpinLockClaim. Without this branch a shared acquire took the
+// CRITICAL_SECTION even under exploration, where an OS-blocking enter on
+// a lock another fiber holds across its yield parks the only host thread
+// forever.
+//
+static void KmSpinLockSharedClaim(void* Context)
+{
+    ((KM_LOCK*)Context)->SchedState++;
+}
+
 unsigned char KmAcquireLock(KM_LOCK* Lock)
 {
     KmRequireIrqlAtMost(KM_DISPATCH_LEVEL, "KeAcquireSpinLock");
 
     KM_THREAD_STATE* state = KmThreadState();
 
-    if (Lock->OwnerThread == GetCurrentThreadId())
+    if (Lock->OwnerThread == KmSchedThreadId())
     {
         KmReportViolation(KmViolationLockRecursion,
             "recursive acquisition of spin lock '%s' -- self-deadlock", Lock->Name);
@@ -433,12 +515,12 @@ unsigned char KmAcquireLock(KM_LOCK* Lock)
     // is simply not scheduled until the holder releases -- and, more to
     // the point, every acquire and release becomes a scheduling point, so
     // the explorer can preempt inside a critical section rather than only
-    // between whole threads.
+    // between whole threads. The claim runs under the baton, immediately
+    // after the free-check: see KmSpinLockClaim for why it must not move.
     //
     if (KmSchedActive())
     {
-        KmSchedWaitUntil(KmLockFreePredicate, Lock, "spin lock");
-        Lock->SchedState = 1;
+        KmSchedWaitUntilClaim(KmLockFreePredicate, Lock, KmSpinLockClaim, Lock, "spin lock");
     }
     else
     {
@@ -457,7 +539,7 @@ unsigned char KmAcquireLock(KM_LOCK* Lock)
         state->Irql = KM_DISPATCH_LEVEL;
     }
 
-    Lock->OwnerThread = GetCurrentThreadId();
+    Lock->OwnerThread = KmSchedThreadId();
     Lock->OwnerPreviousIrql = old;
 
     KmPushHeld(Lock->Id);
@@ -467,7 +549,7 @@ unsigned char KmAcquireLock(KM_LOCK* Lock)
 
 void KmReleaseLock(KM_LOCK* Lock, unsigned char OldIrql)
 {
-    if (Lock->OwnerThread != GetCurrentThreadId())
+    if (Lock->OwnerThread != KmSchedThreadId())
     {
         KmReportViolation(KmViolationLockOwner,
             "spin lock '%s' released by a thread that does not hold it", Lock->Name);
@@ -502,6 +584,14 @@ void KmAcquireLockShared(KM_LOCK* Lock)
 
     KmRecordOrder(Lock->Id);
 
+    if (KmSchedActive())
+    {
+        KmSchedWaitUntilClaim(KmLockSharablePredicate, Lock,
+            KmSpinLockSharedClaim, Lock, "spin lock shared");
+        KmPushHeld(Lock->Id);
+        return;
+    }
+
     EnterCriticalSection(&Lock->Cs);
 
     KmPushHeld(Lock->Id);
@@ -510,6 +600,21 @@ void KmAcquireLockShared(KM_LOCK* Lock)
 void KmReleaseLockShared(KM_LOCK* Lock)
 {
     KmPopHeld(Lock->Id);
+
+    if (KmSchedActive())
+    {
+        if (Lock->SchedState <= 0)
+        {
+            KmReportViolation(KmViolationLockOwner,
+                "spin lock '%s' released shared without a shared hold", Lock->Name);
+            return;
+        }
+
+        Lock->SchedState--;
+        KmSchedYield();
+        return;
+    }
+
     LeaveCriticalSection(&Lock->Cs);
 }
 
@@ -896,6 +1001,17 @@ static DWORD WINAPI KmThreadTrampoline(LPVOID Parameter)
 
 KM_THREAD* KmStartThread(PKM_THREAD_ROUTINE Routine, void* Context)
 {
+    if (KmSchedActive())
+    {
+        //
+        // A real thread inside an exploration breaks the one-runner
+        // model: nothing schedules it, and its writes race the baton.
+        //
+        KmReportViolation(KmViolationLifetime,
+            "KmStartThread under systematic exploration -- use KmSchedSpawn");
+        return NULL;
+    }
+
     KM_THREAD* thread = (KM_THREAD*)calloc(1, sizeof(KM_THREAD));
 
     thread->Routine = Routine;
@@ -909,6 +1025,13 @@ void KmJoinThread(KM_THREAD* Thread)
 {
     if (!Thread)
     {
+        return;
+    }
+
+    if (KmSchedActive())
+    {
+        KmReportViolation(KmViolationLifetime,
+            "KmJoinThread under systematic exploration");
         return;
     }
 
@@ -929,12 +1052,41 @@ void KmBarrierWait(KM_BARRIER* Barrier)
 
     while (Barrier->Count < Barrier->Target)
     {
-        YieldProcessor();
+        if (KmSchedActive())
+        {
+            //
+            // A spinning fiber never yields the host thread, so the
+            // thread being waited for could never run; wait
+            // cooperatively instead.
+            //
+            KmSchedYield();
+        }
+        else
+        {
+            //
+            // Pause rather than burn the whole slice: on a hyperthread
+            // sibling the thread being waited for shares this core's
+            // execution resources, and a tight spin starves exactly the
+            // thread whose progress would end the spin.
+            //
+            YieldProcessor();
+        }
     }
 }
 
 void KmJitter(void)
 {
+    if (KmSchedActive())
+    {
+        //
+        // Jitter exists to widen race windows; under the executor the
+        // equivalent of giving up the processor is handing another
+        // modelled thread the baton here.
+        //
+        KmSchedYield();
+        return;
+    }
+
     //
     // SwitchToThread rather than a spin: it actually gives up the
     // remainder of the quantum to another runnable thread on this

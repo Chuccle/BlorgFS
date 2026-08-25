@@ -225,7 +225,11 @@ TEST_F(SocketSchedTest, NoInterleavingFreesTheContextTwice)
 
     KmSchedSetAtomicYields(0);
 
-    EXPECT_EQ(0, result.Deadlocks) << "a schedule deadlocked";
+    //
+// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+// assertion after this one would run against corrupted state.
+//
+ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";

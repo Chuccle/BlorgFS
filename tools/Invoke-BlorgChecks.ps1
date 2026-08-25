@@ -282,7 +282,13 @@ if ($runsBuild) {
         # underneath, so a premature free lands on the guarded pool rather
         # than on a corrupted list days later.
         #
-        $ok = (Invoke-TestExe 'NodeTableSandbox.exe' 'test:kernel-nodetable' 300 '' 'build:NodeTableSandbox') -and $ok
+        # The budget is generous because the revival proof inside is a
+        # full exhaustive exploration (~150k replays, several minutes):
+        # its schedule space grew when lock claims moved under the baton
+        # and contenders started genuinely blocking. A timeout here means
+        # the machine slowed or the space exploded, not a test failure.
+        #
+        $ok = (Invoke-TestExe 'NodeTableSandbox.exe' 'test:kernel-nodetable' 900 '' 'build:NodeTableSandbox') -and $ok
 
         #
         # Every remaining driver translation unit -- all of IRP dispatch,

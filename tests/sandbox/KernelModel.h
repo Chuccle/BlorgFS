@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 //
 // An executable model of the kernel rules BlorgFS depends on.
@@ -308,6 +308,23 @@ typedef struct _KM_THREAD KM_THREAD;
 
 KM_THREAD* KmStartThread(PKM_THREAD_ROUTINE Routine, void* Context);
 void KmJoinThread(KM_THREAD* Thread);
+
+//
+// Per-modelled-thread scratch slots for shim state that NT keeps per
+// thread (the top-level IRP). Backed by the same storage as IRQL and
+// the held-lock stack, so it follows whichever identity scheme is
+// active -- TLS for real threads, the executor's per-fiber slots under
+// exploration.
+//
+void* KmGetThreadScratch(int Slot);
+void KmSetThreadScratch(int Slot, void* Value);
+
+//
+// Zeroes every modelled thread's executor-side state. Called by the
+// scheduler at each replay boundary because fibers are pooled across
+// replays; real-thread TLS state is deliberately untouched.
+//
+void KmResetPerThreadModelState(void);
 
 //
 // A rendezvous for N threads, so a test can line several threads up at

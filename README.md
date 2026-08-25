@@ -146,6 +146,16 @@ Note `-fsanitize=thread` is **unsupported** for `x86_64-pc-windows-msvc`;
 there is no TSan on this platform. Interleaving coverage comes from the
 systematic scheduler instead (`tests\sandbox\Scheduler.h`).
 
+The scheduler's lock contract is **claim-under-the-baton**: a primitive waits
+via `KmSchedWaitUntilClaim`, and its claim callback runs while the caller still
+holds the baton, immediately after the predicate that justified it. Claiming
+anywhere else reopens a TOCTOU window between check and claim -- the spin-lock
+double-grant and the ERESOURCE double-hold were both exactly that window.
+A deadlocked schedule drains its parked threads serially through the baton
+rather than releasing them all at once, so an abandoned run exits cleanly
+instead of corrupting every replay after it. `SchedulerAudit` in
+`NodeTableSchedTest.cpp` pins both properties.
+
 ## Measuring performance
 
 **Benchmark on an optimised Release build with Driver Verifier disabled.**

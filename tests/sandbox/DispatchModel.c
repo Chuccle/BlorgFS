@@ -409,6 +409,18 @@ NTSTATUS KeWaitForMultipleObjects(
 
     KmRequireIrqlAtMost(PASSIVE_LEVEL, "KeWaitForMultipleObjects");
 
+    if (KmSchedActive())
+    {
+        //
+        // Same hazard as KeWaitForSingleObject under the executor: a
+        // real wait parks the only host thread. Fail loudly rather than
+        // hang.
+        //
+        KmReportViolation(KmViolationLifetime,
+            "KeWaitForMultipleObjects under systematic exploration");
+        return STATUS_TIMEOUT;
+    }
+
     HANDLE handles[MAXIMUM_WAIT_OBJECTS];
 
     for (ULONG i = 0; i < Count; ++i)

@@ -12,6 +12,12 @@
 
 #include "..\..\src\Driver.h"
 
+// Declared explicitly rather than relying on Driver.h's include order:
+// some harnesses (ClientFuzz) compile this file without the full driver
+// header chain, and an undeclared KmGetThreadScratch would be assumed
+// to return int -- truncating a pointer on x64.
+#include "KernelModel.h"
+
 #include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -374,6 +380,18 @@ NTSTATUS KeWaitForSingleObject(PVOID Object, KWAIT_REASON Reason, KPROCESSOR_MOD
     (void)Timeout;
 
     KmRequireIrqlAtMost(PASSIVE_LEVEL, "KeWaitForSingleObject");
+
+    if (KmSchedActive())
+    {
+        //
+        // A real wait would park the host thread with every modelled
+        // fiber on it: nothing could ever signal the event. No explored
+        // body waits today; fail loudly rather than hang if one appears.
+        //
+        KmReportViolation(KmViolationLifetime,
+            "KeWaitForSingleObject under systematic exploration");
+        return STATUS_SUCCESS;
+    }
 
     PKEVENT event = (PKEVENT)Object;
 
@@ -1190,7 +1208,7 @@ LARGE_INTEGER KeQueryPerformanceCounter(PLARGE_INTEGER PerformanceFrequency)
 
 PETHREAD PsGetCurrentThread(VOID)
 {
-    return (PETHREAD)(ULONG_PTR)GetCurrentThreadId();
+    return (PETHREAD)(ULONG_PTR)KmSchedThreadId();
 }
 
 PEPROCESS PsGetCurrentProcess(VOID)
@@ -1204,32 +1222,26 @@ PEPROCESS PsGetCurrentProcess(VOID)
 // re-entrant call apart from a fresh request, and a shared global would
 // make two sandbox threads see each other's re-entrancy.
 //
-static DWORD TopLevelIrpSlot = TLS_OUT_OF_INDEXES;
-static long TopLevelIrpSlotInit = 0;
-
-static DWORD TopLevelSlot(void)
-{
-    if (0 == InterlockedCompareExchange(&TopLevelIrpSlotInit, 1, 0))
-    {
-        TopLevelIrpSlot = TlsAlloc();
-    }
-
-    while (TLS_OUT_OF_INDEXES == TopLevelIrpSlot)
-    {
-        Sleep(0);
-    }
-
-    return TopLevelIrpSlot;
-}
+//
+// volatile for the same reason as the model's ThreadStateSlot: the init
+// handshake below spins on this from other threads, its address never
+// escapes, and a release optimizer may hoist the load out of the loop.
+//
+//
+// The top-level IRP is per-thread in NT. It lives in the model's
+// per-modelled-thread scratch slot 0, which follows the active identity
+// scheme -- TLS for real threads, per-fiber slots under exploration,
+// where OS TLS would alias every fiber onto one value.
+//
 
 PIRP IoGetTopLevelIrp(VOID)
 {
-    return (PIRP)TlsGetValue(TopLevelSlot());
+    return (PIRP)KmGetThreadScratch(0);
 }
 
 VOID IoSetTopLevelIrp(PIRP Irp)
 {
-    TlsSetValue(TopLevelSlot(), Irp);
+    KmSetThreadScratch(0, Irp);
 }
 
 //
