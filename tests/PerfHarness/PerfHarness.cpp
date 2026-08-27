@@ -567,19 +567,25 @@ static bool PrintFilesystemStatistics(HANDLE volume)
 }
 
 //
-// Sequential read of one file. Unbuffered mode is what exercises the HTTP
-// path honestly -- a buffered re-read of a file already resident in Cc
-// measures memcpy, not this filesystem.
+// One file the stream workload could run against. The size rides along
+// because the find walk already paid for it and the largest-first ordering
+// in CollectStreamFiles needs it; querying each path again afterwards
+// would spend a metadata round trip relearning what was just in hand.
 //
+struct StreamFileCandidate
+{
+    std::wstring Path;
+    unsigned long long Bytes;
+};
+
 //
-// Distinct files for the stream workload, largest-first so a short file
-// cannot end a stream early and flatter the result. Recursive, because the
-// media layout that motivates this puts one file per directory.
+// Distinct files for the stream workload. Recursive, because the media
+// layout that motivates this puts one file per directory.
 //
 static void CollectStreamFilesInto(
     const std::wstring& directory,
     unsigned long long minimumBytes,
-    std::vector<std::wstring>* files)
+    std::vector<StreamFileCandidate>* files)
 {
     std::wstring pattern = directory + L"\\*";
 
@@ -611,12 +617,20 @@ static void CollectStreamFilesInto(
 
         if (size >= minimumBytes)
         {
-            files->push_back(full);
+            StreamFileCandidate candidate;
+            candidate.Path = full;
+            candidate.Bytes = size;
+            files->push_back(candidate);
         }
     }
     while (FindNextFileW(handle, &find));
 
     FindClose(handle);
+}
+
+static bool StreamFileIsLarger(const StreamFileCandidate& left, const StreamFileCandidate& right)
+{
+    return left.Bytes > right.Bytes;
 }
 
 static bool CollectStreamFiles(
@@ -631,12 +645,30 @@ static bool CollectStreamFiles(
     //
     const unsigned long long minimumBytes = 64ull * 1024 * 1024;
 
-    CollectStreamFilesInto(directory, minimumBytes, files);
+    std::vector<StreamFileCandidate> candidates;
 
-    if (files->size() < streamCount)
+    CollectStreamFilesInto(directory, minimumBytes, &candidates);
+
+    if (candidates.size() < streamCount)
     {
-        files->clear();
-        CollectStreamFilesInto(directory, 8ull * 1024 * 1024, files);
+        candidates.clear();
+        CollectStreamFilesInto(directory, 8ull * 1024 * 1024, &candidates);
+    }
+
+    //
+    // Largest-first, so the first streamCount files never include one that
+    // hits EOF partway through the window: a stream that ends early shrinks
+    // its own share of the aggregate and drags the fairness ratio around as
+    // a side effect of directory enumeration order rather than of the
+    // driver.
+    //
+    std::sort(candidates.begin(), candidates.end(), StreamFileIsLarger);
+
+    files->clear();
+
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        files->push_back(candidates[i].Path);
     }
 
     return !files->empty();
@@ -894,6 +926,11 @@ static bool RunStreams(
     return true;
 }
 
+//
+// Sequential read of one file. Unbuffered mode is what exercises the HTTP
+// path honestly -- a buffered re-read of a file already resident in Cc
+// measures memcpy, not this filesystem.
+//
 static bool RunSequential(const wchar_t* path, bool unbuffered, unsigned long long* bytesOut, double* secondsOut)
 {
     DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
@@ -1351,8 +1388,25 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
             return 1;
         }
 
-        const DWORD blockKb = static_cast<DWORD>(_wtoi(argv[3]));
-        const unsigned long count = static_cast<unsigned long>(_wtoi(argv[4]));
+        //
+        // _wtoi yields 0 for anything unparsable, and a zero block size or
+        // count would otherwise run a "workload" that reads nothing and
+        // reports a confident 0.00 MB/s -- a plausible-looking measurement
+        // of a typo.
+        //
+        const int parsedBlockKb = _wtoi(argv[3]);
+        const int parsedCount = _wtoi(argv[4]);
+
+        if (parsedBlockKb <= 0 || parsedCount <= 0)
+        {
+            fprintf(stderr, "  [FAIL] blockKB and count must be positive integers (got '%ws', '%ws')\n", argv[3], argv[4]);
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        const DWORD blockKb = static_cast<DWORD>(parsedBlockKb);
+        const unsigned long count = static_cast<unsigned long>(parsedCount);
 
         ok = RunRandom(argv[2], blockKb * 1024, count, &bytes, &seconds);
         sprintf_s(label, "random read (%lu KB x %lu)", blockKb, count);
@@ -1376,6 +1430,19 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
             return 1;
         }
 
+        //
+        // _wtof yields 0.0 for unparsable text, and a zero deadline ends
+        // the loop before the first read: a valid-looking report carrying
+        // ThroughputMBs=0 would be written and exit 0.
+        //
+        if (!(runSeconds > 0.0))
+        {
+            fprintf(stderr, "  [FAIL] duration must be a positive number of seconds (got '%ws')\n", argc > 4 ? argv[4] : L"");
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
         const bool unbuffered = (argc > 5) && (0 == wcscmp(argv[5], L"unbuffered"));
 
         ok = RunStreams(argv[2], streamCount, runSeconds, unbuffered, &bytes, &seconds);
@@ -1391,7 +1458,17 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
             return 1;
         }
 
-        const unsigned long passes = static_cast<unsigned long>(_wtoi(argv[3]));
+        const int parsedPasses = _wtoi(argv[3]);
+
+        if (parsedPasses <= 0)
+        {
+            fprintf(stderr, "  [FAIL] passes must be a positive integer (got '%ws')\n", argv[3]);
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        const unsigned long passes = static_cast<unsigned long>(parsedPasses);
 
         ok = RunMetadata(argv[2], passes, &opens, &seconds);
         sprintf_s(label, "metadata storm (%lu passes)", passes);
@@ -1417,18 +1494,32 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
 
     BLORGFS_STATISTICS_RESPONSE stats;
 
+    bool reported = false;
+
     if (QueryDriverStatistics(handles.Control, &stats))
     {
         PrintDriverStatistics(stats);
 
         if (reportPath)
         {
-            WriteReport(reportPath, label, bytes, opens, seconds, stats);
+            reported = WriteReport(reportPath, label, bytes, opens, seconds, stats);
+        }
+        else
+        {
+            reported = true;
         }
     }
 
     CloseHandles(&handles);
-    return 0;
+
+    //
+    // Exit nonzero when the counters could not be read or the report could
+    // not be written, even though the workload itself ran. The gate checks
+    // this exit code AND the presence of a fresh report; a silent success
+    // here is precisely what lets the previous session's report pose as
+    // this run's.
+    //
+    return reported ? 0 : 1;
 }
 
 int wmain(int argc, wchar_t** argv)

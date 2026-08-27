@@ -20,6 +20,10 @@
     take minutes and fail entirely on a machine without egress, which is
     exactly when you most want a verdict. Pass -SymbolServer to opt in.
 
+    Exit codes: 0 no bugcheck found; 1 a bugcheck was found (driver on
+    stack or not -- see DriverOnStack in the verdict); 3 triage itself
+    failed and no verdict should be trusted.
+
 .PARAMETER DumpPath
     The .dmp to analyse.
 
@@ -118,7 +122,25 @@ $commands = '.lastevent; !analyze -v; k; !verifier 3; q'
 
 Write-Host "Triaging $DumpPath" -ForegroundColor Cyan
 
-$output = & $cdb -z $DumpPath -c $commands 2>&1 | Out-String
+#
+# 2>&1 under $ErrorActionPreference='Stop' turns cdb's routine stderr
+# chatter -- symbol-load lines above all -- into a terminating
+# NativeCommandError mid-pipeline, so whether triage survives depends on
+# whether the debugger happened to mutter. Invoke-BlorgProofs.ps1 dodges
+# the same trap by not redirecting; here stderr carries part of the
+# analysis, so the preference is relaxed for the duration of the call and
+# restored afterwards.
+#
+$previousEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+
+try {
+    $output = & $cdb -z $DumpPath -c $commands 2>&1 | Out-String
+    $cdbExit = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previousEap
+}
 
 $lines = $output -split "`r?`n"
 
@@ -158,7 +180,7 @@ $stackEnd = $lines.Length
 
 for ($i = 0; $i -lt $lines.Length; $i++) {
     if ($stackStart -lt 0 -and $lines[$i] -match 'Call Site') { $stackStart = $i; continue }
-    if ($stackStart -ge 0 -and $lines[$i] -match '^\s*$' -and ($i - $stackStart) -gt 1) { $stackEnd = $i; break }
+    if ($stackStart -ge 0 -and $lines[$i] -match '^\s*$') { $stackEnd = $i; break }
 }
 
 $stackText = if ($stackStart -ge 0) {
@@ -201,6 +223,7 @@ $report = [ordered]@{
     DriverOnStack    = [int]$driverOnStack
     VerifierPresent  = [int]$verifierFlagged
     SymbolServerUsed = [int]$SymbolServer.IsPresent
+    CdbExit          = $cdbExit
 }
 
 $body = ($report.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "`n"
@@ -232,6 +255,23 @@ if ($driverOnStack) {
 if ($bugcheck) {
     Write-Host "`nBugcheck $bugcheck, $DriverName not on the captured stack." -ForegroundColor Yellow
     exit 1
+}
+
+#
+# Fail closed on broken triage, which is reached only when nothing above
+# matched: an unreadable dump, a wrong dump type or a cdb that died yields
+# empty fields, and calling that "no bugcheck" would let whoever consumes
+# this verdict close the loop on a crashed machine believing none
+# happened. Real debugger output always carries its banner and a prompt,
+# so their absence means the analysis never actually ran.
+#
+$looksLikeDebuggerOutput = ($output -match '(?i)Microsoft \(R\) Windows Debugger') -or ($output -match '\b\d+:\d+>')
+
+if (-not $looksLikeDebuggerOutput -or
+    (((-not $bugcheck) -and (-not $exceptionCode) -and (-not $lastEvent)) -and $cdbExit -ne 0))
+{
+    Write-Host "`nTRIAGE FAILED: the debugger produced no parsable verdict (cdb exit $cdbExit) -- read the full log before concluding anything." -ForegroundColor Red
+    exit 3
 }
 
 Write-Host "`nNo bugcheck signature found (usermode dump, or a clean break)." -ForegroundColor Green

@@ -731,11 +731,11 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
     {
         if (BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE))
         {
-            if(filePath.IsAllocated)
+            if (filePath.IsAllocated)
             {
                 ExFreePool(filePath.String.Buffer);
             }
-            
+
             return STATUS_FILE_IS_A_DIRECTORY;
         }
 
@@ -959,14 +959,14 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         }
 
         return STATUS_FILE_IS_A_DIRECTORY;
-    } 
+    }
     else if (!dirEntInfo.IsDirectory && BooleanFlagOn(options, FILE_DIRECTORY_FILE))
-    { 
+    {
         if (filePath.IsAllocated)
         {
             ExFreePool(filePath.String.Buffer);
         }
-    
+
         return STATUS_NOT_A_DIRECTORY;
     }
 
@@ -998,9 +998,9 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                 {
                     BlorgNodeTablePublish(desiredNode);
                 }
-                else if (0 == ReadNoFence64(&desiredNode->RefCount))
+                else
                 {
-                    BlorgNodeDeferReap(desiredNode);
+                    BlorgNodeDeferReapIfIdle(desiredNode);
                 }
 
                 ExReleaseResourceLite(vcb->Header.Resource);
@@ -1032,9 +1032,9 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                 {
                     BlorgNodeTablePublish(desiredNode);
                 }
-                else if (0 == ReadNoFence64(&desiredNode->RefCount))
+                else
                 {
-                    BlorgNodeDeferReap(desiredNode);
+                    BlorgNodeDeferReapIfIdle(desiredNode);
                 }
 
                 ExReleaseResourceLite(vcb->Header.Resource);
@@ -1186,6 +1186,18 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         case BlorgDeviceFileSystem:
         {
             result = BlorgFileSystemCreate(Irp);
+            BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
+            break;
+        }
+
+        //
+        // Unreachable through the I/O manager today (only this driver's
+        // three device objects carry its major table), but the cases above
+        // complete inside themselves, so a fourth kind would strand the IRP
+        // here rather than fail it. Complete unconditionally.
+        //
+        default:
+        {
             BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }

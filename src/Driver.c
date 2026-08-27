@@ -856,10 +856,16 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DriverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = BlorgQuerySecurity;
     DriverObject->MajorFunction[IRP_MJ_SET_SECURITY] = BlorgSetSecurity;
 
+    //
+    // Zeroed BEFORE the table is published below: nothing can dispatch yet
+    // (no device object exists), but publishing a pointer to uninitialized
+    // storage and filling it lines later is an ordering one future edit away
+    // from mattering.
+    //
+    RtlZeroMemory(&BlorgFsFastDispatch, sizeof(FAST_IO_DISPATCH));
+
 #pragma warning(suppress: 28175)
     DriverObject->FastIoDispatch = &BlorgFsFastDispatch;
-
-    RtlZeroMemory(&BlorgFsFastDispatch, sizeof(FAST_IO_DISPATCH));
 
     global.CacheManagerCallbacks.AcquireForLazyWrite = BlorgAcquireNodeForLazyWrite;
     global.CacheManagerCallbacks.ReleaseFromLazyWrite = BlorgReleaseNodeFromLazyWrite;
@@ -877,6 +883,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     if (!NT_SUCCESS(result))
     {
+        //
+        // Every load-failure exit frees what DriverEntry allocated ahead of
+        // the failing step, including the two allocations whose own init is
+        // "tolerant" and therefore easy to forget: the per-processor
+        // statistics table and the TLS provider handles.
+        //
+        BlorgStatisticsCleanup();
+        BlorgTlsGlobalCleanup();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -885,6 +899,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     if (!NT_SUCCESS(result))
     {
         BlorgCleanupHttpClient();
+        BlorgStatisticsCleanup();
+        BlorgTlsGlobalCleanup();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -895,6 +911,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     {
         BlorgFreeSecurityDescriptor();
         BlorgCleanupHttpClient();
+        BlorgStatisticsCleanup();
+        BlorgTlsGlobalCleanup();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -911,6 +929,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         global.FileSystemDeviceObject = NULL;
         BlorgFreeSecurityDescriptor();
         BlorgCleanupHttpClient();
+        BlorgStatisticsCleanup();
+        BlorgTlsGlobalCleanup();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -965,6 +985,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
         global.DiskDeviceObject = NULL;
         BlorgFreeSecurityDescriptor();
+        BlorgStatisticsCleanup();
+        BlorgTlsGlobalCleanup();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
@@ -996,6 +1018,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
         global.DiskDeviceObject = NULL;
         BlorgFreeSecurityDescriptor();
+        BlorgStatisticsCleanup();
+        BlorgTlsGlobalCleanup();
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 

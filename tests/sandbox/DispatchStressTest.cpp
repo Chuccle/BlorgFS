@@ -84,7 +84,6 @@ struct ThreadArg
     StressState* State;
     int ThreadIndex;
     int Iterations;
-    volatile long* SeenBadCount;
 };
 
 DWORD WINAPI StressOpenCloseThread(LPVOID Param)
@@ -188,7 +187,6 @@ TEST_F(DispatchStressTest, ManyThreadsOpenAndCloseWithoutLosingCounts)
     const int kThreads = 64;
     const int kIterationsPerThread = 2000;
 
-    volatile long badCount = 0;
     ThreadArg args[kThreads];
     HANDLE handles[kThreads];
 
@@ -197,7 +195,6 @@ TEST_F(DispatchStressTest, ManyThreadsOpenAndCloseWithoutLosingCounts)
         args[i].State = &state;
         args[i].ThreadIndex = i;
         args[i].Iterations = kIterationsPerThread;
-        args[i].SeenBadCount = &badCount;
         handles[i] = CreateThread(NULL, 0, StressOpenCloseThread, &args[i], 0, NULL);
     }
 

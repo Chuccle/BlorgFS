@@ -853,4 +853,59 @@ TEST_F(CreateDirectoryTest, InsertByPathTreatsAnExistingFileLeafAsAlreadyPresent
     EXPECT_EQ(nullptr, inserted) << "nothing new is created for a path that already resolves";
 }
 
+TEST_F(CreateDirectoryTest, FailedColdOpenDefersItsInsertedNodeForReap)
+{
+    //
+    // Targets the SearchByPath-hit failure arm specifically: the node
+    // already sits in the tree (pre-inserted here, unpublished, no
+    // handles), the open resolves to it, and the access check rejects.
+    // Its only route out of the tree is BlorgVolumeCreate's own idle-test
+    // defer -- nothing will ever close it. The freshly-inserted sibling
+    // arm frees inline and is deliberately NOT the shape under test.
+    //
+    // Probe is the tree itself: a cold SearchByPath under the VCB resource
+    // finds a stranded node and misses a reaped one, whatever the
+    // lookaside lists are caching. Deterministic, which is what makes this
+    // a mutation target rather than an argument.
+    //
+    DIRECTORY_ENTRY_METADATA meta = {};
+    meta.Size = 1024;
+
+    UNICODE_STRING clipPath = Path(L"\\clip.bin");
+
+    PCOMMON_CONTEXT node = nullptr;
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &clipPath, &meta, Volume, &node));
+    ASSERT_NE(nullptr, node);
+
+    Root->CachedListing = BuildListing(L"clip.bin", L"movies");
+
+    CreateOpener opener;
+    PrepareOpener(&opener, clipPath,
+        FILE_READ_DATA | FILE_WRITE_DATA, kShareAll, 0);
+
+    BlorgCreate(Volume, &opener.CreateIrp);
+
+    ASSERT_EQ(STATUS_ACCESS_DENIED, opener.CreateIrp.IoStatus.Status)
+        << "the open must fail after resolving the node for this path to be exercised";
+
+    SIZE_T postOpen = ShimPoolOutstanding();
+
+    ShimDrainWorkItems();
+
+    //
+    // The listing hit seeded the path cache (production frees it via TTL
+    // or invalidation); the test owns neither, so drop it before teardown's
+    // quiescence floor.
+    //
+    UNICODE_STRING clipSeed = Path(L"\\clip.bin");
+    BlorgPathCacheInvalidate(&clipSeed);
+
+    ExAcquireResourceExclusiveLite(Vcb->Header.Resource, TRUE);
+    PCOMMON_CONTEXT stranded = BlorgSearchByPath(Root, &clipPath);
+    ExReleaseResourceLite(Vcb->Header.Resource);
+
+    EXPECT_EQ(nullptr, stranded)
+        << "the resolved node was never reaped after its open failed";
+}
+
 } // namespace

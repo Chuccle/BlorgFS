@@ -341,6 +341,7 @@ NTSTATUS BlorgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
+    FsRtlEnterFileSystem();
     switch (BlorgDeviceKind(DeviceObject))
     {
         case BlorgDeviceVolume:
@@ -358,6 +359,7 @@ NTSTATUS BlorgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             break;
         }
     }
+    FsRtlExitFileSystem();
 
     Irp->IoStatus.Status = result;
 

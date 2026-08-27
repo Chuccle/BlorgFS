@@ -155,7 +155,10 @@ VOID BlorgFspCsqCompleteCanceledIrp(IO_CSQ* Csq, PIRP Irp)
     BlorgCompleteRequest(Irp, STATUS_CANCELLED, IO_NO_INCREMENT);
 }
 
-// System threads disable kernel APCs so no need to explicitly disable APCs here.
+// PsCreateSystemThread creates threads inside a critical region with kernel
+// APCs disabled (see wdm.h PsCreateSystemThread Remarks); the region
+// persists for the thread's lifetime.  No explicit KeEnterCriticalRegion
+// needed here.
 VOID BlorgFspDispatch(_In_ PVOID StartContext)
 
 /*++
@@ -349,10 +352,10 @@ NTSTATUS BlorgPrePostIrp(
                 IoReadAccess,
                 IrpSp->Parameters.SetEa.Length);
         }
-		default:
-		{
-			break;
-		}
+        default:
+        {
+            break;
+        }
     }
 
     return STATUS_SUCCESS;
@@ -534,10 +537,10 @@ void BlorgOplockComplete(PVOID Context, PIRP Irp)
 //
 static void StopWorkQueueThreads(ULONG ThreadCount)
 {
-	if (!InterlockedCompareExchange(&FspQueue.ThreadsActive, FALSE, TRUE))
-	{
-		return;
-	}
+    if (!InterlockedCompareExchange(&FspQueue.ThreadsActive, FALSE, TRUE))
+    {
+        return;
+    }
 
     KeSetEvent(&FspQueue.TerminationEvent, EVENT_INCREMENT, FALSE);
 
@@ -578,7 +581,7 @@ NTSTATUS BlorgCreateWorkQueue(void)
 {
     if (InterlockedCompareExchange(&FspQueue.ThreadsActive, TRUE, FALSE))
     {
-		return STATUS_SUCCESS;
+        return STATUS_SUCCESS;
     }   
 
     KeInitializeSpinLock(&FspQueue.IrpQueueSpinLock);
@@ -597,7 +600,7 @@ NTSTATUS BlorgCreateWorkQueue(void)
 
     if (!NT_SUCCESS(result))
     {
-		InterlockedExchange(&FspQueue.ThreadsActive, FALSE);
+        InterlockedExchange(&FspQueue.ThreadsActive, FALSE);
         return result;
     }
 

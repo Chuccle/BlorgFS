@@ -16,9 +16,9 @@
     all, so a sweep without it measures the previous run's leftovers rather
     than the configuration under test.
 
-    Emits one row per stream count and a scaling-efficiency column, plus the
-    driver's own ring counters so a throughput change can be attributed rather
-    than guessed at.
+    Emits one row per stream count and a scaling-efficiency column, plus
+    the path-cache hit/miss counts so a throughput change can be attributed
+    rather than guessed at.
 
 .PARAMETER StreamCounts
     Concurrency levels to sweep. Default 1,2,4,8,12 -- spanning below, at, and
@@ -72,8 +72,24 @@ function Invoke-Guest([string[]]$CommandArgs) {
     & $vmrun @auth @CommandArgs 2>&1
 }
 
+#
+# For commands whose failure must stop the sweep rather than degrade it:
+# a vmrun call that silently failed used to surface as a missing row or a
+# NaN column, and the sweep still ended in success. Measurement tooling
+# that drops points quietly produces confident nonsense.
+#
+function Invoke-GuestStrict([string[]]$CommandArgs) {
+    $out = Invoke-Guest $CommandArgs
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "vmrun $($CommandArgs[0]) failed (exit $LASTEXITCODE): $out"
+    }
+
+    return $out
+}
+
 function Invoke-GuestPowerShell([string]$Command) {
-    Invoke-Guest @('runProgramInGuest', $vmx, '-activeWindow',
+    Invoke-GuestStrict @('runProgramInGuest', $vmx, '-activeWindow',
         'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
         '-NoProfile', '-Command', $Command) | Out-Null
 }
@@ -99,10 +115,23 @@ function Reset-Driver {
 
     Start-Sleep -Seconds 20
 
+    #
+    # The probe itself is allowed to fail while the guest boots -- that is
+    # what the loop is for. What is not allowed is falling through the loop
+    # without ever seeing the guest again and measuring against a machine
+    # that is down, which is what the previous version did: ~170 seconds of
+    # polite retries, then business as usual.
+    #
+    $ready = $false
+
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Seconds 5
         $probe = Invoke-Guest @('directoryExistsInGuest', $vmx, $GuestDeployDir)
-        if ($probe -match 'exists') { break }
+        if ($probe -match 'exists') { $ready = $true; break }
+    }
+
+    if (-not $ready) {
+        throw "guest did not become reachable within the reboot window -- refusing to measure against a VM that may be down"
     }
 
     # Demand-start: the driver does not come up by itself after a reboot.
@@ -132,11 +161,10 @@ foreach ($count in $StreamCounts) {
 
     $localOut = Join-Path $env:TEMP "blorg-scaling-$count.txt"
     Remove-Item $localOut -ErrorAction SilentlyContinue
-    Invoke-Guest @('copyFileFromGuestToHost', $vmx, $guestOut, $localOut) | Out-Null
+    Invoke-GuestStrict @('copyFileFromGuestToHost', $vmx, $guestOut, $localOut) | Out-Null
 
     if (-not (Test-Path $localOut)) {
-        Write-Warning "no result for $count stream(s)"
-        continue
+        throw "guest reported success but no result file arrived for $count stream(s)"
     }
 
     $text = Get-Content $localOut -Raw
@@ -147,7 +175,7 @@ foreach ($count in $StreamCounts) {
         return [double]::NaN
     }
 
-    $rows += [pscustomobject]@{
+    $row = [pscustomobject]@{
         Streams   = $count
         Aggregate = Field 'aggregate\s+([\d.]+) MB/s'
         Fairness  = Field 'fairness ([\d.]+)'
@@ -155,11 +183,23 @@ foreach ($count in $StreamCounts) {
         P95ms     = Field 'latency p95\s+([\d.]+) ms'
         P99ms     = Field 'latency p99\s+([\d.]+) ms'
         MaxMs     = Field 'latency max\s+([\d.]+) ms'
-        Armed     = Field 'armed / refused\s+(\d+)'
-        Refused   = Field 'armed / refused\s+\d+ / (\d+)'
         Hits      = Field 'hit\s+(\d+)'
         Misses    = Field 'miss\s+(\d+)'
     }
+
+    #
+    # A NaN here means the harness produced no such line -- it failed, or
+    # its output drifted from what this script parses. Either way the row
+    # would silently poison the efficiency column from inside an
+    # apparently-successful sweep.
+    #
+    foreach ($field in 'Aggregate', 'Fairness', 'P50ms', 'P95ms', 'P99ms', 'MaxMs') {
+        if ([double]::IsNaN($row.$field)) {
+            throw "PerfHarness output for $count stream(s) is missing '$field' (saved at $localOut)"
+        }
+    }
+
+    $rows += $row
 }
 
 if (-not $rows) { throw 'no runs produced results.' }
@@ -168,16 +208,24 @@ if (-not $rows) { throw 'no runs produced results.' }
 # Scaling efficiency against the single-stream result: 1.0 means aggregate
 # throughput grew linearly with stream count, which is the ideal this workload
 # is measured against. Anything well below it is contention, starvation or
-# serialisation, and the ring counters beside it say which.
+# serialisation, and the counters beside it say which.
 #
-$single = ($rows | Where-Object { $_.Streams -eq $rows[0].Streams } | Select-Object -First 1).Aggregate
+# The anchor is explicitly the Streams==1 row, never "whatever survived
+# first": anchoring at rows[0] made every efficiency value relative to an
+# arbitrary stream count whenever the 1-stream run was the one that failed.
+#
+$singleRow = $rows | Where-Object { $_.Streams -eq 1 } | Select-Object -First 1
+
+if (-not $singleRow) {
+    throw 'no 1-stream row: scaling efficiency needs it as its anchor -- include 1 in -StreamCounts'
+}
 
 $table = $rows | ForEach-Object {
-    $ideal = $single * ($_.Streams / $rows[0].Streams)
+    $ideal = $singleRow.Aggregate * $_.Streams
     $_ | Add-Member -NotePropertyName Efficiency -NotePropertyValue ([math]::Round($_.Aggregate / $ideal, 3)) -PassThru
 }
 
-$rendered = $table | Format-Table Streams, Aggregate, Efficiency, Fairness, P50ms, P95ms, P99ms, MaxMs, Armed, Refused -AutoSize | Out-String
+$rendered = $table | Format-Table Streams, Aggregate, Efficiency, Fairness, P50ms, P95ms, P99ms, MaxMs, Hits, Misses -AutoSize | Out-String
 
 Write-Host $rendered
 

@@ -169,24 +169,24 @@ $excludeDirs = @('SteamLibrary', 'temp')
 $topDirs = [System.IO.Directory]::GetDirectories("$root\") |
     Where-Object { $excludeDirs -notcontains (Split-Path $_ -Leaf) }
 
-# Capped and isolated per top-level directory: a Sort-Object over the whole
-# tree would force full materialisation before producing anything (no early
-# stop despite the lazy enumerator), and one bad subdirectory should not
-# take out the whole run.
-$targets = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+# Enumerate everything first, THEN choose smallest-first. Capping during
+# enumeration selected "first N encountered" -- traversal order, not size --
+# and sorting afterwards only ordered what had already been chosen, so the
+# documented smallest-first coverage did not exist. Materialising the list
+# costs memory proportional to the corpus's file COUNT (paths only, no
+# contents), which is the price of the selection property being real.
+$allFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
 foreach ($top in $topDirs) {
-    if ($targets.Count -ge $MaxFiles) { break }
     try {
         foreach ($p in [System.IO.Directory]::EnumerateFiles($top, "*", [System.IO.SearchOption]::AllDirectories)) {
             $fi = [System.IO.FileInfo]::new($p)
-            if ($fi.Length -gt 0) { $targets.Add($fi) }
-            if ($targets.Count -ge $MaxFiles) { break }
+            if ($fi.Length -gt 0) { $allFiles.Add($fi) }
         }
     } catch {
         Write-Host "  skipping $top : $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
-$targets = $targets | Sort-Object Length
+$targets = @($allFiles | Sort-Object Length | Select-Object -First $MaxFiles)
 
 if (-not $targets) { Write-Host "No non-empty files to check." -ForegroundColor Yellow; exit 1 }
 Write-Host "  checking $($targets.Count) files"
@@ -199,7 +199,13 @@ foreach ($f in $targets) {
     $httpLen = $null
     try {
         $httpLen = Get-HttpLength $bp
-        if ($httpLen -lt 0)               { Ok "size:$label (backend gave no length)" }
+        #
+        # Unverifiable is not passing: a backend that will not state a
+        # length makes the size comparison impossible, and logging that as
+        # green is how a metadata deserialise bug hides behind a chatty
+        # server. Fail and say which side withheld it.
+        #
+        if ($httpLen -lt 0)               { Bad "size:$label" "backend HEAD gave no Content-Length -- size unverifiable" }
         elseif ($httpLen -eq $f.Length)   { Ok "size:$label ($($f.Length))" }
         else                              { Bad "size:$label" "driver $($f.Length) != backend $httpLen" }
     } catch { Bad "size:$label" "HEAD failed: $($_.Exception.Message)" }
@@ -225,8 +231,15 @@ foreach ($f in $targets) {
                 # resolves to the (int,int) overload and throws trying to
                 # narrow the length down to Int32 -- silent overload
                 # resolution, not an intentional narrowing.
+                #
+                # Next's bound is EXCLUSIVE, so the ceiling is maxOff + 1:
+                # with the bare maximum as the bound, the final byte of the
+                # file was unreachable and the range check never sampled the
+                # last-page boundary at all. Residual limit: offsets past
+                # 2 GiB in a >2 GiB file stay unsampled -- stated here rather
+                # than silently believed covered.
                 $maxOff = [long]($f.Length - 1)
-                $randCeiling = if ($maxOff -lt [int]::MaxValue) { [int]$maxOff } else { [int]::MaxValue }
+                $randCeiling = if ($maxOff -lt [int]::MaxValue) { [int]$maxOff + 1 } else { [int]::MaxValue }
                 $off = [long]$rnd.Next(0, $randCeiling)
                 $remaining = $f.Length - $off
                 $cnt = if ($remaining -lt 65536) { [int]$remaining } else { 65536 }
@@ -253,8 +266,19 @@ foreach ($f in $targets) {
         try {
             $want = if ($f.Length -lt 4096) { [int]$f.Length } else { 4096 }
             $t = Read-DriverRange $f.FullName ($f.Length - $want) ($want + 4096)
-            if ($t.Count -eq $want) { Ok "tail:$label (EOF-straddling read returned $want)" }
-            else { Bad "tail:$label" "read past EOF returned $($t.Count), expected $want" }
+            #
+            # The count alone is not the check: a tail of the right length
+            # filled with zeros would pass it. The bytes must match what the
+            # backend holds for that same range.
+            #
+            $h = Get-HttpBytes $bp ($f.Length - $want) ($f.Length - 1)
+            if ($t.Count -ne $want) {
+                Bad "tail:$label" "read past EOF returned $($t.Count), expected $want"
+            }
+            elseif (-not [System.Linq.Enumerable]::SequenceEqual([byte[]]$t, [byte[]]$h)) {
+                Bad "tail:$label" "tail bytes differ from backend over [$($f.Length - $want), $($f.Length))"
+            }
+            else { Ok "tail:$label (EOF-straddling read returned $want matching bytes)" }
         } catch { Bad "tail:$label" $_.Exception.Message }
     }
 }

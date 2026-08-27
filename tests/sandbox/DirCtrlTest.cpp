@@ -177,6 +177,13 @@ TEST_F(DirCtrlTest, WildcardPatternMatchesOnlyEntriesSatisfyingIt)
 
     ASSERT_EQ(STATUS_SUCCESS, status);
     auto* first = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer);
+
+    //
+    // The length is driver-reported, so it is pinned before being used as
+    // the memcmp bound: a zero or truncated length would make the name
+    // comparison pass without comparing the name.
+    //
+    ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), first->FileNameLength);
     EXPECT_EQ(0, memcmp(first->FileName, L"file0.bin", first->FileNameLength));
 }
 
@@ -191,6 +198,8 @@ TEST_F(DirCtrlTest, ExactPatternWithNoWildcardsRequiresAnExactMatch)
 
     ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack));
     auto* first = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer);
+
+    ASSERT_EQ(sizeof(L"file1.bin") - sizeof(WCHAR), first->FileNameLength);
     EXPECT_EQ(0, memcmp(first->FileName, L"file1.bin", first->FileNameLength))
         << "file0.bin must have been skipped -- no wildcard means exact comparison";
     EXPECT_EQ(0u, first->NextEntryOffset) << "only one entry can match an exact pattern";
@@ -210,10 +219,14 @@ TEST_F(DirCtrlTest, NoFileNameMatchesEveryEntry)
     EXPECT_TRUE(BooleanFlagOn(Ccb->Flags, CCB_FLAG_MATCH_ALL));
 
     auto* first = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer);
+
+    ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), first->FileNameLength);
     EXPECT_EQ(0, memcmp(first->FileName, L"file0.bin", first->FileNameLength));
     ASSERT_NE(0u, first->NextEntryOffset) << "the subdirectory entry must follow";
 
     auto* second = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer + first->NextEntryOffset);
+
+    ASSERT_EQ(sizeof(L"dir0") - sizeof(WCHAR), second->FileNameLength);
     EXPECT_EQ(0, memcmp(second->FileName, L"dir0", second->FileNameLength))
         << "files are indexed before subdirectories";
 }
@@ -311,6 +324,8 @@ TEST_F(DirCtrlTest, RestartScanResetsCurrentIndexToZero)
     ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&secondReq->Irp, &secondReq->Stack));
 
     auto* second = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(secondBuffer);
+
+    ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), second->FileNameLength);
     EXPECT_EQ(0, memcmp(second->FileName, L"file0.bin", second->FileNameLength))
         << "SL_RESTART_SCAN must re-serve the first entry, not resume from index 1";
 }
@@ -329,6 +344,8 @@ TEST_F(DirCtrlTest, FileIdBothDirectoryInformationFillsAnEntry)
 
     ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack));
     auto* entry = reinterpret_cast<PFILE_ID_BOTH_DIR_INFORMATION>(buffer);
+
+    ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), entry->FileNameLength);
     EXPECT_EQ(0, memcmp(entry->FileName, L"file0.bin", entry->FileNameLength));
 }
 
@@ -342,6 +359,8 @@ TEST_F(DirCtrlTest, FileFullDirectoryInformationFillsAnEntry)
 
     ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack));
     auto* entry = reinterpret_cast<PFILE_FULL_DIR_INFORMATION>(buffer);
+
+    ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), entry->FileNameLength);
     EXPECT_EQ(0, memcmp(entry->FileName, L"file0.bin", entry->FileNameLength));
 }
 

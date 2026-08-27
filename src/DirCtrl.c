@@ -913,12 +913,16 @@ NTSTATUS BlorgDirectoryControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             break;
         }
         case BlorgDeviceDisk:
-        {
-            BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
-            break;
-        }
         case BlorgDeviceFileSystem:
+        default:
         {
+            //
+            // One body for everything that is not the volume, unknown
+            // included -- same unconditional-completion rule as BlorgRead's
+            // switch, for the same reason: the cases complete inside
+            // themselves, so a kind that matched none of them would strand
+            // the IRP.
+            //
             BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }

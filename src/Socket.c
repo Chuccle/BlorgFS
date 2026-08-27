@@ -104,6 +104,53 @@ static IO_COMPLETION_ROUTINE SocketContextCompletionRoutine;
 static IO_COMPLETION_ROUTINE SocketAsyncCompletionRoutine;
 static KDEFERRED_ROUTINE SocketAsyncTimeoutDpc;
 
+//
+// Pre-warm pump and teardown state, declared here because
+// BlorgInitialiseWskClient (below) resets it and BlorgCleanupWskSocketPool
+// waits on it.
+//
+// Remaining is the steps still owed by a fill. InFlight counts connects
+// issued but not yet completed -- 0 or 1, since the pump keeps exactly one
+// step outstanding (see SocketPrewarmPump) -- and is what teardown polls.
+// ShuttingDown latches teardown. Running/Pending carry the pump's liveness
+// hand-off (see their comment at the pump).
+//
+// Ownership discipline: SocketPool.Lock is the single owner of every write
+// to all five words, which is why they are plain LONG/BOOLEAN rather than
+// interlocked -- an atomic on a lock-owned word costs a LOCK prefix and,
+// worse, misstates who protects it (the same reasoning that demoted the
+// reap gate's Queued/ShuttingDown in Structs.c). Check-and-act pairs sit
+// inside one locked section each, per the house claim-under-the-baton rule:
+// the fill-start admission, the latch-check-plus-raise, the consume, and
+// both Running/Pending transitions are linearized decisions, not fence
+// arguments -- on weakly-ordered ARM64 a bare read can miss a just-made
+// store on another word, and no schedule explorer catches it because the
+// model is sequentially consistent.
+//
+// The one access outside the lock is teardown's poll of InFlight, and it
+// is safe by direction: every increment was made inside a locked section
+// that completed before teardown's own locked latch section, so it cannot
+// be missed; only a not-yet-visible DECREMENT can delay an exit, never
+// shorten one.
+//
+// IRQL is why the lock is the pool spinlock rather than anything APC-ish:
+// StepComplete and the pump's issue path run on WSK completion chains at
+// <= DISPATCH_LEVEL, where a push lock or ERESOURCE would be illegal. The
+// sections are a handful of instructions with no blocking inside, so
+// raising to DISPATCH for them costs nothing.
+//
+static LONG SocketPrewarmRemaining;
+static LONG SocketPrewarmInFlight;
+static LONG SocketPrewarmShuttingDown;
+
+//
+// Pump-loop liveness flags -- declared with the rest of the pump's state
+// because BlorgInitialiseWskClient resets them; see their full comment at
+// SocketPrewarmPump.
+//
+static BOOLEAN SocketPrewarmPumpRunning;
+static BOOLEAN SocketPrewarmPumpPending;
+
 // CloseWskSocket is defined below but referenced earlier (BlorgCleanupWskSocketPool).
 static NTSTATUS CloseWskSocket(PKSOCKET Socket);
 
@@ -398,10 +445,10 @@ static VOID SocketAsyncTimeoutDpc(PKDPC Dpc, PVOID Context, PVOID SystemArgument
 
     PKSOCKET_ASYNC_CONTEXT asyncContext = Context;
 
-	if (!asyncContext)
-	{
-		return;
-	}
+    if (!asyncContext)
+    {
+        return;
+    }
 
     BLORGFS_STAT_INC(SocketTimeouts);
 
@@ -490,6 +537,16 @@ NTSTATUS BlorgInitialiseWskClient(void)
 
     ExInitializeNPagedLookasideList(&AsyncContextLookaside, NULL, NULL, POOL_NX_ALLOCATION, sizeof(KSOCKET_ASYNC_CONTEXT), SOCKET_TAG, 0);
 
+    //
+    // Nothing can be in flight across an initialise -- the previous
+    // teardown polled until there was not -- so the reset is plain stores.
+    //
+    SocketPrewarmRemaining = 0;
+    SocketPrewarmInFlight = 0;
+    SocketPrewarmShuttingDown = 0;
+    SocketPrewarmPumpRunning = FALSE;
+    SocketPrewarmPumpPending = FALSE;
+
     ULONG tlsRecvRecords;
 
     switch (MmQuerySystemSize())
@@ -535,9 +592,43 @@ void BlorgCleanupWskClient(void)
 // lock around each CloseWskSocket call since that call waits on an IRP
 // and must not hold a spinlock across a blocking wait.
 //
+// The pre-warm latch goes first, for the same reason the HTTP client is
+// drained before anything else at unload: a pre-warm connect still in
+// flight owns nothing this function can see (it is not in the pool yet),
+// and its completion would otherwise run after WskDeregister -- handing a
+// socket to a pool nobody will drain again, against a provider that has
+// been released. Latching first stops the chain; the poll waits out any
+// step already counted as in flight, whose completion may still release a
+// socket into this pool -- which is exactly why the poll precedes the drain
+// loop rather than following it.
+//
+// Latch-and-zero run under SocketPool.Lock so they linearize against every
+// raise (see the state-block comment); the poll that follows is a bare read
+// by design -- increments were fenced out of their lock sections before
+// this thread acquired and released the same lock, and a late-arriving
+// decrement only makes an exit wait longer than necessary, never shorter.
+//
+// The poll itself is KeDelayExecutionThread-backed rather than one blocking
+// wait, matching BlorgNodeTableTeardown's poll of Queued: PASSIVE-only,
+// legal wherever teardown runs, and needing no cross-thread wakeup
+// primitive -- the completing side is an interlocked decrement, not a
+// signal.
+//
 VOID BlorgCleanupWskSocketPool(void)
 {
     KIRQL oldIrql;
+
+    KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+    SocketPrewarmShuttingDown = TRUE;
+    SocketPrewarmRemaining = 0;
+    KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+
+    LARGE_INTEGER prewarmInterval = { .QuadPart = -10LL * 10 * 1000 };
+
+    while (ReadNoFence(&SocketPrewarmInFlight))
+    {
+        KeDelayExecutionThread(KernelMode, FALSE, &prewarmInterval);
+    }
 
     KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
 
@@ -806,26 +897,46 @@ static VOID SocketPrewarmComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reus
 // Deliberately fire-and-forget, and deliberately not all at once: each
 // connect is issued only after the previous one has completed, so
 // pre-warming cannot itself create the SYN burst it exists to avoid.
-// Nothing waits on any of this -- the caller returns immediately and the
-// pool fills behind it.
+// Nothing on this path waits -- the one exception is teardown
+// (BlorgCleanupWskSocketPool), which waits for the step already in flight,
+// because a connect that outlives WskDeregister completes into an unloaded
+// image. A fill refused by that latch is dropped whole: DriverEntry runs
+// long before any unload, and a pre-warm that loses the race leaves exactly
+// the behaviour that existed before pre-warming.
 //
 static VOID SocketPrewarmPump(VOID);
 
 //
-// Steps still owed. Only ever updated via interlocked ops, so it doesn't
-// need to be volatile.
+// Steps still owed by a fill -- declared with the rest of the pump's
+// teardown state above, which Initialise and Cleanup both touch.
 //
-static LONG SocketPrewarmRemaining;
 
 //
-// Pump-loop gate and its work token. PumpGate is held by whichever caller
-// is running the issue loop; PumpWanted records that a step is owed and is
-// consumed by that loop. Both interlocked, so neither is volatile.
+// Pump-loop liveness flags, both owned by SocketPool.Lock -- which is what
+// lets them be plain BOOLEANs rather than interlocked LONGs: every writer
+// holds the lock, so plain accesses are exact inside it and no fence
+// argument is needed anywhere. Running says an issue loop is live; Pending
+// records that a completion published a step while one was. The old
+// PumpGate/PumpWanted pair carried this same protocol on bare atomics with
+// a barrier-recheck tail -- the shape that hides exactly the weak-memory
+// window the reap gate's rework removed.
 //
-static LONG SocketPrewarmPumpGate;
-static LONG SocketPrewarmPumpWanted;
+static BOOLEAN SocketPrewarmPumpRunning;
+static BOOLEAN SocketPrewarmPumpPending;
 
 static SOCKADDR_STORAGE SocketPrewarmAddress;
+
+//
+// Diagnostic read of the pump's budget word, used solely by the
+// socket-sandbox race test to assert that a fill fully drains. Reading
+// Remaining without the lock is the same benign-direction access
+// teardown's poll makes: a not-yet-visible decrement can only delay the
+// test's observation, never fabricate a stale non-zero after settling.
+//
+ULONG BlorgPrewarmRemainingForDiagnostics(VOID)
+{
+    return C_CAST(ULONG, ReadNoFence(&SocketPrewarmRemaining));
+}
 
 //
 // A completed step owes the next one to the pump rather than issuing it.
@@ -834,11 +945,37 @@ static SOCKADDR_STORAGE SocketPrewarmAddress;
 // completion routine inline on every path that finishes synchronously (see
 // SocketPrewarmPump).
 //
+// Order here is load-bearing twice over. The socket handoff
+// (SocketPrewarmComplete -> BlorgReleaseReusableWskSocket) precedes the
+// in-flight drop so that a teardown which observes InFlight == 0 knows the
+// step's socket is already in the pool its drain loop is about to walk --
+// drop first and the poll could exit in the gap, resurrecting exactly the
+// post-teardown release this whole protocol exists to prevent. And the
+// accounting runs under the pool lock (see the state-block comment for why
+// the consume is a plain locked read-and-write rather than a CAS loop),
+// with the pump re-entry -- which takes that same lock again inside the
+// acquire -- deferred until after it is dropped.
+//
 static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
 {
     SocketPrewarmComplete(Status, Socket, Reused, CompletionContext);
 
-    if (InterlockedDecrement(&SocketPrewarmRemaining) > 0)
+    KIRQL oldIrql;
+    BOOLEAN chain = FALSE;
+
+    KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+
+    --SocketPrewarmInFlight;
+
+    if (!SocketPrewarmShuttingDown && 0 < SocketPrewarmRemaining)
+    {
+        SocketPrewarmRemaining--;
+        chain = (0 < SocketPrewarmRemaining);
+    }
+
+    KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+
+    if (chain)
     {
         SocketPrewarmPump();
     }
@@ -859,29 +996,92 @@ static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN 
 // backend is exactly the case where every step fails that way, so the
 // recursion was reachable precisely when it ran to full depth.
 //
-// So a completion sets the work token and calls this; if a loop is already
-// running -- on this stack or on another processor -- the gate turns that
-// call into a return, and the running loop takes the step instead. Stack
-// depth is constant no matter how the connects complete, and the "one
+// So a completion sets Pending and calls this; if a loop is already
+// running -- on this stack or on another processor -- the flag pair turns
+// that call into a return, and the running loop takes the step instead.
+// Stack depth is constant no matter how the connects complete, and the "one
 // connect at a time" property the SYN-burst avoidance depends on is
-// unchanged: the token is consumed inside the gate, so only the gate holder
-// ever has a step outstanding.
+// unchanged: only the Running holder ever issues.
 //
-// The gate-clear/recheck tail is the reap worker's (Structs.c), for the
-// same reason and with the same proof: a completion that finds the gate
-// held has already published its token, and the clear is a full barrier, so
-// the recheck after it cannot be satisfied from before it. Either the
-// completion takes the gate itself or this recheck sees its token. No step
-// can be dropped by both.
+// Both flags are read and written under SocketPool.Lock, which is what
+// replaces the old gate-clear-then-recheck tail: a completion publishing
+// Pending either lands before the holder's final locked section (which
+// consumes it there) or after Running was cleared (so its own Pump call
+// becomes the new loop). No schedule drops a step by both paths.
 //
 static VOID SocketPrewarmPump(VOID)
 {
-    InterlockedExchange(&SocketPrewarmPumpWanted, TRUE);
+    KIRQL oldIrql;
 
-    while (!InterlockedCompareExchange(&SocketPrewarmPumpGate, TRUE, FALSE))
+    //
+    // Every call publishes one owed step up front -- including the chain
+    // re-entry from StepComplete, which arrives holding no Pending of its
+    // own. Publishing before the Running check keeps both exits correct:
+    // if a loop is already live it consumes this publication in its normal
+    // sweep, and if this call becomes the loop it consumes it itself.
+    //
+    KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+    SocketPrewarmPumpPending = TRUE;
+    KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+
+    for (;;)
     {
-        while (InterlockedExchange(&SocketPrewarmPumpWanted, FALSE))
+        BOOLEAN run = FALSE;
+
+        KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+
+        if (!SocketPrewarmPumpRunning)
         {
+            SocketPrewarmPumpRunning = TRUE;
+            run = TRUE;
+        }
+
+        KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+
+        if (!run)
+        {
+            return;
+        }
+
+        for (;;)
+        {
+            BOOLEAN more = FALSE;
+
+            KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+            more = SocketPrewarmPumpPending;
+            SocketPrewarmPumpPending = FALSE;
+            KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+
+            if (!more)
+            {
+                break;
+            }
+
+            //
+            // The latch check and the in-flight raise are one locked
+            // decision -- see the state-block comment for why this pairing
+            // must not be split into a bare read followed by an action.
+            // Once the raise has happened the issue is unconditional even
+            // if teardown latches immediately after: a step counted as
+            // in flight must go out, because only its completion (or the
+            // synchronous-failure arm below) brings the count back down.
+            //
+            KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+
+            BOOLEAN latched = C_CAST(BOOLEAN, SocketPrewarmShuttingDown);
+
+            if (!latched)
+            {
+                ++SocketPrewarmInFlight;
+            }
+
+            KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+
+            if (latched)
+            {
+                break;
+            }
+
             NTSTATUS status = BlorgAcquireReusableWskSocketAsync(
                 C_CAST(const SOCKADDR*, &SocketPrewarmAddress),
                 TRUE,
@@ -890,23 +1090,44 @@ static VOID SocketPrewarmPump(VOID)
 
             if (STATUS_PENDING != status)
             {
-                InterlockedExchange(&SocketPrewarmRemaining, 0);
+                KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+                --SocketPrewarmInFlight;
+                SocketPrewarmRemaining = 0;
+                KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
                 break;
             }
         }
 
-        InterlockedExchange(&SocketPrewarmPumpGate, FALSE);
+        //
+        // Tail recheck: the original gate-clear/recheck pattern. Release
+        // Running and re-read Pending in one locked section so that a
+        // completion that publishes during our release either takes Running
+        // itself (sees Running=FALSE) or is visible to the re-read.
+        //
+        // When Pending was TRUE: someone published while we held Running.
+        // Clear Running and loop back so the inner loop picks it up.
+        // We must NOT consume Pending here (no Pending = FALSE), because
+        // the inner loop is the only path that issues a connect.
+        //
+        // When Pending was FALSE: no outstanding work. Clear Running and
+        // return.
+        //
+        KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+        SocketPrewarmPumpRunning = FALSE;
+        BOOLEAN pending = SocketPrewarmPumpPending;
+        KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
 
-        if (!ReadNoFence(&SocketPrewarmPumpWanted))
+        if (!pending)
         {
-            break;
+            return;
         }
     }
 }
 
 //
-// Starts filling the pool. Safe to call more than once: a second call
-// while a fill is in flight is ignored rather than doubling the rate.
+// Starts filling the pool. Safe to call more than once: a second call while
+// a fill is running -- owed steps left, or the tail connect still in
+// flight -- is ignored rather than doubling the rate.
 //
 VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 {
@@ -915,12 +1136,43 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
         return;
     }
 
-    if (0 != InterlockedCompareExchange(&SocketPrewarmRemaining, C_CAST(LONG, Count), 0))
+    //
+    // Fill admission is one locked decision: not while teardown has latched,
+    // not while another fill's steps are owed, not while its tail step is
+    // still in flight (which is the state a finished budget leaves behind).
+    // Checking and claiming under the same lock section is what makes this
+    // safe against a concurrently-running teardown on weakly-ordered
+    // silicon -- see the state-block comment above.
+    //
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+
+    if (SocketPrewarmShuttingDown ||
+        0 != SocketPrewarmRemaining ||
+        0 != SocketPrewarmInFlight)
     {
+        KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
         return;
     }
 
-    RtlCopyMemory(&SocketPrewarmAddress, RemoteAddress, sizeof(SocketPrewarmAddress));
+    SocketPrewarmRemaining = C_CAST(LONG, Count);
+
+    //
+    // Copy only the family-sized address. The caller hands a PSOCKADDR at
+    // an object sized for its family -- DriverEntry passes ai_addr, the
+    // sandbox tests a stack SOCKADDR_IN -- so copying the full
+    // SOCKADDR_STORAGE read past its end. Every consumer of
+    // SocketPrewarmAddress (SockAddrEqual, WskSocketConnect, the per-socket
+    // RemoteAddress copy) honors the family size too.
+    //
+    ULONG addressLength = (AF_INET6 == RemoteAddress->sa_family)
+        ? C_CAST(ULONG, sizeof(SOCKADDR_IN6))
+        : C_CAST(ULONG, sizeof(SOCKADDR_IN));
+
+    RtlCopyMemory(&SocketPrewarmAddress, RemoteAddress, addressLength);
+
+    KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
 
     SocketPrewarmPump();
 }
@@ -1185,10 +1437,10 @@ static VOID SocketConnectTimeoutDpc(PKDPC Dpc, PVOID Context, PVOID SystemArgume
 
     PKSOCKET_CONNECT_ASYNC_CONTEXT connectCtx = Context;
 
-	if (!connectCtx)
-	{
-		return;
-	}
+    if (!connectCtx)
+    {
+        return;
+    }
 
     BLORGFS_STAT_INC(SocketTimeouts);
 
@@ -1219,7 +1471,7 @@ static NTSTATUS SocketConnectAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject,
 
     if (!connectCtx)
     {
-		return STATUS_INVALID_PARAMETER;
+        return STATUS_INVALID_PARAMETER;
     }
 
     NTSTATUS status = DisarmSocketTimeout(&connectCtx->Timeout, Irp->IoStatus.Status);

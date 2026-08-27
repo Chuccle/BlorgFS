@@ -305,6 +305,78 @@ TEST_F(ReadTest, PagingReadStraddlingEndOfFileIsTrimmedBeforeTheFetch)
         << "only the 100 bytes before EOF should have been fetched, not the full 8192 requested";
 }
 
+//
+// The trim's second comparison is signed arithmetic on values the caller
+// does not bound: a backend-declared size near LONGLONG_MAX keeps the
+// offset below the first EOF test while offset + length wraps negative,
+// which made both trim comparisons false and sent an untrimmed, nonsensical
+// range to the fetch. The guard under test refuses the unrepresentable end
+// outright; this drives exactly that shape -- offset inside the declared
+// size, sum past it in unsigned terms, wrapped in signed ones.
+//
+TEST_F(ReadTest, UnrepresentableReadEndIsRefusedRatherThanWrapped)
+{
+    PFCB huge = nullptr;
+    UNICODE_STRING name = Path(L"\\media\\huge.bin");
+
+    ASSERT_EQ(STATUS_SUCCESS,
+        BlorgCreateFCB(&huge, (CSHORT)BLORGFS_FCB_SIGNATURE, &name, Volume, MAXLONGLONG));
+    InitializeListHead(&huge->Links);
+
+    const ULONG length = 4096;
+    const ULONG64 offset = MAXLONGLONG - 1024;
+
+    ReadRequest* req = PrepareRead(huge, offset, length, IRP_PAGING_IO | IRP_NOCACHE,
+        0, NewBuffer(length));
+
+    NTSTATUS status = BlorgRead(Volume, &req->Irp);
+
+    EXPECT_EQ(STATUS_END_OF_FILE, status);
+    EXPECT_EQ(0u, req->Irp.IoStatus.Information);
+    EXPECT_EQ(0u, SandboxSocketsCreated())
+        << "a wrapped end must never reach the fetch issuer as an untrimmed range";
+
+    BlorgFreeFileContext(huge, Volume);
+}
+
+//
+// Every dispatcher that completes inside its cases must still complete for
+// a device kind that matches none of them -- the unknown kind cannot reach
+// here through the I/O manager today, but a stranded IRP is one future
+// routing change away, so the completion is unconditional. Before the
+// default arm existed, BlorgRead returned its error status with the IRP
+// uncompleted: no CompletionCount, a caller waiting forever.
+//
+TEST_F(ReadTest, UnknownDeviceObjectStillCompletesTheIrp)
+{
+    DEVICE_OBJECT foreignDevice;
+    memset(&foreignDevice, 0, sizeof(foreignDevice));
+
+    //
+    // Point none of the three identity globals at anything, so
+    // BlorgDeviceKind answers Unknown for the synthetic device.
+    //
+    PDEVICE_OBJECT savedVolume = global.VolumeDeviceObject;
+    PDEVICE_OBJECT savedDisk = global.DiskDeviceObject;
+    PDEVICE_OBJECT savedFileSystem = global.FileSystemDeviceObject;
+    global.VolumeDeviceObject = nullptr;
+    global.DiskDeviceObject = nullptr;
+    global.FileSystemDeviceObject = nullptr;
+
+    ReadRequest* req = PrepareRead(Fcb, 0, 4096, IRP_PAGING_IO | IRP_NOCACHE,
+        0, NewBuffer(4096));
+
+    NTSTATUS status = BlorgRead(&foreignDevice, &req->Irp);
+
+    global.VolumeDeviceObject = savedVolume;
+    global.DiskDeviceObject = savedDisk;
+    global.FileSystemDeviceObject = savedFileSystem;
+
+    EXPECT_EQ(STATUS_INVALID_DEVICE_REQUEST, status);
+    EXPECT_EQ(1, req->Irp.CompletionCount)
+        << "an unmatched device kind must complete the IRP, not strand it";
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Paging path: inline direct fetch
 ///////////////////////////////////////////////////////////////////////////

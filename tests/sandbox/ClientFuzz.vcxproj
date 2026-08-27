@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -111,7 +111,21 @@
     <ClCompile Include="KernelModel.c" />
     <ClCompile Include="NtShim.c" />
     <ClCompile Include="NtShimSync.c" />
-    <ClCompile Include="Scheduler.c" />
+    <!--
+      Scheduler.c is the one translation unit whose cross-context flags
+      (FiberMode, SelfFlsReady, AtomicYields) are ordered through named
+      Interlocked intrinsics rather than MSVC-semantics volatiles. It
+      therefore compiles under ISO rules: /std:c11, /volatile:iso and
+      /permissive-, where volatile carries no synchronization meaning at
+      all and nothing may lean on it. Scoped to this file so the rest of
+      each sandbox keeps its existing settings; see the MEMORY MODEL
+      comment at the top of Scheduler.c.
+    -->
+    <ClCompile Include="Scheduler.c">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalOptions>/volatile:iso %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="StructsModel.c" />
     <ClCompile Include="NoStatisticsStub.c" />
     <ClCompile Include="NoTlsHandshakeStub.c" />

@@ -92,8 +92,16 @@ function Get-Num {
 
     if (-not $Map.ContainsKey($Key)) { return $null }
 
+    #
+    # Invariant culture explicitly: PerfHarness prints %.4f under the C
+    # locale, i.e. always dot decimals. TryParse without a culture uses the
+    # caller's regional settings, where '.' can be a group separator -- on
+    # such a machine "1183.4521" parses as ~11.8 million and every delta
+    # becomes fiction.
+    #
     $parsed = 0.0
-    if ([double]::TryParse($Map[$Key], [ref]$parsed)) { return $parsed }
+    if ([double]::TryParse($Map[$Key], [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) { return $parsed }
     return $null
 }
 
@@ -173,6 +181,30 @@ foreach ($name in $errorCounters) {
     }
 }
 
+#
+# Keys every report must carry. The regression loops below skip a metric
+# whose key is absent on either side, so a counter renamed or dropped on
+# the harness side would otherwise quietly shrink what gets compared and
+# still end in "All checks passed". A missing key is a schema break and
+# fails here instead.
+#
+$requiredKeys = @(
+    'Workload',
+    'ThroughputMBs', 'OpensPerSec',
+    'ReadsPagingInline',
+    'FetchesIssued', 'FetchesCompleted', 'FetchesFailed',
+    'FetchLatencyMeanUs', 'FetchLatencyP50Us', 'FetchLatencyP99Us',
+    'ConnectionReuseRate', 'PathCacheHitRate'
+) + $errorCounters
+
+$missingCurrent = $requiredKeys | Where-Object { -not $cur.ContainsKey($_) }
+
+if ($missingCurrent) {
+    foreach ($key in $missingCurrent) {
+        $failures.Add("REQUIRED key '$key' absent from current report -- the harness schema changed")
+    }
+}
+
 # ---------------------------------------------------------------- regressions
 
 if (-not $Baseline) {
@@ -183,6 +215,19 @@ else {
 
     if ($cur['Workload'] -ne $base['Workload']) {
         $failures.Add("baseline is for workload '$($base['Workload'])' but current is '$($cur['Workload'])' -- not comparable")
+    }
+
+    #
+    # Same schema demand on the baseline: an old-format file would
+    # otherwise silently drop its half of each comparison. Regenerate it
+    # deliberately rather than comparing against a shrinking key set.
+    #
+    $missingBase = $requiredKeys | Where-Object { -not $base.ContainsKey($_) }
+
+    if ($missingBase) {
+        foreach ($key in $missingBase) {
+            $failures.Add("REQUIRED key '$key' absent from baseline -- regenerate the baseline against the current schema")
+        }
     }
 
     # Higher is better, expressed as a percentage of the baseline.

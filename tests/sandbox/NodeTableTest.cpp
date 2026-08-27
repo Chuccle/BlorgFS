@@ -691,4 +691,62 @@ TEST_F(NodeTableTest, TeardownDrainsPublishedNodes)
     // TearDown calls BlorgNodeTableTeardown and then asserts quiescence.
 }
 
+//
+// The unload race, realized deterministically. Teardown runs to completion
+// -- latch set, queue drained, work item FREED -- and only then does the
+// last handle on an idle node drop, deferring it and kicking the worker.
+// The kick must refuse: queuing here is IoQueueWorkItem on freed memory.
+//
+// On current hardware the sequential form below passes because x86-TSO
+// (and the SC scheduler) never let a plain load skip an already-committed
+// store -- which is precisely the point. The bare-latch read this refusal
+// historically rested on has no ordering edge of its own; on weakly
+// ordered ARM64 it can miss teardown's store and queue anyway. Removing
+// the refusal makes THIS test fail on TODAY's machine, which is what makes
+// it a mutation target rather than a tautology: whatever guarantees the
+// refusal must keep guaranteeing it here.
+//
+TEST_F(NodeTableTest, TeardownCompletedBeforeALateKickRefusesToQueueTheFreedWorkItem)
+{
+    DIRECTORY_ENTRY_METADATA meta = {};
+    meta.Size = 1024;
+
+    UNICODE_STRING name = Path(L"\\late.bin");
+
+    PCOMMON_CONTEXT node = nullptr;
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &name, &meta, Volume, &node));
+    ASSERT_NE(nullptr, node);
+
+    BlorgNodeTablePublish(node);
+
+    //
+    // Simulate the one open handle whose close is about to happen: the
+    // node is published, idle except for this reference, and its drop will
+    // run the idle test and kick.
+    //
+    InterlockedIncrement64(&node->RefCount);
+
+    BlorgNodeTableTeardown();
+
+    EXPECT_EQ(0, KmObjectsLive(KmObjectWorkItem))
+        << "teardown must have freed the reap work item";
+
+    //
+    // The late kick: final dereference, after teardown completed.
+    //
+    BlorgNodeDereference(node);
+
+    EXPECT_EQ(0, KmObjectsLive(KmObjectWorkItem))
+        << "a kick after teardown completed queued the freed work item";
+
+    //
+    // The deferred node stays claimed on the reap list -- teardown already
+    // ran, so nothing will drain it -- but FreeTree below frees it through
+    // the tree, and the next fixture's BlorgNodeTableInit resets the list
+    // head. Nothing else to observe here; the work-item count above is the
+    // assertion that matters.
+    //
+}
+
 } // namespace

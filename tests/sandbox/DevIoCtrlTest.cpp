@@ -585,14 +585,15 @@ protected:
 
 //
 // The crashing shape: a device whose driver asked for no extension at all.
+// memset guarantees DeviceExtension is nullptr -- there is nothing
+// meaningful to assert about that here, since it is true by construction;
+// the property under test lives entirely in the status below, which says
+// the mount was declined without ever reading the extension.
 //
 TEST_F(ForeignMountTest, MountOfADeviceWithNoExtensionIsDeclined)
 {
     DEVICE_OBJECT foreign;
     memset(&foreign, 0, sizeof(foreign));
-
-    ASSERT_EQ(nullptr, foreign.DeviceExtension)
-        << "this test is about a device object that carries no extension at all";
 
     MountRequest* req = PrepareMount(&foreign);
 

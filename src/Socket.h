@@ -169,7 +169,10 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket);
 // SYN and its retransmit, caused by the burst itself), and they are what
 // puts a 1438 ms worst case on a volume whose median read is 0.005 ms.
 //
-// Idempotent: a call made while a fill is already running is ignored.
+// Idempotent: a call made while a fill is already running is ignored, and
+// a call made after teardown has latched the pump (BlorgCleanupWskSocketPool)
+// is dropped whole -- teardown waits out any step already in flight, so no
+// connect can complete into a torn-down client.
 //
 //
 // Connections opened ahead of demand at driver start.

@@ -452,6 +452,15 @@ VOID BlorgNodeDereference(PCOMMON_CONTEXT Node);
 VOID BlorgNodeDeferReap(PCOMMON_CONTEXT Node);
 
 //
+// Defers an idle node (no handles, no pins) to the reap worker, taking the
+// node's bucket lock shared around the idle test. For callers that hold no
+// lock over the node's counts -- the failed-open arms in Create.c, whose
+// bare RefCount read could otherwise be stale in the direction that
+// strands a node forever.
+//
+VOID BlorgNodeDeferReapIfIdle(PCOMMON_CONTEXT Node);
+
+//
 //  Full-path resolution cache (PathCache.c). Memoizes create-time existence
 //  results (exists+metadata / not-found) by full path, decoupled from node
 //  lifetime. Sharded and push-locked for concurrent access.

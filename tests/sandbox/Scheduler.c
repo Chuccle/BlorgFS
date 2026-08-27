@@ -65,6 +65,22 @@
 #include <stdlib.h>
 #include <intrin.h>
 
+//
+// This translation unit compiles under /volatile:iso and ISO conformance
+// mode (see the Scheduler.c items in the sandbox .vcxproj files), where
+// volatile carries NO synchronization meaning -- deliberately. Anything
+// whose visibility crosses contexts without a fiber switch between reader
+// and writer goes through KmAtomicGet and KmAtomicExchange below, thin
+// wrappers over the documented _Interlocked* intrinsics -- the same
+// primitives the driver itself uses. Their architecture story lives at
+// those wrappers, not repeated at each use. Every other static in this
+// file is reached only across SwitchToFiber boundaries, and that
+// executor argument is architecture-neutral too: SwitchToFiber is an
+// opaque externally-linked call, so a compiler barrier on any target,
+// and the kernel context-switch path it enters issues full barriers on
+// every architecture Windows ships.
+//
+
 // Generous: atomic-granularity exploration reaches a few hundred scheduling
 // points on a two-thread body, and truncation costs coverage rather than
 // correctness, so the cap is a safety net rather than a tuning knob.
@@ -106,12 +122,14 @@ static int Current = -1;
 static int Active = 0;
 
 //
-// Read by worker fibers inside AtomicYield while only ever written on the
-// exploring thread between replays, when no worker is running. volatile
-// documents that contract; the happens-before comes from the switch back
-// to the explorer between replays.
+// Read by AtomicYield at every interlocked scheduling point; written by
+// KmSchedSetAtomicYields from whatever configures the exploration. All
+// access goes through KmAtomicGet/KmAtomicExchange. In practice writer
+// and readers share the exploring thread and program order would
+// suffice -- naming the orderings keeps the flag correct even if that
+// execution shape ever changes.
 //
-static volatile int AtomicYields = 0;
+static long AtomicYields = 0;
 
 //
 // Random-sample mode: instead of enumerating the space depth-first, run
@@ -452,7 +470,50 @@ static long FiberMode = 0;
 //
 static DWORD SelfFls = FLS_OUT_OF_INDEXES;
 
+//
+// Whether SelfFls holds a real allocation. Readiness must NOT be inferred
+// by inspecting SelfFls itself: FlsAlloc can legitimately return index 0,
+// and treating that as "not allocated" would make KmSchedSelfIndex report
+// -1 for every fiber -- HandOff would then no-op, every modelled thread
+// would run start-to-finish serially, and the exploration would silently
+// lose ALL interleaving coverage while still passing its assertions.
+//
+// Release-published by the initializer after SelfFls and MainFiber are
+// fully set, acquire-read by KmSchedSelfIndex, so a reader that sees 1
+// also sees the initialized SelfFls no matter which OS thread it is on.
+//
+static long SelfFlsReady = 0;
+
 #define KM_SCHED_ID_BASE 0xE0000000ul
+
+//
+// Named atomic primitives for the cross-context flags. Kept as wrappers
+// rather than spread through the code so the architecture story lives in
+// exactly one place:
+//
+// - Every _Interlocked* intrinsic is a full-fence RMW on every target
+//   MSVC ships -- x86, x64, ARM32, ARM64: x86/x64 locked instructions are
+//   always full fences, and the ARM implementations map to interlocked
+//   operations at least as strong. Acquire-and-release-or-stronger at
+//   every site, so no caller depends on anything weaker than it looks.
+// - The _acq/_rel-suffixed spellings would let an ARM build drop to
+//   ldar/stlr strength. They are deliberately NOT used: on this toolset
+//   they declare but do not link on x64, and these flags' access rates
+//   make full-fence cost unmeasurable next to the fiber switches around
+//   them.
+// - If this file ever compiles under a non-MSVC compiler, these two
+//   wrappers are the only things to rewrite, around <stdatomic.h> or the
+//   platform equivalent.
+//
+static long KmAtomicGet(long* Target)
+{
+    return _InterlockedOr(Target, 0);
+}
+
+static long KmAtomicExchange(long* Target, long Value)
+{
+    return _InterlockedExchange(Target, Value);
+}
 
 int KmSchedActive(void)
 {
@@ -461,7 +522,7 @@ int KmSchedActive(void)
 
 int KmSchedSelfIndex(void)
 {
-    if (!SelfFls || SelfFls == FLS_OUT_OF_INDEXES)
+    if (0 == KmAtomicGet(&SelfFlsReady))
     {
         return -1;
     }
@@ -486,7 +547,15 @@ void CALLBACK FiberTrampoline(PVOID Parameter);
 
 static void EnsureFibers(void)
 {
-    if (0 == InterlockedCompareExchange(&FiberMode, 1, 0))
+    //
+    // Init-once. The exchange is a full-barrier RMW: the winner's stores
+    // of SelfFls, MainFiber and the fiber pool are published before
+    // SelfFlsReady's release store, and every later caller's acquire side
+    // orders its check against that publication. Only ever 0 -> 1, so an
+    // unconditional exchange is equivalent to the compare-exchange it
+    // replaced.
+    //
+    if (0 == KmAtomicExchange(&FiberMode, 1))
     {
         SelfFls = FlsAlloc(NULL);
 
@@ -497,6 +566,13 @@ static void EnsureFibers(void)
             fprintf(stderr, "[sched] ConvertThreadToFiber failed\n");
             exit(2);
         }
+
+        //
+        // Set only after the allocation actually succeeded, and never
+        // cleared: fibers exist for the life of the process. The fence on
+        // the exchange publishes SelfFls and MainFiber with it.
+        //
+        KmAtomicExchange(&SelfFlsReady, 1);
     }
 
     for (int i = 0; i < KM_SCHED_MAX_THREADS; ++i)
@@ -1116,12 +1192,12 @@ KM_SCHED_RESULT KmExploreInterleavingsSeeded(
 //
 void KmSchedSetAtomicYields(int Enabled)
 {
-    AtomicYields = Enabled;
+    KmAtomicExchange(&AtomicYields, Enabled);
 }
 
 static void AtomicYield(void)
 {
-    if (AtomicYields)
+    if (0 != KmAtomicGet(&AtomicYields))
     {
         KmSchedYield();
     }

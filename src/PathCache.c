@@ -233,6 +233,14 @@ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_EN
     ExReleasePushLockShared(&bucket->Lock);
     KeLeaveCriticalRegion();
 
+    //
+    // Counts every resolution, not every miss -- this is "how many
+    // create-time lookups ran", alongside PathCacheHits/Misses which split
+    // it, and MetaDataDiskReads (Client.c) which counts only the network
+    // fetches a miss can lead to. It is deliberately not "metadata I/O":
+    // a pure cache hit moves no bytes and must not inflate an I/O-shaped
+    // number.
+    //
     BLORGFS_STAT_INC(MetaDataReads);
 
     if (PathCacheMiss == result)

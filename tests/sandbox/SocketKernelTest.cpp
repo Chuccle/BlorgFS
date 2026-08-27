@@ -1,4 +1,4 @@
-//
+﻿//
 // Kernel-behaviour tests for the real Socket.c, run against the rule
 // model (KernelModel.h) with a scriptable WSK provider (WskModel.h).
 //
@@ -22,9 +22,16 @@
 
 #include <gtest/gtest.h>
 
+#include <thread>
+
 extern "C" {
 #include "..\..\src\Driver.h"
 #include "..\..\src\Socket.h"
+#include "Scheduler.h"
+
+// Diagnostic read of the pump's budget word (Socket.c); used solely by
+// PrewarmChainSurvivesCompletionRacingThePumpLoop.
+ULONG BlorgPrewarmRemainingForDiagnostics(VOID);
 }
 
 namespace
@@ -702,6 +709,235 @@ TEST_F(SocketKernelTest, EnsureTlsRecvBufferFailsResourcesIndependently)
     EXPECT_EQ(mdl, socket->TlsRecvMdl);
 
     BlorgCloseWskSocketAsync(socket);
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Pre-warm pump and its teardown contract
+///////////////////////////////////////////////////////////////////////////
+
+//
+// The chain must issue exactly its budget -- one connect per owed step,
+// each issued only after the previous one completes, one outstanding at a
+// time -- and terminate with nothing deferred. This pins the accounting the
+// unload-race test below leans on: Remaining consumed by completions but
+// never past zero, InFlight returning to zero with the idle event set.
+//
+TEST_F(SocketKernelTest, PrewarmChainIssuesExactlyItsBudgetAndTerminates)
+{
+    WSK_MODEL_BEHAVIOUR deferred = Behaviour(WskModelDeferred, STATUS_SUCCESS, 0);
+    WskModelSetConnectBehaviour(&deferred);
+
+    SOCKADDR_IN address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(80);
+
+    BlorgPrewarmSocketPool((PSOCKADDR)&address, 3);
+
+    EXPECT_EQ(1, WskModelDeferredCount())
+        << "the pump keeps exactly one step outstanding";
+
+    //
+    // One release cascades: completing step N issues step N+1 inline
+    // (deferred again), which this same drain then delivers, until the
+    // budget is spent.
+    //
+    EXPECT_GT(WskModelReleaseDeferred(), 0);
+
+    EXPECT_EQ(0, WskModelDeferredCount()) << "the chain did not terminate";
+    EXPECT_EQ(3u, WskModelConnects());
+
+    BlorgCleanupWskSocketPool();
+
+    EXPECT_EQ(0, KmObjectsLive(KmObjectSocket)) << "the filled pool did not drain";
+}
+
+//
+// The unload race: a pre-warm connect still outstanding when teardown runs,
+// with the transport answering only after teardown began. Before teardown
+// waited on the pump, that ordering resurrected a live socket into a pool
+// whose owner had already been released -- leaked in usermode terms, and in
+// the kernel a completion routine running against a deregistered provider
+// out of an unloaded image.
+//
+// The verdict is deliberately timing-independent. Whether the cleanup
+// thread has actually reached its wait when the release lands decides only
+// WHICH path drains the socket -- woken wait, or socket already in the pool
+// when the drain loop starts. What no ordering may produce is a live socket
+// once both sides are done, which is exactly what the pre-fix code produced
+// whenever the transport answered second.
+//
+TEST_F(SocketKernelTest, TeardownDrainsAPrewarmConnectThatOutlivesIt)
+{
+    WSK_MODEL_BEHAVIOUR deferred = Behaviour(WskModelDeferred, STATUS_SUCCESS, 0);
+    WskModelSetConnectBehaviour(&deferred);
+
+    SOCKADDR_IN address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(80);
+
+    BlorgPrewarmSocketPool((PSOCKADDR)&address, 1);
+    ASSERT_EQ(1, WskModelDeferredCount());
+
+    std::thread cleaner(BlorgCleanupWskSocketPool);
+
+    //
+    // Head start for the cleaner so the blocked-in-wait path is the one
+    // typically exercised rather than the arrived-early one. Not required
+    // for the verdict -- see the comment above.
+    //
+    Sleep(100);
+
+    WskModelReleaseDeferred();
+
+    cleaner.join();
+
+    EXPECT_EQ(0, WskModelDeferredCount());
+    EXPECT_EQ(0, KmObjectsLive(KmObjectSocket))
+        << "a pre-warm connect outlived teardown";
+    EXPECT_GT(WskModelCloses(), 0u)
+        << "the socket the late completion produced was never closed";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// The pump's lost-wakeup window
+///////////////////////////////////////////////////////////////////////////
+//
+// A completion that lands while a pump loop is mid-flight cannot issue the
+// next step itself -- that would nest one WSK dispatch frame inside the
+// one that completed (see SocketPrewarmPump). It publishes a token and
+// relies on the holder to pick it up before exiting; the holder's tail is
+// what stands between a completion landing in the consume-to-clear window
+// and a fill that stalls forever with steps still owed.
+//
+// This runs the two real participants -- a fill's issue loop and a
+// completion draining the deferred connect -- as REAL threads, sampled
+// across many iterations. Real threads were chosen over the systematic
+// explorer deliberately: the fiber scheduler parks and resumes modelled
+// threads while SocketPool.Lock is held mid-loop, and its serial drain
+// can resume those out of pairing, which produced stall snapshots
+// (remaining=1 with zero pending) that the protocol's accounting cannot
+// produce on any single-threaded run of the identical flow. Sampling with
+// OS threads keeps the publish/final-consume window under genuine
+// preemption -- including the weak-memory ordering the SC explorer cannot
+// model at all -- without that artifact.
+//
+struct PumpRaceProof
+{
+    SOCKADDR_IN Address;
+    volatile long Stalls;
+    volatile long Healthy;
+    volatile long Stop;
+};
+
+unsigned int PumpRaceSeed = 0;
+
+ULONG PumpRaceRandom()
+{
+    PumpRaceSeed = PumpRaceSeed * 1664525u + 1013904223u;
+    return PumpRaceSeed >> 8;
+}
+
+void PumpRaceCompleter(PumpRaceProof* proof)
+{
+    //
+    // Draining is jittered so completions land in every phase of the
+    // fill: before the first issue, mid-issue, after the loop exited.
+    // SwitchToThread rather than Sleep: a real preemption window at
+    // scheduler granularity, without the 15 ms timer floor that would
+    // make thousands of iterations a minutes-long test.
+    //
+    for (unsigned i = PumpRaceRandom() % 8; i > 0; --i)
+    {
+        SwitchToThread();
+    }
+
+    while (!ReadNoFence(&proof->Stop))
+    {
+        if (WskModelReleaseDeferred() == 0)
+        {
+            SwitchToThread();
+        }
+    }
+
+    WskModelReleaseDeferred();
+}
+
+TEST_F(SocketKernelTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
+{
+    PumpRaceProof proof = {};
+    proof.Address.sin_family = AF_INET;
+    proof.Address.sin_port = htons(80);
+    PumpRaceSeed = 0xB10B;
+
+    const int kIterations = 2000;
+
+    for (int i = 0; i < kIterations && testing::Test::HasNonfatalFailure() == false; ++i)
+    {
+        WskModelReset();
+
+        ASSERT_EQ(STATUS_SUCCESS, BlorgInitialiseWskClient());
+
+        WSK_MODEL_BEHAVIOUR deferred = Behaviour(WskModelDeferred, STATUS_SUCCESS, 0);
+        WskModelSetConnectBehaviour(&deferred);
+
+        std::thread completer(PumpRaceCompleter, &proof);
+
+        BlorgPrewarmSocketPool(C_CAST(const SOCKADDR*, &proof.Address), 2);
+
+        //
+        // Settle: spin until the budget word reaches zero (or the bound),
+        // THEN verify. Waiting for an empty deferred queue first is wrong:
+        // the fill may not have queued its connect yet, and draining
+        // nothing leaves the budget unconsumed -- a harness artifact that
+        // mimics exactly the stall under proof.
+        //
+        // The invariant is Remaining itself -- a pooled-socket handoff can
+        // satisfy a step without opening a new connection, so
+        // "connects == budget" is not sound; Remaining==0 is: every
+        // decrement chains exactly one further issue or an explicit
+        // refusal this scenario never arms.
+        //
+        int settle = 0;
+
+        while (BlorgPrewarmRemainingForDiagnostics() > 0 && settle < 2000)
+        {
+            WskModelReleaseDeferred();
+            SwitchToThread();
+            ++settle;
+        }
+
+        ULONG remaining = BlorgPrewarmRemainingForDiagnostics();
+
+        InterlockedExchange(&proof.Stop, 1);
+        completer.join();
+        InterlockedExchange(&proof.Stop, 0);
+
+        WskModelReleaseDeferred();
+
+        if (remaining == 0)
+        {
+            InterlockedIncrement(&proof.Healthy);
+        }
+        else
+        {
+            InterlockedIncrement(&proof.Stalls);
+
+            printf("[  diag    ] stall (iteration %d): remaining=%lu\n",
+                i, remaining);
+        }
+
+        BlorgCleanupWskClient();
+    }
+
+    //
+    // Coverage: most iterations must have exercised a healthy fill, or
+    // the assertion above passes vacuously.
+    //
+    EXPECT_GT(proof.Healthy, kIterations / 2)
+        << "the racing hand-off was rarely exercised";
+
+    EXPECT_EQ(0, proof.Stalls)
+        << "a completion landed in the pump's publish window and the budget stalled";
 }
 
 } // namespace

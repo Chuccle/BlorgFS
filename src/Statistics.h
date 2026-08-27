@@ -120,7 +120,7 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 UserFileWrites;
     ULONG64 UserFileWriteBytes;
     ULONG64 UserDiskWrites;
-    ULONG64 MetaDataReads;
+    ULONG64 MetaDataReads;               // create-time path resolutions: every lookup, cache hit or miss
     ULONG64 MetaDataReadBytes;
     ULONG64 MetaDataDiskReads;
     ULONG64 MetaDataWrites;

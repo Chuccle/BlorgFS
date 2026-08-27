@@ -406,6 +406,13 @@ TEST_F(FileInfoTest, FsVolumeInformationReportsLabelAndSerial)
 
     ASSERT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
     EXPECT_EQ(0x12345678u, buffer->VolumeSerialNumber);
+
+    //
+    // The length is pinned before it is used as the memcmp bound: a driver
+    // that reported 0 (or a prefix) would otherwise make the name check
+    // compare nothing and pass regardless of what was written.
+    //
+    ASSERT_EQ(sizeof(L"BLORGDRIVE") - sizeof(WCHAR), buffer->VolumeLabelLength);
     EXPECT_EQ(0, memcmp(buffer->VolumeLabel, L"BLORGDRIVE", buffer->VolumeLabelLength));
 }
 
@@ -448,6 +455,13 @@ TEST_F(FileInfoTest, FsAttributeInformationReportsReadOnlyAndName)
 
     ASSERT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
     EXPECT_TRUE(BooleanFlagOn(buffer->FileSystemAttributes, FILE_READ_ONLY_VOLUME));
+
+    //
+    // Pinned for the same reason as the volume label above: the length is
+    // driver-reported, so using it as the memcmp bound lets an empty name
+    // pass the comparison it exists to make.
+    //
+    ASSERT_EQ(sizeof(L"BLORGFS") - sizeof(WCHAR), buffer->FileSystemNameLength);
     EXPECT_EQ(0, memcmp(buffer->FileSystemName, L"BLORGFS", buffer->FileSystemNameLength));
 }
 
@@ -485,18 +499,46 @@ TEST_F(FileInfoTest, FsAttributeInformationTooSmallForNameOverflows)
 
 TEST_F(FileInfoTest, FsFullSizeInformationReportsZeroedCapacity)
 {
-    FILE_FS_FULL_SIZE_INFORMATION buffer{};
+    //
+    // Every field is poisoned before the call so a handler that leaves the
+    // buffer untouched -- or fills only part of it -- cannot pass under the
+    // zero-initialized default. The volume fronts a backend with no size
+    // concept, so "unknown" must be explicit zeros, not residue.
+    //
+    FILE_FS_FULL_SIZE_INFORMATION buffer;
+    memset(&buffer, 0xFF, sizeof(buffer));
     QueryRequest* req = PrepareVolumeQuery(FileFsFullSizeInformation, &buffer, sizeof(buffer));
 
-    EXPECT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
+
+    EXPECT_EQ(0u, static_cast<ULONG64>(buffer.TotalAllocationUnits.QuadPart)) << "capacity is unknown, not zero-by-accident";
+    EXPECT_EQ(0u, static_cast<ULONG64>(buffer.ActualAvailableAllocationUnits.QuadPart));
+    EXPECT_EQ(0u, static_cast<ULONG64>(buffer.CallerAvailableAllocationUnits.QuadPart));
+    EXPECT_EQ(0u, buffer.SectorsPerAllocationUnit);
+    EXPECT_EQ(0u, buffer.BytesPerSector);
 }
 
 TEST_F(FileInfoTest, FsFullSizeInformationExReportsZeroedCapacity)
 {
-    FILE_FS_FULL_SIZE_INFORMATION_EX buffer{};
+    FILE_FS_FULL_SIZE_INFORMATION_EX buffer;
+    memset(&buffer, 0xFF, sizeof(buffer));
     QueryRequest* req = PrepareVolumeQuery(FileFsFullSizeInformationEx, &buffer, sizeof(buffer));
 
-    EXPECT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
+
+    EXPECT_EQ(0, buffer.ActualTotalAllocationUnits) << "capacity is unknown, not zero-by-accident";
+    EXPECT_EQ(0, buffer.ActualAvailableAllocationUnits);
+    EXPECT_EQ(0, buffer.ActualPoolUnavailableAllocationUnits);
+    EXPECT_EQ(0, buffer.CallerTotalAllocationUnits);
+    EXPECT_EQ(0, buffer.CallerAvailableAllocationUnits);
+    EXPECT_EQ(0, buffer.CallerPoolUnavailableAllocationUnits);
+    EXPECT_EQ(0, buffer.UsedAllocationUnits);
+    EXPECT_EQ(0, buffer.TotalReservedAllocationUnits);
+    EXPECT_EQ(0, buffer.VolumeStorageReserveAllocationUnits);
+    EXPECT_EQ(0, buffer.AvailableCommittedAllocationUnits);
+    EXPECT_EQ(0, buffer.PoolAvailableAllocationUnits);
+    EXPECT_EQ(0u, buffer.SectorsPerAllocationUnit);
+    EXPECT_EQ(0u, buffer.BytesPerSector);
 }
 
 TEST_F(FileInfoTest, UnhandledFsInformationClassIsRejected)

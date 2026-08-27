@@ -13,6 +13,12 @@
 static ULONG NodeTableBucketIndexFor(const UNICODE_STRING* Path);
 
 //
+// Defined below BlorgNodeDeferReapIfIdle, which is its only caller outside
+// Unpin/Dereference's own idle-test path.
+//
+static VOID NodeDeferReapIfIdleLocked(PCOMMON_CONTEXT Node);
+
+//
 //  Allocates and initializes an FCB (file node) from the volume's
 //  lookaside lists: non-paged header resources, paged node, copied name,
 //  and advanced header/oplock setup. Zeroes exactly
@@ -359,21 +365,25 @@ void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
 //  lock nests inside either. Bucket locks and node resources are never
 //  held together.
 //
-//  Atomics discipline: RefCount, PinCount, and OnReapList have writers
-//  under different locks (opens mutate RefCount under the node resource,
-//  closes under the bucket lock shared, pins under the bucket lock), so
-//  no single lock owns any counter -- every mutation is Interlocked*, and
-//  every cross-thread read goes through ReadNoFence*. A read's exactness
-//  therefore never comes from the read itself; it comes from the context
-//  each call site states: the bucket lock exclusive (excludes all
-//  droppers), the VCB resource exclusive (excludes the worker), or the
-//  reader's own immediately preceding interlocked op (full barrier).
-//  ShuttingDown/Queued are the one exception: mutations are interlocked,
-//  the only unfenced read (NodeReapKick) is ordered by the Queued claim
-//  taken just before it, and teardown's poll of Queued is a ReadAcquire
-//  paired with the worker's interlocked gate clear -- acquire is enough
-//  there (no store on the poll side to order), and a full-barrier CAS
-//  poll would just ping-pong the line against the worker.
+//  Atomics discipline -- split by lock ownership. RefCount, PinCount, and
+//  OnReapList have writers under different locks (opens mutate RefCount
+//  under the node resource, closes under the bucket lock shared, pins
+//  under the bucket lock), so no single lock owns any counter -- every
+//  mutation is Interlocked*, and every cross-thread read goes through
+//  ReadNoFence*. A read's exactness therefore never comes from the read
+//  itself; it comes from the context each call site states: the bucket
+//  lock exclusive (excludes all droppers), the VCB resource exclusive
+//  (excludes the worker), or the reader's own immediately preceding
+//  interlocked op (full barrier).
+//
+//  NodeReap.Queued/ShuttingDown are the opposite case, and are plain:
+//  NodeReap.Lock owns every write to both (kick claim/rollback, worker
+//  gate-clear, teardown latch), so atomics would only misstate that
+//  ownership. Their check-and-act pairs live inside single locked
+//  sections; the two accesses outside the lock are safe by direction --
+//  teardown's ReadAcquire poll of Queued (a missed clear delays its exit,
+//  never shortens it) and kick's latch read, which sits inside the same
+//  locked section as its claim.
 //
 
 #define NODE_TABLE_BUCKETS 256u   // power of two
@@ -420,17 +430,14 @@ typedef struct _NODE_REAP_STATE
     PIO_WORKITEM      WorkItem;     // preallocated at volume create
 
     //
-    // Interlocked gate: worker queued/running. Every mutation is
-    // interlocked; NodeReapKick claims it BEFORE checking ShuttingDown
-    // (and rolls back if set) so teardown's set-flag-then-poll-Queued
-    // sequence and the kick's claim-then-check sequence form a correct
-    // Dekker pair -- check-then-claim in the kick would let a kick slip
-    // a queue past teardown's last Queued poll and touch the freed
-    // work item.
+    // Interlocked gate: worker queued/running. NOT lock-owned -- unlike
+    // the demoted Queued/ShuttingDown below, its writers span locks that
+    // never nest (claimers hold bucket or VCB; the worker tail holds
+    // NodeReap alone), so the atomic is load-bearing here.
     //
     LONG              Queued;
 
-    LONG              ShuttingDown; // Interlocked teardown latch: suppresses further kicks.
+    LONG              ShuttingDown; // Latch: NodeReap.Lock owns every write; see BlorgNodeTableTeardown.
 } NODE_REAP_STATE;
 
 static NODE_TABLE_BUCKET NodeTable[NODE_TABLE_BUCKETS];
@@ -465,26 +472,49 @@ static ULONG NodeTableBucketIndexFor(const UNICODE_STRING* Path)
 //
 // Queues the reap worker if it isn't already queued/running. The Queued
 // gate makes kicks idempotent; the worker re-checks the list after
-// clearing the gate, closing the push-while-running race. The claim is
-// taken BEFORE the ShuttingDown check and rolled back if it fires: the
-// interlocked claim is a full barrier, so a kick that wins it after
-// teardown's final Queued poll is guaranteed to observe ShuttingDown set
-// (see the field comments on NODE_REAP_STATE). A rollback can only occur
-// with ShuttingDown set, when no lost-wakeup concern remains -- teardown
-// drains the list itself.
+// clearing the gate, closing the push-while-running race.
+//
+// The claim and the ShuttingDown check are ONE locked decision under
+// NodeReap.Lock -- the same baton every pusher and the drain hold --
+// which linearizes this against teardown's latch-set the way the
+// README's claim-under-the-baton rule requires. The previous shape
+// claimed Queued with a bare CAS and then read ShuttingDown bare: two
+// independently-atomic words with no ordering edge between the read
+// and the other side's write, which on weakly ordered silicon is a
+// TOCTOU window whose loss queues the work item teardown has already
+// freed. Under the lock there is nothing to miss: either this kick ran
+// before teardown's locked section and its queue is legitimate, or it
+// runs after and observes the latch.
+//
+// Both flags are plain rather than interlocked for the same reason:
+// NodeReap.Lock owns every write to them, so atomics would only obscure
+// that ownership while costing a LOCK prefix.
+//
+// IRQL: every caller here is PASSIVE-guaranteed and holds a critical
+// region -- closes via BlorgNodeDeferReap (inside FsRtlEnterFileSystem),
+// the worker tail via its own KeEnterCriticalRegion after
+// FsRtlExitFileSystem. Nothing on a DISPATCH completion chain reaches it.
+// The push lock's <=APC requirement is therefore met on every path.
 //
 static VOID NodeReapKick(VOID)
 {
-    if (InterlockedCompareExchange(&NodeReap.Queued, TRUE, FALSE))
+    ExAcquirePushLockExclusive(&NodeReap.Lock);
+
+    if (NodeReap.Queued)
     {
+        ExReleasePushLockExclusive(&NodeReap.Lock);
         return;
     }
 
     if (ReadNoFence(&NodeReap.ShuttingDown))
     {
-        InterlockedExchange(&NodeReap.Queued, FALSE);
+        ExReleasePushLockExclusive(&NodeReap.Lock);
         return;
     }
+
+    NodeReap.Queued = TRUE;
+
+    ExReleasePushLockExclusive(&NodeReap.Lock);
 
     IoQueueWorkItem(NodeReap.WorkItem, NodeReapWorker, DelayedWorkQueue, NULL);
 }
@@ -503,13 +533,34 @@ VOID BlorgNodeDeferReap(PCOMMON_CONTEXT Node)
         return;
     }
 
-    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&NodeReap.Lock);
     PushEntryList(&NodeReap.List, &Node->ReapLink);
     ExReleasePushLockExclusive(&NodeReap.Lock);
-    KeLeaveCriticalRegion();
 
     NodeReapKick();
+}
+
+//
+// Idle test + deferral under the node's own bucket lock shared. This is
+// the entry point for callers that hold no lock over the node's counts
+// (the failed-open arms in BlorgVolumeCreate): RefCount's writers hold the
+// node resource and the bucket respectively, so a bare read outside this
+// lock can be arbitrarily stale in BOTH directions -- a stale zero defers
+// harmlessly (the worker re-checks), but a stale nonzero skips the defer
+// and strands a node nothing will ever re-test. Under the bucket lock the
+// decision shares its baton with every closer's drop.
+//
+// Callers holding the VCB resource exclusive are already inside the
+// documented VCB -> bucket order; taking it shared here nests with every
+// other bucket-shared holder.
+//
+VOID BlorgNodeDeferReapIfIdle(PCOMMON_CONTEXT Node)
+{
+    NODE_TABLE_BUCKET* bucket = &NodeTable[Node->TableBucketIndex];
+
+    ExAcquirePushLockShared(&bucket->Lock);
+    NodeDeferReapIfIdleLocked(Node);
+    ExReleasePushLockShared(&bucket->Lock);
 }
 
 //
@@ -570,8 +621,6 @@ static BOOLEAN NodeTableTryRetire(PCOMMON_CONTEXT Node)
 VOID BlorgNodeTablePublish(PCOMMON_CONTEXT Node)
 {
     NODE_TABLE_BUCKET* bucket = &NodeTable[Node->TableBucketIndex];
-
-    KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&bucket->Lock);
 
     if (NULL == Node->TableLink.Flink)
@@ -580,7 +629,6 @@ VOID BlorgNodeTablePublish(PCOMMON_CONTEXT Node)
     }
 
     ExReleasePushLockExclusive(&bucket->Lock);
-    KeLeaveCriticalRegion();
 }
 
 //
@@ -650,14 +698,12 @@ VOID BlorgNodeDereference(PCOMMON_CONTEXT Node)
 {
     NODE_TABLE_BUCKET* bucket = &NodeTable[Node->TableBucketIndex];
 
-    KeEnterCriticalRegion();
     ExAcquirePushLockShared(&bucket->Lock);
 
     InterlockedDecrement64(&Node->RefCount);
     NodeDeferReapIfIdleLocked(Node);
 
     ExReleasePushLockShared(&bucket->Lock);
-    KeLeaveCriticalRegion();
 }
 
 //
@@ -690,10 +736,23 @@ NTSTATUS BlorgNodeTableInit(PDEVICE_OBJECT VolumeDeviceObject)
 //
 VOID BlorgNodeTableTeardown(VOID)
 {
-    if (InterlockedCompareExchange(&NodeReap.ShuttingDown, TRUE, FALSE))
+    //
+    // Latch teardown under the same lock the kicks claim through: a kick
+    // that runs after this section observes ShuttingDown set and rolls
+    // back, so nothing can queue the work item this function is about to
+    // free. (See NODE_REAP_STATE for why the pairing lives under the
+    // lock rather than in fence reasoning.)
+    //
+    if (NodeReap.ShuttingDown)
     {
         return;
     }
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&NodeReap.Lock);
+    NodeReap.ShuttingDown = TRUE;
+    ExReleasePushLockExclusive(&NodeReap.Lock);
+    KeLeaveCriticalRegion();
 
     LARGE_INTEGER interval = { .QuadPart = -10LL * 10 * 1000 };
 
@@ -771,12 +830,11 @@ void BlorgReapEmptyAncestorDcbs(PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObjec
 // race-free because the drop happens under the bucket lock exclusive
 // while every count drop and its idle test run under it shared. The
 // gate-clear/recheck tail closes the race with pushes that arrived while
-// the worker was running: a pusher whose kick lost the Queued CAS
-// completed its list push before that CAS, and the tail's interlocked
-// gate clear is a full barrier, so the List.Next read after it cannot be
-// hoisted, cached, or satisfied from before the clear -- either the
-// pusher re-queues the worker itself, or this recheck sees its entry.
-// No push can be missed by both.
+// the worker was running: both the clear and the List recheck run under
+// NodeReap.Lock -- the same lock every pusher holds across its push --
+// so a push is either visible to the recheck or the pusher's own kick
+// call (made after its locked push) finds the gate free and queues the
+// worker itself. No push can be missed by both.
 //
 static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 {
@@ -804,7 +862,6 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
             NODE_TABLE_BUCKET* bucket = &NodeTable[node->TableBucketIndex];
             BOOLEAN freeNode = FALSE;
 
-            KeEnterCriticalRegion();
             ExAcquirePushLockExclusive(&bucket->Lock);
 
             if ((0 == ReadNoFence64(&node->RefCount)) &&
@@ -826,7 +883,6 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
             }
 
             ExReleasePushLockExclusive(&bucket->Lock);
-            KeLeaveCriticalRegion();
 
             if (freeNode)
             {
@@ -842,12 +898,29 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
         FsRtlExitFileSystem();
     }
 
-    InterlockedExchange(&NodeReap.Queued, FALSE);
+    //
+    // Gate-clear and recheck under the reap lock: pushes publish List.Next
+    // under this same lock, so a push that landed before this section is
+    // visible to the recheck, and one that lands after finds Queued clear
+    // and queues the worker through its own kick. (The previous barrier
+    // argument for these two bare operations is what the baton replaces.)
+    //
+    // KeEnterCriticalRegion of its own: FsRtlExitFileSystem above already
+    // released the dispatch region, and NodeReapKick's own push-lock
+    // acquisition needs the <=APC guarantee.
+    //
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&NodeReap.Lock);
+    NodeReap.Queued = FALSE;
+    BOOLEAN pending = (NULL != NodeReap.List.Next);
+    ExReleasePushLockExclusive(&NodeReap.Lock);
 
-    if (ReadPointerNoFence(C_CAST(PVOID volatile*, &NodeReap.List.Next)))
+    if (pending)
     {
         NodeReapKick();
     }
+
+    KeLeaveCriticalRegion();
 }
 
 //

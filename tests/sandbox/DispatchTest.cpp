@@ -16,11 +16,6 @@ extern "C" {
 
 #include "DeviceKindScope.h"
 
-TEST(DispatchSandbox, LinksEveryDispatchTranslationUnit)
-{
-    SUCCEED() << "every dispatch .c compiled and linked against the kernel model";
-}
-
 //
 // Proves the three shim hooks actually flip the branch they claim to,
 // rather than existing as decoration. This does not yet drive them

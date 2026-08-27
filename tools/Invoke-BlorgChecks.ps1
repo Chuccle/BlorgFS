@@ -162,13 +162,27 @@ function Invoke-TestExe {
         return $true
     }
 
+    #
+    # Newest hit across BOTH build roots, not the first enumeration hit:
+    # a solution build writes to the repo root while a project-by-project
+    # build writes under tests\<project>, both roots persist, and they can
+    # hold binaries of different ages (README, "Build output lands in two
+    # different places"). Enumeration order is directory order, so taking
+    # the first hit has already run one stale exe past this gate.
+    #
     $exe = Get-ChildItem $repoRoot -Filter $Pattern -Recurse -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -match [regex]::Escape("x64\$Configuration") } |
+        Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
 
     if (-not $exe) {
-        Add-Result $Label 'SKIP' "no $Pattern built"
-        return $true
+        #
+        # Not SKIP: we only get here when the corresponding build PASSED,
+        # so a missing binary means it landed somewhere this glob cannot
+        # see -- exactly the state a green result must never paper over.
+        #
+        Add-Result $Label 'FAIL' "$Pattern not found under any x64\$Configuration root despite a successful build"
+        return $false
     }
 
     #
@@ -200,7 +214,7 @@ function Invoke-TestExe {
     $output = $stdout.Result
     $errorOutput = $stderr.Result
 
-    Set-Content -Encoding utf8 -Path (Join-Path $env:TEMP "$Label.out") -Value $output
+    Set-Content -Encoding utf8 -Path (Join-Path $env:TEMP "$($Label -replace ':', '-').out") -Value $output
 
     if ($proc.ExitCode -ne 0) {
         $tail = ($output -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 3) -join ' | '
@@ -324,6 +338,7 @@ if ($Tier -eq 'Perf' -or $Tier -eq 'All') {
 
     $harness = Get-ChildItem $repoRoot -Filter 'PerfHarness.exe' -Recurse -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -match [regex]::Escape("x64\$Configuration") } |
+        Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
 
     if (-not $harness) {
@@ -348,12 +363,28 @@ if ($Tier -eq 'Perf' -or $Tier -eq 'All') {
 
         foreach ($w in $workloads) {
             $reportPath = Join-Path $runDirectory "$($w.Name).txt"
+
+            #
+            # Delete the previous run's report BEFORE running, not after
+            # failing to find one: a harness that crashes or loses the
+            # volume mid-run exits without writing anything, and Test-Path
+            # below would otherwise present the last session's numbers as
+            # this run's and compare them against the baseline.
+            #
+            Remove-Item $reportPath -Force -ErrorAction SilentlyContinue
+
             $harnessArgs = $w.Args + @('--report', $reportPath)
 
             & $harness.FullName @harnessArgs | Out-Null
 
+            if ($LASTEXITCODE -ne 0) {
+                Add-Result "perf:$($w.Name)" 'FAIL' "PerfHarness exited $LASTEXITCODE"
+                $ok = $false
+                continue
+            }
+
             if (-not (Test-Path $reportPath)) {
-                Add-Result "perf:$($w.Name)" 'FAIL' 'harness produced no report'
+                Add-Result "perf:$($w.Name)" 'FAIL' 'harness exited 0 but wrote no report'
                 $ok = $false
                 continue
             }
@@ -361,6 +392,21 @@ if ($Tier -eq 'Perf' -or $Tier -eq 'All') {
             $baselinePath = Join-Path $BaselineDirectory "$($w.Name).txt"
 
             if ($UpdateBaseline) {
+                #
+                # An accepted baseline must clear the invariant checks even
+                # so: a run with unbalanced fetch accounting or failed
+                # fetches is not a number worth measuring regressions
+                # against, and accepting it silently poisons every later
+                # comparison. Compare with no -Baseline runs invariants only.
+                #
+                & (Join-Path $PSScriptRoot 'Compare-BlorgMetrics.ps1') -Current $reportPath
+
+                if ($LASTEXITCODE -ne 0) {
+                    Add-Result "perf:$($w.Name)" 'FAIL' 'baseline rejected -- current run failed the invariant checks'
+                    $ok = $false
+                    continue
+                }
+
                 Copy-Item $reportPath $baselinePath -Force
                 Add-Result "perf:$($w.Name)" 'BASELINE' "written to $baselinePath"
                 continue
@@ -376,9 +422,8 @@ if ($Tier -eq 'Perf' -or $Tier -eq 'All') {
                 $ok = $false
             }
             else {
-                $status = if (Test-Path $baselinePath) { 'PASS' } else { 'PASS' }
                 $detail = if (Test-Path $baselinePath) { '' } else { 'no baseline yet -- invariants only' }
-                Add-Result "perf:$($w.Name)" $status $detail
+                Add-Result "perf:$($w.Name)" 'PASS' $detail
             }
         }
     }

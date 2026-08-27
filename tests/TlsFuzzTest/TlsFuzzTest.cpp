@@ -20,14 +20,20 @@
 #include <cstring>
 #include "..\..\src\Tls.h"
 
-// Resolves a path under <repo root>\FuzzSeeds\, with repo root found by
-// walking up from this exe's own path until a directory containing
+// Resolves a path under <repo root>\tests\FuzzSeeds\, with repo root found
+// by walking up from this exe's own path until a directory containing
 // BlorgFS.sln turns up -- not any machine- or session-specific location,
 // and not a hardcoded directory-depth guess either: MSBuild's actual
 // output directory for a project built as part of the .sln (the normal
 // way to build this) is the solution root's x64\<Config>\, not a
 // project-nested TlsFuzzTest\x64\<Config>\, so a fixed "N components up"
 // count silently breaks depending on how the exe happened to be built.
+//
+// The seed corpus lives under tests\, next to the projects that consume
+// it. Resolving to <repo root>\FuzzSeeds instead pointed at a directory
+// that does not exist, every target silently skipped, and the suite
+// reported total success while fuzzing nothing -- which is why a missing
+// seed is now fatal (see LoadSeedOrDie) rather than a skip.
 static void GetFuzzSeedPath(char* outPath, size_t outSize, const char* name)
 {
     char dir[MAX_PATH];
@@ -51,7 +57,7 @@ static void GetFuzzSeedPath(char* outPath, size_t outSize, const char* name)
         *slash = '\0';
     }
 
-    sprintf_s(outPath, outSize, "%s\\FuzzSeeds\\%s.bin", dir, name);
+    sprintf_s(outPath, outSize, "%s\\tests\\FuzzSeeds\\%s.bin", dir, name);
 }
 
 static unsigned char* LoadSeed(const char* name, unsigned long* lenOut)
@@ -71,11 +77,39 @@ static unsigned char* LoadSeed(const char* name, unsigned long* lenOut)
     fseek(f, 0, SEEK_SET);
 
     unsigned char* buf = new unsigned char[sz];
-    fread(buf, 1, sz, f);
+
+    if (fread(buf, 1, sz, f) != static_cast<size_t>(sz))
+    {
+        printf("  !! short read on seed %s\n", name);
+        fclose(f);
+        delete[] buf;
+        return nullptr;
+    }
+
     fclose(f);
 
     *lenOut = C_CAST(unsigned long, sz);
     return buf;
+}
+
+//
+// A missing seed must be fatal rather than a silent skip. The banner at
+// the end of main claims every parser survived its iterations; a target
+// whose seed failed to load ran nothing at all, and an exe launched
+// outside the repo layout -- where GetFuzzSeedPath's walk finds no .sln --
+// would otherwise report total success while fuzzing nothing.
+//
+static unsigned char* LoadSeedOrDie(const char* name, unsigned long* lenOut)
+{
+    unsigned char* seed = LoadSeed(name, lenOut);
+
+    if (!seed)
+    {
+        fprintf(stderr, "  [FAIL] seed %s.bin did not load -- the corresponding parser was NOT fuzzed\n", name);
+        exit(1);
+    }
+
+    return seed;
 }
 
 // A generous over-allocation for the mutated copy: several targets
@@ -162,127 +196,117 @@ int main()
     // --- Target: BlorgTlsParseServerHello ---
     {
         unsigned long realLen;
-        unsigned char* seed = LoadSeed("server_hello_body", &realLen);
-        if (seed)
+        unsigned char* seed = LoadSeedOrDie("server_hello_body", &realLen);
+
+        printf("Fuzzing BlorgTlsParseServerHello...\n");
+        static unsigned char buf[FUZZ_BUF_CAP];
+
+        for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
         {
-            printf("Fuzzing BlorgTlsParseServerHello...\n");
-            static unsigned char buf[FUZZ_BUF_CAP];
+            unsigned long len = Mutate(&rng, seed, realLen, buf);
+            unsigned char randomOut[TLS_HANDSHAKE_RANDOM_LEN];
+            unsigned char pubKeyOut[TLS_ECC_PUBKEY_LEN];
 
-            for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
-            {
-                unsigned long len = Mutate(&rng, seed, realLen, buf);
-                unsigned char randomOut[TLS_HANDSHAKE_RANDOM_LEN];
-                unsigned char pubKeyOut[TLS_ECC_PUBKEY_LEN];
+            // Return value deliberately ignored -- fuzzing only cares
+            // whether the call corrupts memory or hangs, not whether
+            // it accepts or rejects a given mutation.
+            BlorgTlsParseServerHello(buf, len, randomOut, pubKeyOut);
 
-                // Return value deliberately ignored -- fuzzing only cares
-                // whether the call corrupts memory or hangs, not whether
-                // it accepts or rejects a given mutation.
-                BlorgTlsParseServerHello(buf, len, randomOut, pubKeyOut);
-
-                if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
-            }
-
-            printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
-            delete[] seed;
+            if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
         }
+
+        printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
+        delete[] seed;
     }
 
     // --- Target: BlorgTlsParseCertificateMessage ---
     {
         unsigned long realLen;
-        unsigned char* seed = LoadSeed("certificate_message_body", &realLen);
-        if (seed)
+        unsigned char* seed = LoadSeedOrDie("certificate_message_body", &realLen);
+
+        printf("Fuzzing BlorgTlsParseCertificateMessage...\n");
+        static unsigned char buf[FUZZ_BUF_CAP];
+
+        for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
         {
-            printf("Fuzzing BlorgTlsParseCertificateMessage...\n");
-            static unsigned char buf[FUZZ_BUF_CAP];
+            unsigned long len = Mutate(&rng, seed, realLen, buf);
+            const unsigned char* leafCertOut;
+            unsigned long leafCertLenOut;
 
-            for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
-            {
-                unsigned long len = Mutate(&rng, seed, realLen, buf);
-                const unsigned char* leafCertOut;
-                unsigned long leafCertLenOut;
+            BlorgTlsParseCertificateMessage(buf, len, &leafCertOut, &leafCertLenOut);
 
-                BlorgTlsParseCertificateMessage(buf, len, &leafCertOut, &leafCertLenOut);
-
-                if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
-            }
-
-            printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
-            delete[] seed;
+            if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
         }
+
+        printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
+        delete[] seed;
     }
 
     // --- Target: BlorgTlsExtractSpkiFromCertificate (fed the leaf DER directly) ---
     {
         unsigned long realLen;
-        unsigned char* seed = LoadSeed("leaf_cert_der", &realLen);
-        if (seed)
+        unsigned char* seed = LoadSeedOrDie("leaf_cert_der", &realLen);
+
+        printf("Fuzzing BlorgTlsExtractSpkiFromCertificate...\n");
+        static unsigned char buf[FUZZ_BUF_CAP];
+
+        for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
         {
-            printf("Fuzzing BlorgTlsExtractSpkiFromCertificate...\n");
-            static unsigned char buf[FUZZ_BUF_CAP];
+            unsigned long len = Mutate(&rng, seed, realLen, buf);
+            const unsigned char* spkiOut;
+            unsigned long spkiLenOut;
 
-            for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
-            {
-                unsigned long len = Mutate(&rng, seed, realLen, buf);
-                const unsigned char* spkiOut;
-                unsigned long spkiLenOut;
+            BlorgTlsExtractSpkiFromCertificate(buf, len, &spkiOut, &spkiLenOut);
 
-                BlorgTlsExtractSpkiFromCertificate(buf, len, &spkiOut, &spkiLenOut);
-
-                if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
-            }
-
-            printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
-            delete[] seed;
+            if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
         }
+
+        printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
+        delete[] seed;
     }
 
     // --- Target: BlorgTlsDecodeP256SubjectPublicKeyInfo ---
     {
         unsigned long realLen;
-        unsigned char* seed = LoadSeed("spki_der", &realLen);
-        if (seed)
+        unsigned char* seed = LoadSeedOrDie("spki_der", &realLen);
+
+        printf("Fuzzing BlorgTlsDecodeP256SubjectPublicKeyInfo...\n");
+        static unsigned char buf[FUZZ_BUF_CAP];
+
+        for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
         {
-            printf("Fuzzing BlorgTlsDecodeP256SubjectPublicKeyInfo...\n");
-            static unsigned char buf[FUZZ_BUF_CAP];
+            unsigned long len = Mutate(&rng, seed, realLen, buf);
+            unsigned char pubKeyOut[TLS_ECC_PUBKEY_LEN];
 
-            for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
-            {
-                unsigned long len = Mutate(&rng, seed, realLen, buf);
-                unsigned char pubKeyOut[TLS_ECC_PUBKEY_LEN];
+            BlorgTlsDecodeP256SubjectPublicKeyInfo(buf, len, pubKeyOut);
 
-                BlorgTlsDecodeP256SubjectPublicKeyInfo(buf, len, pubKeyOut);
-
-                if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
-            }
-
-            printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
-            delete[] seed;
+            if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
         }
+
+        printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
+        delete[] seed;
     }
 
     // --- Target: BlorgTlsParseCertificateVerifyMessage ---
     {
         unsigned long realLen;
-        unsigned char* seed = LoadSeed("certificate_verify_message_body", &realLen);
-        if (seed)
+        unsigned char* seed = LoadSeedOrDie("certificate_verify_message_body", &realLen);
+
+        printf("Fuzzing BlorgTlsParseCertificateVerifyMessage...\n");
+        static unsigned char buf[FUZZ_BUF_CAP];
+
+        for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
         {
-            printf("Fuzzing BlorgTlsParseCertificateVerifyMessage...\n");
-            static unsigned char buf[FUZZ_BUF_CAP];
+            unsigned long len = Mutate(&rng, seed, realLen, buf);
+            unsigned char sigOut[64];
 
-            for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
-            {
-                unsigned long len = Mutate(&rng, seed, realLen, buf);
-                unsigned char sigOut[64];
+            BlorgTlsParseCertificateVerifyMessage(buf, len, sigOut);
 
-                BlorgTlsParseCertificateVerifyMessage(buf, len, sigOut);
-
-                if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
-            }
-
-            printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
-            delete[] seed;
+            if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
         }
+
+        printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
+        delete[] seed;
     }
 
     // --- Target: BlorgTlsAeadDecrypt -- mutate ciphertext/tag (attacker-
@@ -290,44 +314,41 @@ int main()
     // values (not attacker-controlled from the client's perspective). ---
     {
         unsigned long keyLen, ivLen, aadLen, ctLen, tagLen;
-        unsigned char* key = LoadSeed("aead_key", &keyLen);
-        unsigned char* iv = LoadSeed("aead_iv", &ivLen);
-        unsigned char* aad = LoadSeed("aead_aad", &aadLen);
-        unsigned char* ciphertext = LoadSeed("aead_ciphertext", &ctLen);
-        unsigned char* tag = LoadSeed("aead_tag", &tagLen);
+        unsigned char* key = LoadSeedOrDie("aead_key", &keyLen);
+        unsigned char* iv = LoadSeedOrDie("aead_iv", &ivLen);
+        unsigned char* aad = LoadSeedOrDie("aead_aad", &aadLen);
+        unsigned char* ciphertext = LoadSeedOrDie("aead_ciphertext", &ctLen);
+        unsigned char* tag = LoadSeedOrDie("aead_tag", &tagLen);
 
-        if (key && iv && aad && ciphertext && tag)
+        printf("Fuzzing BlorgTlsAeadDecrypt (ciphertext + tag mutated, key/iv/aad fixed)...\n");
+        static unsigned char ctBuf[FUZZ_BUF_CAP];
+        unsigned char tagBuf[TLS_TAG_LEN];
+        static unsigned char plaintextOut[FUZZ_BUF_CAP];
+
+        for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
         {
-            printf("Fuzzing BlorgTlsAeadDecrypt (ciphertext + tag mutated, key/iv/aad fixed)...\n");
-            static unsigned char ctBuf[FUZZ_BUF_CAP];
-            unsigned char tagBuf[TLS_TAG_LEN];
-            static unsigned char plaintextOut[FUZZ_BUF_CAP];
+            unsigned long ctLenMutated = Mutate(&rng, ciphertext, ctLen, ctBuf);
 
-            for (unsigned long i = 0; i < FUZZ_ITERATIONS; i++)
+            // Tag is fixed-size in the real protocol (TLS_TAG_LEN) --
+            // mutate its bytes but keep it at the correct length,
+            // since a caller in the real driver always slices
+            // exactly TLS_TAG_LEN bytes off a record regardless of
+            // what's in them.
+            memcpy(tagBuf, tag, TLS_TAG_LEN);
+            unsigned int numFlips = 1 + (FuzzRand(&rng) % 4);
+            for (unsigned int f = 0; f < numFlips; f++)
             {
-                unsigned long ctLenMutated = Mutate(&rng, ciphertext, ctLen, ctBuf);
-
-                // Tag is fixed-size in the real protocol (TLS_TAG_LEN) --
-                // mutate its bytes but keep it at the correct length,
-                // since a caller in the real driver always slices
-                // exactly TLS_TAG_LEN bytes off a record regardless of
-                // what's in them.
-                memcpy(tagBuf, tag, TLS_TAG_LEN);
-                unsigned int numFlips = 1 + (FuzzRand(&rng) % 4);
-                for (unsigned int f = 0; f < numFlips; f++)
-                {
-                    tagBuf[FuzzRand(&rng) % TLS_TAG_LEN] = C_CAST(unsigned char, FuzzRand(&rng) & 0xFF);
-                }
-
-                if (ctLenMutated > sizeof(plaintextOut)) ctLenMutated = C_CAST(unsigned long, sizeof(plaintextOut));
-
-                BlorgTlsAeadDecrypt(key, iv, 0, aad, aadLen, ctBuf, ctLenMutated, tagBuf, plaintextOut);
-
-                if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
+                tagBuf[FuzzRand(&rng) % TLS_TAG_LEN] = C_CAST(unsigned char, FuzzRand(&rng) & 0xFF);
             }
 
-            printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
+            if (ctLenMutated > sizeof(plaintextOut)) ctLenMutated = C_CAST(unsigned long, sizeof(plaintextOut));
+
+            BlorgTlsAeadDecrypt(key, iv, 0, aad, aadLen, ctBuf, ctLenMutated, tagBuf, plaintextOut);
+
+            if (0 == (i % 50000)) printf("  %lu iterations OK\n", i);
         }
+
+        printf("  done: %d iterations, no crash\n\n", FUZZ_ITERATIONS);
 
         delete[] key; delete[] iv; delete[] aad; delete[] ciphertext; delete[] tag;
     }

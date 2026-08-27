@@ -198,12 +198,23 @@ TEST_F(HttpClientTest, PeerSendingMoreBodyThanContentLengthMustNotOverrunTheCall
     Read(canaried, requested);
     Drain();
 
-    for (SIZE_T i = requested; i < sizeof(canaried); ++i)
+    //
+    // The driver's contract for a peer that sends more body than its
+    // declared Content-Length is REJECTION: the response is a protocol
+    // violation, reported as STATUS_INVALID_PARAMETER with the caller's
+    // buffer left untouched. That is stronger than "did not overrun" --
+    // these assertions equally catch a client that copies some or all of
+    // the over-sent bytes before failing, which a canary alone would not.
+    //
+    ASSERT_EQ(1, LastRead.Calls);
+    ASSERT_EQ(STATUS_INVALID_PARAMETER, LastRead.Status);
+
+    for (SIZE_T i = 0; i < sizeof(canaried); ++i)
     {
         ASSERT_EQ(0xAA, canaried[i])
-            << "byte " << i << " past the caller's " << requested << "-byte buffer was "
-               "overwritten -- a peer that over-sends its declared Content-Length can "
-               "write past the MDL the caller supplied";
+            << "byte " << i << " was overwritten -- byte 0..3 must survive "
+               "unwritten too; a peer that over-sends its declared Content-Length "
+               "must not reach the caller's MDL at all";
     }
 
     FreeMdl();
@@ -528,6 +539,15 @@ TEST_F(HttpClientTest, DribbledResponseReassembles)
 // a fresh connection -- without that, every keep-alive race would surface
 // as a user-visible read failure.
 //
+// The stale connection needs no scripted CLOSE: its warmup script is
+// exhausted after the first read, and the peer treats an exhausted script
+// as a close -- which is classified identically to an idle-close for
+// retry purposes. Scripts bind at socket CREATION, so the step list set
+// before the second read is inherited only by the RETRY's fresh socket;
+// putting a CLOSE_STEP there would close the retry connection instead of
+// the stale one, which is exactly what an earlier version of this test
+// did without noticing.
+//
 TEST_F(HttpClientTest, IdleClosedPooledConnectionIsRetriedOnce)
 {
     static const SANDBOX_STEP warmup[] =
@@ -546,7 +566,6 @@ TEST_F(HttpClientTest, IdleClosedPooledConnectionIsRetriedOnce)
 
     static const SANDBOX_STEP script[] =
     {
-        CLOSE_STEP,
         DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nGOOD")
     };
 
@@ -561,6 +580,17 @@ TEST_F(HttpClientTest, IdleClosedPooledConnectionIsRetriedOnce)
 
     EXPECT_GT(SandboxSocketsCreated(), createdBefore) << "the retry did not open a fresh connection";
     EXPECT_EQ(1, LastRead.Calls);
+
+    //
+    // A fresh connection plus a callback proves the retry machinery ran,
+    // not that it worked: only the delivered status and bytes say whether
+    // the retried read actually succeeded or failed after reconnecting.
+    //
+    ASSERT_EQ(STATUS_SUCCESS, LastRead.Status)
+        << "the retry reconnected but the read still failed";
+    ASSERT_EQ(sizeof(second), LastRead.Bytes);
+    EXPECT_EQ(0, memcmp(second, "GOOD", sizeof(second)))
+        << "the retried read delivered wrong body bytes";
 
     FreeMdl();
 }

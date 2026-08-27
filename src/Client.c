@@ -128,6 +128,14 @@
 // operations are interlocked and legal at any IRQL, and the event is only
 // ever waited on by the single PASSIVE-level unload path.
 //
+// The other candidate primitive is IO_REMOVE_LOCK: IoReleaseRemoveLock is
+// documented <= DISPATCH_LEVEL where the rundown release is not, acquire
+// refuses after IoReleaseRemoveLockAndWait exactly as above, and it would
+// delete this whole block. Kept out deliberately -- it buys I/O-manager
+// machinery for what two LONGs express -- but it is the shape to grow into
+// if a third async issuer ever needs to share one unload gate with this
+// one (the pre-warm pump's gate in Socket.c is the second of that kind).
+//
 static volatile LONG HttpActiveRequests = 1;
 static KEVENT HttpDrainEvent;
 
@@ -1321,11 +1329,11 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
             break;
         }
 
-		case HttpStageReadResponse:
-		{
-			HttpReadResponse(Ctx);
-			break;
-		}
+        case HttpStageReadResponse:
+        {
+            HttpReadResponse(Ctx);
+            break;
+        }
 
         case HttpStageDispatch:
         {
