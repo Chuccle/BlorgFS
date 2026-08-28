@@ -293,6 +293,164 @@ The driver runs in a VM for testing — `deploy\Deploy-ToVM.ps1` builds, copies,
 and installs it via vmrun. Run the `Perf` tier inside the guest, where the
 volume is mounted.
 
+## Playback stutter: subtitles, and why the obvious measurements missed it
+
+Measured 2026-08-28 against master, Release, Driver Verifier off, on the
+reported symptom: video and subtitle lag watching media off `B:`.
+
+The file that reproduces it is H.264 + AAC + `S_TEXT/UTF8` at 2.6 Mbit/s --
+0.33 MB/s sustained against a driver that does 17-28 MB/s. Throughput was
+never the question. **The trigger is enabling subtitles**, and until they
+are on, nothing about this driver is visible to the player at all.
+
+### What subtitles change
+
+Same file, same player, same session; the only difference is the subtitle
+track:
+
+| | subs off, 25 seeks | subs on |
+|---|---|---|
+| user reads | 75 | 1211 |
+| mean | 713 us | 5794 us |
+| max | 16.2 ms | 258 ms |
+| **over one frame (41 ms)** | **0 (0.00%)** | **86 (7.10%)** |
+| paging reads sequential | 100% | **70.4%** |
+| user bytes | 19.6 MB | **428 MB** |
+
+Three things happen at once. Sequential paging reads fall to 70.4%, so the
+cache manager -- which only predicts forward-sequential access -- stops
+prefetching for roughly a third of them. The player reads about 22 times
+more data than the bitrate needs, because a text subtitle track is sparse
+and interleaved and following it drags the demuxer across ranges the video
+stream never touches. And the resulting latency distribution is bimodal
+with nothing between the modes: 863 reads at 16-64 us because the bytes
+were resident, 111 reads at 16-131 ms because they were not.
+
+### It is this driver, on a clean control
+
+The same file was copied to the guest's own disk and played by the same
+player, same subtitle track, same seeking, same two vCPUs. **It played
+smoothly, and this driver's counters recorded zero reads for the duration**,
+so the control is clean rather than merely plausible.
+
+That exonerates decode -- identical decode and compositing work, no
+stutter -- and retires CPU capacity as an independent explanation, since
+two cores are demonstrably enough for this content.
+
+It also makes the outlier records legible. The six worst fetches show 88 to
+159 ms in `send`, for a request of a couple of hundred bytes, with
+`FetchesActive` of 0 or 1: nothing else in flight, and no physical way a
+send of that size takes that long. Those are the driver's own completions
+being delayed by the driver's own work. Playing from this volume adds
+428 MB through WSK receive, HTTP parsing and copies on top of decode, where
+the local path adds close to nothing.
+
+So both driver-side costs share one root, and both scale with over-fetch:
+
+- a cold read costs a round trip plus a 512 KB to 1 MB body, against
+  roughly 0.1 ms for the same read locally, and
+- moving those bytes costs CPU that delays the completions of the very
+  fetches being waited on.
+
+### Concurrency cannot fix this
+
+`FetchesActive` is 0 on five of the six worst fetches and 1 on the other.
+At the moment of every stall the driver had nothing else in flight, so the
+pipeline was idle, not saturated.
+
+That is the shape of the problem. Concurrency scales throughput; this is
+latency on a serial dependency chain. The demuxer cannot issue the next
+read until the current one returns, because its contents determine the next
+offset, and the cache manager only parallelises access it can predict.
+Adding width buys nothing here, and would cost something -- more in-flight
+completions competing for the two cores already delaying the ones we have.
+
+Which is why the mitigations that matter attack latency: fetch less per
+cold read, or do not go to the network at all.
+
+### NTFS as the reference
+
+Measured through the same standard FSCTL this driver implements, same
+workload (256 KB requests over a cold region of the same 1.2 GB file):
+
+| | average read the cache manager issues |
+|---|---|
+| NTFS (`C:`) | **98 KB** |
+| BlorgFS (`B:`) | **675 KB** |
+
+NTFS issues roughly one disk read per request, sized just above it -- 2,677
+user reads produced 2,681 disk reads -- and does not batch aggressively even
+while streaming sequentially at 771 MB/s. This driver clusters about seven
+times larger.
+
+That reframes `READ_AHEAD_GRANULARITY`. The evidence table in `Driver.h`
+compared 256 KB, 512 KB and 1 MB and picked the middle, but every option
+tested was already far outside where the reference filesystem sits, and all
+three were measured on eight concurrent streams -- a throughput workload,
+not the latency-shaped one that stalls. It is a well-evidenced choice among
+outliers.
+
+The counter-argument is real and has to be measured rather than assumed:
+NTFS reads from a local disk where a request costs about 0.1 ms, so small
+reads cost it nothing, while this driver pays a ~12.7 ms round trip per
+request. Shrinking granularity trades stall latency for more round trips on
+sequential streaming. `ReadAheadGranularityKb` in the service's
+`Parameters` key exists to sweep that trade without a rebuild per point;
+zero means never call `CcSetReadAheadGranularity` and leave Cc's default.
+
+### What it is not
+
+Tested and dead, recorded so they are not re-proposed:
+
+- **Not the MKV Cues index.** The theory was that each seek drags a read to
+  the index at the end of the file. `end-of-file` reads: **0**.
+- **Not metadata.** The theory was that the player re-opens or re-stats on
+  seek. `creates` and `file info`: **0 and 0**.
+- **Not decode.** See the local control above.
+- **Not seeking.** Twenty-five scripted seeks at two second intervals, the
+  rate the reporter used, produced zero reads over a frame interval.
+
+An earlier version of this section concluded that seeking was the cause, on
+a 1:1 seek-to-stall figure taken from a paced *simulation* that issued
+synchronous 64 KB reads and blocked on each. Media Player reads ~262 KB
+asynchronously behind its own buffer, and paging reads stay 100% sequential
+across 25 seeks. The simulation exhibited the problem it was built to look
+for.
+
+### How to measure this, and four ways to get it wrong
+
+Every one of these cost a wrong conclusion before it was understood.
+
+**Driver-side latency is not what a user feels.** The cache manager sits in
+front of all of it and exists to hide exactly those numbers -- driven at
+playback rate the driver was issuing 67 ms fetches while the reader saw
+0.11 ms. `UserReadLatency*` in `BLORGFS_STATISTICS` is the number to read;
+the chunk-fetch block explains it but is not it.
+
+**Most application reads never become an IRP.** Buffered synchronous reads
+of a cached file are served by fast I/O, so timing `IRP_MJ_READ` produced
+one sample against a reader's 780. `FastIoRead` is wrapped
+(`BlorgFastIoRead`) for this reason: `FsRtlCopyRead` is where a caller
+blocks, because it calls `CcCopyRead` inline.
+
+**Validate instrumentation against something independent before trusting
+it.** The user-read timer was checked against a usermode reader measuring
+itself on the other side of the syscall boundary: 780 samples against 780,
+max 31.174 ms against 31.4 ms. Without that step its first version -- which
+saw one read in 780 -- would have looked like a finding.
+
+**A simulation of a player is not a player.** Read pace, read size, and
+whether reads are synchronous all change the answer, and a reader written
+to exhibit a hypothesis will exhibit it. Drive the real application:
+`PerfHarness reset`, run it, `PerfHarness stats`.
+
+Two further traps already paid for: reads at full speed measure read-ahead
+working rather than playback feeling slow, so pace a simulated reader at
+the real bitrate; and every `*MaxUs` field was summed across processors
+rather than max-reduced until 2026-08-28, so any maximum taken from this
+driver before then is inflated by roughly the processor count.
+
+
 ## TODO: on-disk hot cache
 
 The prefetch ring was removed rather than replaced. What follows is the
