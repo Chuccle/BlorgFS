@@ -398,6 +398,93 @@ sequential streaming. `ReadAheadGranularityKb` in the service's
 `Parameters` key exists to sweep that trade without a rebuild per point;
 zero means never call `CcSetReadAheadGranularity` and leave Cc's default.
 
+### The granularity sweep, and why there is no right constant
+
+That trade has now been measured rather than assumed, and the answer is
+that no value of `READ_AHEAD_GRANULARITY` is free.
+
+First, the fact that decides how to read the table. **Cc's default is not
+adaptive.** Between `CcInitializeCacheMap` and `CcSetReadAheadGranularity`
+the granularity of a cached file is `PAGE_SIZE` -- a constant, 4 KB. So
+"leave the default" is not letting Cc choose, it is pinning the granule to
+one page, the smallest value in the sweep. Every point below is a constant;
+the sweep has no adaptive arm in it at all.
+
+Granularity is the rounding unit for read-ahead, so a small read drags its
+whole aligned granule, and a large granule means a demand read waits on a
+large fetch. That single mechanism produces both columns: throughput rises
+with granule size because fetches get larger and fewer, and the tail rises
+with it because each stall is longer.
+
+Measured on one cold guest per matrix, a dataset no other cell touches, and
+the granularity assignment alternated within each workload so file identity
+cannot track the setting. Sequential rows are the mean of two runs with the
+assignment reversed; the others are single runs.
+
+| granule | seq MB/s | seq tail | streams x8 MB/s | streams x8 tail | demux MB/s | demux amplification | demux tail |
+|---|---|---|---|---|---|---|---|
+| 512 KB (committed) | **27.1** | 3.26% | **32.2** | 13.3% | 0.75 | 28.1x | 4.2% |
+| 128 KB | 20.8 | **0.11%** | **32.1** | 29.2% | 0.64 | 20.6x | 0.44% |
+| 64 KB (FastFat) | 16.8 | 0.13% | 28.2 | 15.6% | **0.86** | 10.8x | **0.22%** |
+| 4 KB (`PAGE_SIZE`) | 16.1 | **0.09%** | 28.7 | 14.0% | 0.82 | **1.4x** | 1.0% |
+
+"Tail" is the share of application-visible reads longer than a 24 fps frame
+interval -- the number a viewer can see, not the mean.
+
+The shape is monotone and the endpoints both regress:
+
+- **512 KB costs the tail.** Sequential buffered reads spend 3.26% of their
+  reads over a frame against 0.11% at 128 KB, a factor of thirty. At four
+  concurrent streams its worst read was **1087 ms** against 118 ms at
+  `PAGE_SIZE`. On a filesystem whose stated purpose is playback, a
+  one-second read is the whole complaint.
+- **`PAGE_SIZE` costs throughput.** Sequential buffered drops from 27.1 to
+  16.1 MB/s, **-41%**, because the same bytes now take 4096 fetches instead
+  of 832 -- five times the round trips at ~12.7 ms each.
+
+Two controls back the rig up. Unbuffered sequential reads, where Cc is out
+of the path, move -5% with amplification 1.00 at both ends -- no effect
+where none is possible. Buffered 4 KB random reads are flat at 0.39 MB/s
+and amplification 1.00, because Cc's read-ahead is pattern-triggered and
+never arms on uniformly random access, so granularity is inert there.
+
+**Unresolved, and load-bearing before anything is committed:**
+
+- `streams x8` at 128 KB reported a 29.2% tail, roughly double every other
+  setting, from a single run against a different directory. That is either
+  the one real objection to 128 KB or it is noise, and one sample cannot
+  tell.
+- The `meta` storm produced no usable result at any setting, so
+  metadata-heavy work is unmeasured.
+- The demux workload reads in 4 KB blocks while Media Player issues ~262 KB
+  reads. The granule that minimises amplification is the one matching the
+  read size, so the playback column is the row most flattering to small
+  values and the one least entitled to decide this.
+
+### Why a constant is the wrong shape
+
+The two regressions above are not in tension by accident. Large granules
+win when a file object is being read forwards, because the fetch amortises;
+they lose when it is being picked at, because a small read waits for a large
+fetch. Those are different file objects, often at the same moment -- a video
+track streaming while a subtitle track is picked at -- and one constant has
+to serve both.
+
+The driver already knows which is which. `READ_STREAM_TRACKER` in the FCB
+exists to answer exactly that question and `BlorgReadIsSequential` already
+reports 54-73% sequential on these workloads. So the shape that fits the
+evidence is not a better constant but a granularity that starts small and
+is raised for a file object whose reads have proven sequential -- Cc's
+per-file-object setting is the right granularity of control for it, and the
+adaptivity Cc does not provide is adaptivity this driver has the state to
+provide itself.
+
+What has to be checked before building it: `CcSetReadAheadGranularity` is
+documented as setting the value for a cached file, and nothing says it may
+be called more than once per file object. FastFat calls it once, at
+cache-map time. If a second call is not legal the idea does not survive in
+this form, and that is the first thing to establish rather than the last.
+
 ### What it is not
 
 Tested and dead, recorded so they are not re-proposed:
@@ -449,6 +536,38 @@ working rather than playback feeling slow, so pace a simulated reader at
 the real bitrate; and every `*MaxUs` field was summed across processors
 rather than max-reduced until 2026-08-28, so any maximum taken from this
 driver before then is inflated by roughly the processor count.
+
+**A workload that cannot exhibit the effect will report that there is no
+effect.** Four candidate workloads were tried against read-ahead
+granularity before one could see it, and each was rejected on its own
+measurement rather than on argument: unbuffered random (amplification
+1.000, Cc is not in the path), buffered random (1.000, read-ahead is
+pattern-triggered and never arms), a demuxer model whose cursors advanced
+by their own block size (1.002 at 99.8% sequential -- `seq` in disguise,
+read-ahead working perfectly), and the same model with a large stride but
+no burst (2.07x at 1% sequential, too scattered to arm anything). Sweeping
+any of the four would have produced a flat line and the confident wrong
+conclusion that granularity does not matter. What reproduces the captured
+trace is `demux`: several cursors, each reading a short adjacent burst then
+skipping a stride, which is what a container's interleaved tracks look like
+from one file object. The driver's own sequential test is exact adjacency,
+so the trace's 70.4% sequential is itself the evidence that the real
+pattern contains runs, not scattered reads.
+
+**Calibrating on one statistic is not validation.** That `demux` model was
+tuned until its amplification matched the trace (24.8x against 22x) and its
+sequential share was close, and the match was treated as licence to sweep.
+It reads in 4 KB blocks; the player issues ~262 KB. Matching one number
+while missing another by two orders of magnitude is the same class of error
+as matching fetch latency and calling it what the user feels.
+
+**Compare shares, not counts, across runs of different length.** Runs with
+different file sizes or durations produce different read totals, so an
+absolute count of reads over a frame ranks the longest run worst.
+`UserReadsOverFrameShare` exists for this. It is already a percentage --
+`SafeRatio` multiplies by 100 -- so multiplying again yields impossible
+values above 100% and, worse, preserves the ordering while destroying the
+magnitude.
 
 
 ## TODO: on-disk hot cache
