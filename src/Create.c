@@ -614,6 +614,10 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 //  KdBreakPoint and finding one survivor should read this rather than
 //  assume it was missed.
 //
+//  CreateHits is raised on the path-cache and cached-listing hits, which is
+//  what FAT_STATISTICS means by the name: a create answered from what the
+//  driver already had, with no request to the backend.
+//
 NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
 {
     struct OwnedString
@@ -811,11 +815,6 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
         if (PathCacheExists == pc)
         {
-            //
-            // FAT_STATISTICS calls this a create hit: answered from
-            // what the driver already had, with no request to the
-            // backend.
-            //
             BLORGFS_STAT_INC(CreateHits);
             BLORGFS_LOG("Create path-cache HIT (exists): %wZ\n", &filePath.String);
             dirEntInfo = cached;
@@ -1162,6 +1161,11 @@ static NTSTATUS BlorgFileSystemCreate(PIRP Irp)
 //  path returned STATUS_PENDING (async network lookup or FSP requeue in
 //  flight).
 //
+//  SuccessfulCreates/FailedCreates are counted here rather than at each
+//  return inside BlorgVolumeCreate: this is the one place a create's final
+//  status is known, and a create that pends is counted by whichever
+//  completion finishes it rather than twice.
+//
 NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -1180,12 +1184,6 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             result = BlorgVolumeCreate(Irp, irpSp, DeviceObject);
             if (STATUS_PENDING != result)
             {
-                //
-                // Counted here rather than at each return inside
-                // BlorgVolumeCreate: this is the one place a create's
-                // final status is known, and a create that pends is
-                // counted by whichever completion finishes it.
-                //
                 if (NT_SUCCESS(result))
                 {
                     BLORGFS_STAT_INC(SuccessfulCreates);

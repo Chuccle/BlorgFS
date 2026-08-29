@@ -1,4 +1,4 @@
-//
+﻿//
 // Async HTTP client used to talk to the Blorg metadata/file server.
 // Every public entry point (BlorgHttpGetDirectoryInfo, BlorgHttpGetFileInfo,
 // BlorgHttpGetFile/BlorgHttpGetFileMdl) issues a request and returns
@@ -2528,6 +2528,12 @@ static VOID HttpCompleteWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // reference did not go through the request/response cycle cleanly, so the
 // socket is closed rather than pooled.
 //
+// The per-phase spans are computed once here and used twice: for the
+// latency sums, and for the outlier record. Whether that record is kept at
+// all is decided inside BlorgStatisticsRecordSlowFetch by a raw-tick
+// threshold compare, so a fetch that is not an outlier pays nothing beyond
+// the call.
+//
 static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 {
     Ctx->FinalStatus = Status;
@@ -2602,11 +2608,6 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 
         statsBlock->FetchSplitSamples++;
 
-        //
-        // File this fetch if it ran long. The threshold lives inside the
-        // call, so the phases are computed once here for both the sums
-        // above and the outlier record, rather than twice.
-        //
         BlorgStatisticsRecordSlowFetch(
             completedQpc - Ctx->IssueQpc,
             (0 != Ctx->SocketQpc)
@@ -2653,26 +2654,33 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
     {
         switch (Ctx->Operation)
         {
-        case HttpOpDirInfo:
-            if (Ctx->Completion.DirInfo.Routine)
+            case HttpOpDirInfo:
             {
-                Ctx->Completion.DirInfo.Routine(Status, NULL, Ctx->CallerContext);
-            }
-            break;
+                if (Ctx->Completion.DirInfo.Routine)
+                {
+                    Ctx->Completion.DirInfo.Routine(Status, NULL, Ctx->CallerContext);
+                }
 
-        case HttpOpFileInfo:
-            if (Ctx->Completion.FileInfo.Routine)
-            {
-                Ctx->Completion.FileInfo.Routine(Status, NULL, Ctx->CallerContext);
+                break;
             }
-            break;
+            case HttpOpFileInfo:
+            {
+                if (Ctx->Completion.FileInfo.Routine)
+                {
+                    Ctx->Completion.FileInfo.Routine(Status, NULL, Ctx->CallerContext);
+                }
 
-        case HttpOpFileRead:
-            if (Ctx->Completion.FileRead.Routine)
-            {
-                Ctx->Completion.FileRead.Routine(Status, NULL, Ctx->CallerContext);
+                break;
             }
-            break;
+            case HttpOpFileRead:
+            {
+                if (Ctx->Completion.FileRead.Routine)
+                {
+                    Ctx->Completion.FileRead.Routine(Status, NULL, Ctx->CallerContext);
+                }
+
+                break;
+            }
         }
 
         if (Ctx->Socket)

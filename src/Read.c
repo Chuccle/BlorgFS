@@ -84,34 +84,6 @@ static VOID ReadTrackStream(FCB* Fcb, ULONG64 Offset, ULONG Length)
     stream->End = Offset + Length;
 }
 
-//
-//  Completion for an async non-cached read. Invoked from the WSK
-//  completion path at <= DISPATCH_LEVEL, so everything it touches must be
-//  legal there: the source body lives in the NonPagedPoolNx HTTP receive
-//  buffer, and the destination is the user buffer already locked into
-//  Irp->MdlAddress by BlorgPrePostIrp when the IRP was posted to the FSP queue.
-//  CallerContext is the PIRP.
-//
-//  This is a zero-copy read (BlorgHttpGetFileMdl): the body was received
-//  directly into Irp->MdlAddress by the client, so there is nothing to
-//  map, copy, or free here -- FileBuffer carries only the byte count
-//  (the client validated it against the requested range length, so it
-//  never exceeds the locked user buffer).
-//
-//  In DBG builds this pairs with the ActiveFetches increment at the
-//  direct-fetch issue site in BlorgVolumeRead -- every BlorgHttpGetFileMdl
-//  call from there has exactly one completion here. The per-chunk fetch
-//  latency trace reads DriverContext[2], the issue-time QPC stamp set in
-//  BlorgVolumeRead under the same log-level gate (and only for READ IRPs;
-//  [1] belongs to the CREATE path's stash), and formats it as an integer
-//  only -- this runs at <= DISPATCH on the WSK completion chain, where
-//  %wZ/%Z would touch paged code and bugcheck.
-//
-//  For non-paging reads, this mirrors the post-read bookkeeping the
-//  synchronous path used to do: advance the file position for
-//  synchronous file objects and note that a fast-IO read happened.
-//
-//
 // Files the application-visible latency of one non-paging read.
 //
 // A zero stamp means a paging read, or an IRP completed by a path that
@@ -178,6 +150,33 @@ BOOLEAN BlorgFastIoRead(
     return handled;
 }
 
+//
+//  Completion for an async non-cached read. Invoked from the WSK
+//  completion path at <= DISPATCH_LEVEL, so everything it touches must be
+//  legal there: the source body lives in the NonPagedPoolNx HTTP receive
+//  buffer, and the destination is the user buffer already locked into
+//  Irp->MdlAddress by BlorgPrePostIrp when the IRP was posted to the FSP queue.
+//  CallerContext is the PIRP.
+//
+//  This is a zero-copy read (BlorgHttpGetFileMdl): the body was received
+//  directly into Irp->MdlAddress by the client, so there is nothing to
+//  map, copy, or free here -- FileBuffer carries only the byte count
+//  (the client validated it against the requested range length, so it
+//  never exceeds the locked user buffer).
+//
+//  Two spans are closed here, and they are not the same span.
+//  DriverContext[2] carries the fetch issue stamp set at the direct-fetch
+//  site in BlorgVolumeRead and measures what the driver waited on the
+//  network; DriverContext[3] carries the arrival stamp set in BlorgRead
+//  and measures what the application waited on the driver. Only READ IRPs
+//  use these two slots -- [1] belongs to the CREATE path's stash. Nothing
+//  here formats a %wZ/%Z: this runs at <= DISPATCH on the WSK completion
+//  chain, where that would touch paged code and bugcheck.
+//
+//  For non-paging reads, this mirrors the post-read bookkeeping the
+//  synchronous path used to do: advance the file position for
+//  synchronous file objects and note that a fast-IO read happened.
+//
 static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
 {
     PIRP irp = CallerContext;
@@ -418,6 +417,19 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // FO_SYNCHRONOUS_IO file objects, and set FO_FILE_FAST_IO_READ so the
 // dirent's last-access time is updated on close.
 //
+// UserDiskReads is raised alongside the driver's own FetchesIssued at the
+// direct-fetch site because it is the same event named by the standard:
+// FILESYSTEM_STATISTICS means by it a read that had to leave the cache to
+// be answered, and UserFileReadBytes over it is the average size the cache
+// manager asked this filesystem for. That is what makes
+// `fsutil fsinfo statistics` on this volume comparable with the same
+// command on NTFS; reporting zero made the standard surface useless and
+// sent the only comparison that needed it through the vendor IOCTL.
+//
+// The read-ahead granularity override is applied at cache-map time, where
+// zero means leave Cc's own default in place -- the one setting no override
+// value can express.
+//
 NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
@@ -550,17 +562,6 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         BLORGFS_STAT_INC(FetchesIssued);
 
-        //
-        // The standard counters for the same event. UserDiskReads is what
-        // FILESYSTEM_STATISTICS means by a read that had to leave the
-        // cache to be answered, and it is what makes
-        // `fsutil fsinfo statistics` on this volume comparable with the
-        // same command on NTFS -- UserFileReadBytes over UserDiskReads is
-        // the average size the cache manager asked this filesystem for.
-        // Reporting zero there made the standard surface useless and sent
-        // the only comparison that needed it through the vendor IOCTL
-        // instead.
-        //
         BLORGFS_STAT_INC(UserDiskReads);
 
         if (BooleanFlagOn(Irp->Flags, IRP_NOCACHE))
@@ -594,10 +595,6 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             CcInitializeCacheMap(IrpSp->FileObject, C_CAST(PCC_FILE_SIZES, &fcb->Header.AllocationSize), FALSE, &global.CacheManagerCallbacks, fcb);
 
-            //
-            // Zero means leave Cc's own default in place, which is the one
-            // setting no override value can express.
-            //
             if (0 != global.ReadAheadGranularity)
             {
                 CcSetReadAheadGranularity(IrpSp->FileObject, global.ReadAheadGranularity);
@@ -695,6 +692,17 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 // entry/exit bracketing, then routes to BlorgVolumeRead for the volume
 // device object (disk/FS-control device objects have no read support yet).
 //
+// A non-paging read is stamped on arrival into DriverContext[3], which
+// READ IRPs otherwise leave unused. DriverContext[2] already carries the
+// fetch issue stamp and is a different span: that one starts when the
+// driver asks the network, this one when the application asks the driver.
+//
+// The synchronous return is where that span is closed, rather than in
+// BlorgCompleteRequest, because it is the interesting case: a cached read
+// that misses blocks inside CcCopyReadEx and arrives back here having
+// waited, which is precisely the stall a viewer feels and the only place
+// it is visible.
+//
 NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -711,13 +719,6 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         {
             BlorgSetupIrpContext(Irp, IoIsOperationSynchronous(Irp));
 
-            //
-            // Stamp the arrival of a read somebody is waiting on.
-            // DriverContext[3] is otherwise unused by READ IRPs;
-            // DriverContext[2] already carries the fetch issue stamp, which
-            // is a different span -- that one starts when the driver asks
-            // the network, this one when the application asks the driver.
-            //
             const BOOLEAN userRead = !BooleanFlagOn(Irp->Flags, IRP_PAGING_IO);
             const LONG64 arrivedQpc = userRead ? BlorgStatisticsNow() : 0;
 
@@ -730,14 +731,6 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
             if (STATUS_PENDING != result)
             {
-                //
-                // Recorded here rather than in BlorgCompleteRequest because
-                // this is the synchronous case, and it is the interesting
-                // one: a cached read that misses blocks inside
-                // CcCopyReadEx and returns here having waited, which is
-                // precisely the stall a viewer feels and the only place it
-                // is visible.
-                //
                 BlorgReadRecordUserLatency(arrivedQpc);
                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }

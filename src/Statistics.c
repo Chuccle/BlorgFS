@@ -1,4 +1,4 @@
-#include "Driver.h"
+﻿#include "Driver.h"
 
 //
 // Implements the statistics block declared in Statistics.h: the
@@ -8,8 +8,8 @@
 // and the summed BLORGFS_STATISTICS_RESPONSE for the vendor IOCTL.
 //
 // See Statistics.h for the design: why storage is per-processor and
-// non-interlocked, why gauges are the exception, and why the FAT type is
-// the honest one to report.
+// non-interlocked, why in-flight depth is derived rather than gauged, and
+// why the FAT type is the honest one to report.
 //
 
 #define STATISTICS_TAG 'tSPB'
@@ -146,16 +146,14 @@ static ULONG64 StatisticsQpcToMicroseconds(LONG64 ElapsedQpc)
 // than wrapping, which is what makes the top bucket mean "at least this
 // slow" -- the shape the tail question is actually asking about.
 //
+// One bit scan rather than a shift loop: the bucket is one past the
+// position of the highest set bit, which is what BitScanReverse64 returns
+// directly. The loop this replaced ran up to 27 iterations, and this sits
+// on the fast-I/O read path where a cache hit costs 16 us -- past some
+// point the measurement distorts what it measures.
+//
 static ULONG StatisticsLatencyBucket(ULONG64 Microseconds)
 {
-    //
-    // One bit scan rather than a shift loop. The bucket is defined as one
-    // past the position of the highest set bit, which is what
-    // BitScanReverse64 returns directly; the loop that used to compute it
-    // ran up to 27 iterations, and this now sits on the fast-I/O read path
-    // where a cache hit costs 16 us and every avoidable nanosecond in the
-    // measurement is measurement distorting what it measures.
-    //
     ULONG highestBit;
 
     if (!BitScanReverse64(&highestBit, Microseconds))
@@ -308,17 +306,22 @@ static BOOLEAN StatisticsFieldIsMax(SIZE_T ByteOffset)
     return FALSE;
 }
 
+//
+// Merges one processor's block into the running total, field by field as
+// ULONG64 lanes: counters sum, and the *MaxUs fields reduce with max
+// because summing two processors' worst fetches describes a latency no
+// fetch ever had.
+//
+// The walk stops before the outlier ring. Everything above it is a counter
+// or a maximum and merges arithmetically; the ring is per-processor
+// diagnostic state, and summing a record's fields across processors would
+// produce a fetch that never happened.
+//
 static VOID StatisticsAccumulate(PBLORGFS_STATISTICS Out, const BLORGFS_STATISTICS* Entry)
 {
     ULONG64* out = C_CAST(ULONG64*, Out);
     const ULONG64* entry = C_CAST(const ULONG64*, Entry);
 
-    //
-    // Stop before the outlier ring. Everything above it is a counter or a
-    // maximum and merges arithmetically; the ring is per-processor
-    // diagnostic state, and summing a record's fields across processors
-    // would produce a fetch that never happened.
-    //
     const SIZE_T fields = FIELD_OFFSET(BLORGFS_STATISTICS, SlowFetchSequence) / sizeof(ULONG64);
 
     for (SIZE_T i = 0; i < fields; ++i)
@@ -339,6 +342,18 @@ static VOID StatisticsAccumulate(PBLORGFS_STATISTICS Out, const BLORGFS_STATISTI
 // them: a rate taken over a window of thousands of operations does not
 // need the fields to be mutually instantaneous, and a lock here would
 // cost every counter site more than the precision is worth.
+//
+// The outlier ring is the exception, because a torn record is a fabricated
+// one rather than a stale one. Each slot's sequence is read, the record
+// copied, and the sequence read again: the owning processor can wrap onto
+// that slot mid-copy and leave a record half one fetch and half another, so
+// a sequence that moved means the copy is discarded. A missing tail sample
+// is worth more than an invented one.
+//
+// Surviving records are insertion-sorted by completion stamp, oldest first,
+// capped at the response's size. Per-processor sequence numbers order one
+// processor's records and say nothing about another's, so the stamp is the
+// only thing that puts a merged tail back into the order it happened.
 //
 VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
 {
@@ -365,12 +380,6 @@ VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
 
     Out->FetchesActive = StatisticsFetchesActive();
 
-    //
-    // Copy each outlier, then re-read its sequence: a writer that wrapped
-    // onto this slot while it was being copied leaves a record that is
-    // half one fetch and half another, and a torn tail sample is worse
-    // than a missing one. A slot that moved is dropped by zeroing it.
-    //
     Out->SlowFetchesSeen = 0;
 
     ULONG kept = 0;
@@ -385,13 +394,6 @@ VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
         {
             BLORGFS_SLOW_FETCH record;
 
-            //
-            // Read the sequence, copy, read it again. The owning processor
-            // can wrap onto this slot mid-copy, which would leave a record
-            // that is half one fetch and half another; a moved sequence
-            // says that happened and the record is dropped. A missing tail
-            // sample is worth more than a fabricated one.
-            //
             const ULONG64 before =
                 C_CAST(ULONG64, ReadAcquire64(C_CAST(LONG64 volatile*, &entry->SlowFetches[i].Sequence)));
 
@@ -405,13 +407,6 @@ VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
                 continue;
             }
 
-            //
-            // Insertion sort by completion stamp, oldest first, capped at
-            // the response's size. Per-processor sequence numbers order one
-            // processor's records and say nothing about another's, so the
-            // stamp is the only thing that puts a merged tail back into the
-            // order it happened.
-            //
             ULONG at = kept;
 
             while (at > 0 && Out->SlowFetches[at - 1].CompletedQpc > record.CompletedQpc)
@@ -457,17 +452,21 @@ VOID BlorgStatisticsReset(VOID)
 //
 // Files one outlier into the shared ring.
 //
-// The claim on the sequence is a single interlocked increment, so slots are
-// handed out without a lock at any IRQL, and a fetch only writes the slot
-// its own claim names. The ring wraps by design: with a 250 ms threshold
-// the fetches that reach here are rare, and when they are not, the most
-// recent sixteen are more useful than the first sixteen of a flood.
+// The slots live in the calling processor's own block, so the claim on the
+// sequence is a plain increment: no other processor can be handing out this
+// slot, and nothing here needs a locked read-modify-write at any IRQL. The
+// ring wraps by design -- with a 250 ms threshold the fetches that reach
+// here are rare, and when they are not, the most recent are more useful
+// than the first few of a flood.
 //
-// Sequence is written last, and with a release, so a reader never sees a
-// slot advertised as filled before the fields it describes are visible.
-// The reader still has to tolerate a slot being overwritten underneath it
-// -- it re-reads the sequence afterwards and drops the record if it moved,
-// which is the only part of this that has to be exact.
+// Sequence is written last, and with a release rather than a plain store:
+// the writer is this processor but the reader is whichever one serves the
+// query, and on a weakly ordered machine a plain store could advertise the
+// slot as filled before the fields it describes are visible. A
+// store-release is not a locked operation -- nothing on x64, one STLR on
+// ARM64. The reader still has to tolerate a slot being overwritten
+// underneath it, which BlorgStatisticsQuery does by re-reading the
+// sequence; that is the only part of this that has to be exact.
 //
 VOID BlorgStatisticsRecordSlowFetch(
     LONG64 TotalQpc,
@@ -493,11 +492,6 @@ VOID BlorgStatisticsRecordSlowFetch(
         return;
     }
 
-    //
-    // A plain increment on this processor's own block. The slot is this
-    // processor's, so no other processor can be handing it out, and
-    // nothing here needs a locked read-modify-write.
-    //
     const ULONG64 sequence = ++statsBlock->SlowFetchSequence;
     PBLORGFS_SLOW_FETCH slot =
         &statsBlock->SlowFetches[(sequence - 1) % BLORGFS_SLOW_FETCH_PER_CPU];
@@ -514,14 +508,6 @@ VOID BlorgStatisticsRecordSlowFetch(
     slot->ConnectionReused = ConnectionReused ? 1u : 0u;
 
 
-    //
-    // Published last, and with a release rather than a plain store: the
-    // writer is this processor but the reader is whichever one served the
-    // query, and on a weakly ordered machine a plain store could make the
-    // slot look filled before the fields it describes are visible. A
-    // store-release is not a locked operation -- it costs nothing on x64
-    // and one STLR on ARM64.
-    //
     WriteRelease64(C_CAST(LONG64 volatile*, &slot->Sequence), C_CAST(LONG64, sequence));
 }
 
