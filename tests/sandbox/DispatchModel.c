@@ -82,6 +82,29 @@ BOOLEAN CcCopyReadEx(PFILE_OBJECT F, PLARGE_INTEGER O, ULONG L, BOOLEAN W, PVOID
     return TRUE;
 }
 
+//
+// FsRtlCopyRead is the real fast-I/O read helper, which takes the FCB
+// resource and calls CcCopyRead. The driver wraps it only to time the
+// wait, so the model reproduces the part the wrapper depends on -- the
+// TRUE/FALSE contract -- and routes the copy through the same
+// CcCopyReadEx stub above so ShimForceNextCcCopyReadMiss still steers
+// both paths from one place.
+//
+BOOLEAN FsRtlCopyRead(
+    PFILE_OBJECT FileObject,
+    PLARGE_INTEGER FileOffset,
+    ULONG Length,
+    BOOLEAN Wait,
+    ULONG LockKey,
+    PVOID Buffer,
+    PIO_STATUS_BLOCK IoStatus,
+    PDEVICE_OBJECT DeviceObject)
+{
+    (void)LockKey; (void)DeviceObject;
+
+    return CcCopyReadEx(FileObject, FileOffset, Length, Wait, Buffer, IoStatus, NULL);
+}
+
 VOID CcMdlRead(PFILE_OBJECT F, PLARGE_INTEGER O, ULONG L, PMDL* M, PIO_STATUS_BLOCK S)
 {
     (void)F; (void)O; (void)L;

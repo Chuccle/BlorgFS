@@ -26,13 +26,44 @@ LONG64 BlorgStatisticsNow(VOID)
     return KmNow();
 }
 
-//
 BLORGFS_STATISTICS ShimStatistics;
-BLORGFS_STATISTICS_GLOBAL BlorgStatisticsGauges;
 
 PBLORGFS_STATISTICS BlorgStatisticsForCurrentProcessor(VOID)
 {
     return &ShimStatistics;
+}
+
+//
+// The outlier ring is a reporting surface, not behaviour: nothing in
+// Client.c reads it back, so the scenarios and the fuzzer only need the
+// symbol to exist. Counting the calls anyway makes it cheap for a test to
+// assert that a slow fetch was filed at all, without pulling the real
+// ring's wrap and tear-detection into the sandbox.
+//
+ULONG64 ShimSlowFetchesRecorded;
+
+VOID BlorgStatisticsRecordSlowFetch(
+    LONG64 TotalQpc,
+    LONG64 AcquireQpc,
+    LONG64 SendQpc,
+    LONG64 WaitQpc,
+    LONG64 TtfbQpc,
+    LONG64 BodyQpc,
+    ULONG64 Bytes,
+    BOOLEAN ConnectionReused)
+{
+    UNREFERENCED_PARAMETER(AcquireQpc);
+    UNREFERENCED_PARAMETER(SendQpc);
+    UNREFERENCED_PARAMETER(WaitQpc);
+    UNREFERENCED_PARAMETER(TtfbQpc);
+    UNREFERENCED_PARAMETER(BodyQpc);
+    UNREFERENCED_PARAMETER(Bytes);
+    UNREFERENCED_PARAMETER(ConnectionReused);
+
+    if (TotalQpc >= 0)
+    {
+        ShimSlowFetchesRecorded++;
+    }
 }
 
 VOID BlorgStatisticsRecordLatency(ULONG64* Sum, ULONG64* Max, ULONG64* Buckets, LONG64 ElapsedQpc)
@@ -65,32 +96,3 @@ VOID BlorgStatisticsRecordLatency(ULONG64* Sum, ULONG64* Max, ULONG64* Buckets, 
     }
 }
 
-VOID BlorgStatisticsGaugeIncrement(LONG64 volatile* Gauge, LONG64 volatile* Peak)
-{
-    LONG64 current = InterlockedIncrement64(Gauge);
-
-    if (!Peak)
-    {
-        return;
-    }
-
-    for (;;)
-    {
-        LONG64 observed = *Peak;
-
-        if (current <= observed)
-        {
-            return;
-        }
-
-        if (observed == InterlockedCompareExchange64(Peak, current, observed))
-        {
-            return;
-        }
-    }
-}
-
-VOID BlorgStatisticsGaugeDecrement(LONG64 volatile* Gauge)
-{
-    InterlockedDecrement64(Gauge);
-}

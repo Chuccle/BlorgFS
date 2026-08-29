@@ -101,6 +101,7 @@ BOOLEAN CcUninitializeCacheMap(PFILE_OBJECT F, PLARGE_INTEGER TruncateSize, PVOI
 VOID CcSetReadAheadGranularity(PFILE_OBJECT F, ULONG Granularity);
 VOID CcSetAdditionalCacheAttributes(PFILE_OBJECT F, BOOLEAN DisableReadAhead, BOOLEAN DisableWriteBehind);
 BOOLEAN CcCopyReadEx(PFILE_OBJECT F, PLARGE_INTEGER Offset, ULONG Length, BOOLEAN Wait, PVOID Buffer, PIO_STATUS_BLOCK Status, PETHREAD Thread);
+BOOLEAN FsRtlCopyRead(PFILE_OBJECT F, PLARGE_INTEGER Offset, ULONG Length, BOOLEAN Wait, ULONG LockKey, PVOID Buffer, PIO_STATUS_BLOCK Status, PDEVICE_OBJECT Device);
 VOID CcMdlRead(PFILE_OBJECT F, PLARGE_INTEGER Offset, ULONG Length, PMDL* Mdl, PIO_STATUS_BLOCK Status);
 VOID CcFlushCache(PVOID SectionPointer, PLARGE_INTEGER Offset, ULONG Length, PIO_STATUS_BLOCK Status);
 

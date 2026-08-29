@@ -39,12 +39,39 @@
 //    aggregates read over windows of thousands of operations, not ledger
 //    entries. Anything that must be exact does not belong in this block.
 //
-// Gauges are the one exception. A value that goes up and down (fetches
-// in flight) cannot be split across per-CPU entries, because the
-// decrement can land on a different CPU than the increment and the sum
-// would drift permanently. Those few live in BLORGFS_STATISTICS_GLOBAL
-// and are interlocked; there is one increment per 512 KB fetch, so the
-// shared line costs nothing at that rate.
+// Eventually consistent is the standard these hold themselves to, and it
+// is good enough deliberately. A lost increment moves a rate by a
+// millionth; a locked operation on the read path moves the thing being
+// measured.
+//
+// There is one distinction that standard does NOT license, and it is worth
+// stating because the difference is easy to lose. Tolerating a stale or
+// missing sample is not the same as tolerating an invented one. A reported
+// maximum that summed two processors' worst fetches described a latency no
+// fetch had, was entirely plausible, and cost a day's wrong conclusions
+// before the per-fetch records contradicted it. So: counters may be lossy,
+// and nothing here may be fabricated. That is why the outlier ring's
+// publish is a store-release and its read is checked for tearing -- neither
+// is a locked operation, and both exist to stop a reader seeing a record
+// that never happened rather than to make anything exact.
+//
+// There are no exceptions to that rule, and there used to be one. A gauge
+// -- fetches in flight -- was kept in a shared interlocked word on the
+// argument that a value going up and down cannot be split across per-CPU
+// entries, because the decrement can land on a different processor than
+// the increment. That argument is wrong: splitting it into two monotone
+// counters makes the difference of their sums exact wherever the halves
+// land. The gauge was also redundant, being raised at the same point as
+// FetchesIssued and dropped at the same points as FetchesCompleted and
+// FetchesFailed, so in-flight is simply
+//
+//     FetchesIssued - (FetchesCompleted + FetchesFailed)
+//
+// computed by the reader. What went with it is the running peak, which
+// cannot be maintained without knowing the global depth at every issue.
+// The per-processor outlier records carry the depth at the moment of each
+// slow fetch, which is what the peak was being read for and is strictly
+// more useful than one high-water mark.
 //
 // Compiled into two places, same arrangement as Tls.h:
 //  - BlorgFS.vcxproj (kernel driver), which defines BLORGFS_KERNEL_BUILD
@@ -103,6 +130,74 @@
 #define BLORGFS_STATISTICS_LINE 64
 
 //
+// Per-fetch records for the fetches that ran long, and why summed
+// counters were not enough to explain them.
+//
+// The aggregate split localises the driver's latency tail to the body
+// phase, and stops there: a sum and a max cannot say whether one fetch was
+// slow in every phase or slow in one, nor what else was in flight beside
+// it. That distinction is the whole question, because contention between
+// concurrent fetches accounts for the spread up to roughly four times the
+// base latency and does not account for the far tail (README, "Playback lag
+// is seek latency").
+//
+// So the outliers are kept individually. They are rare enough to afford it
+// -- four fetches over 250 ms in a 49-second playback window.
+//
+// Filed per processor, like every other counter here, and for the same
+// reason: a shared ring needs an interlocked increment to hand out a slot,
+// and this block exists so that no processor ever takes a lock or dirties
+// another processor's line to record something. Rarity was the argument
+// for tolerating an exception, which is not the same as needing one. The
+// merge a per-processor arrangement costs is a sort by completion stamp at
+// query time, paid once by a reader rather than on every outlier.
+//
+#define BLORGFS_SLOW_FETCH_THRESHOLD_US 250000
+
+//
+// Slots per processor, and the total the query merges them into. Small,
+// because a processor filing more than four outliers inside one
+// measurement window has a problem the newest four will describe just as
+// well as the oldest.
+//
+#define BLORGFS_SLOW_FETCH_PER_CPU      4
+#define BLORGFS_SLOW_FETCH_SAMPLES      16
+
+//
+// All fields are 8 bytes so the record carries no padding into the wire
+// format. Sequence is 1-based; zero means the slot was never filled.
+//
+typedef struct _BLORGFS_SLOW_FETCH
+{
+    ULONG64 Sequence;
+
+    //
+    // Completion stamp, in QPC ticks. Records are filed per processor, so
+    // this is what puts them back in the order they happened when the
+    // query merges the rings -- a per-processor sequence number orders a
+    // processor's own records and says nothing about anyone else's.
+    //
+    ULONG64 CompletedQpc;
+    ULONG64 TotalUs;
+    ULONG64 AcquireUs;
+    ULONG64 SendUs;
+    ULONG64 WaitUs;
+    ULONG64 TtfbUs;
+    ULONG64 BodyUs;
+    ULONG64 Bytes;
+
+    //
+    // Fetches in flight when this one completed, and whether it ran on a
+    // pooled connection. Together these separate "slow because it was
+    // sharing the link" from "slow for a reason we have not found yet",
+    // which is the only question these records exist to answer.
+    //
+    LONG64  FetchesActive;
+    ULONG64 ConnectionReused;
+
+} BLORGFS_SLOW_FETCH, * PBLORGFS_SLOW_FETCH;
+
+//
 // Internal per-processor counter block. Held in ULONG64 throughout,
 // including for the fields that are reported as ULONG through the
 // non-EX FSCTL: a media stream moves 4 GB in minutes, so 32-bit byte
@@ -144,6 +239,28 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ReadsPosted;                 // non-cached read posted to the FSP queue
     ULONG64 ReadsSequential;             // started exactly where a previous read ended
     ULONG64 ReadsEndOfFile;              // rejected at or past EOF
+
+    //
+    // How long an application actually waited for a read, measured from
+    // dispatch to completion on non-paging reads only.
+    //
+    // Every other latency in this block is the driver's own view -- how
+    // long a fetch took, how long a round trip took -- and none of it is
+    // what a user experiences, because the cache manager sits in front of
+    // it and is supposed to hide exactly those numbers. Measured at
+    // playback rate the driver was issuing 67 ms fetches while the reader
+    // saw 0.11 ms, and reasoning about stutter from the fetch figure was
+    // reasoning from the wrong layer.
+    //
+    // Paging reads are excluded deliberately: they are the cache manager's
+    // own traffic, issued on its schedule rather than in answer to anyone
+    // waiting, so counting them here would put read-ahead's latency back
+    // into the number that exists to exclude it.
+    //
+    ULONG64 UserReadSamples;
+    ULONG64 UserReadLatencySumUs;
+    ULONG64 UserReadLatencyMaxUs;
+    ULONG64 UserReadLatencyBuckets[BLORGFS_STATISTICS_LATENCY_BUCKETS];
 
     // --- HTTP chunk fetches --------------------------------------------
     ULONG64 FetchesIssued;               // every range GET the driver makes
@@ -239,23 +356,24 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 FetchBodyMaxUs;
     ULONG64 FetchSplitSamples;
 
+
+    //
+    // Everything from here down is per-processor diagnostic state rather
+    // than a counter, and must not be summed across processors.
+    // StatisticsAccumulate stops at SlowFetchSequence's offset for exactly
+    // that reason, so anything added below is excluded automatically and
+    // anything added above is summed automatically -- which is the right
+    // default in both directions.
+    //
+    ULONG64 SlowFetchSequence;
+    BLORGFS_SLOW_FETCH SlowFetches[BLORGFS_SLOW_FETCH_PER_CPU];
+
 } BLORGFS_STATISTICS, * PBLORGFS_STATISTICS;
 
 //
-// Counters that cannot be split per-processor: a gauge's increment and
-// decrement can run on different CPUs, so summing per-CPU entries would
-// drift permanently. Interlocked, and cheap at one update per fetch.
-//
-typedef struct _BLORGFS_STATISTICS_GLOBAL
-{
-    LONG64 FetchesActive;
-    LONG64 FetchesActivePeak;
-
-} BLORGFS_STATISTICS_GLOBAL, * PBLORGFS_STATISTICS_GLOBAL;
-
-//
 // Wire format for IOCTL_BLORGFS_QUERY_STATISTICS: the summed per-CPU
-// counters, the gauges, and enough timebase to turn counts into rates.
+// counters, the merged outlier records, and enough timebase to turn counts
+// into rates.
 // Version is checked by the driver so a stale harness fails loudly
 // instead of misreading a struct whose tail moved.
 //
@@ -267,7 +385,8 @@ typedef struct _BLORGFS_STATISTICS_GLOBAL
 //
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
-#define BLORGFS_STATISTICS_VERSION 5
+
+#define BLORGFS_STATISTICS_VERSION 9
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {
@@ -298,7 +417,25 @@ typedef struct _BLORGFS_STATISTICS_RESPONSE
     LONG64 NowQpc;
 
     BLORGFS_STATISTICS Totals;
-    BLORGFS_STATISTICS_GLOBAL Gauges;
+
+    //
+    // Fetches in flight when this response was built, derived rather than
+    // tracked: FetchesIssued minus the fetches that have completed or
+    // failed. No running peak, because maintaining one would mean knowing
+    // the global depth at every issue; the outlier records below carry the
+    // depth at each slow fetch instead.
+    //
+    LONG64 FetchesActive;
+
+    //
+    // Every fetch that crossed the threshold, which is not the same as
+    // every fetch in the ring: SlowFetchesSeen counts them all, the ring
+    // keeps the most recent BLORGFS_SLOW_FETCH_SAMPLES. Reporting both
+    // means a reader can tell a full ring from a truncated one instead of
+    // assuming it saw everything.
+    //
+    ULONG64 SlowFetchesSeen;
+    BLORGFS_SLOW_FETCH SlowFetches[BLORGFS_SLOW_FETCH_SAMPLES];
 
 } BLORGFS_STATISTICS_RESPONSE, * PBLORGFS_STATISTICS_RESPONSE;
 
@@ -336,7 +473,6 @@ typedef struct _BLORGFS_STATISTICS_RESPONSE
 extern PBLORGFS_STATISTICS BlorgStatisticsTable;
 extern ULONG BlorgStatisticsEntryStride;
 extern ULONG BlorgStatisticsProcessorCount;
-extern BLORGFS_STATISTICS_GLOBAL BlorgStatisticsGauges;
 
 //
 // This processor's counter block, or NULL if statistics are unavailable.
@@ -386,11 +522,19 @@ VOID BlorgStatisticsRecordLatency(
 LONG64 BlorgStatisticsNow(VOID);
 
 //
-// Interlocked gauge helpers (see BLORGFS_STATISTICS_GLOBAL). Increment
-// also carries the running peak forward.
+// Files one outlier. Callable at <= DISPATCH_LEVEL, like everything else
+// on the completion chain, and cheap enough to call unconditionally
+// because the threshold test happens here rather than at every call site.
 //
-VOID BlorgStatisticsGaugeIncrement(LONG64 volatile* Gauge, LONG64 volatile* Peak);
-VOID BlorgStatisticsGaugeDecrement(LONG64 volatile* Gauge);
+VOID BlorgStatisticsRecordSlowFetch(
+    LONG64 TotalQpc,
+    LONG64 AcquireQpc,
+    LONG64 SendQpc,
+    LONG64 WaitQpc,
+    LONG64 TtfbQpc,
+    LONG64 BodyQpc,
+    ULONG64 Bytes,
+    BOOLEAN ConnectionReused);
 
 //
 // Allocates the per-processor table (sized for the maximum processor

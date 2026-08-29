@@ -24,7 +24,6 @@ PBLORGFS_STATISTICS BlorgStatisticsTable = NULL;
 static PVOID StatisticsTableAllocation = NULL;
 ULONG BlorgStatisticsEntryStride = 0;
 ULONG BlorgStatisticsProcessorCount = 0;
-BLORGFS_STATISTICS_GLOBAL BlorgStatisticsGauges = { 0 };
 
 //
 // QPC frequency, captured once at init. QueryPerformanceCounter's
@@ -38,6 +37,18 @@ static LONG64 StatisticsQpcFrequency = 0;
 // computed over the window the driver actually observed.
 //
 static LONG64 StatisticsEpochQpc = 0;
+
+//
+// The outlier threshold, converted to QPC ticks once at init.
+//
+// Every file-read completion asks "was this one slow?", and the answer has
+// to cost a comparison. Converting the elapsed span to microseconds first
+// would put a 64-bit multiply and divide on the completion path for the
+// 99.7% of fetches that are not outliers, to compute a number those
+// fetches then discard. Comparing raw ticks moves the arithmetic to the
+// fetches that are actually being recorded.
+//
+static LONG64 StatisticsSlowFetchThresholdQpc = 0;
 
 //
 // Byte offset of processor Index's entry. The table is one flat
@@ -85,6 +96,50 @@ PBLORGFS_STATISTICS BlorgStatisticsForCurrentProcessor(VOID)
 }
 
 //
+// Fetches in flight, derived from the monotone counters rather than kept
+// in a gauge.
+//
+// Issue raises FetchesIssued and completion raises FetchesCompleted or
+// FetchesFailed, so the difference of the sums is the live depth wherever
+// the two halves landed -- which is what makes a per-processor
+// arrangement work here at all, and why the shared interlocked word this
+// replaces was never necessary.
+//
+// Summing every processor is a reader's cost. The only writer-side caller
+// is the outlier record, which by construction runs a handful of times per
+// measurement window.
+//
+static LONG64 StatisticsFetchesActive(VOID)
+{
+    ULONG64 issued = 0;
+    ULONG64 settled = 0;
+
+    for (ULONG i = 0; i < BlorgStatisticsProcessorCount; ++i)
+    {
+        const BLORGFS_STATISTICS* entry = StatisticsEntry(i);
+
+        issued += entry->FetchesIssued;
+        settled += entry->FetchesCompleted + entry->FetchesFailed;
+    }
+
+    return (issued > settled) ? C_CAST(LONG64, issued - settled) : 0;
+}
+
+//
+// QPC ticks to microseconds. Returns zero for a negative or unmeasurable
+// span rather than wrapping it into an enormous unsigned one.
+//
+static ULONG64 StatisticsQpcToMicroseconds(LONG64 ElapsedQpc)
+{
+    if (ElapsedQpc < 0 || 0 == StatisticsQpcFrequency)
+    {
+        return 0;
+    }
+
+    return (C_CAST(ULONG64, ElapsedQpc) * 1000000ULL) / C_CAST(ULONG64, StatisticsQpcFrequency);
+}
+
+//
 // Bucket index for a microsecond latency: 0 for anything under 1 us,
 // otherwise one past the position of the value's highest set bit, so
 // bucket i holds [2^(i-1), 2^i). Saturates at the last bucket rather
@@ -93,15 +148,26 @@ PBLORGFS_STATISTICS BlorgStatisticsForCurrentProcessor(VOID)
 //
 static ULONG StatisticsLatencyBucket(ULONG64 Microseconds)
 {
-    ULONG bucket = 0;
+    //
+    // One bit scan rather than a shift loop. The bucket is defined as one
+    // past the position of the highest set bit, which is what
+    // BitScanReverse64 returns directly; the loop that used to compute it
+    // ran up to 27 iterations, and this now sits on the fast-I/O read path
+    // where a cache hit costs 16 us and every avoidable nanosecond in the
+    // measurement is measurement distorting what it measures.
+    //
+    ULONG highestBit;
 
-    while (Microseconds && bucket < (BLORGFS_STATISTICS_LATENCY_BUCKETS - 1))
+    if (!BitScanReverse64(&highestBit, Microseconds))
     {
-        Microseconds >>= 1;
-        bucket++;
+        return 0;
     }
 
-    return bucket;
+    const ULONG bucket = highestBit + 1;
+
+    return (bucket < BLORGFS_STATISTICS_LATENCY_BUCKETS)
+        ? bucket
+        : (BLORGFS_STATISTICS_LATENCY_BUCKETS - 1);
 }
 
 VOID BlorgStatisticsRecordLatency(
@@ -115,7 +181,7 @@ VOID BlorgStatisticsRecordLatency(
         return;
     }
 
-    ULONG64 microseconds = (C_CAST(ULONG64, ElapsedQpc) * 1000000ULL) / C_CAST(ULONG64, StatisticsQpcFrequency);
+    ULONG64 microseconds = StatisticsQpcToMicroseconds(ElapsedQpc);
 
     *Sum += microseconds;
 
@@ -128,43 +194,6 @@ VOID BlorgStatisticsRecordLatency(
     {
         Buckets[StatisticsLatencyBucket(microseconds)]++;
     }
-}
-
-//
-// Gauge increment plus running peak. The peak is a compare-exchange loop
-// rather than a read-then-store: two CPUs raising the gauge at once would
-// otherwise both read the old peak and one update would vanish, which for
-// a "how deep did the pipeline ever get" number is the one sample that
-// mattered.
-//
-VOID BlorgStatisticsGaugeIncrement(LONG64 volatile* Gauge, LONG64 volatile* Peak)
-{
-    LONG64 current = InterlockedIncrement64(Gauge);
-
-    if (!Peak)
-    {
-        return;
-    }
-
-    for (;;)
-    {
-        LONG64 observedPeak = ReadNoFence64(Peak);
-
-        if (current <= observedPeak)
-        {
-            return;
-        }
-
-        if (observedPeak == InterlockedCompareExchange64(Peak, current, observedPeak))
-        {
-            return;
-        }
-    }
-}
-
-VOID BlorgStatisticsGaugeDecrement(LONG64 volatile* Gauge)
-{
-    InterlockedDecrement64(Gauge);
 }
 
 //
@@ -206,6 +235,9 @@ NTSTATUS BlorgStatisticsInitialize(VOID)
     StatisticsEpochQpc = KeQueryPerformanceCounter(&frequency).QuadPart;
     StatisticsQpcFrequency = frequency.QuadPart;
 
+    StatisticsSlowFetchThresholdQpc = C_CAST(LONG64,
+        (C_CAST(ULONG64, StatisticsQpcFrequency) * BLORGFS_SLOW_FETCH_THRESHOLD_US) / 1000000ULL);
+
     return STATUS_SUCCESS;
 }
 
@@ -233,14 +265,72 @@ VOID BlorgStatisticsCleanup(VOID)
 //
 C_ASSERT(0 == (sizeof(BLORGFS_STATISTICS) % sizeof(ULONG64)));
 
+//
+// The fields whose per-processor values must be reduced with max rather
+// than added.
+//
+// Summing every ULONG64 in the block is right for counters and wrong for
+// maxima, and the wrongness is invisible: adding two processors' worst
+// fetches reports a latency no fetch ever had, in a field whose entire
+// purpose is to name the worst real one. On this two-processor guest it
+// roughly doubled the reported tail, and a driver-versus-usermode
+// comparison was drawn against it before the per-fetch outlier records
+// showed no fetch anywhere near the figure.
+//
+// Listed by offset rather than accumulated field by field so the counter
+// path stays one loop, with a compile-time check below that the list has
+// not drifted from the struct.
+//
+static const SIZE_T StatisticsMaxFields[] =
+{
+    FIELD_OFFSET(BLORGFS_STATISTICS, FetchLatencyMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, UserReadLatencyMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, HandshakeLatencyMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, FetchPreSendMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, FetchAcquireMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, FetchFreshAcquireMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, FetchSendMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, FetchWaitMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, FetchTtfbMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, FetchBodyMaxUs),
+};
+
+static BOOLEAN StatisticsFieldIsMax(SIZE_T ByteOffset)
+{
+    for (SIZE_T i = 0; i < RTL_NUMBER_OF(StatisticsMaxFields); ++i)
+    {
+        if (StatisticsMaxFields[i] == ByteOffset)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 static VOID StatisticsAccumulate(PBLORGFS_STATISTICS Out, const BLORGFS_STATISTICS* Entry)
 {
     ULONG64* out = C_CAST(ULONG64*, Out);
     const ULONG64* entry = C_CAST(const ULONG64*, Entry);
 
-    for (SIZE_T i = 0; i < (sizeof(BLORGFS_STATISTICS) / sizeof(ULONG64)); ++i)
+    //
+    // Stop before the outlier ring. Everything above it is a counter or a
+    // maximum and merges arithmetically; the ring is per-processor
+    // diagnostic state, and summing a record's fields across processors
+    // would produce a fetch that never happened.
+    //
+    const SIZE_T fields = FIELD_OFFSET(BLORGFS_STATISTICS, SlowFetchSequence) / sizeof(ULONG64);
+
+    for (SIZE_T i = 0; i < fields; ++i)
     {
-        out[i] += entry[i];
+        if (StatisticsFieldIsMax(i * sizeof(ULONG64)))
+        {
+            out[i] = (entry[i] > out[i]) ? entry[i] : out[i];
+        }
+        else
+        {
+            out[i] += entry[i];
+        }
     }
 }
 
@@ -273,8 +363,78 @@ VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
         StatisticsAccumulate(&Out->Totals, StatisticsEntry(i));
     }
 
-    Out->Gauges.FetchesActive = ReadNoFence64(&BlorgStatisticsGauges.FetchesActive);
-    Out->Gauges.FetchesActivePeak = ReadNoFence64(&BlorgStatisticsGauges.FetchesActivePeak);
+    Out->FetchesActive = StatisticsFetchesActive();
+
+    //
+    // Copy each outlier, then re-read its sequence: a writer that wrapped
+    // onto this slot while it was being copied leaves a record that is
+    // half one fetch and half another, and a torn tail sample is worse
+    // than a missing one. A slot that moved is dropped by zeroing it.
+    //
+    Out->SlowFetchesSeen = 0;
+
+    ULONG kept = 0;
+
+    for (ULONG cpu = 0; cpu < BlorgStatisticsProcessorCount; ++cpu)
+    {
+        PBLORGFS_STATISTICS entry = StatisticsEntry(cpu);
+
+        Out->SlowFetchesSeen += entry->SlowFetchSequence;
+
+        for (ULONG i = 0; i < BLORGFS_SLOW_FETCH_PER_CPU; ++i)
+        {
+            BLORGFS_SLOW_FETCH record;
+
+            //
+            // Read the sequence, copy, read it again. The owning processor
+            // can wrap onto this slot mid-copy, which would leave a record
+            // that is half one fetch and half another; a moved sequence
+            // says that happened and the record is dropped. A missing tail
+            // sample is worth more than a fabricated one.
+            //
+            const ULONG64 before =
+                C_CAST(ULONG64, ReadAcquire64(C_CAST(LONG64 volatile*, &entry->SlowFetches[i].Sequence)));
+
+            record = entry->SlowFetches[i];
+
+            const ULONG64 after =
+                C_CAST(ULONG64, ReadNoFence64(C_CAST(LONG64 volatile*, &entry->SlowFetches[i].Sequence)));
+
+            if (0 == before || before != after)
+            {
+                continue;
+            }
+
+            //
+            // Insertion sort by completion stamp, oldest first, capped at
+            // the response's size. Per-processor sequence numbers order one
+            // processor's records and say nothing about another's, so the
+            // stamp is the only thing that puts a merged tail back into the
+            // order it happened.
+            //
+            ULONG at = kept;
+
+            while (at > 0 && Out->SlowFetches[at - 1].CompletedQpc > record.CompletedQpc)
+            {
+                if (at < BLORGFS_SLOW_FETCH_SAMPLES)
+                {
+                    Out->SlowFetches[at] = Out->SlowFetches[at - 1];
+                }
+
+                --at;
+            }
+
+            if (at < BLORGFS_SLOW_FETCH_SAMPLES)
+            {
+                Out->SlowFetches[at] = record;
+
+                if (kept < BLORGFS_SLOW_FETCH_SAMPLES)
+                {
+                    ++kept;
+                }
+            }
+        }
+    }
 }
 
 //
@@ -291,11 +451,78 @@ VOID BlorgStatisticsReset(VOID)
         RtlZeroMemory(StatisticsEntry(i), sizeof(BLORGFS_STATISTICS));
     }
 
-    InterlockedExchange64(
-        &BlorgStatisticsGauges.FetchesActivePeak,
-        ReadNoFence64(&BlorgStatisticsGauges.FetchesActive));
-
     StatisticsEpochQpc = BlorgStatisticsNow();
+}
+
+//
+// Files one outlier into the shared ring.
+//
+// The claim on the sequence is a single interlocked increment, so slots are
+// handed out without a lock at any IRQL, and a fetch only writes the slot
+// its own claim names. The ring wraps by design: with a 250 ms threshold
+// the fetches that reach here are rare, and when they are not, the most
+// recent sixteen are more useful than the first sixteen of a flood.
+//
+// Sequence is written last, and with a release, so a reader never sees a
+// slot advertised as filled before the fields it describes are visible.
+// The reader still has to tolerate a slot being overwritten underneath it
+// -- it re-reads the sequence afterwards and drops the record if it moved,
+// which is the only part of this that has to be exact.
+//
+VOID BlorgStatisticsRecordSlowFetch(
+    LONG64 TotalQpc,
+    LONG64 AcquireQpc,
+    LONG64 SendQpc,
+    LONG64 WaitQpc,
+    LONG64 TtfbQpc,
+    LONG64 BodyQpc,
+    ULONG64 Bytes,
+    BOOLEAN ConnectionReused)
+{
+    if (0 == StatisticsSlowFetchThresholdQpc || TotalQpc < StatisticsSlowFetchThresholdQpc)
+    {
+        return;
+    }
+
+    const ULONG64 TotalUs = StatisticsQpcToMicroseconds(TotalQpc);
+
+    PBLORGFS_STATISTICS statsBlock = BlorgStatisticsForCurrentProcessor();
+
+    if (!statsBlock)
+    {
+        return;
+    }
+
+    //
+    // A plain increment on this processor's own block. The slot is this
+    // processor's, so no other processor can be handing it out, and
+    // nothing here needs a locked read-modify-write.
+    //
+    const ULONG64 sequence = ++statsBlock->SlowFetchSequence;
+    PBLORGFS_SLOW_FETCH slot =
+        &statsBlock->SlowFetches[(sequence - 1) % BLORGFS_SLOW_FETCH_PER_CPU];
+
+    slot->CompletedQpc = C_CAST(ULONG64, BlorgStatisticsNow());
+    slot->TotalUs = TotalUs;
+    slot->AcquireUs = StatisticsQpcToMicroseconds(AcquireQpc);
+    slot->SendUs = StatisticsQpcToMicroseconds(SendQpc);
+    slot->WaitUs = StatisticsQpcToMicroseconds(WaitQpc);
+    slot->TtfbUs = StatisticsQpcToMicroseconds(TtfbQpc);
+    slot->BodyUs = StatisticsQpcToMicroseconds(BodyQpc);
+    slot->Bytes = Bytes;
+    slot->FetchesActive = StatisticsFetchesActive();
+    slot->ConnectionReused = ConnectionReused ? 1u : 0u;
+
+
+    //
+    // Published last, and with a release rather than a plain store: the
+    // writer is this processor but the reader is whichever one served the
+    // query, and on a weakly ordered machine a plain store could make the
+    // slot look filled before the fields it describes are visible. A
+    // store-release is not a locked operation -- it costs nothing on x64
+    // and one STLR on ARM64.
+    //
+    WriteRelease64(C_CAST(LONG64 volatile*, &slot->Sequence), C_CAST(LONG64, sequence));
 }
 
 //

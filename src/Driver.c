@@ -630,6 +630,29 @@ static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNIC
     }
 
 
+    //
+    // Read-ahead granularity override, in kilobytes, for sweeping this
+    // value without a rebuild and redeploy per point.
+    //
+    // The committed default was measured on eight concurrent streams --
+    // a throughput workload -- and never against a latency-shaped one,
+    // and nothing below 256 KB was ever tried, where FastFat uses 64 KB
+    // and Cc's own default is a page. Answering that with evidence means
+    // running several points, and a registry value makes a point cost a
+    // service restart instead of a six-minute deploy.
+    //
+    // Zero means do not call CcSetReadAheadGranularity at all, which is
+    // the "leave it default" case and cannot be expressed by any other
+    // value.
+    //
+    ULONG granularityKb = 0;
+
+    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"ReadAheadGranularityKb", REG_DWORD, &granularityKb, sizeof(granularityKb), &actualSize)))
+    {
+        global.ReadAheadGranularity = granularityKb * 1024;
+        BLORGFS_LOG("ReadBlorgfsRegistryConfig() - read-ahead granularity override: %lu KB\n", granularityKb);
+    }
+
     UCHAR pinValue[TLS_HASH_LEN];
 
     if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"TlsPin", REG_BINARY, pinValue, sizeof(pinValue), &actualSize))
@@ -874,7 +897,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     BlorgFsFastDispatch.SizeOfFastIoDispatch = sizeof(FAST_IO_DISPATCH);
     BlorgFsFastDispatch.FastIoCheckIfPossible = FastIoCheckIfPossible;
-    BlorgFsFastDispatch.FastIoRead = FsRtlCopyRead;
+    BlorgFsFastDispatch.FastIoRead = BlorgFastIoRead;
     BlorgFsFastDispatch.MdlRead = FsRtlMdlReadDev;
     BlorgFsFastDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;
     
@@ -948,6 +971,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     hostString.Length = 0;
     hostString.MaximumLength = sizeof(hostBuffer);
     hostString.Buffer = hostBuffer;
+
+    global.ReadAheadGranularity = READ_AHEAD_GRANULARITY;
 
     ReadBlorgfsRegistryConfig(RegistryPath, &portString, &hostString);
 

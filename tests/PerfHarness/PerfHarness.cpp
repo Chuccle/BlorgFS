@@ -294,6 +294,75 @@ static double SafeRatio(unsigned long long numerator, unsigned long long denomin
 // requests the backend served warm and a slow mode from cold ones -- is
 // invisible in any single summary number.
 //
+// The individual fetches that ran long, newest last.
+//
+// The histogram above says how many fetches were slow; it cannot say why
+// any one of them was, because a sum and a max cannot distinguish a fetch
+// that was slow in every phase from one that stalled in a single phase.
+// That is the open question about this driver's tail: contention between
+// concurrent fetches explains the spread up to roughly four times the base
+// latency and does not explain the far tail, where usermode driving the
+// same server over matched runs caps at ~100 ms and the driver reaches
+// ~900 ms.
+//
+// So read these by comparing "active" against "body". Several fetches in
+// flight with a long body is the link being shared and is expected. One
+// fetch in flight with a long body is the thing we are looking for.
+//
+static void PrintSlowFetches(const BLORGFS_STATISTICS_RESPONSE& stats)
+{
+    if (0 == stats.SlowFetchesSeen)
+    {
+        return;
+    }
+
+    printf("\n  slow fetches (over %u ms)\n", BLORGFS_SLOW_FETCH_THRESHOLD_US / 1000);
+
+    const unsigned long long kept =
+        (stats.SlowFetchesSeen < BLORGFS_SLOW_FETCH_SAMPLES)
+            ? stats.SlowFetchesSeen
+            : BLORGFS_SLOW_FETCH_SAMPLES;
+
+    printf("    %llu seen", stats.SlowFetchesSeen);
+
+    if (stats.SlowFetchesSeen > BLORGFS_SLOW_FETCH_SAMPLES)
+    {
+        printf(", showing the most recent %llu", kept);
+    }
+
+    printf("\n");
+    printf("      %6s %9s %8s %8s %8s %8s %9s %6s %5s\n",
+        "seq", "total us", "acquire", "send", "wait", "ttfb", "body us", "KB", "activ");
+
+    //
+    // Ascending by sequence, so the ring reads in completion order however
+    // it happens to have wrapped. A zeroed slot is one the driver dropped
+    // as torn, or one never filled; either way it has nothing to say.
+    //
+    for (unsigned long long want = (stats.SlowFetchesSeen > kept)
+             ? (stats.SlowFetchesSeen - kept + 1) : 1;
+         want <= stats.SlowFetchesSeen;
+         ++want)
+    {
+        for (ULONG i = 0; i < BLORGFS_SLOW_FETCH_SAMPLES; ++i)
+        {
+            const BLORGFS_SLOW_FETCH& f = stats.SlowFetches[i];
+
+            if (f.Sequence != want)
+            {
+                continue;
+            }
+
+            printf("      %6llu %9llu %8llu %8llu %8llu %8llu %9llu %6llu %5lld%s\n",
+                f.Sequence, f.TotalUs, f.AcquireUs, f.SendUs, f.WaitUs,
+                f.TtfbUs, f.BodyUs, f.Bytes / 1024, f.FetchesActive,
+                f.ConnectionReused ? "" : "  (fresh connection)");
+            break;
+        }
+    }
+}
+
+//
 static void PrintLatencyHistogram(const ULONG64* buckets)
 {
     unsigned long long peak = 0;
@@ -384,12 +453,58 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    user bytes            %12llu\n", t.UserFileReadBytes);
     printf("    non-cached bytes      %12llu\n", t.NonCachedReadBytes);
 
+    //
+    // What the application waited, as opposed to what the driver did.
+    //
+    // This is the only latency here a user can feel. Every figure in the
+    // chunk-fetch block below is behind the cache manager, which exists to
+    // hide exactly those numbers and demonstrably does: at playback rate
+    // the driver issued 67 ms fetches while the reader saw 0.11 ms. Read
+    // this section first, and treat the fetch block as the explanation for
+    // whatever this one shows rather than as a symptom in its own right.
+    //
+    if (t.UserReadSamples > 0)
+    {
+        printf("\n  application-visible read latency (non-paging reads only)\n");
+        printf("    samples               %12llu\n", t.UserReadSamples);
+        printf("    mean                  %12llu us\n",
+            t.UserReadLatencySumUs / t.UserReadSamples);
+        printf("    max                   %12llu us\n", t.UserReadLatencyMaxUs);
+
+        LatencyPercentiles u = ComputePercentiles(t.UserReadLatencyBuckets);
+
+        if (u.Samples > 0)
+        {
+            printf("    p50 / p90 / p99       <=%llu / <=%llu / <=%llu us\n",
+                u.P50UpperUs, u.P90UpperUs, u.P99UpperUs);
+        }
+
+        //
+        // A read that took longer than a frame interval is a read a viewer
+        // could have seen. At 24 fps a frame is 41667 us.
+        //
+        unsigned long long overFrame = 0;
+
+        for (int i = 0; i < BLORGFS_STATISTICS_LATENCY_BUCKETS; ++i)
+        {
+            if ((1ull << i) > 41667ull)
+            {
+                overFrame += t.UserReadLatencyBuckets[i];
+            }
+        }
+
+        printf("    over one frame (41 ms)%12llu  (%.2f%%)\n",
+            overFrame, SafeRatio(overFrame, t.UserReadSamples));
+
+        printf("\n  application-visible read latency distribution\n");
+        PrintLatencyHistogram(t.UserReadLatencyBuckets);
+    }
+
     printf("\n  chunk fetches\n");
     printf("    direct issued         %12llu\n", t.FetchesIssued);
     printf("    completed / failed    %12llu / %llu\n", t.FetchesCompleted, t.FetchesFailed);
     printf("    bytes                 %12llu\n", t.FetchBytes);
-    printf("    in flight now / peak  %12lld / %lld\n",
-        stats.Gauges.FetchesActive, stats.Gauges.FetchesActivePeak);
+    printf("    in flight now         %12lld\n", stats.FetchesActive);
 
     if (t.FetchesCompleted > 0)
     {
@@ -432,6 +547,8 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
 
     printf("\n  chunk fetch latency distribution\n");
     PrintLatencyHistogram(t.FetchLatencyBuckets);
+
+    PrintSlowFetches(stats);
 
     printf("\n  metadata\n");
     printf("    dir listings          %12llu  (%llu failed, mean %llu us)\n",
@@ -1243,7 +1360,7 @@ static bool WriteReport(
     fprintf(f, "FetchLatencyP90Us=%llu\n", p.P90UpperUs);
     fprintf(f, "FetchLatencyP99Us=%llu\n", p.P99UpperUs);
     fprintf(f, "FetchLatencySamples=%llu\n", p.Samples);
-    fprintf(f, "FetchesActivePeak=%lld\n", stats.Gauges.FetchesActivePeak);
+    fprintf(f, "FetchesActive=%lld\n", stats.FetchesActive);
 
     for (int i = 0; i < BLORGFS_STATISTICS_LATENCY_BUCKETS; ++i)
     {

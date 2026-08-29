@@ -111,11 +111,78 @@ static VOID ReadTrackStream(FCB* Fcb, ULONG64 Offset, ULONG Length)
 //  synchronous path used to do: advance the file position for
 //  synchronous file objects and note that a fast-IO read happened.
 //
+//
+// Files the application-visible latency of one non-paging read.
+//
+// A zero stamp means a paging read, or an IRP completed by a path that
+// never took one; either way nobody was waiting on it and there is nothing
+// to record.
+//
+static VOID BlorgReadRecordUserLatency(LONG64 ArrivedQpc)
+{
+    if (0 == ArrivedQpc)
+    {
+        return;
+    }
+
+    PBLORGFS_STATISTICS statsBlock = BlorgStatisticsForCurrentProcessor();
+
+    if (!statsBlock)
+    {
+        return;
+    }
+
+    statsBlock->UserReadSamples++;
+
+    BlorgStatisticsRecordLatency(
+        &statsBlock->UserReadLatencySumUs,
+        &statsBlock->UserReadLatencyMaxUs,
+        statsBlock->UserReadLatencyBuckets,
+        BlorgStatisticsNow() - ArrivedQpc);
+}
+
+//
+// The fast-I/O read path, timed.
+//
+// FsRtlCopyRead does the whole read inline: it takes the FCB's resource,
+// calls CcCopyRead, and returns TRUE having copied the bytes. When the
+// requested range is resident that costs microseconds; when it is not, the
+// call blocks inside CcCopyRead until read-ahead or a demand fetch
+// delivers it, and the caller waits for exactly that long. This wrapper
+// exists so that wait is a number.
+//
+// Recorded only when fast I/O actually handled the read. A FALSE return
+// means the I/O manager will reissue it as an IRP, which BlorgRead times
+// on its own; counting both would double every fallback.
+//
+BOOLEAN BlorgFastIoRead(
+    PFILE_OBJECT FileObject,
+    PLARGE_INTEGER FileOffset,
+    ULONG Length,
+    BOOLEAN Wait,
+    ULONG LockKey,
+    PVOID Buffer,
+    PIO_STATUS_BLOCK IoStatus,
+    PDEVICE_OBJECT DeviceObject)
+{
+    const LONG64 arrivedQpc = BlorgStatisticsNow();
+
+    const BOOLEAN handled = FsRtlCopyRead(
+        FileObject, FileOffset, Length, Wait, LockKey, Buffer, IoStatus, DeviceObject);
+
+    if (handled)
+    {
+        BlorgReadRecordUserLatency(arrivedQpc);
+    }
+
+    return handled;
+}
+
 static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
 {
     PIRP irp = CallerContext;
 
-    BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.FetchesActive);
+    const LONG64 arrivedQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[3]));
 
     LONG64 issueQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[2]));
 
@@ -123,6 +190,7 @@ static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID Ca
     {
         BLORGFS_PRINT("BlorgReadComplete: http read failed: %8lx\n", Status);
         BLORGFS_STAT_INC(FetchesFailed);
+        BlorgReadRecordUserLatency(arrivedQpc);
         BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
@@ -158,6 +226,8 @@ static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID Ca
 
         SetFlag(irpSp->FileObject->Flags, FO_FILE_FAST_IO_READ);
     }
+
+    BlorgReadRecordUserLatency(arrivedQpc);
 
     BlorgCompleteRequest(irp, STATUS_SUCCESS, IO_DISK_INCREMENT);
 }
@@ -323,10 +393,11 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // non-STATUS_PENDING return means the callback never ran (see
 // HttpGetFileCommon), so nothing else will ever terminate the fetch just
 // counted. Left unsettled, FetchesIssued outruns
-// FetchesCompleted + FetchesFailed -- which Compare-BlorgMetrics.ps1
-// reports only as a note about fetches "in flight at sample time" -- and,
-// worse, the FetchesActive gauge ratchets up permanently, taking
-// FetchesActivePeak with it, since a gauge has nothing to reset it.
+// FetchesCompleted + FetchesFailed permanently, and since in-flight is now
+// derived from exactly that difference rather than tracked in a gauge, the
+// reported depth would never return to zero. Compare-BlorgMetrics.ps1
+// reports the same difference as a note about fetches "in flight at sample
+// time".
 //
 // The NonCachedReads/NonCachedReadBytes pair is counted only on an IRP's
 // first pass through here, gated on IRP_CONTEXT_FLAG_IN_FSP. A read that
@@ -479,9 +550,23 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         BLORGFS_STAT_INC(FetchesIssued);
 
-        BlorgStatisticsGaugeIncrement(
-            &BlorgStatisticsGauges.FetchesActive,
-            &BlorgStatisticsGauges.FetchesActivePeak);
+        //
+        // The standard counters for the same event. UserDiskReads is what
+        // FILESYSTEM_STATISTICS means by a read that had to leave the
+        // cache to be answered, and it is what makes
+        // `fsutil fsinfo statistics` on this volume comparable with the
+        // same command on NTFS -- UserFileReadBytes over UserDiskReads is
+        // the average size the cache manager asked this filesystem for.
+        // Reporting zero there made the standard surface useless and sent
+        // the only comparison that needed it through the vendor IOCTL
+        // instead.
+        //
+        BLORGFS_STAT_INC(UserDiskReads);
+
+        if (BooleanFlagOn(Irp->Flags, IRP_NOCACHE))
+        {
+            BLORGFS_STAT_INC(NonCachedDiskReads);
+        }
 
         IoMarkIrpPending(Irp);
 
@@ -496,7 +581,6 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         if (STATUS_PENDING != fetchStatus)
         {
             BLORGFS_STAT_INC(FetchesFailed);
-            BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.FetchesActive);
         }
 
         return fetchStatus;
@@ -510,7 +594,14 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             CcInitializeCacheMap(IrpSp->FileObject, C_CAST(PCC_FILE_SIZES, &fcb->Header.AllocationSize), FALSE, &global.CacheManagerCallbacks, fcb);
 
-            CcSetReadAheadGranularity(IrpSp->FileObject, READ_AHEAD_GRANULARITY);
+            //
+            // Zero means leave Cc's own default in place, which is the one
+            // setting no override value can express.
+            //
+            if (0 != global.ReadAheadGranularity)
+            {
+                CcSetReadAheadGranularity(IrpSp->FileObject, global.ReadAheadGranularity);
+            }
         }
 
         NTSTATUS trimStatus = BlorgTrimReadToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);
@@ -619,11 +710,38 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         case BlorgDeviceVolume:
         {
             BlorgSetupIrpContext(Irp, IoIsOperationSynchronous(Irp));
+
+            //
+            // Stamp the arrival of a read somebody is waiting on.
+            // DriverContext[3] is otherwise unused by READ IRPs;
+            // DriverContext[2] already carries the fetch issue stamp, which
+            // is a different span -- that one starts when the driver asks
+            // the network, this one when the application asks the driver.
+            //
+            const BOOLEAN userRead = !BooleanFlagOn(Irp->Flags, IRP_PAGING_IO);
+            const LONG64 arrivedQpc = userRead ? BlorgStatisticsNow() : 0;
+
+            if (userRead)
+            {
+                Irp->Tail.Overlay.DriverContext[3] = C_CAST(PVOID, C_CAST(ULONG_PTR, arrivedQpc));
+            }
+
             result = BlorgVolumeRead(Irp, irpSp);
+
             if (STATUS_PENDING != result)
             {
+                //
+                // Recorded here rather than in BlorgCompleteRequest because
+                // this is the synchronous case, and it is the interesting
+                // one: a cached read that misses blocks inside
+                // CcCopyReadEx and returns here having waited, which is
+                // precisely the stall a viewer feels and the only place it
+                // is visible.
+                //
+                BlorgReadRecordUserLatency(arrivedQpc);
                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
+
             break;
         }
 
