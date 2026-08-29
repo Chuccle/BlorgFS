@@ -1,4 +1,4 @@
-//
+﻿//
 // BlorgFS performance harness.
 //
 // Runs a defined workload against the mounted volume, then reports what
@@ -1118,24 +1118,47 @@ static bool RunSequential(const wchar_t* path, bool unbuffered, unsigned long lo
 }
 
 //
-// Random reads at a fixed block size. Cc's read-ahead has nothing to
-// predict here, so the interesting output is a fetch-latency distribution
-// that is the raw backend round trip with no lookahead hiding any of it.
+// Random reads at a fixed block size.
+//
+// Unbuffered is the default and answers "what does one backend round trip
+// cost": Cc is out of the path entirely, every read becomes exactly one
+// fetch of the requested size, and the fetch-latency distribution is the
+// raw round trip with no lookahead hiding any of it.
+//
+// Buffered is a different question and the reason the mode exists. A
+// demuxer picking at a file -- the subtitle case -- reads small and
+// scattered through an ordinary buffered handle, so Cc sits in front of it
+// and every small read drags a full read-ahead granule across the network.
+// That amplification is invisible to the unbuffered mode, which by
+// construction fetches exactly what was asked for.
+//
+// FILE_FLAG_RANDOM_ACCESS is deliberately not passed in buffered mode. It
+// is a hint to Cc to suppress read-ahead, which would switch off the very
+// behaviour being measured and report a granularity sweep as a flat line.
+// Media Foundation does not pass it either.
 //
 static bool RunRandom(
     const wchar_t* path,
     DWORD blockSize,
     unsigned long count,
+    bool buffered,
     unsigned long long* bytesOut,
     double* secondsOut)
 {
+    DWORD flags = FILE_ATTRIBUTE_NORMAL;
+
+    if (!buffered)
+    {
+        flags |= FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS;
+    }
+
     HANDLE file = CreateFileW(
         path,
         GENERIC_READ,
         FILE_SHARE_READ,
         nullptr,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS,
+        flags,
         nullptr);
 
     if (INVALID_HANDLE_VALUE == file)
@@ -1199,6 +1222,178 @@ static bool RunRandom(
             }
         }
 
+        total += read;
+    }
+
+    QueryPerformanceCounter(&end);
+
+    VirtualFree(buffer, 0, MEM_RELEASE);
+    CloseHandle(file);
+
+    *bytesOut = total;
+    *secondsOut = static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+    return true;
+}
+
+//
+// Several sequential cursors interleaved through one buffered handle --
+// a demuxer reading a container.
+//
+// This exists because neither of the other read workloads can see what
+// read-ahead granularity costs. `seq` is one cursor walking forwards, which
+// is the case a large granule is chosen for and always wins. `rand` is
+// uniformly random, and Cc's read-ahead is pattern-triggered: with no two
+// consecutive reads adjacent, no lookahead is ever armed, so granularity
+// is not merely unhelpful there, it is inert -- measured amplification of
+// exactly 1.0 at every setting.
+//
+// The playback case is neither. A container holds a video track, an audio
+// track and a subtitle track, and the demuxer advances all of them through
+// one file object, so each cursor is locally sequential while the merged
+// request stream jumps between regions far apart. That is the pattern that
+// arms read-ahead on every cursor and then abandons most of what it fetched
+// when the next read lands in a different track -- which is where a 512 KB
+// granule turns a 4 KB subtitle read into half a megabyte over the network.
+//
+// Tracks are spread evenly across the file rather than packed, because a
+// real container interleaves at a fine grain but its tracks span the whole
+// duration; cursors a few kilobytes apart would be one sequential stream
+// wearing a disguise and would measure `seq` again.
+//
+// Stride is the parameter that decides whether this is a measurement or a
+// restatement of `seq`, and it is worth being explicit about why. A track's
+// consecutive packets are not adjacent on disk: the other tracks' packets
+// sit between them, so a cursor advances by much more than it reads. With
+// stride equal to block -- the first version of this workload -- each cursor
+// walks a contiguous run, read-ahead consumes everything it fetches, and the
+// measured amplification was 1.002 at 99.8% sequential. That is read-ahead
+// working perfectly, which is the answer for a dense track and not the
+// question. With stride well above block, each granule serves only
+// block/stride of its own fetch before the cursor jumps past the rest, which
+// is where a large granule becomes a tax and what the real trace's 70%
+// sequential share and 22x amplification look like.
+//
+// Burst is the third knob and the one that makes the other two describe a
+// real trace rather than a corner of one. A demuxer does not alternate
+// tracks every read: it pulls a whole frame -- several adjacent blocks --
+// then switches. Without that, every read lands somewhere new, the driver's
+// sequential test (which is exact adjacency) reports ~1%, and Cc never arms
+// read-ahead at all. With it, each burst is adjacent enough to arm
+// read-ahead and short enough to abandon most of the granule at the jump.
+//
+// Calibration target is the captured playback trace: 70.4% sequential and
+// 22x amplification. Bursts of B blocks give (B-1)/B sequential by
+// construction, so B=4 is 75% -- and the granule wasted is what the sweep
+// is there to measure.
+//
+static bool RunDemux(
+    const wchar_t* path,
+    unsigned long tracks,
+    DWORD blockSize,
+    DWORD stride,
+    unsigned long burst,
+    unsigned long count,
+    unsigned long long* bytesOut,
+    double* secondsOut)
+{
+    HANDLE file = CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    if (INVALID_HANDLE_VALUE == file)
+    {
+        PrintLastError("open workload file");
+        return false;
+    }
+
+    LARGE_INTEGER fileSize;
+
+    if (!GetFileSizeEx(file, &fileSize))
+    {
+        PrintLastError("GetFileSizeEx");
+        CloseHandle(file);
+        return false;
+    }
+
+    unsigned char* buffer = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, blockSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+
+    if (!buffer)
+    {
+        PrintLastError("allocate read buffer");
+        CloseHandle(file);
+        return false;
+    }
+
+    std::vector<unsigned long long> cursor(tracks);
+    const unsigned long long span = static_cast<unsigned long long>(fileSize.QuadPart) / tracks;
+
+    for (unsigned long t = 0; t < tracks; ++t)
+    {
+        cursor[t] = span * t;
+    }
+
+    LARGE_INTEGER start;
+    LARGE_INTEGER end;
+    LARGE_INTEGER frequency;
+
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+
+    unsigned long long total = 0;
+
+    for (unsigned long i = 0; i < count; ++i)
+    {
+        //
+        // Track switches every `burst` reads, not every read: the reads
+        // within a burst are adjacent, and the jump happens between bursts.
+        //
+        const unsigned long track = (i / burst) % tracks;
+        const bool lastOfBurst = ((i % burst) == (burst - 1));
+
+        //
+        // A cursor that runs off the end of its own span wraps within that
+        // span rather than walking into the next track's region, which
+        // would quietly merge two cursors into one and reduce the track
+        // count the run is labelled with.
+        //
+        if (cursor[track] + stride > span * (track + 1))
+        {
+            cursor[track] = span * track;
+        }
+
+        LARGE_INTEGER offset;
+        offset.QuadPart = static_cast<long long>(cursor[track]);
+
+        OVERLAPPED overlapped = {};
+        overlapped.Offset = offset.LowPart;
+        overlapped.OffsetHigh = static_cast<DWORD>(offset.HighPart);
+
+        DWORD read = 0;
+
+        if (!ReadFile(file, buffer, blockSize, &read, &overlapped))
+        {
+            if (ERROR_HANDLE_EOF != GetLastError())
+            {
+                PrintLastError("ReadFile (demux)");
+                break;
+            }
+        }
+
+        //
+        // Inside a burst the cursor advances by exactly the block, so the
+        // next read is adjacent and the driver counts it sequential. Only
+        // the last read of a burst pays the stride, which is what skips
+        // over the other tracks' packets and abandons the rest of whatever
+        // read-ahead fetched.
+        //
+        cursor[track] += lastOfBurst ? stride : blockSize;
         total += read;
     }
 
@@ -1345,6 +1540,46 @@ static bool WriteReport(
     fprintf(f, "ReadsEndOfFile=%llu\n", t.ReadsEndOfFile);
     fprintf(f, "UserFileReads=%llu\n", t.UserFileReads);
     fprintf(f, "UserFileReadBytes=%llu\n", t.UserFileReadBytes);
+
+    //
+    // What the application waited, in the machine-readable form. The human
+    // table has carried these since they were added and the report did not,
+    // so any sweep driven off this file compared throughput and inferred
+    // the viewer's experience from it -- the exact substitution the
+    // application-visible measurement exists to stop.
+    //
+    // UserReadsOverFrame counts reads longer than a 24 fps frame interval
+    // (41667 us), by the same bucket walk the table prints, because the
+    // number that decides whether playback stutters is not the mean but
+    // how many reads a viewer could have seen.
+    //
+    const LatencyPercentiles u = ComputePercentiles(t.UserReadLatencyBuckets);
+
+    unsigned long long overFrame = 0;
+
+    for (int i = 0; i < BLORGFS_STATISTICS_LATENCY_BUCKETS; ++i)
+    {
+        if ((1ull << i) > 41667ull)
+        {
+            overFrame += t.UserReadLatencyBuckets[i];
+        }
+    }
+
+    fprintf(f, "UserReadSamples=%llu\n", t.UserReadSamples);
+    fprintf(f, "UserReadLatencyMeanUs=%llu\n",
+        (t.UserReadSamples > 0) ? (t.UserReadLatencySumUs / t.UserReadSamples) : 0ull);
+    fprintf(f, "UserReadLatencyMaxUs=%llu\n", t.UserReadLatencyMaxUs);
+    fprintf(f, "UserReadLatencyP50Us=%llu\n", u.P50UpperUs);
+    fprintf(f, "UserReadLatencyP90Us=%llu\n", u.P90UpperUs);
+    fprintf(f, "UserReadLatencyP99Us=%llu\n", u.P99UpperUs);
+    fprintf(f, "UserReadsOverFrame=%llu\n", overFrame);
+    fprintf(f, "UserReadsOverFrameShare=%.6f\n", SafeRatio(overFrame, t.UserReadSamples));
+
+    for (int i = 0; i < BLORGFS_STATISTICS_LATENCY_BUCKETS; ++i)
+    {
+        fprintf(f, "UserReadLatencyBucket%02d=%llu\n", i, t.UserReadLatencyBuckets[i]);
+    }
+
     fprintf(f, "NonCachedReads=%llu\n", t.NonCachedReads);
     fprintf(f, "NonCachedReadBytes=%llu\n", t.NonCachedReadBytes);
 
@@ -1415,7 +1650,20 @@ static void PrintUsage(void)
     printf("  fsstats [drive]                print the standard statistics FSCTL\n");
     printf("  reset [drive]                  start a fresh measurement window (elevated)\n");
     printf("  seq <file> [buffered]          sequential read; unbuffered unless 'buffered'\n");
-    printf("  rand <file> <blockKB> <count>  random reads at a fixed block size\n");
+    printf("  rand <file> <blockKB> <count> [buffered]\n");
+    printf("                                 random reads at a fixed block size;\n");
+    printf("                                 unbuffered unless 'buffered' -- buffered puts Cc in\n");
+    printf("                                 front, which is what makes read-ahead granularity\n");
+    printf("                                 observable at all\n");
+    printf("  demux <file> <tracks> <blockKB> <count> [strideKB]\n");
+    printf("                                 N cursors interleaved through one buffered\n");
+    printf("                                 handle -- a demuxer reading a container. Each\n");
+    printf("                                 reads blockKB then skips to strideKB later, the\n");
+    printf("                                 way a track's packets are separated by the other\n");
+    printf("                                 tracks'. strideKB defaults to blockKB, which is a\n");
+    printf("                                 dense track and measures read-ahead working;\n");
+    printf("                                 raise it to measure what a granule costs when\n");
+    printf("                                 most of it is skipped\n");
     printf("  meta <dir> <passes>            enumerate + open every entry, repeatedly\n");
     printf("  streams <dir> <count> [secs] [unbuffered]\n");
     printf("                                 N concurrent sequential readers, one file each;\n");
@@ -1525,8 +1773,54 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
         const DWORD blockKb = static_cast<DWORD>(parsedBlockKb);
         const unsigned long count = static_cast<unsigned long>(parsedCount);
 
-        ok = RunRandom(argv[2], blockKb * 1024, count, &bytes, &seconds);
-        sprintf_s(label, "random read (%lu KB x %lu)", blockKb, count);
+        const bool buffered = (argc > 5) && (0 == wcscmp(argv[5], L"buffered"));
+
+        ok = RunRandom(argv[2], blockKb * 1024, count, buffered, &bytes, &seconds);
+        sprintf_s(label, "random read (%lu KB x %lu, %s)", blockKb, count,
+            buffered ? "buffered" : "unbuffered");
+    }
+    else if (0 == wcscmp(argv[1], L"demux"))
+    {
+        if (argc < 6)
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        const int parsedTracks = _wtoi(argv[3]);
+        const int parsedBlockKb = _wtoi(argv[4]);
+        const int parsedCount = _wtoi(argv[5]);
+        const int parsedStrideKb = (argc > 6) ? _wtoi(argv[6]) : parsedBlockKb;
+        const int parsedBurst = (argc > 7) ? _wtoi(argv[7]) : 1;
+
+        if (parsedTracks <= 0 || parsedBlockKb <= 0 || parsedCount <= 0 ||
+            parsedStrideKb <= 0 || parsedBurst <= 0)
+        {
+            fprintf(stderr, "  [FAIL] tracks, blockKB, count, strideKB and burst must be positive integers\n");
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        if (parsedStrideKb < parsedBlockKb)
+        {
+            fprintf(stderr, "  [FAIL] strideKB (%d) below blockKB (%d) would re-read the same bytes\n",
+                parsedStrideKb, parsedBlockKb);
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        ok = RunDemux(argv[2],
+            static_cast<unsigned long>(parsedTracks),
+            static_cast<DWORD>(parsedBlockKb) * 1024,
+            static_cast<DWORD>(parsedStrideKb) * 1024,
+            static_cast<unsigned long>(parsedBurst),
+            static_cast<unsigned long>(parsedCount),
+            &bytes, &seconds);
+
+        sprintf_s(label, "demux (%d tracks, %d KB x%d burst, +%d KB x %d)",
+            parsedTracks, parsedBlockKb, parsedBurst, parsedStrideKb, parsedCount);
     }
     else if (0 == wcscmp(argv[1], L"streams"))
     {
@@ -1708,7 +2002,8 @@ int wmain(int argc, wchar_t** argv)
     }
 
     if (0 == wcscmp(argv[1], L"seq") || 0 == wcscmp(argv[1], L"rand") ||
-        0 == wcscmp(argv[1], L"meta") || 0 == wcscmp(argv[1], L"streams"))
+        0 == wcscmp(argv[1], L"meta") || 0 == wcscmp(argv[1], L"streams") ||
+        0 == wcscmp(argv[1], L"demux"))
     {
         if (argc < 3)
         {
