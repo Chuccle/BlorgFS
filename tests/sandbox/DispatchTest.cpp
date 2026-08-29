@@ -112,3 +112,94 @@ TEST(DispatchSandbox, FlushBuffersSucceedsOnEveryDeviceThisDriverOwns)
     EXPECT_EQ(STATUS_INVALID_DEVICE_REQUEST, BlorgFlushBuffers(&device, &foreign))
         << "a flush on a device this driver does not own is a routing error, not a no-op";
 }
+
+//
+// BlorgPrePostIrp must leave every posted IRP describing its user buffer
+// with a locked MDL, because the worker that picks the IRP up runs in a
+// different process context and a raw user VA means nothing there.
+//
+// This is the only test that drives BlorgLockUserBuffer into actually
+// allocating. Everything else either pre-sets MdlAddress so it no-ops
+// (FspWorkQueueStressTest) or never posts at all, which is how the shim's
+// IoAllocateMdl came to ignore its Irp parameter unnoticed: the real one
+// attaches the MDL to Irp->MdlAddress and BlorgLockUserBuffer relies on
+// that, so with the parameter dropped every posted request in the sandbox
+// silently took the unlocked branch and leaked the MDL it had just built.
+// Reverting that one line must fail this test.
+//
+TEST(DispatchSandbox, PrePostIrpLocksAnUnlockedUserBufferBeforeItIsQueued)
+{
+    unsigned char buffer[512] = {};
+
+    FILE_OBJECT fileObject;
+    memset(&fileObject, 0, sizeof(fileObject));
+
+    IO_STACK_LOCATION stack;
+    memset(&stack, 0, sizeof(stack));
+    stack.MajorFunction = IRP_MJ_READ;
+    stack.FileObject = &fileObject;
+    stack.Parameters.Read.Length = sizeof(buffer);
+
+    IRP irp;
+    memset(&irp, 0, sizeof(irp));
+    irp.StackLocation = &stack;
+    irp.UserBuffer = buffer;
+    irp.RequestorMode = KernelMode;
+
+    ASSERT_EQ(nullptr, irp.MdlAddress) << "the point of the test is the NULL case";
+
+    EXPECT_EQ(STATUS_SUCCESS, BlorgPrePostIrp(nullptr, &irp));
+
+    ASSERT_NE(nullptr, irp.MdlAddress)
+        << "the buffer was not locked, so a worker in another process context "
+           "would dereference a raw user VA";
+    EXPECT_EQ(buffer, irp.MdlAddress->Base);
+    EXPECT_EQ(sizeof(buffer), irp.MdlAddress->Length);
+
+    ShimReleaseIrpMdl(&irp);
+
+    EXPECT_EQ(0, KmObjectsLive(KmObjectMdl)) << "the MDL outlived the request";
+}
+
+//
+// A zero-length buffer has nothing to lock, and an IRP that already carries
+// an MDL -- paging I/O, or a second post of the same request -- must not
+// have a second one built over the top of it.
+//
+TEST(DispatchSandbox, PrePostIrpBuildsNoMdlWhenThereIsNothingToLock)
+{
+    FILE_OBJECT fileObject;
+    memset(&fileObject, 0, sizeof(fileObject));
+
+    IO_STACK_LOCATION stack;
+    memset(&stack, 0, sizeof(stack));
+    stack.MajorFunction = IRP_MJ_READ;
+    stack.FileObject = &fileObject;
+    stack.Parameters.Read.Length = 0;
+
+    IRP irp;
+    memset(&irp, 0, sizeof(irp));
+    irp.StackLocation = &stack;
+    irp.RequestorMode = KernelMode;
+
+    EXPECT_EQ(STATUS_SUCCESS, BlorgPrePostIrp(nullptr, &irp));
+    EXPECT_EQ(nullptr, irp.MdlAddress);
+
+    unsigned char buffer[64] = {};
+    PMDL existing = IoAllocateMdl(buffer, sizeof(buffer), FALSE, FALSE, nullptr);
+    ASSERT_NE(nullptr, existing);
+
+    IRP paging;
+    memset(&paging, 0, sizeof(paging));
+    paging.StackLocation = &stack;
+    paging.MdlAddress = existing;
+    paging.RequestorMode = KernelMode;
+    stack.Parameters.Read.Length = sizeof(buffer);
+
+    EXPECT_EQ(STATUS_SUCCESS, BlorgPrePostIrp(nullptr, &paging));
+    EXPECT_EQ(existing, paging.MdlAddress) << "an existing MDL was replaced";
+
+    ShimReleaseIrpMdl(&paging);
+
+    EXPECT_EQ(0, KmObjectsLive(KmObjectMdl));
+}

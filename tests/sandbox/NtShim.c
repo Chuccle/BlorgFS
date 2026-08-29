@@ -420,11 +420,18 @@ VOID ShimFailNextMdlMapping(VOID)
     InterlockedExchange(&MdlMappingFailPending, 1);
 }
 
+//
+// The Irp parameter is not decoration: the real IoAllocateMdl attaches the
+// MDL to Irp->MdlAddress, and BlorgLockUserBuffer depends on that -- it
+// never assigns MdlAddress itself, it only clears it on failure. A shim
+// that ignored Irp left MdlAddress NULL, so every posted read, write and
+// directory query in the sandbox ran the raw-user-pointer branch instead
+// of the locked one, and leaked the MDL it had just built.
+//
 PMDL IoAllocateMdl(PVOID Base, ULONG Length, BOOLEAN Secondary, BOOLEAN ChargeQuota, PVOID Irp)
 {
     (void)Secondary;
     (void)ChargeQuota;
-    (void)Irp;
 
     PMDL mdl = (PMDL)calloc(1, sizeof(MDL));
 
@@ -438,7 +445,33 @@ PMDL IoAllocateMdl(PVOID Base, ULONG Length, BOOLEAN Secondary, BOOLEAN ChargeQu
 
     KmObjectCreated(KmObjectMdl);
 
+    if (Irp)
+    {
+        ((PIRP)Irp)->MdlAddress = mdl;
+    }
+
     return mdl;
+}
+
+//
+// Stands in for the MDL teardown IoCompleteRequest performs, for the tests
+// that drive a dispatch or post path directly and so never complete the
+// IRP they built.
+//
+VOID ShimReleaseIrpMdl(PIRP Irp)
+{
+    if (!Irp || !Irp->MdlAddress)
+    {
+        return;
+    }
+
+    if (Irp->MdlAddress->Locked)
+    {
+        MmUnlockPages(Irp->MdlAddress);
+    }
+
+    IoFreeMdl(Irp->MdlAddress);
+    Irp->MdlAddress = NULL;
 }
 
 VOID IoFreeMdl(PMDL Mdl)

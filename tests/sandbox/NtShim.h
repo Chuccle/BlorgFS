@@ -877,6 +877,13 @@ VOID IoCompleteRequest(PIRP Irp, CCHAR PriorityBoost);
 BOOLEAN IoCancelIrp(PIRP Irp);
 VOID IoMarkIrpPending(PIRP Irp);
 
+//
+// Unlocks and frees whatever MDL is attached to the IRP, the way
+// IoCompleteRequest would, for tests that drive a dispatch or post path
+// directly and never complete the IRP.
+//
+VOID ShimReleaseIrpMdl(PIRP Irp);
+
 typedef char CCHAR;
 
 ///////////////////////////////////////////////////////////////////////////
