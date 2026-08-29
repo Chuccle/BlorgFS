@@ -26,6 +26,25 @@
 //
 #define IRP_CONTEXT_FLAG_NET_DONE                   0x00004000
 
+//
+//  This paging read is Cc's read-ahead rather than a demand fault: nobody
+//  is blocked on it. Set in BlorgRead from the top-level IRP, which the
+//  cache-manager callbacks stamp with FSRTL_CACHE_TOP_LEVEL_IRP before Cc
+//  enters the file system (CacheManager.c) -- the same signal FastFat uses
+//  to tell recursion from a genuine top-level request.
+//
+//  It has to be captured at dispatch and carried, not re-derived later:
+//  BlorgIsIrpTopLevel overwrites the top-level IRP a few lines further on,
+//  and a posted request re-enters on an FSP worker whose top-level is
+//  FSRTL_FSP_TOP_LEVEL_IRP, by which point the distinction is gone.
+//
+//  The distinction matters because the two are not the same request. A
+//  demand read has an application waiting inside CcCopyRead and its
+//  latency is what a viewer feels; a read-ahead is speculative and its
+//  latency costs nothing unless it delays a demand read behind it.
+//
+#define IRP_CONTEXT_FLAG_SPECULATIVE_READ           0x00008000
+
 #if (NTDDI_VERSION >= NTDDI_WINTHRESHOLD)
 #define IRP_CONTEXT_FLAG_SWAPPED_STACK              0x00100000
 #endif

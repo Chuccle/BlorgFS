@@ -203,11 +203,26 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
 
     if (statsBlock && issueQpc)
     {
+        const LONG64 elapsedQpc = BlorgStatisticsNow() - issueQpc;
+
         BlorgStatisticsRecordLatency(
             &statsBlock->FetchLatencySumUs,
             &statsBlock->FetchLatencyMaxUs,
             statsBlock->FetchLatencyBuckets,
-            BlorgStatisticsNow() - issueQpc);
+            elapsedQpc);
+
+        if (BooleanFlagOn(irp->Flags, IRP_PAGING_IO))
+        {
+            const BOOLEAN speculative = BooleanFlagOn(
+                C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[0]),
+                IRP_CONTEXT_FLAG_SPECULATIVE_READ);
+
+            BlorgStatisticsRecordLatency(
+                speculative ? &statsBlock->SpeculativeLatencySumUs : &statsBlock->DemandLatencySumUs,
+                speculative ? &statsBlock->SpeculativeLatencyMaxUs : &statsBlock->DemandLatencyMaxUs,
+                NULL,
+                elapsedQpc);
+        }
     }
 
     if (!BooleanFlagOn(irp->Flags, IRP_PAGING_IO))
@@ -548,6 +563,16 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         {
             BLORGFS_STAT_INC(ReadsPagingInline);
 
+            if (BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]),
+                    IRP_CONTEXT_FLAG_SPECULATIVE_READ))
+            {
+                BLORGFS_STAT_INC(ReadsSpeculative);
+            }
+            else
+            {
+                BLORGFS_STAT_INC(ReadsDemand);
+            }
+
             if (ReadIsSequential(fcb, C_CAST(ULONG64, startingByte.QuadPart)))
             {
                 BLORGFS_STAT_INC(ReadsSequential);
@@ -717,6 +742,9 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
 
+    const BOOLEAN speculative =
+        (C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP) == IoGetTopLevelIrp());
+
     BOOLEAN topLevel = BlorgIsIrpTopLevel(Irp);
 
     FsRtlEnterFileSystem();
@@ -725,6 +753,11 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         case BlorgDeviceVolume:
         {
             BlorgSetupIrpContext(Irp, IoIsOperationSynchronous(Irp));
+
+            if (speculative)
+            {
+                BlorgSetIrpContextFlag(Irp, IRP_CONTEXT_FLAG_SPECULATIVE_READ);
+            }
 
             const BOOLEAN userRead = !BooleanFlagOn(Irp->Flags, IRP_PAGING_IO);
             const LONG64 arrivedQpc = userRead ? BlorgStatisticsNow() : 0;

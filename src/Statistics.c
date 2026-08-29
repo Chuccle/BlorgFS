@@ -283,6 +283,8 @@ static const SIZE_T StatisticsMaxFields[] =
 {
     FIELD_OFFSET(BLORGFS_STATISTICS, FetchLatencyMaxUs),
     FIELD_OFFSET(BLORGFS_STATISTICS, UserReadLatencyMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, SpeculativeLatencyMaxUs),
+    FIELD_OFFSET(BLORGFS_STATISTICS, DemandLatencyMaxUs),
     FIELD_OFFSET(BLORGFS_STATISTICS, HandshakeLatencyMaxUs),
     FIELD_OFFSET(BLORGFS_STATISTICS, FetchPreSendMaxUs),
     FIELD_OFFSET(BLORGFS_STATISTICS, FetchAcquireMaxUs),
