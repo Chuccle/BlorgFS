@@ -1295,6 +1295,15 @@ static bool RunRandom(
 // construction, so B=4 is 75% -- and the granule wasted is what the sweep
 // is there to measure.
 //
+// SuppressReadAhead passes FILE_FLAG_RANDOM_ACCESS, which asks Cc not to
+// read ahead on this handle. Every other mode here deliberately withholds
+// that flag, because suppressing read-ahead switches off the behaviour a
+// granularity sweep exists to measure. It is offered as an explicit mode
+// because it is the controlled way to ask whether read-ahead is what an
+// application is actually waiting on: if the tail collapses to the demand
+// latency when read-ahead is suppressed, the tail was read-ahead's, and if
+// it does not, it was never read-ahead's to begin with.
+//
 static bool RunDemux(
     const wchar_t* path,
     unsigned long tracks,
@@ -1302,6 +1311,7 @@ static bool RunDemux(
     DWORD stride,
     unsigned long burst,
     unsigned long count,
+    bool suppressReadAhead,
     unsigned long long* bytesOut,
     double* secondsOut)
 {
@@ -1311,7 +1321,8 @@ static bool RunDemux(
         FILE_SHARE_READ,
         nullptr,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
+        suppressReadAhead ? (FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS)
+                          : FILE_ATTRIBUTE_NORMAL,
         nullptr);
 
     if (INVALID_HANDLE_VALUE == file)
@@ -1671,7 +1682,7 @@ static void PrintUsage(void)
     printf("                                 unbuffered unless 'buffered' -- buffered puts Cc in\n");
     printf("                                 front, which is what makes read-ahead granularity\n");
     printf("                                 observable at all\n");
-    printf("  demux <file> <tracks> <blockKB> <count> [strideKB]\n");
+    printf("  demux <file> <tracks> <blockKB> <count> [strideKB] [burst] [suppressra]\n");
     printf("                                 N cursors interleaved through one buffered\n");
     printf("                                 handle -- a demuxer reading a container. Each\n");
     printf("                                 reads blockKB then skips to strideKB later, the\n");
@@ -1827,16 +1838,20 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
             return 1;
         }
 
+        const bool suppressReadAhead = (argc > 8) && (0 == wcscmp(argv[8], L"suppressra"));
+
         ok = RunDemux(argv[2],
             static_cast<unsigned long>(parsedTracks),
             static_cast<DWORD>(parsedBlockKb) * 1024,
             static_cast<DWORD>(parsedStrideKb) * 1024,
             static_cast<unsigned long>(parsedBurst),
             static_cast<unsigned long>(parsedCount),
+            suppressReadAhead,
             &bytes, &seconds);
 
-        sprintf_s(label, "demux (%d tracks, %d KB x%d burst, +%d KB x %d)",
-            parsedTracks, parsedBlockKb, parsedBurst, parsedStrideKb, parsedCount);
+        sprintf_s(label, "demux (%d tracks, %d KB x%d burst, +%d KB x %d%s)",
+            parsedTracks, parsedBlockKb, parsedBurst, parsedStrideKb, parsedCount,
+            suppressReadAhead ? ", read-ahead suppressed" : "");
     }
     else if (0 == wcscmp(argv[1], L"streams"))
     {
