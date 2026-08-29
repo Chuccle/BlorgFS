@@ -507,35 +507,68 @@ it is a floor common to all of them and not evidence of anything. The
 metric that does discriminate is the count of reads over a frame, not the
 maximum.
 
-### Solving the sequential tail: it was fetch size all along
+### The granule depends on load, which is why no constant worked
 
-The sequential tail is not a separate phenomenon. It is a direct function
-of how long the fetch a reader is blocked on takes, and that tracks fetch
-size:
+Reads over a frame interval are roughly the share of application reads that
+have to wait for a fetch, times the chance that wait exceeds the frame. A
+granule serves many reads, so halving it roughly doubles how many wait and
+halves how long each waits. Which way that trades depends entirely on where
+fetch latency sits relative to 41.67 ms -- and load moves it:
 
-| fetch mean | reads over a frame |
-|---|---|
-| 13.1 ms (`PAGE_SIZE`) | 0.13% |
-| 19.8 ms (128 KB) | 0.345% |
-| 58.7 ms (512 KB) | 3.40% |
-| 51.2 ms (512 KB split four ways) | 4.38% |
+| | fetch mean | reads over a frame |
+|---|---|---|
+| one reader, 128 KB | 19.8 ms | 0.345% |
+| one reader, 512 KB | 58.7 ms | 3.40% |
+| eight streams, 128 KB | 41.8 ms | 28.9% |
+| eight streams, 512 KB | 102.5 ms | 13.7% |
 
-The frame interval being missed is 41.67 ms, so a granule whose fetch
-averages 58.7 ms misses it routinely and one averaging 19.8 ms almost never
-does. Nothing subtler is going on.
+Unloaded, a 128 KB fetch lands comfortably inside the frame, so the extra
+waits cost nothing and the small granule wins tenfold. Saturated, a 128 KB
+fetch takes 41.8 ms -- sitting exactly on the threshold -- so nearly every
+extra wait becomes visible and the large granule wins by making far fewer
+reads wait at all. Throughput is identical at that point (31.3 against 31.8
+MB/s), so at eight streams this is a latency decision and not a bandwidth
+one, and the benchmark that originally chose 512 KB could not have seen it.
 
-The committed granularity is therefore **128 KB**, and the trade is a
-tenfold reduction in reads a viewer can see for 15% of sequential
-throughput -- 19.03 MB/s against 22.44, which is still an order of
-magnitude above any playback bitrate this volume serves. Full numbers and
-method are in `Driver.h` beside the constant.
+That is the whole reason no constant worked. The variable is load, and
+neither a fixed value nor an amplification-driven policy can observe it.
+The driver can: fetches in flight run about 1.6 to 2.8 for a single reader
+and 21 to 28 at eight streams.
+
+So growth requires a sequential reader **and** a loaded transport. Sequential
+alone is not sufficient and that is the trap -- a lone reader walking a file
+forwards has the same long streak and the same 1.0 amplification as eight of
+them, and growing for it is exactly the 3.40% case. Files start at 128 KB,
+shrink on measured waste, and climb to 512 KB only when depth crosses the
+threshold.
+
+Measured against starting at 512 KB, each cell rebooted with its own dataset
+and the configurations alternated:
+
+| workload | start at 512 KB | load-aware, start at 128 KB |
+|---|---|---|
+| one sequential reader | 3.39% over a frame, 27.4 MB/s | **0.03%**, 19.5 MB/s |
+| eight streams | 15.06%, 31.8 MB/s | **14.47%**, 32.4 MB/s |
+| demux (playback) | 0.83%, 0.99 MB/s | **0.08%**, 1.17 MB/s |
+
+It takes the better of the two constants in each case rather than splitting
+the difference, and the eight-stream cell recorded sixteen grows -- eight
+file objects each doubling twice -- which is the load gate doing exactly
+what it was built for, per file object.
+
+The cost is 29% of throughput for a lone sequential reader, 19.5 MB/s
+against 27.4. That is a file-copy shape rather than a playback one, 19.5
+MB/s remains an order of magnitude above any bitrate this volume serves, and
+it is the price of keeping a lone reader's fetches inside the frame budget.
+Single runs per cell; the underlying constants were replicated, this
+comparison was not.
 
 **Measure interleaved or not at all.** Every earlier comparison here was
-A-then-B in time, and the host drifts: the same 128 KB setting measured
-20.2 MB/s at 0.16% in one session and 12.6 MB/s at 1.8% an hour later. An
-ordered comparison attributes that drift to whichever setting ran second.
-The numbers above alternate 512/128/512/128 with a reboot per run, and the
-replicates came back at 3.37/3.42% and 0.34/0.35% -- tight enough to decide
+A-then-B in time, and the host drifts: the same 128 KB setting measured 20.2
+MB/s at 0.16% in one session and 12.6 MB/s at 1.8% an hour later. An ordered
+comparison hands that drift to whichever setting ran second. The numbers
+above alternate configurations with a reboot per run; the fixed-granule
+replicates came back at 3.37/3.42% and 0.34/0.35%, tight enough to decide
 on, which none of the earlier ordered runs were. The reversal controls used
 before this protected against dataset bias and did nothing about drift.
 

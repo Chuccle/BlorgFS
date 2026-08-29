@@ -155,6 +155,39 @@ static ULONG64 ReadLongestStreak(const FCB* Fcb)
 #define READ_AHEAD_ADAPT_GROW_STREAK  16
 
 //
+// The granule the policy may grow to under load, and the depth that counts
+// as load. Growth needs both, and the reason is that the right granule
+// depends on how busy the transport is -- which neither a constant nor an
+// amplification-driven policy can see.
+//
+// Reads over a frame interval are roughly the share of application reads
+// that have to wait for a fetch, times the chance that wait exceeds the
+// frame. A granule serves many reads, so halving it roughly doubles how
+// many wait while halving how long each waits. Which way that trades
+// depends entirely on where fetch latency sits relative to 41.67 ms, and
+// load moves it:
+//
+//   one stream    128 KB fetches 19.8 ms   0.345% over a frame
+//                 512 KB fetches 58.7 ms   3.40%
+//   eight streams 128 KB fetches 41.8 ms   28.9%
+//                 512 KB fetches 102.5 ms  13.7%
+//
+// Unloaded, a 128 KB fetch lands comfortably under the frame, so the extra
+// waits cost nothing and the small granule wins by a factor of ten. At
+// eight streams the link is saturated and a 128 KB fetch takes 41.8 ms --
+// sitting exactly on the threshold -- so nearly every one of those extra
+// waits is now visible, and the large granule wins by making far fewer
+// reads wait at all. Throughput is identical either way at that point
+// (31.3 MB/s), so this is a latency decision, not a bandwidth one.
+//
+// Depth separates the two cleanly: about 1.6 to 2.8 fetches in flight for a
+// single reader against 21 to 28 at eight streams, so the threshold sits
+// well clear of both.
+//
+#define READ_AHEAD_ADAPT_LOADED_MAX   (PAGE_SIZE * 128)
+#define READ_AHEAD_ADAPT_LOAD_DEPTH   8
+
+//
 // Re-tunes Cc's read-ahead granularity for this file from what the reader
 // has actually been doing.
 //
@@ -222,8 +255,14 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
         vote = 1;
     }
     else if (fetched <= (consumed * READ_AHEAD_ADAPT_EARNED_RATIO) + lead &&
-             ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK)
+             ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK &&
+             BlorgStatisticsFetchesActive() >= READ_AHEAD_ADAPT_LOAD_DEPTH)
     {
+        //
+        // Sequential AND loaded. Sequential alone is not enough: a lone
+        // reader walking a file forwards also has a long streak and
+        // amplification of 1.0, and growing for it is the 3.40% case above.
+        //
         vote = -1;
     }
 
@@ -245,9 +284,21 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 
     Fcb->ReadAheadAgreement = 0;
 
+    //
+    // The configured value is where a file starts, not the range it may
+    // move in. Growth is allowed above it up to the loaded maximum,
+    // because the workload that wants a larger granule is the saturated
+    // one and it is not the one the default is chosen for. A configuration
+    // that raised the start above that maximum keeps its own value as the
+    // ceiling rather than being quietly clamped down.
+    //
+    const ULONG ceiling = (global.ReadAheadGranularity > READ_AHEAD_ADAPT_LOADED_MAX)
+        ? global.ReadAheadGranularity
+        : READ_AHEAD_ADAPT_LOADED_MAX;
+
     const ULONG next = (vote > 0)
         ? ((current > PAGE_SIZE) ? (current / 2) : PAGE_SIZE)
-        : ((current < global.ReadAheadGranularity) ? (current * 2) : global.ReadAheadGranularity);
+        : ((current < ceiling) ? (current * 2) : ceiling);
 
     if (next == current)
     {

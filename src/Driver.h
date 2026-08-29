@@ -57,68 +57,59 @@
 #include "Tls.h"
 
 //
-// Cc's read-ahead granularity for cached reads (Read.c), and now the only
-// lookahead this driver has -- the prefetch ring that used to derive its
-// slot size from this constant is gone.
+// Where Cc's read-ahead granularity starts for a cached file. It is a
+// starting value, not the answer: ReadAdaptGranularity (Read.c) moves it
+// per file object from what the reader turns out to be doing.
 //
-// 128 pages, i.e. 512 KB. Re-measured on a Release driver with Driver
-// Verifier off, 8 concurrent streams, each run bracketed by a usermode HTTP
-// client immediately before and after so network drift cannot be mistaken
-// for a result:
+// 32 pages, 128 KB. The history is worth keeping because the value moved
+// twice and the reasoning moved three times.
+//
+// It was 512 KB, chosen on eight concurrent streams with a Release driver
+// and Driver Verifier off, each run bracketed by a usermode HTTP client so
+// network drift could not be mistaken for a result:
 //
 //   granularity   ratio to usermode   avg paging read   p99
 //     256 KB           0.96               254 KB        165 ms
 //     512 KB           1.06               390 KB        208 ms
 //       1 MB           1.07               546 KB        365 ms
 //
-// 256 KB is plainly worse: the reads stay small and the driver pays the
-// per-request HTTP overhead more often for the same bytes. 1 MB matches
-// 512 KB on throughput and costs 76% on the latency tail, which for media
-// playback is the wrong trade -- a stall is what a viewer notices, and the
-// aggregate they never see.
+// An earlier version of that table came from a Debug build under full
+// Driver Verifier, where Cc clustered very differently (204-281 KB against
+// 390-546 KB here). The instrumentation was not a constant tax, it changed
+// the I/O shape. The answer survived re-measurement; the reasoning did not.
 //
-// The earlier version of this comment reached the same conclusion from a
-// measurement taken under Debug + full Driver Verifier, where Cc clustered
-// very differently (204-281 KB where this environment gives 390-546 KB).
-// The instrumentation was not a constant tax; it changed the I/O shape. The
-// answer survived re-measurement, the reasoning behind it did not.
-//
-// It did not survive the second re-measurement. Everything above is a
-// throughput comparison, and the latency column beside it is a p99 over
-// chunk fetches, not over what an application waited. Measured on what an
+// The answer did not survive the next one. Every column above is
+// throughput, and the latency beside it is a p99 over chunk fetches rather
+// than over anything an application waited for. Measured on what an
 // application waits -- reads longer than a 24 fps frame interval, which is
-// what a viewer can see -- 512 KB is the worst setting tried:
+// what a viewer can see:
 //
-//   granularity   sequential MB/s   fetch mean   reads over a frame
-//     512 KB           22.44          58.7 ms          3.40%
-//     128 KB           19.03          19.8 ms          0.345%
+//                   sequential MB/s   fetch mean   reads over a frame
+//     512 KB             22.44          58.7 ms          3.40%
+//     128 KB             19.03          19.8 ms          0.345%
 //
-// Two runs each, alternating 512/128/512/128 with a reboot per run so that
-// host drift lands on both. That interleaving is not ceremony: the same
-// 128 KB setting measured 20.2 MB/s at 0.16% earlier in one session and
-// 12.6 MB/s at 1.8% an hour later, so any A-then-B ordering attributes the
-// drift to whichever ran second. Replicates came back at 3.37/3.42% and
-// 0.34/0.35%.
+// A read stalls for as long as the fetch it is blocked on, and fetch
+// latency tracks fetch size. 58.7 ms misses a 41.67 ms frame routinely;
+// 19.8 ms almost never does.
 //
-// So the trade is a tenfold reduction in reads a viewer can see for 15% of
-// sequential throughput, and 19 MB/s is still an order of magnitude above
-// any playback bitrate this volume serves. The mechanism is not subtle:
-// a read stalls for as long as the fetch it is blocked on, and fetch
-// latency tracks fetch size -- 19.8 ms at 128 KB against 58.7 ms at 512 KB,
-// where the frame interval being missed is 41.67 ms.
+// And that inverts under load, which is why no constant is right. At eight
+// streams a 128 KB fetch takes 41.8 ms -- on the threshold -- and measures
+// 28.9% against 512 KB's 13.7%, with throughput identical at 31 MB/s. A
+// granule serves many reads, so a smaller one makes more of them wait for
+// less time each, and which way that trades depends on where fetch latency
+// sits relative to the frame. Load moves it. So this value is where a file
+// starts; the policy shrinks it on measured waste and grows it toward
+// READ_AHEAD_ADAPT_LOADED_MAX when a reader is sequential and the
+// transport is busy.
 //
-// Splitting one large fetch into concurrent smaller requests was built to
-// get both, and measured worse than not splitting at every factor tried:
-// mean fetch latency rose from 46.1 ms to 51.2 ms at four slices and to
-// 50-57 ms at two. The connection counters exclude connection churn (100%
-// pool reuse, no fresh connects, no retries, no timeouts); 51.2 ms over
-// four slices is about 12.8 ms each, which is serial. Two processors
-// cannot run four simultaneous WSK receives and HTTP parses concurrently,
-// so on this guest concurrency is not a lever and the code was removed.
-//
-// This is a starting value now rather than the answer: ReadAdaptGranularity
-// (Read.c) moves it per file object from measured amplification, so a
-// picked-at file goes below it and a dense sequential one does not.
+// Splitting one fetch into concurrent smaller requests was built to get
+// both at once and measured worse at every factor: mean fetch latency rose
+// from 46.1 ms to 51.2 ms at four slices, 50-57 ms at two. Connection
+// churn is excluded (100% pool reuse, no fresh connects, retries or
+// timeouts), and 51.2 ms over four slices is about 12.8 ms each, which is
+// serial. Two processors cannot run four simultaneous WSK receives and
+// HTTP parses at once. Removed; see README for why it will look attractive
+// again.
 //
 #define READ_AHEAD_GRANULARITY (PAGE_SIZE * 32)
 
