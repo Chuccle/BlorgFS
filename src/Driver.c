@@ -591,6 +591,15 @@ static BOOLEAN IsValidPortString(const WCHAR* Port, USHORT PortChars)
 // additionally validated as a real port number (IsValidPortString); an
 // invalid value is logged and ignored, keeping the scheme default.
 //
+// ReadAheadGranularityKb is read here too, in kilobytes, so Cc's read-ahead
+// granularity can be swept without a rebuild and redeploy per point. The
+// committed default was measured on eight concurrent streams -- a
+// throughput workload -- and never against a latency-shaped one, and
+// nothing below 256 KB was ever tried, where FastFat uses 64 KB and Cc's
+// own default is a page. Zero means do not call CcSetReadAheadGranularity
+// at all, which is the "leave it default" case and cannot be expressed by
+// any other value.
+//
 static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRING PortOut, PUNICODE_STRING HostOut)
 {
     UNICODE_STRING parametersSuffix = RTL_CONSTANT_STRING(L"\\Parameters");
@@ -629,22 +638,6 @@ static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNIC
         global.TlsEnabled = (0 != tlsEnabledValue);
     }
 
-
-    //
-    // Read-ahead granularity override, in kilobytes, for sweeping this
-    // value without a rebuild and redeploy per point.
-    //
-    // The committed default was measured on eight concurrent streams --
-    // a throughput workload -- and never against a latency-shaped one,
-    // and nothing below 256 KB was ever tried, where FastFat uses 64 KB
-    // and Cc's own default is a page. Answering that with evidence means
-    // running several points, and a registry value makes a point cost a
-    // service restart instead of a six-minute deploy.
-    //
-    // Zero means do not call CcSetReadAheadGranularity at all, which is
-    // the "leave it default" case and cannot be expressed by any other
-    // value.
-    //
     ULONG granularityKb = 0;
 
     if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"ReadAheadGranularityKb", REG_DWORD, &granularityKb, sizeof(granularityKb), &actualSize)))
