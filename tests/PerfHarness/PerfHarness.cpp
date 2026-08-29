@@ -1628,6 +1628,27 @@ static bool WriteReport(
     fprintf(f, "FetchLatencySamples=%llu\n", p.Samples);
     fprintf(f, "FetchesActive=%lld\n", stats.FetchesActive);
 
+    //
+    // The per-phase split, in the machine-readable form. The human table has
+    // printed these since they were added and the report did not, so every
+    // comparison driven off this file could see that a fetch was slow and
+    // not where the time went -- which is the difference between tuning the
+    // granule and finding out that most of a small fetch is fixed overhead.
+    //
+    fprintf(f, "FetchPhaseSamples=%llu\n", t.FetchSplitSamples);
+    fprintf(f, "FetchAcquireMeanUs=%llu\n",
+        (t.FetchSplitSamples > 0) ? (t.FetchAcquireSumUs / t.FetchSplitSamples) : 0ull);
+    fprintf(f, "FetchPreSendMeanUs=%llu\n",
+        (t.FetchSplitSamples > 0) ? (t.FetchPreSendSumUs / t.FetchSplitSamples) : 0ull);
+    fprintf(f, "FetchSendMeanUs=%llu\n",
+        (t.FetchSplitSamples > 0) ? (t.FetchSendSumUs / t.FetchSplitSamples) : 0ull);
+    fprintf(f, "FetchWaitMeanUs=%llu\n",
+        (t.FetchSplitSamples > 0) ? (t.FetchWaitSumUs / t.FetchSplitSamples) : 0ull);
+    fprintf(f, "FetchTtfbMeanUs=%llu\n",
+        (t.FetchSplitSamples > 0) ? (t.FetchTtfbSumUs / t.FetchSplitSamples) : 0ull);
+    fprintf(f, "FetchBodyMeanUs=%llu\n",
+        (t.FetchSplitSamples > 0) ? (t.FetchBodySumUs / t.FetchSplitSamples) : 0ull);
+
     for (int i = 0; i < BLORGFS_STATISTICS_LATENCY_BUCKETS; ++i)
     {
         fprintf(f, "FetchLatencyBucket%02d=%llu\n", i, t.FetchLatencyBuckets[i]);
