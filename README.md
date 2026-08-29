@@ -572,6 +572,48 @@ replicates came back at 3.37/3.42% and 0.34/0.35%, tight enough to decide
 on, which none of the earlier ordered runs were. The reversal controls used
 before this protected against dataset bias and did nothing about drift.
 
+### Why the trade exists at all: 35% of a fetch is our own overhead
+
+Everything above tunes *around* per-fetch cost. A large granule is only
+better because it amortises a fixed cost over more bytes, so the size of
+that fixed cost decides how sharp the trade is. Measured, most of it is
+ours.
+
+Decomposing a fetch (`FetchTtfb*`, `FetchBody*`, now in `--report`) against
+the same backend, from the same guest, with a usermode HTTP client doing
+128 KB keep-alive range GETs beside it:
+
+| per fetch | driver, 196 KB avg | usermode, same bytes |
+|---|---|---|
+| ttfb | 10.10 ms | 5.33 ms |
+| of which send | 0.88 ms | ~0 |
+| of which wait on peer | 9.21 ms | |
+| body transfer | 9.52 ms | ~7.5 ms |
+| **total** | **19.61 ms** | **~12.8 ms** |
+
+The driver's own measurable work is 12 us -- socket acquire 6 us, request
+build 6 us -- so none of the gap is there. It is concentrated before the
+first byte arrives: 1.9x on ttfb against 1.27x on transfer. The backend is
+the same in both columns, so the extra is this driver's path to posting a
+receive and observing the response, not the server thinking.
+
+**That is where "no regression on every workload" is, and it is not in the
+granule.** At usermode parity a 196 KB fetch would cost about 12.8 ms
+instead of 19.6, which at the measured pipeline depth of ~2.7 is roughly 41
+MB/s -- above what 512 KB achieves today -- while leaving every fetch far
+inside the 41.67 ms frame budget, which is what the tail is made of. The
+trade between throughput and stalls exists because fetches are expensive; it
+shrinks as they get cheaper and would not need arbitrating at parity.
+
+Candidates, in the order the measurement points at them: the receive is
+posted only after the send completes, which adds a scheduling hop on a
+two-processor guest; a fetch costs four pool allocations (context, receive
+buffer, request buffer, encoded path) plus an IRP and an MDL per socket
+operation; and the 0.88 ms send of a ~200 byte request is itself an order of
+magnitude more than it should be. None of that has been attempted -- it is
+recorded here because tuning the granule further is optimising the wrong
+term.
+
 ### Splitting the fetch: built, measured, removed
 
 Splitting one large fetch into concurrent range requests over partial MDLs
