@@ -598,7 +598,15 @@ static BOOLEAN IsValidPortString(const WCHAR* Port, USHORT PortChars)
 // nothing below 256 KB was ever tried, where FastFat uses 64 KB and Cc's
 // own default is a page. Zero means do not call CcSetReadAheadGranularity
 // at all, which is the "leave it default" case and cannot be expressed by
-// any other value.
+// any other value -- and note that Cc's default is PAGE_SIZE, a constant,
+// not an adaptive policy, so zero is the smallest setting rather than the
+// absence of one.
+//
+// Anything else is rejected unless it is a power of two of at least
+// PAGE_SIZE, which is what ntifs.h states the granularity must be. The
+// value reaches Cc unexamined otherwise, and a plausible-looking 100 KB
+// would hand it a number it does not accept; a sweep is exactly where
+// someone types one.
 //
 static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRING PortOut, PUNICODE_STRING HostOut)
 {
@@ -642,8 +650,19 @@ static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICO
 
     if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadGranularityKb", REG_DWORD, &granularityKb, sizeof(granularityKb), &actualSize)))
     {
-        global.ReadAheadGranularity = granularityKb * 1024;
-        BLORGFS_LOG("DriverReadRegistryConfig() - read-ahead granularity override: %lu KB\n", granularityKb);
+        const ULONG granularity = granularityKb * 1024;
+
+        if (0 == granularity ||
+            (granularity >= PAGE_SIZE && 0 == (granularity & (granularity - 1))))
+        {
+            global.ReadAheadGranularity = granularity;
+            BLORGFS_LOG("DriverReadRegistryConfig() - read-ahead granularity override: %lu KB\n", granularityKb);
+        }
+        else
+        {
+            BLORGFS_LOG("DriverReadRegistryConfig() - ignoring ReadAheadGranularityKb=%lu: "
+                "granularity must be zero or a power of two at least PAGE_SIZE\n", granularityKb);
+        }
     }
 
     UCHAR pinValue[TLS_HASH_LEN];
