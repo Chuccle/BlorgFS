@@ -560,12 +560,11 @@ TEST_F(ReadTest, CachedReadMissWithWaitReachesFsdPostRequest)
 // contract is that a non-STATUS_PENDING return means the callback never
 // ran, so nothing downstream will ever terminate the fetch just counted.
 //
-// The gauge is the sharp end. FetchesIssued outrunning
-// FetchesCompleted + FetchesFailed only produces a note from
-// Compare-BlorgMetrics.ps1 ("in flight at sample time?"), but
-// FetchesActive is a gauge with nothing to reset it, so every unsettled
-// issue ratchets it -- and FetchesActivePeak -- up for the life of the
-// load, quietly poisoning the concurrency numbers the perf tier reports.
+// In-flight depth is derived from exactly this difference rather than
+// tracked in a gauge, so an issue that never settles does not merely
+// produce a note from Compare-BlorgMetrics.ps1 ("in flight at sample
+// time?") -- it makes the reported depth wrong for the life of the load,
+// since nothing else will ever bring the two counters back level.
 //
 // A NOCACHE paging read with no MDL is the deterministic way to reach a
 // synchronous failure: BlorgHttpGetFileMdl refuses a null TargetMdl
@@ -573,8 +572,6 @@ TEST_F(ReadTest, CachedReadMissWithWaitReachesFsdPostRequest)
 //
 TEST_F(ReadTest, DirectFetchThatFailsToIssueSettlesItsOwnAccounting)
 {
-    InterlockedExchange64(&BlorgStatisticsGauges.FetchesActive, 0);
-    InterlockedExchange64(&BlorgStatisticsGauges.FetchesActivePeak, 0);
     BlorgStatisticsReset();
 
     ReadRequest* req = PrepareRead(Fcb, 0, 4096, IRP_PAGING_IO | IRP_NOCACHE, 0, nullptr);
@@ -589,11 +586,11 @@ TEST_F(ReadTest, DirectFetchThatFailsToIssueSettlesItsOwnAccounting)
 
     Drain();
 
-    EXPECT_EQ(0, ReadNoFence64(&BlorgStatisticsGauges.FetchesActive))
-        << "the in-flight gauge was raised for a fetch that never went out and never will";
-
     BLORGFS_STATISTICS_RESPONSE response;
     BlorgStatisticsQuery(&response);
+
+    EXPECT_EQ(0, response.FetchesActive)
+        << "in-flight was left raised for a fetch that never went out and never will";
 
     EXPECT_EQ(response.Totals.FetchesIssued, response.Totals.FetchesCompleted + response.Totals.FetchesFailed)
         << "every issued fetch must terminate as completed or failed";

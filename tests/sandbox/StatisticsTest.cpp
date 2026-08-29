@@ -68,13 +68,11 @@ protected:
         // A clean window for every test, through the real Reset() path
         // rather than a test-only shortcut, without touching the table
         // allocation or ProcessorCount the environment already set up.
-        // Reset() deliberately leaves the gauges alone (see Statistics.c),
-        // so they are zeroed here instead -- otherwise a gauge left
-        // nonzero by one test would leak into the next.
+        // Reset() now clears everything a test can observe, in-flight
+        // depth included, because that depth is derived from the counters
+        // it zeroes rather than held beside them.
         //
         BlorgStatisticsReset();
-        InterlockedExchange64(&BlorgStatisticsGauges.FetchesActive, 0);
-        InterlockedExchange64(&BlorgStatisticsGauges.FetchesActivePeak, 0);
 
         Block = BlorgStatisticsForCurrentProcessor();
         ASSERT_NE(nullptr, Block);
@@ -195,36 +193,66 @@ TEST_F(StatisticsTest, QueryReflectsDirectCounterIncrements)
     EXPECT_EQ(1u, response.Totals.CreateHits);
 }
 
-TEST_F(StatisticsTest, QueryReportsGaugesDirectlyRatherThanSummingThem)
+//
+// In-flight is derived, not tracked, so the thing to pin is that the
+// derivation is the difference of the monotone counters and not, say, a
+// sum of them. Two issued and one settled is one in flight.
+//
+TEST_F(StatisticsTest, InFlightIsIssuedMinusSettled)
 {
-    BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.FetchesActive, &BlorgStatisticsGauges.FetchesActivePeak);
-    BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.FetchesActive, &BlorgStatisticsGauges.FetchesActivePeak);
+    BLORGFS_STAT_INC(FetchesIssued);
+    BLORGFS_STAT_INC(FetchesIssued);
+    BLORGFS_STAT_INC(FetchesCompleted);
 
     BLORGFS_STATISTICS_RESPONSE response;
     BlorgStatisticsQuery(&response);
 
-    EXPECT_EQ(2, response.Gauges.FetchesActive);
-    EXPECT_EQ(2, response.Gauges.FetchesActivePeak);
+    EXPECT_EQ(1, response.FetchesActive);
+}
+
+//
+// A failed fetch settles its issue as surely as a completed one, and
+// counting only completions would leave the derived depth permanently
+// high on any load that sees a failure.
+//
+TEST_F(StatisticsTest, InFlightCountsAFailedFetchAsSettled)
+{
+    BLORGFS_STAT_INC(FetchesIssued);
+    BLORGFS_STAT_INC(FetchesFailed);
+
+    BLORGFS_STATISTICS_RESPONSE response;
+    BlorgStatisticsQuery(&response);
+
+    EXPECT_EQ(0, response.FetchesActive);
 }
 
 ///////////////////////////////////////////////////////////////////////////
 // Reset
 ///////////////////////////////////////////////////////////////////////////
 
-TEST_F(StatisticsTest, ResetZeroesCountersButPreservesLiveGauges)
+//
+// Reset clears the counters, and in-flight goes with them because it is
+// derived from them rather than held separately.
+//
+// That is a real behaviour change from the gauge this replaced, which
+// survived a reset deliberately so a window opened mid-load did not report
+// a negative depth. The derived form cannot go negative -- the difference
+// is clamped at zero -- and a fetch outstanding across a reset now settles
+// into a window that never saw it issued, which reads as zero rather than
+// as a phantom. Zero is the honest answer for a window that did not
+// observe the issue.
+//
+TEST_F(StatisticsTest, ResetZeroesCountersAndTheDepthDerivedFromThem)
 {
     BLORGFS_STAT_ADD(FetchBytes, 999);
-
-    BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.FetchesActive, &BlorgStatisticsGauges.FetchesActivePeak);
-    BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.FetchesActive, &BlorgStatisticsGauges.FetchesActivePeak);
-    BlorgStatisticsGaugeIncrement(&BlorgStatisticsGauges.FetchesActive, &BlorgStatisticsGauges.FetchesActivePeak);
-    BlorgStatisticsGaugeDecrement(&BlorgStatisticsGauges.FetchesActive); // depth 3 -> 2, peak stays 3
+    BLORGFS_STAT_INC(FetchesIssued);
+    BLORGFS_STAT_INC(FetchesIssued);
+    BLORGFS_STAT_INC(FetchesCompleted);
 
     BLORGFS_STATISTICS_RESPONSE before;
     BlorgStatisticsQuery(&before);
     ASSERT_EQ(999u, before.Totals.FetchBytes);
-    ASSERT_EQ(2, before.Gauges.FetchesActive);
-    ASSERT_EQ(3, before.Gauges.FetchesActivePeak);
+    ASSERT_EQ(1, before.FetchesActive);
 
     BlorgStatisticsReset();
 
@@ -232,11 +260,25 @@ TEST_F(StatisticsTest, ResetZeroesCountersButPreservesLiveGauges)
     BlorgStatisticsQuery(&after);
 
     EXPECT_EQ(0u, after.Totals.FetchBytes);
-    EXPECT_EQ(2, after.Gauges.FetchesActive)
-        << "FetchesActive is a live in-flight gauge -- Reset must not clear it";
-    EXPECT_EQ(2, after.Gauges.FetchesActivePeak)
-        << "Reset restarts the peak from the CURRENT depth, not zero";
+    EXPECT_EQ(0, after.FetchesActive)
+        << "depth is derived from the counters the reset just cleared";
     EXPECT_GT(after.EpochQpc, before.EpochQpc) << "Reset must restamp the epoch to start a fresh window";
+}
+
+//
+// Settled outrunning issued would make the subtraction wrap into an
+// enormous positive depth, which is exactly the shape a reset mid-load
+// produces.
+//
+TEST_F(StatisticsTest, InFlightClampsRatherThanWrappingWhenSettledLeadsIssued)
+{
+    BLORGFS_STAT_INC(FetchesCompleted);
+    BLORGFS_STAT_INC(FetchesCompleted);
+
+    BLORGFS_STATISTICS_RESPONSE response;
+    BlorgStatisticsQuery(&response);
+
+    EXPECT_EQ(0, response.FetchesActive);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -498,47 +540,6 @@ TEST_F(StatisticsTest, RecordLatencyIgnoresANegativeElapsedSample)
     EXPECT_EQ(111u, sum) << "a negative elapsed sample (clock went backward) must be a no-op";
     EXPECT_EQ(222u, max);
     EXPECT_EQ(5u, buckets[3]);
-}
-
-///////////////////////////////////////////////////////////////////////////
-// Gauge peak tracking
-///////////////////////////////////////////////////////////////////////////
-
-TEST(StatisticsGaugeTest, IncrementTracksPeakOnlyWhenCurrentExceedsIt)
-{
-    LONG64 gauge = 0;
-    LONG64 peak = 0;
-
-    BlorgStatisticsGaugeIncrement(&gauge, &peak);
-    EXPECT_EQ(1, gauge);
-    EXPECT_EQ(1, peak);
-
-    BlorgStatisticsGaugeIncrement(&gauge, &peak);
-    EXPECT_EQ(2, gauge);
-    EXPECT_EQ(2, peak);
-
-    BlorgStatisticsGaugeDecrement(&gauge);
-    EXPECT_EQ(1, gauge);
-    EXPECT_EQ(2, peak) << "a decrement must never lower the high-water mark";
-
-    BlorgStatisticsGaugeIncrement(&gauge, &peak); // back to 2, a depth already seen
-    EXPECT_EQ(2, gauge);
-    EXPECT_EQ(2, peak) << "returning to a depth already seen must not disturb the peak";
-
-    BlorgStatisticsGaugeIncrement(&gauge, &peak); // 3, a new high
-    EXPECT_EQ(3, gauge);
-    EXPECT_EQ(3, peak);
-}
-
-TEST(StatisticsGaugeTest, IncrementToleratesNullPeak)
-{
-    LONG64 gauge = 0;
-
-    BlorgStatisticsGaugeIncrement(&gauge, nullptr);
-    BlorgStatisticsGaugeIncrement(&gauge, nullptr);
-    BlorgStatisticsGaugeDecrement(&gauge);
-
-    EXPECT_EQ(1, gauge);
 }
 
 } // namespace

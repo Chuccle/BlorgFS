@@ -144,6 +144,27 @@ _Dispatch_type_(IRP_MJ_CREATE)                   DRIVER_DISPATCH BlorgCreate;
 
 _Dispatch_type_(IRP_MJ_CLOSE)                    DRIVER_DISPATCH BlorgClose;
 _Dispatch_type_(IRP_MJ_READ)                     DRIVER_DISPATCH BlorgRead;
+
+//
+// FastIoRead, wrapping FsRtlCopyRead so the read a caller actually waited
+// on can be timed.
+//
+// Nearly every application read of a cached file arrives here and never
+// becomes an IRP at all -- measured, a 780-read playback produced one
+// IRP_MJ_READ, the first, taken before the cache map existed. Timing only
+// the IRP path therefore measures almost nothing an application does.
+//
+// Spelled out rather than declared as FAST_IO_READ: the usermode sandbox
+// compiles this header against NtShim.h, which has no such typedef.
+BOOLEAN BlorgFastIoRead(
+    PFILE_OBJECT FileObject,
+    PLARGE_INTEGER FileOffset,
+    ULONG Length,
+    BOOLEAN Wait,
+    ULONG LockKey,
+    PVOID Buffer,
+    PIO_STATUS_BLOCK IoStatus,
+    PDEVICE_OBJECT DeviceObject);
 _Dispatch_type_(IRP_MJ_WRITE)                    DRIVER_DISPATCH BlorgWrite;
 _Dispatch_type_(IRP_MJ_QUERY_INFORMATION)        DRIVER_DISPATCH BlorgQueryInformation;
 _Dispatch_type_(IRP_MJ_SET_INFORMATION)          DRIVER_DISPATCH BlorgSetInformation;
@@ -201,6 +222,14 @@ extern struct GLOBAL
 
     CACHE_MANAGER_CALLBACKS CacheManagerCallbacks; // Cc lazy-write/read-ahead callback table
     PVOID LazyWriteThread;                     // thread pointer Cc supplies to lazy-write callbacks
+
+    //
+    // Cc read-ahead granularity actually in force, in bytes. Defaults to
+    // READ_AHEAD_GRANULARITY and is overridden by the
+    // ReadAheadGranularityKb registry value; zero means leave Cc's own
+    // default alone and never call CcSetReadAheadGranularity.
+    //
+    ULONG ReadAheadGranularity;
 
     //
     //  A single self-relative security descriptor handed out (in the

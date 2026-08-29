@@ -811,6 +811,12 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
         if (PathCacheExists == pc)
         {
+            //
+            // FAT_STATISTICS calls this a create hit: answered from
+            // what the driver already had, with no request to the
+            // backend.
+            //
+            BLORGFS_STAT_INC(CreateHits);
             BLORGFS_LOG("Create path-cache HIT (exists): %wZ\n", &filePath.String);
             dirEntInfo = cached;
             haveDirEntInfo = TRUE;
@@ -858,6 +864,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                 {
                     if (FindEntryByName(listing, &leaf, &dirEntInfo))
                     {
+                        BLORGFS_STAT_INC(CreateHits);
                         BLORGFS_LOG("Create listing HIT (exists): %wZ\n", &filePath.String);
                         BlorgPathCacheInsertExists(&filePath.String, &dirEntInfo);
                         haveDirEntInfo = TRUE;
@@ -1173,6 +1180,21 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             result = BlorgVolumeCreate(Irp, irpSp, DeviceObject);
             if (STATUS_PENDING != result)
             {
+                //
+                // Counted here rather than at each return inside
+                // BlorgVolumeCreate: this is the one place a create's
+                // final status is known, and a create that pends is
+                // counted by whichever completion finishes it.
+                //
+                if (NT_SUCCESS(result))
+                {
+                    BLORGFS_STAT_INC(SuccessfulCreates);
+                }
+                else
+                {
+                    BLORGFS_STAT_INC(FailedCreates);
+                }
+
                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
             break;

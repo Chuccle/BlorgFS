@@ -2592,13 +2592,33 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
             NULL,
             Ctx->HeadersQpc - Ctx->IssueQpc);
 
+        const LONG64 completedQpc = BlorgStatisticsNow();
+
         BlorgStatisticsRecordLatency(
             &statsBlock->FetchBodySumUs,
             &statsBlock->FetchBodyMaxUs,
             NULL,
-            BlorgStatisticsNow() - Ctx->HeadersQpc);
+            completedQpc - Ctx->HeadersQpc);
 
         statsBlock->FetchSplitSamples++;
+
+        //
+        // File this fetch if it ran long. The threshold lives inside the
+        // call, so the phases are computed once here for both the sums
+        // above and the outlier record, rather than twice.
+        //
+        BlorgStatisticsRecordSlowFetch(
+            completedQpc - Ctx->IssueQpc,
+            (0 != Ctx->SocketQpc)
+                ? Ctx->SocketQpc - Ctx->IssueQpc : 0,
+            (0 != Ctx->SendDoneQpc && 0 != Ctx->SendQpc)
+                ? Ctx->SendDoneQpc - Ctx->SendQpc : 0,
+            (0 != Ctx->SendDoneQpc)
+                ? Ctx->HeadersQpc - Ctx->SendDoneQpc : 0,
+            Ctx->HeadersQpc - Ctx->IssueQpc,
+            completedQpc - Ctx->HeadersQpc,
+            Ctx->ExpectedContentLength,
+            C_CAST(BOOLEAN, HttpConnectionFresh != Ctx->ConnectionSource));
     }
 
     if (statsBlock && HttpOpFileRead != Ctx->Operation)
