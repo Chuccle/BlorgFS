@@ -83,7 +83,44 @@
 // The instrumentation was not a constant tax; it changed the I/O shape. The
 // answer survived re-measurement, the reasoning behind it did not.
 //
-#define READ_AHEAD_GRANULARITY (PAGE_SIZE * 128)
+// It did not survive the second re-measurement. Everything above is a
+// throughput comparison, and the latency column beside it is a p99 over
+// chunk fetches, not over what an application waited. Measured on what an
+// application waits -- reads longer than a 24 fps frame interval, which is
+// what a viewer can see -- 512 KB is the worst setting tried:
+//
+//   granularity   sequential MB/s   fetch mean   reads over a frame
+//     512 KB           22.44          58.7 ms          3.40%
+//     128 KB           19.03          19.8 ms          0.345%
+//
+// Two runs each, alternating 512/128/512/128 with a reboot per run so that
+// host drift lands on both. That interleaving is not ceremony: the same
+// 128 KB setting measured 20.2 MB/s at 0.16% earlier in one session and
+// 12.6 MB/s at 1.8% an hour later, so any A-then-B ordering attributes the
+// drift to whichever ran second. Replicates came back at 3.37/3.42% and
+// 0.34/0.35%.
+//
+// So the trade is a tenfold reduction in reads a viewer can see for 15% of
+// sequential throughput, and 19 MB/s is still an order of magnitude above
+// any playback bitrate this volume serves. The mechanism is not subtle:
+// a read stalls for as long as the fetch it is blocked on, and fetch
+// latency tracks fetch size -- 19.8 ms at 128 KB against 58.7 ms at 512 KB,
+// where the frame interval being missed is 41.67 ms.
+//
+// Splitting one large fetch into concurrent smaller requests was built to
+// get both, and measured worse than not splitting at every factor tried:
+// mean fetch latency rose from 46.1 ms to 51.2 ms at four slices and to
+// 50-57 ms at two. The connection counters exclude connection churn (100%
+// pool reuse, no fresh connects, no retries, no timeouts); 51.2 ms over
+// four slices is about 12.8 ms each, which is serial. Two processors
+// cannot run four simultaneous WSK receives and HTTP parses concurrently,
+// so on this guest concurrency is not a lever and the code was removed.
+//
+// This is a starting value now rather than the answer: ReadAdaptGranularity
+// (Read.c) moves it per file object from measured amplification, so a
+// picked-at file goes below it and a dense sequential one does not.
+//
+#define READ_AHEAD_GRANULARITY (PAGE_SIZE * 32)
 
 #include "Structs.h"
 #include "Util.h"

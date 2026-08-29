@@ -474,6 +474,44 @@ VOID ShimReleaseIrpMdl(PIRP Irp)
     Irp->MdlAddress = NULL;
 }
 
+VOID IoBuildPartialMdl(PMDL SourceMdl, PMDL TargetMdl, PVOID VirtualAddress, ULONG Length)
+{
+    if (!SourceMdl || !TargetMdl)
+    {
+        KmReportViolation(KmViolationLifetime, "IoBuildPartialMdl with a NULL MDL");
+        return;
+    }
+
+    const unsigned char* sourceStart = (const unsigned char*)SourceMdl->Base;
+    const unsigned char* sliceStart = (const unsigned char*)VirtualAddress;
+
+    ULONG length = Length;
+
+    if (0 == length)
+    {
+        length = (ULONG)(SourceMdl->Length - (SIZE_T)(sliceStart - sourceStart));
+    }
+
+    if (sliceStart < sourceStart ||
+        (sliceStart + length) > (sourceStart + SourceMdl->Length))
+    {
+        KmReportViolation(KmViolationLifetime,
+            "IoBuildPartialMdl slice falls outside the source MDL -- the partial would "
+            "describe pages this request never locked");
+        return;
+    }
+
+    TargetMdl->Base = VirtualAddress;
+    TargetMdl->Length = length;
+
+    //
+    // Deliberately not marked Locked: a partial MDL borrows the source's
+    // page locks and must be freed with IoFreeMdl alone. Marking it would
+    // make the free look like a leak of a locked MDL.
+    //
+    TargetMdl->Locked = FALSE;
+}
+
 VOID IoFreeMdl(PMDL Mdl)
 {
     if (!Mdl)

@@ -7,14 +7,12 @@
 //
 
 //
-//  READ_AHEAD_GRANULARITY (Driver.h) is Cc's read-ahead granularity for
-//  cached reads. Cc's default heuristics are tuned for local disk seek
-//  costs, not for a backend where every miss is an HTTP round trip; left
-//  unset, Cc under-fetches relative to what one Range GET can profitably
-//  return. 256 KB matches HTTP_FILE_INITIAL_RECV_CAPACITY (Client.c) so a
-//  read-ahead-sized fetch doesn't immediately trigger a buffer regrow on
-//  the first response. See Driver.h for why it now sits at 512 KB and why
-//  larger values were measured and rejected.
+//  READ_AHEAD_GRANULARITY (Driver.h) is where Cc's read-ahead granularity
+//  starts for a cached file; ReadAdaptGranularity below moves it per file
+//  from what the reader turns out to be doing. Left unset entirely, Cc's
+//  own default is PAGE_SIZE -- a constant, not a policy -- which
+//  under-fetches badly against a backend where every miss is an HTTP round
+//  trip. See Driver.h for why the starting value is what it is.
 //
 
 //
@@ -884,6 +882,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     BLORGFS_PRINT("Cached Read could not wait\n");
                     return BlorgFsdPostRequest(Irp, IrpSp);
                 }
+
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {

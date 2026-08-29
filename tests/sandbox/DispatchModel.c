@@ -1,4 +1,4 @@
-//
+﻿//
 // The kernel surface the IRP dispatch translation units call out to.
 //
 // Everything here is modelled only as far as a dispatch test can observe
