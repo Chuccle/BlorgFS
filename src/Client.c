@@ -3074,7 +3074,7 @@ NTSTATUS BlorgHttpGetFileMdl(
 // Frees a PDIRECTORY_INFO returned via BlorgHttpGetDirectoryInfo's
 // completion callback.
 //
-void BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
+VOID BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
 {
     if (DirInfo)
     {
@@ -3086,7 +3086,7 @@ void BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
 // Frees a FILE_BUFFER's BaseAddress from a buffer-mode BlorgHttpGetFile
 // completion. No-op for zero-copy (MDL) reads, where BaseAddress is NULL.
 //
-void BlorgFreeHttpFile(PFILE_BUFFER FileBuffer)
+VOID BlorgFreeHttpFile(PFILE_BUFFER FileBuffer)
 {
     if (FileBuffer && FileBuffer->BaseAddress)
     {
@@ -3104,7 +3104,7 @@ NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRI
 }
 
 // Thin wrapper over BlorgFreeWskAddrInfo; frees results from BlorgGetHttpAddrInfo.
-void BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo)
+VOID BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo)
 {
     BlorgFreeWskAddrInfo(AddrInfo);
 }
@@ -3113,7 +3113,7 @@ void BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo)
 // Thin wrapper over BlorgInitialiseWskClient; driver-load-time setup of the WSK
 // transport this client runs on.
 //
-NTSTATUS BlorgInitialiseHttpClient(void)
+NTSTATUS BlorgInitialiseHttpClient(VOID)
 {
     KeInitializeEvent(&HttpDrainEvent, NotificationEvent, FALSE);
 
@@ -3132,7 +3132,7 @@ NTSTATUS BlorgInitialiseHttpClient(void)
 // request may still queue an IO work item against
 // global.FileSystemDeviceObject.
 //
-VOID BlorgDrainHttpClient(void)
+VOID BlorgDrainHttpClient(VOID)
 {
     HttpReleaseActive();
 
@@ -3143,7 +3143,7 @@ VOID BlorgDrainHttpClient(void)
 // Thin wrapper over BlorgCleanupWskClient; driver-unload-time teardown of the
 // WSK transport.
 //
-void BlorgCleanupHttpClient(void)
+VOID BlorgCleanupHttpClient(VOID)
 {
     BlorgCleanupWskClient();
 }

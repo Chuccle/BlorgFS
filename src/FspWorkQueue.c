@@ -380,7 +380,7 @@ NTSTATUS BlorgPrePostIrp(
 //  safely rather than corrupting memory when run in the wrong context.
 //
 
-void BlorgOplockPrePostIrp(PVOID Context, PIRP Irp)
+VOID BlorgOplockPrePostIrp(PVOID Context, PIRP Irp)
 {
     BlorgPrePostIrp(Context, Irp);
 
@@ -503,7 +503,7 @@ Return Value:
 // callback has no such return path, so it completes the IRP itself, with the
 // status its siblings hand back for exactly this condition.
 //
-void BlorgOplockComplete(PVOID Context, PIRP Irp)
+VOID BlorgOplockComplete(PVOID Context, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Context);
 
@@ -577,7 +577,7 @@ static void StopWorkQueueThreads(ULONG ThreadCount)
 // by the driver load/unload path, but if that changes we internally
 // synchronise.
 //
-NTSTATUS BlorgCreateWorkQueue(void)
+NTSTATUS BlorgCreateWorkQueue(VOID)
 {
     if (InterlockedCompareExchange(&FspQueue.ThreadsActive, TRUE, FALSE))
     {
@@ -643,7 +643,7 @@ NTSTATUS BlorgCreateWorkQueue(void)
 // result, and cancelling it here is the one path where no handler pass
 // will ever consume it.
 //
-void BlorgDestroyWorkQueue(void)
+VOID BlorgDestroyWorkQueue(VOID)
 {
     StopWorkQueueThreads(FspQueue.ThreadCount);
 

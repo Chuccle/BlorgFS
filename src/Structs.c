@@ -267,7 +267,7 @@ while(0)
 // ccb->Entries is a borrowed pointer into the DCB's CachedListing (owned
 // and freed by the DCB), so it is NOT freed here.
 //
-void BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject)
+VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     switch (GET_NODE_TYPE(Context))
     {
@@ -734,15 +734,14 @@ NTSTATUS BlorgNodeTableInit(PDEVICE_OBJECT VolumeDeviceObject)
 // FreeFileContextTree immediately after) and resets the buckets. Runs at
 // PASSIVE after the FSP queue is drained, so no new pushes can race it.
 //
+// Teardown latches under the same lock the kicks claim through, so a kick
+// running after that section observes ShuttingDown set and rolls back, and
+// nothing can queue the work item this function is about to free. See
+// NODE_REAP_STATE for why that pairing lives under the lock rather than in
+// fence reasoning.
+//
 VOID BlorgNodeTableTeardown(VOID)
 {
-    //
-    // Latch teardown under the same lock the kicks claim through: a kick
-    // that runs after this section observes ShuttingDown set and rolls
-    // back, so nothing can queue the work item this function is about to
-    // free. (See NODE_REAP_STATE for why the pairing lives under the
-    // lock rather than in fence reasoning.)
-    //
     if (NodeReap.ShuttingDown)
     {
         return;
@@ -800,7 +799,7 @@ VOID BlorgNodeTableTeardown(VOID)
 // NodeTableTryRetire makes the count checks atomic against the lock-free
 // open path.
 //
-void BlorgReapEmptyAncestorDcbs(PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject)
+VOID BlorgReapEmptyAncestorDcbs(PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     while ((BLORGFS_DCB_SIGNATURE == GET_NODE_TYPE(Dcb)) &&
            IsListEmpty(&Dcb->ChildrenList) &&
@@ -835,6 +834,16 @@ void BlorgReapEmptyAncestorDcbs(PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObjec
 // so a push is either visible to the recheck or the pusher's own kick
 // call (made after its locked push) finds the gate free and queues the
 // worker itself. No push can be missed by both.
+//
+// The tail is a gate-clear and recheck under the reap lock. Pushes publish
+// List.Next under that same lock, so a push landing before this section is
+// visible to the recheck, and one landing after finds Queued clear and
+// queues the worker through its own kick. The baton is what replaces the
+// previous barrier argument for two bare operations.
+//
+// That tail takes KeEnterCriticalRegion of its own: FsRtlExitFileSystem
+// above has already released the dispatch region, and NodeReapKick's own
+// push-lock acquisition needs the <= APC guarantee.
 //
 static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 {
@@ -898,17 +907,6 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
         FsRtlExitFileSystem();
     }
 
-    //
-    // Gate-clear and recheck under the reap lock: pushes publish List.Next
-    // under this same lock, so a push that landed before this section is
-    // visible to the recheck, and one that lands after finds Queued clear
-    // and queues the worker through its own kick. (The previous barrier
-    // argument for these two bare operations is what the baton replaces.)
-    //
-    // KeEnterCriticalRegion of its own: FsRtlExitFileSystem above already
-    // released the dispatch region, and NodeReapKick's own push-lock
-    // acquisition needs the <=APC guarantee.
-    //
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&NodeReap.Lock);
     NodeReap.Queued = FALSE;
