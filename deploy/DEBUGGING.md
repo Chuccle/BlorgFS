@@ -119,6 +119,24 @@ problem and was not.
   on the same guest. Each attempt strands a `cmd.exe` in the guest, so a
   pile of them is a symptom of this and not of anything else. **Drive the
   guest with `powershell.exe` only.**
+
+  It does not always hang: it also returns **exit 1** on a completely
+  healthy guest, for both `cmd.exe /c exit 0` and `cmd.exe /c ver`, while
+  `powershell.exe -Command 'exit 0'` returns 0 in the same second. That
+  makes `cmd.exe` uniquely bad as a *health probe*, which is the one job it
+  looks perfect for: the probe reports every guest as dead, and any
+  recovery escalation behind it then fires against a guest that was fine.
+  On 2026-08-29 a sweep did exactly that, hard-resetting a working VM and
+  producing a black console that was then read as evidence of a driver
+  hang. The rule above already said not to do this.
+- **`shutdown /r /t 0` never returns through `runProgramInGuest`.**
+  `runProgramInGuest` blocks until the guest program exits, and with `/t 0`
+  the OS tears the process down before it can exit, so vmrun waits forever
+  on a status that will never arrive. The guest reboots normally and sits
+  there idle while the host-side script hangs -- twelve minutes of apparent
+  "slow measurement" that was one stuck call. Use **`shutdown /r /t 5`**:
+  `shutdown.exe` schedules and returns, PowerShell exits, vmrun returns,
+  and the reboot fires afterwards.
 - **Pass scripts as files, not as `-Command` strings.** Bash mangles `$_`
   and `$($...)` before PowerShell ever sees them, which silently corrupts
   the script — the usual symptom is an empty output file rather than an
