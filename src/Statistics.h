@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 //
 // Always-on filesystem statistics.
@@ -446,7 +446,7 @@ typedef struct _BLORGFS_STATISTICS_RESPONSE
 //  routes any IOCTL whose CTL_CODE device type is FILE_DEVICE_FILE_SYSTEM
 //  as IRP_MJ_FILE_SYSTEM_CONTROL (an FSCTL) instead of
 //  IRP_MJ_DEVICE_CONTROL, regardless of driver intent, so these would
-//  never reach BlorgFsdoDeviceControl -- they would fall into FsCtrl.c's
+//  never reach DevIoCtrlFsdo -- they would fall into FsCtrl.c's
 //  unhandled-FSCTL default and return STATUS_INVALID_DEVICE_REQUEST every
 //  time, which is exactly the failure this shape produced before the
 //  device type was corrected.

@@ -410,7 +410,7 @@ static NTSTATUS EnumerateDirectoryEntries(
 //  already belongs to the DCB cache (freed at DCB teardown), so the
 //  query is simply failed.
 //
-static VOID BlorgDirComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID CallerContext)
+static VOID DirCtrlComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID CallerContext)
 {
     PIRP irp = CallerContext;
 
@@ -468,7 +468,7 @@ static VOID BlorgDirComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Cal
 // package; this volume is read-only so notifications are never fired,
 // only completed at handle cleanup).
 //
-// On the NET_DONE second pass, BlorgDirComplete has already cached the
+// On the NET_DONE second pass, DirCtrlComplete has already cached the
 // listing on the DCB, so the fetch is skipped and enumeration runs
 // directly; queries on other handles to the same directory reuse that
 // cache too. The CCB is re-checked for a pattern/MATCH_ALL after
@@ -483,11 +483,11 @@ static VOID BlorgDirComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Cal
 // this directory) is reused directly with no round trip and no NET_DONE
 // second pass. The ERESOURCE cannot be held across the async completion
 // (it runs on a different thread), so it is released before issuing;
-// BlorgDirComplete caches the listing on the DCB and re-queues this IRP
+// DirCtrlComplete caches the listing on the DCB and re-queues this IRP
 // with NET_DONE set. The fetch depends only on dcb->FullPath, so it is
 // hoisted out of both pattern branches above. ccb->Entries then points
 // at the DCB's shared cached listing (populated by an earlier query on
-// a hit, or by BlorgDirComplete on the NET_DONE pass); if still NULL,
+// a hit, or by DirCtrlComplete on the NET_DONE pass); if still NULL,
 // there is nothing to enumerate and it is never dereferenced.
 //
 // The fetch-issuing check below is gated on !dcb->CachedListing alone,
@@ -499,7 +499,7 @@ static VOID BlorgDirComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Cal
 // is wrong; NULL only ever means "not fetched yet", never "empty" (an
 // empty directory still publishes a real zero-count DIRECTORY_INFO).
 // Issuing a second fetch here in that race is redundant but not unsafe:
-// BlorgDirComplete already discards whichever of two racing fetches
+// DirCtrlComplete already discards whichever of two racing fetches
 // loses the publish (see its own comment), the same protection this
 // leans on for two different handles racing the same DCB.
 //
@@ -508,7 +508,7 @@ static VOID BlorgDirComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Cal
 // the IRP pending. This volume is read-only and never changes, so
 // FsRtlNotifyFullReportChange is never called -- the IRP simply waits
 // until the handle is cleaned up (FsRtlNotifyCleanup in
-// BlorgVolumeCleanup completes it). The name is only used by the
+// CleanupVolume completes it). The name is only used by the
 // package to match reported changes; since none are ever reported, its
 // exact encoding is immaterial. The package marks the IRP pending
 // itself, so this function returns STATUS_PENDING and must not touch
@@ -661,7 +661,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             if (!netDone && !dcb->CachedListing)
             {
                 ExReleaseResourceLite(dcb->Header.Resource);
-                return BlorgHttpGetDirectoryInfo(&dcb->FullPath, BlorgDirComplete, Irp);
+                return BlorgHttpGetDirectoryInfo(&dcb->FullPath, DirCtrlComplete, Irp);
             }
 
             ccb->Entries = dcb->CachedListing;

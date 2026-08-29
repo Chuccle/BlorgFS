@@ -19,7 +19,7 @@
 // also the truthful one.
 //
 
-static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+static NTSTATUS VolumeInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     FS_INFORMATION_CLASS fsInformationClass = IrpSp->Parameters.QueryVolume.FsInformationClass;
     ULONG inputLength = IrpSp->Parameters.QueryVolume.Length;
@@ -177,7 +177,7 @@ static NTSTATUS BlorgVolumeQueryVolumeInformation(PIRP Irp, PIO_STACK_LOCATION I
         }
         default:
         {
-            BLORGFS_PRINT("BlorgVolumeQueryVolumeInformation: FsInformationClass=%d\n", fsInformationClass);
+            BLORGFS_PRINT("VolumeInfoQuery: FsInformationClass=%d\n", fsInformationClass);
             result = STATUS_INVALID_PARAMETER;
         }
     }
@@ -203,7 +203,7 @@ NTSTATUS BlorgQueryVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     {
         case BlorgDeviceVolume:
         {
-            result = BlorgVolumeQueryVolumeInformation(Irp, irpSp);
+            result = VolumeInfoQuery(Irp, irpSp);
             break;
         }
         case BlorgDeviceDisk:
@@ -225,7 +225,7 @@ NTSTATUS BlorgQueryVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 //
 // IRP_MJ_SET_VOLUME_INFORMATION dispatch entry point. All device types are
 // currently unimplemented stubs -- the volume is read-only (see
-// FILE_READ_ONLY_VOLUME in BlorgVolumeQueryVolumeInformation), so this
+// FILE_READ_ONLY_VOLUME in VolumeInfoQuery), so this
 // always completes with STATUS_INVALID_DEVICE_REQUEST.
 //
 NTSTATUS BlorgSetVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)

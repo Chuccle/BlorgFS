@@ -44,7 +44,7 @@ static const GUID BLORGFS_DDO_GUID = { 0xcc6e9f4d, 0x1968, 0x4d95, { 0x91, 0xaf,
 //  PASSIVE_LEVEL from DriverEntry; failure is non-fatal (the manual symlink
 //  still gives working file I/O), but image activation needs it.
 //
-static NTSTATUS BlorgNotifyMountManagerVolumeArrival(PCUNICODE_STRING DeviceName)
+static NTSTATUS DriverNotifyMountManagerVolumeArrival(PCUNICODE_STRING DeviceName)
 {
     UNICODE_STRING mountMgrName = RTL_CONSTANT_STRING(MOUNTMGR_DEVICE_NAME);
     PFILE_OBJECT mountMgrFileObject = NULL;
@@ -115,7 +115,7 @@ static NTSTATUS BlorgNotifyMountManagerVolumeArrival(PCUNICODE_STRING DeviceName
 // reach it. No device extension: this object is identified by its pointer
 // (BlorgDeviceKind, Driver.h) and carries no per-device state.
 //
-static NTSTATUS CreateBlorgDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* DiskDeviceObject)
+static NTSTATUS DriverCreateDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* DiskDeviceObject)
 {
     BLORGFS_PRINT("Entering Drive Creation\n");
     *DiskDeviceObject = NULL;
@@ -146,8 +146,8 @@ static NTSTATUS CreateBlorgDiskDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE
     return result;
 }
 
-// Tears down the disk device object created by CreateBlorgDiskDeviceObject.
-static void DeleteBlorgDiskDeviceObject(PDEVICE_OBJECT DiskDeviceObject)
+// Tears down the disk device object created by DriverCreateDiskDeviceObject.
+static VOID DriverDeleteDiskDeviceObject(PDEVICE_OBJECT DiskDeviceObject)
 {
     if (DiskDeviceObject)
     {
@@ -161,7 +161,7 @@ static void DeleteBlorgDiskDeviceObject(PDEVICE_OBJECT DiskDeviceObject)
 // directory-notify package, unwinding each already-initialized piece in
 // reverse order if a later step fails so no resource leaks on a partial
 // mount failure. The notify IRPs registered against the directory-notify
-// package are completed in DeleteBlorgVolumeDeviceObject (via
+// package are completed in DriverDeleteVolumeDeviceObject (via
 // FsRtlNotifyUninitializeSync) and at handle cleanup (FsRtlNotifyCleanup).
 // FsRtlNotifyInitializeSync raises on allocation failure, which is
 // acceptable here since it only runs at driver/volume init as a load
@@ -273,7 +273,7 @@ NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
 // locking is needed. Without this walk, any nodes still cached in the
 // tree would outlive the lookaside lists they were allocated from.
 //
-static void FreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
+static VOID FreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
 {
     while (!IsListEmpty(&RootDcb->ChildrenList))
     {
@@ -309,7 +309,7 @@ static void FreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
 // a volume already mid-teardown, which is worse; the gate keeps the
 // teardown sequence as it is and makes the late completions safe.
 //
-static void DeleteBlorgVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
+static VOID DriverDeleteVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
 {
     if (VolumeDeviceObject)
     {
@@ -342,7 +342,7 @@ static void DeleteBlorgVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
 // it is deliberately non-fatal -- a failure costs those IOCTLs, not the
 // filesystem, and the device SDDL still governs who may open it.
 //
-static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* FileSystemDeviceObject)
+static NTSTATUS DriverCreateFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* FileSystemDeviceObject)
 {
     BLORGFS_PRINT("Entering Filesystem Creation\n");
     *FileSystemDeviceObject = NULL;
@@ -386,7 +386,7 @@ static NTSTATUS CreateBlorgFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, P
 // deletes that volume device object, then unregisters and deletes the
 // FSDO itself.
 //
-static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObject)
+static VOID DriverDeleteFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObject)
 {
     if (FileSystemDeviceObject)
     {
@@ -399,7 +399,7 @@ static void DeleteBlorgFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceObj
         if (volumeDeviceObject)
         {
             ObDereferenceObject(volumeDeviceObject);
-            DeleteBlorgVolumeDeviceObject(volumeDeviceObject);
+            DriverDeleteVolumeDeviceObject(volumeDeviceObject);
             global.VolumeDeviceObject = NULL;
         }
 
@@ -436,11 +436,11 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
     BlorgDrainHttpClient();
 
     ObDereferenceObject(global.FileSystemDeviceObject);
-    DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
+    DriverDeleteFileSystemDeviceObject(global.FileSystemDeviceObject);
     global.FileSystemDeviceObject = NULL;
 
     ObDereferenceObject(global.DiskDeviceObject);
-    DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
+    DriverDeleteDiskDeviceObject(global.DiskDeviceObject);
     global.DiskDeviceObject = NULL;
 
     BlorgFreeHttpAddrInfo(global.RemoteAddressInfo);
@@ -512,7 +512,7 @@ static_assert(
 // 32-byte pin, a short port string, or a BLORGFS_REG_HOST_MAX_CHARS
 // hostname) -- not a general-purpose arbitrarily-sized read.
 //
-static NTSTATUS ReadBlorgfsRegistryValue(
+static NTSTATUS DriverReadRegistryValue(
     HANDLE ParametersKey,
     PCWSTR ValueName,
     ULONG ExpectedType,
@@ -600,7 +600,7 @@ static BOOLEAN IsValidPortString(const WCHAR* Port, USHORT PortChars)
 // at all, which is the "leave it default" case and cannot be expressed by
 // any other value.
 //
-static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRING PortOut, PUNICODE_STRING HostOut)
+static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRING PortOut, PUNICODE_STRING HostOut)
 {
     UNICODE_STRING parametersSuffix = RTL_CONSTANT_STRING(L"\\Parameters");
 
@@ -633,22 +633,22 @@ static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNIC
     ULONG tlsEnabledValue = 0;
     ULONG actualSize = 0;
 
-    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"TlsEnabled", REG_DWORD, &tlsEnabledValue, sizeof(tlsEnabledValue), &actualSize)))
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"TlsEnabled", REG_DWORD, &tlsEnabledValue, sizeof(tlsEnabledValue), &actualSize)))
     {
         global.TlsEnabled = (0 != tlsEnabledValue);
     }
 
     ULONG granularityKb = 0;
 
-    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"ReadAheadGranularityKb", REG_DWORD, &granularityKb, sizeof(granularityKb), &actualSize)))
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadGranularityKb", REG_DWORD, &granularityKb, sizeof(granularityKb), &actualSize)))
     {
         global.ReadAheadGranularity = granularityKb * 1024;
-        BLORGFS_LOG("ReadBlorgfsRegistryConfig() - read-ahead granularity override: %lu KB\n", granularityKb);
+        BLORGFS_LOG("DriverReadRegistryConfig() - read-ahead granularity override: %lu KB\n", granularityKb);
     }
 
     UCHAR pinValue[TLS_HASH_LEN];
 
-    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"TlsPin", REG_BINARY, pinValue, sizeof(pinValue), &actualSize))
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"TlsPin", REG_BINARY, pinValue, sizeof(pinValue), &actualSize))
         && TLS_HASH_LEN == actualSize)
     {
         BlorgTlsSetPin(pinValue);
@@ -656,7 +656,7 @@ static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNIC
 
     WCHAR portValue[BLORGFS_REG_PORT_MAX_CHARS];
 
-    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"RemotePort", REG_SZ, portValue, sizeof(portValue), &actualSize))
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"RemotePort", REG_SZ, portValue, sizeof(portValue), &actualSize))
         && actualSize >= sizeof(WCHAR))
     {
         USHORT portChars = C_CAST(USHORT, (actualSize - sizeof(WCHAR)) / sizeof(WCHAR));
@@ -668,13 +668,13 @@ static VOID ReadBlorgfsRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNIC
         }
         else
         {
-            BLORGFS_LOG("ReadBlorgfsRegistryConfig() - ignoring invalid RemotePort registry value, using scheme default\n");
+            BLORGFS_LOG("DriverReadRegistryConfig() - ignoring invalid RemotePort registry value, using scheme default\n");
         }
     }
 
     WCHAR hostValue[BLORGFS_REG_HOST_MAX_CHARS];
 
-    if (NT_SUCCESS(ReadBlorgfsRegistryValue(parametersKey, L"RemoteHost", REG_SZ, hostValue, sizeof(hostValue), &actualSize))
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"RemoteHost", REG_SZ, hostValue, sizeof(hostValue), &actualSize))
         && actualSize >= sizeof(WCHAR))
     {
         HostOut->Length = C_CAST(USHORT, actualSize) - sizeof(WCHAR);
@@ -785,7 +785,7 @@ static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
 // TLS/port config (TlsEnabled, TlsPin, an optional RemotePort override)
 // is read from the registry before resolving the backend address, so the
 // default port can depend on whatever TlsEnabled ends up being -- see
-// ReadBlorgfsRegistryConfig. With no explicit RemotePort override, the
+// DriverReadRegistryConfig. With no explicit RemotePort override, the
 // default port tracks TlsEnabled exactly (a plaintext server can't parse
 // a ClientHello, and a TLS-speaking one won't understand plaintext HTTP):
 // 443 if TRUE, 8080 if FALSE. RTL_CONSTANT_STRING only expands to a valid
@@ -816,7 +816,7 @@ static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
 // that matters: it puts this FSD on the I/O manager's registration list there
 // and then, and every arriving volume is offered to every registered
 // filesystem from another thread, so a mount can land while DriverEntry is
-// still running. BlorgMountVolume already says so and is written to survive
+// still running. FsCtrlMountVolume already says so and is written to survive
 // it (FsCtrl.c: "the window DriverEntry opens between IoRegisterFileSystem
 // and the DDO existing").
 //
@@ -930,7 +930,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     }
 
     PDEVICE_OBJECT fileSystemDeviceObject;
-    result = CreateBlorgFileSystemDeviceObject(DriverObject, &fileSystemDeviceObject);
+    result = DriverCreateFileSystemDeviceObject(DriverObject, &fileSystemDeviceObject);
 
     if (!NT_SUCCESS(result))
     {
@@ -945,12 +945,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     global.FileSystemDeviceObject = fileSystemDeviceObject;
 
     PDEVICE_OBJECT diskDeviceObject;
-    result = CreateBlorgDiskDeviceObject(DriverObject, &diskDeviceObject);
+    result = DriverCreateDiskDeviceObject(DriverObject, &diskDeviceObject);
 
     if (!NT_SUCCESS(result))
     {
         ObDereferenceObject(global.FileSystemDeviceObject);
-        DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
+        DriverDeleteFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
         BlorgFreeSecurityDescriptor();
         BlorgCleanupHttpClient();
@@ -976,7 +976,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     global.ReadAheadGranularity = READ_AHEAD_GRANULARITY;
 
-    ReadBlorgfsRegistryConfig(RegistryPath, &portString, &hostString);
+    DriverReadRegistryConfig(RegistryPath, &portString, &hostString);
 
     if (0 == portString.Length)
     {
@@ -1006,10 +1006,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     {
         BlorgCleanupHttpClient();
         ObDereferenceObject(global.FileSystemDeviceObject);
-        DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
+        DriverDeleteFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
         ObDereferenceObject(global.DiskDeviceObject);
-        DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
+        DriverDeleteDiskDeviceObject(global.DiskDeviceObject);
         global.DiskDeviceObject = NULL;
         BlorgFreeSecurityDescriptor();
         BlorgStatisticsCleanup();
@@ -1039,10 +1039,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         BlorgFreeHttpAddrInfo(global.RemoteAddressInfo);
         BlorgCleanupHttpClient();
         ObDereferenceObject(global.FileSystemDeviceObject);
-        DeleteBlorgFileSystemDeviceObject(global.FileSystemDeviceObject);
+        DriverDeleteFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
         ObDereferenceObject(global.DiskDeviceObject);
-        DeleteBlorgDiskDeviceObject(global.DiskDeviceObject);
+        DriverDeleteDiskDeviceObject(global.DiskDeviceObject);
         global.DiskDeviceObject = NULL;
         BlorgFreeSecurityDescriptor();
         BlorgStatisticsCleanup();
@@ -1066,7 +1066,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     {
         UNICODE_STRING diskDeviceName = RTL_CONSTANT_STRING(BLORGFS_DDO_STRING);
-        NTSTATUS mountMgrStatus = BlorgNotifyMountManagerVolumeArrival(&diskDeviceName);
+        NTSTATUS mountMgrStatus = DriverNotifyMountManagerVolumeArrival(&diskDeviceName);
 
         if (!NT_SUCCESS(mountMgrStatus))
         {

@@ -33,7 +33,7 @@
 //  that check is load-bearing rather than defensive. BlorgFileSystemControl
 //  routes the FSDO down this same IRP_MN_USER_FS_REQUEST arm as the volume,
 //  and a handle on the control device has no node behind it --
-//  BlorgFileSystemCreate reports FILE_OPENED and leaves FsContext NULL. The
+//  CreateFileSystem reports FILE_OPENED and leaves FsContext NULL. The
 //  oplock FSCTLs are all FILE_ANY_ACCESS, so reaching them needs only the
 //  GENERIC_READ the FSDO's SDDL grants World (BLORGFS_FSDO_DEVICE_SDDL_STRING,
 //  Driver.h); without the check, GET_NODE_TYPE dereferences NULL and any
@@ -55,7 +55,7 @@
 //  not be touched or completed here; the check may have broken conflicting
 //  oplocks, so IsFastIoPossible is refreshed before releasing the lock.
 //
-static NTSTATUS BlorgUserFsCtrl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+static NTSTATUS FsCtrlUser(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     PCOMMON_CONTEXT node = IrpSp->FileObject->FsContext;
     BOOLEAN sharedRequest = FsRtlOplockIsSharedRequest(Irp);
@@ -178,7 +178,7 @@ static NTSTATUS BlorgUserFsCtrl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 // and the DDO existing: global.DiskDeviceObject is still NULL there, and
 // the explicit NULL test below keeps a NULL target from matching it.
 //
-static NTSTATUS BlorgMountVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+static NTSTATUS FsCtrlMountVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     PDEVICE_OBJECT targetDeviceObject = IrpSp->Parameters.MountVolume.DeviceObject;
 
@@ -216,8 +216,8 @@ static NTSTATUS BlorgMountVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
 //
 // IRP_MJ_FILE_SYSTEM_CONTROL dispatch entry point: for the volume/FSDO
-// devices, routes IRP_MN_USER_FS_REQUEST to BlorgUserFsCtrl (oplock
-// requests) and IRP_MN_MOUNT_VOLUME to BlorgMountVolume; the disk device
+// devices, routes IRP_MN_USER_FS_REQUEST to FsCtrlUser (oplock
+// requests) and IRP_MN_MOUNT_VOLUME to FsCtrlMountVolume; the disk device
 // has no handling. Leaves the IRP untouched (does not complete it) if the
 // result is STATUS_PENDING, since that means an oplock request now owns it.
 //
@@ -237,12 +237,12 @@ NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             {
                 case IRP_MN_USER_FS_REQUEST:
                 {
-                    result = BlorgUserFsCtrl(Irp, irpSp);
+                    result = FsCtrlUser(Irp, irpSp);
                     break;
                 }
                 case IRP_MN_MOUNT_VOLUME:
                 {
-                    result = BlorgMountVolume(Irp, irpSp);
+                    result = FsCtrlMountVolume(Irp, irpSp);
                     break;
                 }
                 default:

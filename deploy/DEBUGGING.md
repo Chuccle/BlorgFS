@@ -1,4 +1,4 @@
-# Debugging this VM: what's real and what's noise
+﻿# Debugging this VM: what's real and what's noise
 
 This VM setup is flaky in ways that look alarming but usually aren't. This
 document is a decision tree for telling the two apart, plus the specific
@@ -218,7 +218,7 @@ wrong ones.
 
 The actual chain:
 
-1. `BlorgMountVolume` (`FsCtrl.c`) self-mounts: it creates the volume device
+1. `FsCtrlMountVolume` (`FsCtrl.c`) self-mounts: it creates the volume device
    object and sets `VPB_MOUNTED`.
 2. Filter Manager attaches minifilters to the now-mounted volume — `fltmc
    instances` shows `WdFilter`, `UCPD`, `applockerfltr`, `bfs` and

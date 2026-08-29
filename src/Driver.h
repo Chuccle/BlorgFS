@@ -197,7 +197,7 @@ extern struct GLOBAL
     PDEVICE_OBJECT DiskDeviceObject;           // the disk device object backing the B: symlink
 
     //
-    //  The mounted volume device object, or NULL before BlorgMountVolume
+    //  The mounted volume device object, or NULL before FsCtrlMountVolume
     //  has run. Held here rather than in an FSDO device extension because
     //  these three pointers are jointly what identifies an incoming
     //  DEVICE_OBJECT (BlorgDeviceKind, Structs.h) -- keeping one of them
@@ -247,7 +247,7 @@ extern struct GLOBAL
     //
     //  Settable two ways, which interact --
     //
-    //    * Registry, read once at DriverEntry (ReadBlorgfsRegistryConfig
+    //    * Registry, read once at DriverEntry (DriverReadRegistryConfig
     //      in Driver.c): HKLM\<service key>\Parameters\TlsEnabled
     //      (REG_DWORD). This also picks the default remote port (443 if
     //      TRUE, 8080 if FALSE, unless Parameters\RemotePort explicitly
@@ -307,7 +307,7 @@ extern struct GLOBAL
 // while the other two see only mount and control traffic.
 //
 // This works because there is exactly one device object of each kind. The
-// single volume is already assumed by BlorgMountVolume, which stores one
+// single volume is already assumed by FsCtrlMountVolume, which stores one
 // pointer; a driver mounting several would need the tag back.
 //
 typedef enum _BLORGFS_DEVICE_KIND

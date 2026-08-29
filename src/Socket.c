@@ -358,7 +358,7 @@ static NTSTATUS InitialiseSocketContext(PKSOCKET_CONTEXT SocketContext)
 }
 
 // Releases the IRP allocated by InitialiseSocketContext.
-static void FreeSocketContext(PKSOCKET_CONTEXT SocketContext)
+static VOID FreeSocketContext(PKSOCKET_CONTEXT SocketContext)
 {
     IoFreeIrp(SocketContext->Irp);
 }
@@ -367,7 +367,7 @@ static void FreeSocketContext(PKSOCKET_CONTEXT SocketContext)
 // If the op is still pending, blocks on CompletionEvent and replaces
 // *Status with the IRP's final status. No-op if already completed.
 //
-static void WaitForCompletionSocketContext(PKSOCKET_CONTEXT SocketContext, PNTSTATUS Status)
+static VOID WaitForCompletionSocketContext(PKSOCKET_CONTEXT SocketContext, PNTSTATUS Status)
 {
     if (*Status == STATUS_PENDING)
     {

@@ -1,7 +1,7 @@
-#pragma once
+﻿#pragma once
 
 //
-// One place that builds a synthetic DIRECTORY_INFO the way BlorgDirComplete
+// One place that builds a synthetic DIRECTORY_INFO the way DirCtrlComplete
 // would have cached one, for the tests that need a warm directory without a
 // network round trip (CreateDirectoryTest.cpp's listing-hit branch,
 // DirCtrlTest.cpp's enumeration).

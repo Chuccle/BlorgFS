@@ -46,7 +46,7 @@
 //  FILE_DEVICE_UNKNOWN, not FILE_DEVICE_FILE_SYSTEM: the latter makes the
 //  I/O manager route the request as IRP_MJ_FILE_SYSTEM_CONTROL instead of
 //  the IRP_MJ_DEVICE_CONTROL this is handled under, so it would never
-//  reach BlorgFsdoDeviceControl at all (see the same note on the
+//  reach DevIoCtrlFsdo at all (see the same note on the
 //  statistics IOCTLs in Statistics.h).
 //
 #define IOCTL_BLORGFS_SET_TLS_PIN \
@@ -78,7 +78,7 @@
 //  a revision that cannot be read is rejected as a bad parameter instead of
 //  being guessed at.
 //
-static NTSTATUS BlorgFsdoDeviceControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+static NTSTATUS DevIoCtrlFsdo(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     switch (IrpSp->Parameters.DeviceIoControl.IoControlCode)
     {
@@ -172,7 +172,7 @@ static NTSTATUS BlorgFsdoDeviceControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 //  section succeed, so both report a synthetic disk number/extent kept
 //  consistent with each other.
 //
-static NTSTATUS BlorgDiskDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+static NTSTATUS DevIoCtrlDisk(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     ULONG outLength = IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
 
@@ -350,12 +350,12 @@ NTSTATUS BlorgDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
         case BlorgDeviceDisk:
         {
-            result = BlorgDiskDeviceControl(DeviceObject, Irp, irpSp);
+            result = DevIoCtrlDisk(DeviceObject, Irp, irpSp);
             break;
         }
         case BlorgDeviceFileSystem:
         {
-            result = BlorgFsdoDeviceControl(Irp, irpSp);
+            result = DevIoCtrlFsdo(Irp, irpSp);
             break;
         }
     }

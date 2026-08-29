@@ -411,7 +411,7 @@ VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path)
 //  but a Dir that already ends in one has consumed it in the prefix match
 //  itself -- the character at that index is then the first character of the
 //  child's name, not a separator. The volume root ("\", the root DCB's
-//  FullPath per Driver.c, and what BlorgDirComplete passes on a root listing
+//  FullPath per Driver.c, and what DirCtrlComplete passes on a root listing
 //  publish) is the only such Dir this driver produces; without the
 //  trailing-separator case it matched nothing beneath itself, silently
 //  disabling the stale-negative eviction that invalidation exists to perform

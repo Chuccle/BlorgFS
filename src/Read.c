@@ -30,7 +30,7 @@
 //  build and without a DbgPrint on the read path perturbing the very
 //  timings being characterized.
 //
-static BOOLEAN BlorgReadIsSequential(const FCB* Fcb, ULONG64 Offset)
+static BOOLEAN ReadIsSequential(const FCB* Fcb, ULONG64 Offset)
 {
     BOOLEAN sequential = FALSE;
 
@@ -90,7 +90,7 @@ static VOID ReadTrackStream(FCB* Fcb, ULONG64 Offset, ULONG Length)
 // never took one; either way nobody was waiting on it and there is nothing
 // to record.
 //
-static VOID BlorgReadRecordUserLatency(LONG64 ArrivedQpc)
+static VOID ReadRecordUserLatency(LONG64 ArrivedQpc)
 {
     if (0 == ArrivedQpc)
     {
@@ -144,7 +144,7 @@ BOOLEAN BlorgFastIoRead(
 
     if (handled)
     {
-        BlorgReadRecordUserLatency(arrivedQpc);
+        ReadRecordUserLatency(arrivedQpc);
     }
 
     return handled;
@@ -177,7 +177,7 @@ BOOLEAN BlorgFastIoRead(
 //  synchronous path used to do: advance the file position for
 //  synchronous file objects and note that a fast-IO read happened.
 //
-static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
+static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
 {
     PIRP irp = CallerContext;
 
@@ -187,9 +187,9 @@ static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID Ca
 
     if (!NT_SUCCESS(Status))
     {
-        BLORGFS_PRINT("BlorgReadComplete: http read failed: %8lx\n", Status);
+        BLORGFS_PRINT("ReadComplete: http read failed: %8lx\n", Status);
         BLORGFS_STAT_INC(FetchesFailed);
-        BlorgReadRecordUserLatency(arrivedQpc);
+        ReadRecordUserLatency(arrivedQpc);
         BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
@@ -226,7 +226,7 @@ static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID Ca
         SetFlag(irpSp->FileObject->Flags, FO_FILE_FAST_IO_READ);
     }
 
-    BlorgReadRecordUserLatency(arrivedQpc);
+    ReadRecordUserLatency(arrivedQpc);
 
     BlorgCompleteRequest(irp, STATUS_SUCCESS, IO_DISK_INCREMENT);
 }
@@ -249,7 +249,7 @@ static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID Ca
 // declared size but cannot be bounded by it, which is the same
 // caller-visible answer as any other tail past EOF.
 //
-static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG BytesLength, PIRP Irp, PULONG RealLengthOut)
+static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG BytesLength, PIRP Irp, PULONG RealLengthOut)
 {
     if (StartingByte.QuadPart >= Fcb->Header.FileSize.QuadPart)
     {
@@ -307,7 +307,7 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // caller that builds its own IRP -- IoAllocateIrp plus a hand-filled
 // Parameters.Read.ByteOffset, which is exactly what a filter layered above
 // a filesystem does -- is validated by nobody. Nothing downstream would
-// catch it either: BlorgTrimReadToFileSize's two comparisons are both
+// catch it either: ReadTrimToFileSize's two comparisons are both
 // false for a negative offset (it is neither >= FileSize nor does adding
 // the length exceed it), so the read passes through untrimmed and is then
 // widened to ULONG64, turning -4096 into 2^64-4096. Nothing downstream
@@ -350,7 +350,7 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // and lands in the paging IRP's MDL with no copy. Tracking applies to
 // paging reads only: they carry none of the
 // post-read bookkeeping (file-position advance, fast-IO flag) that
-// non-paging reads get in BlorgReadComplete. The BlorgReadIsSequential
+// non-paging reads get in ReadComplete. The ReadIsSequential
 // sample is taken before ReadTrackStream advances the trackers, so it
 // characterizes the read against the stream's prior position.
 //
@@ -370,22 +370,22 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // The direct async HTTP read returns STATUS_PENDING on success; the client
 // receives the body straight into the locked user MDL (zero-copy -- both
 // arrival paths have one: MM supplies it for paging I/O, BlorgPrePostIrp locked
-// one for posted non-paging reads) and BlorgReadComplete completes the IRP
+// one for posted non-paging reads) and ReadComplete completes the IRP
 // from the WSK completion path, so this function neither blocks nor copies
 // nor completes the IRP itself. If issuing the request fails synchronously,
 // the callback never runs and the returned error completes the IRP
 // normally. DriverContext[2] is stamped with the issue-time QPC value
-// that BlorgReadComplete turns into the chunk-latency histogram (READ
+// that ReadComplete turns into the chunk-latency histogram (READ
 // IRPs do not otherwise use DriverContext[2]), and this is the one
 // direct-fetch issue site for every non-cached read (paging misses and
 // posted non-paging reads alike), so it is where FetchesIssued and the
 // in-flight gauge are raised, paired with the completion accounting in
-// BlorgReadComplete. With the prefetch ring gone these count every fetch
+// ReadComplete. With the prefetch ring gone these count every fetch
 // the driver makes, so FetchesIssued is now simply the request rate against
 // the backend.
 //
 // Both counters are raised before the issue, because a synchronously
-// completing issue runs BlorgReadComplete -- and its matching decrement --
+// completing issue runs ReadComplete -- and its matching decrement --
 // before the call returns. That ordering makes the synchronous FAILURE
 // case this path's own to settle: the client's contract is that a
 // non-STATUS_PENDING return means the callback never ran (see
@@ -410,7 +410,7 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
 // The cached path delays CcInitializeCacheMap until the first read, in
 // case the caller never does any I/O to the file (FileObject->
 // PrivateCacheMap stays NULL until then). The cache manager does not
-// tolerate reads beyond file size, hence the same BlorgTrimReadToFileSize
+// tolerate reads beyond file size, hence the same ReadTrimToFileSize
 // trim used by the non-cached path. Non-paging requests then mirror the
 // synchronous-path bookkeeping: advance CurrentByteOffset for
 // FO_SYNCHRONOUS_IO file objects, and set FO_FILE_FAST_IO_READ so the
@@ -517,7 +517,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
     {
         BLORGFS_PRINT("Non cached read.\n");
 
-        NTSTATUS trimStatus = BlorgTrimReadToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);
+        NTSTATUS trimStatus = ReadTrimToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);
 
         if (STATUS_END_OF_FILE == trimStatus)
         {
@@ -548,7 +548,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         {
             BLORGFS_STAT_INC(ReadsPagingInline);
 
-            if (BlorgReadIsSequential(fcb, C_CAST(ULONG64, startingByte.QuadPart)))
+            if (ReadIsSequential(fcb, C_CAST(ULONG64, startingByte.QuadPart)))
             {
                 BLORGFS_STAT_INC(ReadsSequential);
             }
@@ -575,7 +575,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             startingByte.QuadPart,
             realLength,
             Irp->MdlAddress,
-            BlorgReadComplete,
+            ReadComplete,
             Irp);
 
         if (STATUS_PENDING != fetchStatus)
@@ -600,7 +600,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             }
         }
 
-        NTSTATUS trimStatus = BlorgTrimReadToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);
+        NTSTATUS trimStatus = ReadTrimToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);
 
         if (STATUS_END_OF_FILE == trimStatus)
         {
@@ -738,7 +738,7 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
             if (STATUS_PENDING != result)
             {
-                BlorgReadRecordUserLatency(arrivedQpc);
+                ReadRecordUserLatency(arrivedQpc);
                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
 

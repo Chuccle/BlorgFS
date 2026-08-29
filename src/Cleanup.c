@@ -21,7 +21,7 @@
 // shared-oplock grants already consult FileLock, so a dead handle's
 // locks must not outlive it once IRP_MJ_LOCK_CONTROL lands.
 //
-static NTSTATUS BlorgVolumeCleanup(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
+static NTSTATUS CleanupVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
 {
     PFILE_OBJECT fileObject = IrpSp->FileObject;
     PCOMMON_CONTEXT node = fileObject->FsContext;
@@ -68,7 +68,7 @@ static NTSTATUS BlorgVolumeCleanup(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_O
         }
         default:
         {
-            BLORGFS_PRINT("BlorgVolumeCleanup: Unknown node type\n");
+            BLORGFS_PRINT("CleanupVolume: Unknown node type\n");
             return STATUS_INVALID_DEVICE_REQUEST;
         }
     }
@@ -90,7 +90,7 @@ NTSTATUS BlorgCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     {
         case BlorgDeviceVolume:
         {
-            result = BlorgVolumeCleanup(Irp, irpSp, DeviceObject);
+            result = CleanupVolume(Irp, irpSp, DeviceObject);
             break;
         }
         case BlorgDeviceDisk:

@@ -1,7 +1,7 @@
-//
+﻿//
 // Functional tests for PathCache.c: the sharded full-path resolution
 // cache wired into the create path (via BlorgPathCacheLookup/InsertExists/
-// InsertNotFound) and into BlorgDirComplete (via BlorgPathCacheInvalidatePrefix
+// InsertNotFound) and into DirCtrlComplete (via BlorgPathCacheInvalidatePrefix
 // on a listing refresh). Exercised here through its own public API rather
 // than through IRP dispatch -- the cache's state machine (TTL, targeted/
 // prefix invalidation, per-bucket FIFO eviction) is what OpenCppCoverage
@@ -204,7 +204,7 @@ TEST_F(PathCacheTest, PrefixInvalidationRemovesSubtreeButNotSiblings)
 //
 // The volume root is a real, reachable value for this API, not a
 // hypothetical: Driver.c creates the root DCB with
-// RTL_CONSTANT_STRING(L"\\"), and BlorgDirComplete invalidates with
+// RTL_CONSTANT_STRING(L"\\"), and DirCtrlComplete invalidates with
 // BlorgPathCacheInvalidatePrefix(&dcb->FullPath) on every listing publish --
 // so a refresh of the volume root passes exactly this Dir.
 //
@@ -218,7 +218,7 @@ TEST_F(PathCacheTest, PrefixInvalidationRemovesSubtreeButNotSiblings)
 // and the leaf, which is why every non-root directory works.
 //
 // Consequence in the driver: the stale-negative protection
-// BlorgDirComplete documents ("a stale not-found memoized before the
+// DirCtrlComplete documents ("a stale not-found memoized before the
 // file appeared on the backend would otherwise shadow the new listing
 // until its TTL lapses") does not apply to files in the volume root. A
 // file created on the backend after a failed open stays unopenable --

@@ -1,4 +1,4 @@
-//
+﻿//
 // Real-thread stress coverage for the real FspWorkQueue.c: the cancel-safe
 // IRP queue (IO_CSQ) and its worker dispatch loop, under genuine concurrent
 // producers and consumers -- previously 3.3% covered and, unlike every
@@ -383,12 +383,12 @@ TEST_F(FspWorkQueueStressTest, UnhandledMajorFunctionIsCompletedRatherThanStrand
 // The teardown drain and the cancel callback are the only two places that
 // complete a posted IRP without running its handler, and an IRP that an
 // async completion re-queued is carrying that completion's result in
-// DriverContext[1] -- allocated by BlorgCreateComplete, and normally
+// DriverContext[1] -- allocated by CreateComplete, and normally
 // consumed at the top of BlorgVolumeCreate's next pass. When that pass
 // never happens the block has no other owner.
 //
 // Driven through BlorgFsdRequeueRequest with the same stash-then-flag-then-
-// requeue sequence BlorgCreateComplete uses, so the IRP arrives in the
+// requeue sequence CreateComplete uses, so the IRP arrives in the
 // queue in exactly the shape production leaves it in. No worker runs here
 // (PsCreateSystemThread is a no-op in this sandbox), so the IRP is still
 // queued when BlorgDestroyWorkQueue drains it -- which is the scenario: an
@@ -424,7 +424,7 @@ TEST_F(FspWorkQueueStressTest, TeardownDrainFreesTheStashOnAnIrpItCancels)
 }
 
 //
-// The teardown ordering DeleteBlorgVolumeDeviceObject actually uses:
+// The teardown ordering DriverDeleteVolumeDeviceObject actually uses:
 // BlorgDestroyWorkQueue stops the workers and drains the queue, and only then
 // are the nodes freed -- and freeing a node runs FsRtlUninitializeOplock,
 // which releases every IRP the oplock package is still holding through

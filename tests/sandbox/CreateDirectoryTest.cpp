@@ -1,4 +1,4 @@
-//
+﻿//
 // Directory create/open coverage over the real Create.c: CheckDirectoryAccess,
 // OpenExistingDcb, OpenRootDcb, BreakHandleOplockOnSharingViolation,
 // SplitPathLeaf and FindEntryByName -- none of which any other sandbox
@@ -25,13 +25,13 @@
 // this file avoids elsewhere -- so it stays untested until a write path
 // gives it a real caller.
 //
-// BlorgCreateComplete (the async BlorgHttpGetFileInformation completion)
+// CreateComplete (the async BlorgHttpGetFileInformation completion)
 // is also still 0%: reaching it means scripting a real HTTP round trip
 // through the real Client.c and SandboxSocket peer, which is follow-on
 // work, not done here. What IS covered without a network round trip is
 // the OTHER way BlorgVolumeCreate resolves a cold path: a pre-populated
 // parent DCB->CachedListing, which is exactly how a warm directory's
-// children resolve once BlorgDirComplete has cached its listing. That
+// children resolve once DirCtrlComplete has cached its listing. That
 // path exercises SplitPathLeaf and both of FindEntryByName's loops for
 // free.
 //
@@ -199,7 +199,7 @@ protected:
 
     //
     // A synthetic parent-directory listing with one file and one
-    // subdirectory entry, built the way BlorgDirComplete would have cached
+    // subdirectory entry, built the way DirCtrlComplete would have cached
     // one -- so BlorgVolumeCreate's listing-hit branch (FindEntryByName,
     // reached without any network round trip) can be driven directly. The
     // layout arithmetic lives in ListingBuilder.h, shared with

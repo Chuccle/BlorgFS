@@ -360,7 +360,7 @@ typedef struct _DCB BLORGFS_COMMON_CONTEXT_BASE
     // handle closes, when the DCB and listing are freed together
     // (BlorgFreeFileContext). Borrowed (not owned) by per-handle CCBs via
     // CCB.Entries. Write-once: published NULL -> non-NULL exactly once
-    // via WritePointerRelease (BlorgDirComplete) and never replaced.
+    // via WritePointerRelease (DirCtrlComplete) and never replaced.
     // BlorgVolumeCreate reads it with ReadPointerAcquire holding only the
     // VCB resource -- not this DCB's -- so it is the release/acquire pair,
     // not a common lock, that orders the listing's contents before the

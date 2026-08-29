@@ -11,7 +11,7 @@
 //  interlocked drops.
 //
 
-static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
+static NTSTATUS CloseVolume(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject)
 {
     PFILE_OBJECT fileObject = IrpSp->FileObject;
     PVCB vcb = BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->Vcb;
@@ -47,7 +47,7 @@ static NTSTATUS BlorgVolumeClose(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Volume
         }
         default:
         {
-            BLORGFS_PRINT("BlorgVolumeClose: Unknown Node type\n");
+            BLORGFS_PRINT("CloseVolume: Unknown Node type\n");
             return STATUS_INVALID_DEVICE_REQUEST;
         }
     }
@@ -69,7 +69,7 @@ NTSTATUS BlorgClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     {
         case BlorgDeviceVolume:
         {
-            result = BlorgVolumeClose(irpSp, DeviceObject);
+            result = CloseVolume(irpSp, DeviceObject);
             break;
         }
         case BlorgDeviceDisk:

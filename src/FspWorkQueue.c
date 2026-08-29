@@ -290,7 +290,7 @@ Return Value:
 //  rather than silently skipping the insert -- a skipped insert would
 //  strand an IRP its poster already reported as STATUS_PENDING.
 //
-static void AddToWorkqueue(
+static VOID AddToWorkqueue(
     PIRP Irp
 )
 {
@@ -535,7 +535,7 @@ VOID BlorgOplockComplete(PVOID Context, PIRP Irp)
 // by the driver load/unload path, but if that changes we internally
 // synchronise.
 //
-static void StopWorkQueueThreads(ULONG ThreadCount)
+static VOID StopWorkQueueThreads(ULONG ThreadCount)
 {
     if (!InterlockedCompareExchange(&FspQueue.ThreadsActive, FALSE, TRUE))
     {

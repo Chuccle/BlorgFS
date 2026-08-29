@@ -1,4 +1,4 @@
-//
+﻿//
 // Exhaustive interleaving proof of concurrent dispatch, through the real
 // public IRP_MJ entry points -- BlorgCreate -- rather than through an
 // internal function called directly.
@@ -114,7 +114,7 @@ struct DispatchProof
 
     //
     // The B: symlink's backing disk device object, normally set once by
-    // CreateBlorgDiskDeviceObject at mount and read by OpenExistingFcb to
+    // DriverCreateDiskDeviceObject at mount and read by OpenExistingFcb to
     // wire FileObject->Vpb on a successful open. Modelled here as a bare
     // DEVICE_OBJECT with a VPB, not through the real disk-device creation
     // path -- BlorgVolumeCreate never touches its contents beyond this one

@@ -1,4 +1,4 @@
-//
+﻿//
 // Coverage for the real DevIoCtrl.c: the FSDO vendor IOCTLs (TLS pin
 // update, statistics query/reset) and the DDO's MOUNTDEV identity and
 // synthetic disk-geometry IOCTLs. Previously 0% -- and the only surface in
@@ -421,7 +421,7 @@ TEST_F(DevIoCtrlTest, UnknownIoctlIsRejectedOnBothDevices)
 //
 // The control device (\.\BlorgFS) shares BlorgFileSystemControl's
 // IRP_MN_USER_FS_REQUEST arm with the volume, but a handle on it has no
-// node behind it: BlorgFileSystemCreate reports FILE_OPENED and leaves
+// node behind it: CreateFileSystem reports FILE_OPENED and leaves
 // FsContext NULL. The oplock FSCTLs read the node's type as their first
 // act, and every one of them is FILE_ANY_ACCESS, so a caller needs only
 // the GENERIC_READ the FSDO's SDDL grants World.
@@ -443,7 +443,7 @@ protected:
     };
 
     //
-    // A handle on the control device, exactly as BlorgFileSystemCreate
+    // A handle on the control device, exactly as CreateFileSystem
     // leaves one: no FsContext, no CCB.
     //
     FsctlRequest* PrepareControlDeviceFsctl(ULONG code, ULONG inputLength, ULONG outputLength)

@@ -36,7 +36,7 @@
 // Initializes the WAIT and RECURSIVE_CALL flags in an IRP's driver-context
 // flags word from a clean (zeroed) state.
 //
-inline void BlorgSetupIrpContext(PIRP Irp, BOOLEAN Wait)
+inline VOID BlorgSetupIrpContext(PIRP Irp, BOOLEAN Wait)
 {
     ULONG_PTR flags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
 
