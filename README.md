@@ -479,11 +479,33 @@ per-file-object setting is the right granularity of control for it, and the
 adaptivity Cc does not provide is adaptivity this driver has the state to
 provide itself.
 
-What has to be checked before building it: `CcSetReadAheadGranularity` is
-documented as setting the value for a cached file, and nothing says it may
-be called more than once per file object. FastFat calls it once, at
-cache-map time. If a second call is not legal the idea does not survive in
-this form, and that is the first thing to establish rather than the last.
+`CcSetReadAheadGranularity` is re-callable, which the design depends on and
+nothing documents. It is described as setting the value for a cached file,
+FastFat calls it once at cache-map time, and a silently-ignored second call
+would have killed the idea. Measured rather than assumed: starting a demux
+run at 512 KB and switching to `PAGE_SIZE` partway through moved
+amplification from 27.5x to **18.7x** on the same file and the same
+setting, with the switch point accounting for the size of the move (it
+fires after 300 paging reads, and a 512 KB run only produces about 420, so
+roughly 71% of the run stayed at 512 KB: 0.71 x 27.5 + 0.29 x 1.4 is about
+20). Run-to-run variation on that cell is ~2%, so a 32% drop is the
+re-call, not noise. Speculative reads rose 167 to 246 and demand reads 245
+to 361 across the same switch, which is what smaller granules produce.
+
+What is still unestablished is the microscopic mechanism. Read-ahead is
+demonstrably what costs the slow reads -- suppressing it with
+FILE_FLAG_RANDOM_ACCESS drops reads over a frame from 46/43 to 2/4 across
+replicates, with ReadsSpeculative confirming the suppression actually
+happened -- but whether the damage is collision (a reader faulting into a
+range an in-flight read-ahead already claimed, and inheriting its latency),
+transport congestion from fetching 27x the bytes, or priority inversion is
+not settled by aggregates. An earlier reading of this section claimed
+collision on the grounds that the worst application read tracked the worst
+speculative fetch. That was wrong: the maximum sits at 58-66 ms in every
+configuration measured, including with read-ahead entirely suppressed, so
+it is a floor common to all of them and not evidence of anything. The
+metric that does discriminate is the count of reads over a frame, not the
+maximum.
 
 ### What it is not
 
