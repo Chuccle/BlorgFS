@@ -14,6 +14,10 @@
              edits, which is what the Stop hook in .claude\settings.json
              does.
 
+      Proof  Build, plus exactly what Fast leaves out: the exhaustive
+             interleaving explorations and the full fuzz corpus. Minutes.
+             Run before landing lifetime, dispatch or parser changes.
+
       Fast   Build, plus every usermode test: the crypto vector suite,
              the TLS fuzz corpus, the HTTP client logic sandbox (scenarios
              and fuzzer), and the kernel-behaviour suite -- the real
@@ -71,7 +75,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Build', 'Fast', 'Perf', 'All')][string]$Tier = 'Fast',
+    [ValidateSet('Build', 'Fast', 'Proof', 'Perf', 'All')][string]$Tier = 'Fast',
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Debug',
     [string]$PerfDrive = 'B',
     [string]$PerfFile,
@@ -231,8 +235,28 @@ function Invoke-TestExe {
 
 $ok = $true
 
-$runsBuild = $Tier -in @('Build', 'Fast', 'All')
+$runsBuild = $Tier -in @('Build', 'Fast', 'Proof', 'All')
 $runsTests = $Tier -in @('Fast', 'All')
+
+#
+# The exhaustive interleaving explorations and the fuzzers are verification
+# runs, not regression tests, and they do not belong in the loop a person
+# runs after every edit. Measured: the whole test set took 608 seconds, of
+# which 546 was one sandbox and 518 was a single exhaustive proof. What is
+# left after excluding them is around a second, which is the difference
+# between a gate that gets run and one that gets skipped.
+#
+# Nothing is deleted. -Tier Proof runs exactly what Fast excludes, so the
+# proofs stay one command away and CI can run both.
+#
+$runsProofs = $Tier -in @('Proof', 'All')
+
+#
+# gtest filter applied in Fast. *SchedTest.* is every systematic
+# interleaving exploration; they exhaust schedule spaces in the tens of
+# thousands and are what the Proof tier exists for.
+#
+$FastFilter = '--gtest_filter=-*SchedTest.*:*StressTest.*'
 
 if ($runsBuild) {
     Write-Host "==> Build tier ($Configuration)" -ForegroundColor Cyan
@@ -274,7 +298,7 @@ if ($runsBuild) {
         # the client returned a plausible status.
         #
         $ok = (Invoke-TestExe 'ClientSandbox.exe' 'test:client-scenarios' 300 '' 'build:ClientSandbox') -and $ok
-        $ok = (Invoke-TestExe 'ClientFuzz.exe' 'test:client-fuzz' 600 '50000' 'build:ClientFuzz') -and $ok
+        $ok = (Invoke-TestExe 'ClientFuzz.exe' 'test:client-fuzz' 60 "200 $FastFilter" 'build:ClientFuzz') -and $ok
 
         #
         # The real Socket.c against the kernel rule model (gtest). Covers
@@ -285,7 +309,7 @@ if ($runsBuild) {
         # -- the negative controls proving each of those rules is actually
         # enforced rather than merely documented.
         #
-        $ok = (Invoke-TestExe 'SocketSandbox.exe' 'test:kernel-socket' 300 '' 'build:SocketSandbox') -and $ok
+        $ok = (Invoke-TestExe 'SocketSandbox.exe' 'test:kernel-socket' 120 $FastFilter 'build:SocketSandbox') -and $ok
 
         #
 
@@ -302,7 +326,7 @@ if ($runsBuild) {
         # and contenders started genuinely blocking. A timeout here means
         # the machine slowed or the space exploded, not a test failure.
         #
-        $ok = (Invoke-TestExe 'NodeTableSandbox.exe' 'test:kernel-nodetable' 900 '' 'build:NodeTableSandbox') -and $ok
+        $ok = (Invoke-TestExe 'NodeTableSandbox.exe' 'test:kernel-nodetable' 120 $FastFilter 'build:NodeTableSandbox') -and $ok
 
         #
         # Every remaining driver translation unit -- all of IRP dispatch,
@@ -312,7 +336,7 @@ if ($runsBuild) {
         # here has drifted from the shim, and a test cannot be written for
         # a file that does not build.
         #
-        $ok = (Invoke-TestExe 'DispatchSandbox.exe' 'test:kernel-dispatch' 300 '' 'build:DispatchSandbox') -and $ok
+        $ok = (Invoke-TestExe 'DispatchSandbox.exe' 'test:kernel-dispatch' 120 $FastFilter 'build:DispatchSandbox') -and $ok
 
         #
         # The real TlsHandshake.c against the same model, with a fake TLS
@@ -329,6 +353,41 @@ if ($runsBuild) {
         #
         $ok = (Invoke-TestExe 'TlsHandshakeSandbox.exe' 'test:kernel-tlshandshake' 300 '' 'build:TlsHandshakeSandbox') -and $ok
     }
+}
+
+# ------------------------------------------------------------------ Proof
+
+#
+# Exactly what Fast excludes, so the two together are the old Fast and
+# nothing has stopped being checked -- it has stopped being checked on
+# every edit.
+#
+# These are the systematic interleaving explorations and the fuzzer. They
+# exhaust schedule spaces rather than sampling them, which is what makes
+# them proofs and also what makes them minutes rather than milliseconds.
+# Run before landing anything that touches node lifetime, dispatch, the
+# path cache, the socket watchdog, or the HTTP response parser.
+#
+if ($runsProofs) {
+    Write-Host "==> Proof tier (exhaustive; minutes, not seconds)" -ForegroundColor Cyan
+
+    $proofFilter = '--gtest_filter=*SchedTest.*:*StressTest.*'
+
+    $ok = (Invoke-TestExe 'SocketSandbox.exe'   'proof:socket'    300  $proofFilter 'build:SocketSandbox') -and $ok
+    $ok = (Invoke-TestExe 'DispatchSandbox.exe' 'proof:dispatch'  600  $proofFilter 'build:DispatchSandbox') -and $ok
+
+    #
+    # The long one: the revival proof alone exhausts ~56k schedules and
+    # takes several minutes, and it grew when lock claims moved under the
+    # baton and contenders began genuinely blocking. A timeout here means
+    # the machine slowed or the space exploded, not a test failure.
+    #
+    $ok = (Invoke-TestExe 'NodeTableSandbox.exe' 'proof:nodetable' 1800 $proofFilter 'build:NodeTableSandbox') -and $ok
+
+    #
+    # The full corpus rather than the 500-iteration smoke Fast runs.
+    #
+    $ok = (Invoke-TestExe 'ClientFuzz.exe' 'proof:client-fuzz' 900 '50000' 'build:ClientFuzz') -and $ok
 }
 
 # ------------------------------------------------------------------- Perf

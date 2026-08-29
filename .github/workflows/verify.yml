@@ -7,9 +7,15 @@ name: Exhaustive verification
 # stay quick enough that people actually wait for it.
 #
 # This workflow is everything whose cost is measured in minutes rather than
-# seconds: bounded model checking, and fuzzing/interleaving exploration run
-# far past the sample a PR can afford. None of it is a good gate -- a CBMC
-# regression is worth a nightly failure, not a blocked merge.
+# seconds: bounded model checking, the systematic interleaving explorations,
+# the threaded stress runs, and the full fuzz corpus. None of it is a good
+# gate -- a CBMC regression or an exhausted schedule space is worth a
+# nightly failure, not a blocked merge.
+#
+# The interleavings job and build.yml's sandbox step are deliberately
+# complementary: the gate filters *SchedTest.* and *StressTest.* out, this
+# runs exactly those. Change the filter in one and change it in the other,
+# or verification silently stops happening.
 #
 # What is NOT here: the Perf tier. It needs a mounted BlorgFS volume and a
 # reachable HTTP backend, neither of which a hosted runner has, so it stays
@@ -70,3 +76,105 @@ jobs:
 
           & "$env:GITHUB_WORKSPACE\tools\Invoke-BlorgProofs.ps1" -CbmcPath $cbmc
           if ($LASTEXITCODE -ne 0) { throw "CBMC proofs failed with exit code $LASTEXITCODE" }
+
+  interleavings:
+    runs-on: windows-latest
+    name: Interleaving proofs and full fuzz
+    # Six hours is the hosted-runner ceiling, and this job is meant to use
+    # it. The atomic-granularity soaks alone ran 97 minutes locally without
+    # exhausting their space; the whole set is hours, which is the point of
+    # putting it on a schedule instead of a gate.
+    timeout-minutes: 350
+
+    # Exactly what the PR gate excludes.
+    #
+    # build.yml runs the sandbox suites with
+    # --gtest_filter=-*SchedTest.*:*StressTest.*, because those two are 546
+    # of the 608 seconds the suites used to take and a single exhaustive
+    # proof is 518 of them. They are verification runs rather than
+    # regression tests: a proof that exhausts a schedule space is worth a
+    # nightly failure, not a blocked merge.
+    #
+    # The filter here is that one inverted, so between the two workflows
+    # nothing has stopped being checked -- it has stopped being checked on
+    # every push.
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2.0.0
+
+      - name: Build sandbox suites
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $projects = @(
+            'tests\sandbox\ClientFuzz.vcxproj',
+            'tests\sandbox\SocketSandbox.vcxproj',
+            'tests\sandbox\NodeTableSandbox.vcxproj',
+            'tests\sandbox\DispatchSandbox.vcxproj'
+          )
+          foreach ($proj in $projects) {
+            msbuild $proj /p:Configuration=Debug /p:Platform=x64 /m /v:minimal
+            if ($LASTEXITCODE -ne 0) { throw "$proj failed to build" }
+          }
+
+      - name: Run interleaving proofs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $searchRoots = @('x64\Debug', 'tests\sandbox\x64\Debug')
+          $failed = @()
+
+          foreach ($suite in @('SocketSandbox.exe', 'DispatchSandbox.exe', 'NodeTableSandbox.exe')) {
+            $path = $searchRoots |
+                    ForEach-Object { Join-Path $_ $suite } |
+                    Where-Object { Test-Path $_ } |
+                    Select-Object -First 1
+
+            if (-not $path) { throw "$suite was not built" }
+
+            Write-Host "--- $suite (proofs) ---"
+
+            # --gtest_also_run_disabled_tests is what makes this exhaustive
+            # rather than merely slow. The DISABLED_ tests are the
+            # atomic-granularity soaks: every interlocked operation becomes
+            # a scheduling point, which is strictly stronger than the lock
+            # granularity the gated proofs run at, and far too expensive to
+            # run anywhere a person waits.
+            #
+            # The two kinds report differently and both matter. The
+            # lock-granularity proofs assert they finished under their
+            # schedule cap, so a pass means the space was exhausted and no
+            # interleaving of those threads can fail the invariant. The
+            # soaks cannot exhaust -- this scheduler does no partial-order
+            # reduction and the atomic space for two threads is far larger
+            # than any cap -- so they are large samples, and they print
+            # exhausted=NO to say so rather than implying a proof.
+            & $path '--gtest_filter=*SchedTest.*:*StressTest.*' --gtest_also_run_disabled_tests
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::$suite proofs failed with exit code $LASTEXITCODE"
+              $failed += $suite
+            }
+          }
+
+          if ($failed.Count -gt 0) { throw "interleaving proofs failed: $($failed -join ', ')" }
+
+      - name: Run the full fuzz corpus
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = @('x64\Debug', 'tests\sandbox\x64\Debug') |
+                  ForEach-Object { Join-Path $_ 'ClientFuzz.exe' } |
+                  Where-Object { Test-Path $_ } |
+                  Select-Object -First 1
+          if (-not $path) { throw "ClientFuzz.exe was not built" }
+
+          # 50000 iterations, against the 200-iteration smoke the gate runs.
+          & $path 50000
+          if ($LASTEXITCODE -ne 0) { throw "ClientFuzz failed with exit code $LASTEXITCODE" }
+

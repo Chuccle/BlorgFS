@@ -14,7 +14,7 @@
 // callers rely on and which no memory-safety check would catch on its own.
 //
 
-#include "..\..\Tls.c"
+#include "..\..\..\src\Tls.c"
 
 #define DER_HARNESS_BYTES 8
 

@@ -3,7 +3,7 @@
     Runs the CBMC proof harnesses against the real driver sources.
 
 .DESCRIPTION
-    Bounded model checking, not testing. Each harness in sandbox\verification
+    Bounded model checking, not testing. Each harness in tests\sandbox\verification
     includes a driver .c directly, so what is proved is a property of the
     shipping translation unit rather than of a transcription of it. Within the
     stated bound CBMC explores every input -- all byte values, all lengths --
@@ -70,7 +70,7 @@ function Get-VcVars {
 $proofs = @(
     @{
         Name     = 'TlsDerReadTlv'
-        Source   = 'sandbox\verification\TlsDerHarness.c'
+        Source   = 'tests\sandbox\verification\TlsDerHarness.c'
         Function = 'TlsDerReadTlvHarness'
         Unwind   = 12
         Covers   = 'DER tag/length reads over every input up to an 8-byte buffer'

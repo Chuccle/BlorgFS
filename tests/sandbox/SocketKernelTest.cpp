@@ -766,7 +766,17 @@ TEST_F(SocketKernelTest, PrewarmChainIssuesExactlyItsBudgetAndTerminates)
 // once both sides are done, which is exactly what the pre-fix code produced
 // whenever the transport answered second.
 //
-TEST_F(SocketKernelTest, TeardownDrainsAPrewarmConnectThatOutlivesIt)
+//
+// Same fixture, different name, because these two are sampling runs rather
+// than unit tests: each drives thousands of iterations against real threads
+// and settles by spinning, so they cost hundreds of milliseconds where
+// every other test here costs single digits. The name is what the Fast
+// tier filters on -- it excludes *StressTest.* and *SchedTest.* so the
+// gate stays about a second, and -Tier Proof runs exactly those.
+//
+using SocketStressTest = SocketKernelTest;
+
+TEST_F(SocketStressTest, TeardownDrainsAPrewarmConnectThatOutlivesIt)
 {
     WSK_MODEL_BEHAVIOUR deferred = Behaviour(WskModelDeferred, STATUS_SUCCESS, 0);
     WskModelSetConnectBehaviour(&deferred);
@@ -862,7 +872,7 @@ void PumpRaceCompleter(PumpRaceProof* proof)
     WskModelReleaseDeferred();
 }
 
-TEST_F(SocketKernelTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
+TEST_F(SocketStressTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
 {
     PumpRaceProof proof = {};
     proof.Address.sin_family = AF_INET;
