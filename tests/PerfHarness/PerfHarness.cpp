@@ -450,6 +450,14 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    sequential            %12llu  (%.1f%% of paging)\n",
         t.ReadsSequential, SafeRatio(t.ReadsSequential, t.ReadsPagingInline));
     printf("    end-of-file           %12llu\n", t.ReadsEndOfFile);
+    printf("    speculative (Cc RA)   %12llu  mean %llu us / max %llu us\n",
+        t.ReadsSpeculative,
+        (t.ReadsSpeculative > 0) ? (t.SpeculativeLatencySumUs / t.ReadsSpeculative) : 0ull,
+        t.SpeculativeLatencyMaxUs);
+    printf("    demand (someone waits)%12llu  mean %llu us / max %llu us\n",
+        t.ReadsDemand,
+        (t.ReadsDemand > 0) ? (t.DemandLatencySumUs / t.ReadsDemand) : 0ull,
+        t.DemandLatencyMaxUs);
     printf("    user bytes            %12llu\n", t.UserFileReadBytes);
     printf("    non-cached bytes      %12llu\n", t.NonCachedReadBytes);
 
@@ -1538,6 +1546,14 @@ static bool WriteReport(
     fprintf(f, "ReadsPosted=%llu\n", t.ReadsPosted);
     fprintf(f, "ReadsSequential=%llu\n", t.ReadsSequential);
     fprintf(f, "ReadsEndOfFile=%llu\n", t.ReadsEndOfFile);
+    fprintf(f, "ReadsSpeculative=%llu\n", t.ReadsSpeculative);
+    fprintf(f, "ReadsDemand=%llu\n", t.ReadsDemand);
+    fprintf(f, "SpeculativeLatencyMeanUs=%llu\n",
+        (t.ReadsSpeculative > 0) ? (t.SpeculativeLatencySumUs / t.ReadsSpeculative) : 0ull);
+    fprintf(f, "SpeculativeLatencyMaxUs=%llu\n", t.SpeculativeLatencyMaxUs);
+    fprintf(f, "DemandLatencyMeanUs=%llu\n",
+        (t.ReadsDemand > 0) ? (t.DemandLatencySumUs / t.ReadsDemand) : 0ull);
+    fprintf(f, "DemandLatencyMaxUs=%llu\n", t.DemandLatencyMaxUs);
     fprintf(f, "UserFileReads=%llu\n", t.UserFileReads);
     fprintf(f, "UserFileReadBytes=%llu\n", t.UserFileReadBytes);
 

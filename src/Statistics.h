@@ -241,6 +241,26 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ReadsEndOfFile;              // rejected at or past EOF
 
     //
+    // Paging reads split by whether anything was waiting on them:
+    // speculative is Cc's read-ahead, demand is a fault with an
+    // application blocked inside CcCopyRead.
+    //
+    // The split exists because the measured latency tail is not explained
+    // by fetch size. At four concurrent streams a 512 KB granule produced a
+    // worst read of 1087 ms against a single fetch's ~29 ms, which is
+    // head-of-line blocking rather than transfer time. If that is right,
+    // the demand latency is the number that matters and the speculative
+    // latency is the queue in front of it -- and these two pairs say so
+    // directly instead of by inference from a granularity sweep.
+    //
+    ULONG64 ReadsSpeculative;            // Cc read-ahead: nobody is waiting
+    ULONG64 ReadsDemand;                 // fault: an application is blocked
+    ULONG64 SpeculativeLatencySumUs;
+    ULONG64 SpeculativeLatencyMaxUs;
+    ULONG64 DemandLatencySumUs;
+    ULONG64 DemandLatencyMaxUs;
+
+    //
     // How long an application actually waited for a read, measured from
     // dispatch to completion on non-paging reads only.
     //
@@ -386,7 +406,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
 
-#define BLORGFS_STATISTICS_VERSION 9
+#define BLORGFS_STATISTICS_VERSION 10
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {
