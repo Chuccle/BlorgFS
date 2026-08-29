@@ -239,6 +239,16 @@ static VOID BlorgReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID Ca
 // at or past it -- expected/handled by callers like a media player
 // seeking near the tail of a file, not a hard error.
 //
+// The second bound is the one that is easy to miss. A backend-declared size
+// near the top of the range, and a hand-built kernel IRP whose offset sits
+// just under it, make the addition wrap signed: the sum goes negative, both
+// it and the end-of-file comparison go false, and an untrimmed request
+// reaches the fetch with a nonsensical range. The negative-offset check at
+// the top of BlorgVolumeRead catches only half of that shape. END_OF_FILE
+// rather than an error, because the read genuinely starts inside the
+// declared size but cannot be bounded by it, which is the same
+// caller-visible answer as any other tail past EOF.
+//
 static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG BytesLength, PIRP Irp, PULONG RealLengthOut)
 {
     if (StartingByte.QuadPart >= Fcb->Header.FileSize.QuadPart)
@@ -253,17 +263,6 @@ static NTSTATUS BlorgTrimReadToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, UL
         return STATUS_END_OF_FILE;
     }
 
-    //
-    // A backend-declared size near the top of the range and a hand-built
-    // kernel IRP whose offset sits just under it make the addition below
-    // wrap signed -- the sum goes negative, both it and the first comparison
-    // here go false, and an untrimmed request reaches the fetch with a
-    // nonsensical range. The negative-offset check at the top of
-    // BlorgVolumeRead catches only half of that shape; this catches the
-    // other half. END_OF_FILE rather than an error: the read genuinely
-    // starts inside the declared size but cannot be bounded by it, which is
-    // the same caller-visible answer as any other tail past EOF.
-    //
     if (StartingByte.QuadPart > MAXLONGLONG - C_CAST(LONGLONG, BytesLength))
     {
         BLORGFS_PRINT("Read end unrepresentable - file size = %llu, requested starting byte = %llu, requested length = %lu\n",
@@ -703,6 +702,14 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 // waited, which is precisely the stall a viewer feels and the only place
 // it is visible.
 //
+// One switch body covers everything that is not the volume, unknown kinds
+// included: each completes with the initialised-invalid status. An unknown
+// kind cannot reach this entry point through the I/O manager today -- only
+// this driver's three device objects carry its major table -- but a
+// dispatcher that completes inside its cases rather than after the switch
+// would strand the IRP on any future fourth kind, so the completion is
+// unconditional.
+//
 NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -738,15 +745,6 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             break;
         }
 
-        //
-        // One body for everything that is not the volume, unknown included:
-        // each of these completes with the initialized-invalid status. An
-        // unknown kind cannot reach this entry point through the I/O manager
-        // today -- only this driver's three device objects carry its major
-        // table -- but a dispatcher that completes inside its cases rather
-        // than after the switch strands the IRP on any future fourth kind,
-        // so the completion is unconditional.
-        //
         case BlorgDeviceDisk:
         case BlorgDeviceFileSystem:
         default:

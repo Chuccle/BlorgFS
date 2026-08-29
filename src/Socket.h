@@ -151,11 +151,11 @@ extern ULONG SocketTlsRecvCapacity;
 //
 NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket);
 
-NTSTATUS BlorgInitialiseWskClient(void);
-void BlorgCleanupWskClient(void);
+NTSTATUS BlorgInitialiseWskClient(VOID);
+VOID BlorgCleanupWskClient(VOID);
 
 NTSTATUS BlorgGetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo);
-void BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo);
+VOID BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo);
 
 NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket);
 
@@ -194,7 +194,7 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket);
 
 VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count);
 
-void BlorgCleanupWskSocketPool(void);
+VOID BlorgCleanupWskSocketPool(VOID);
 
 //
 // Fire-and-forget socket close. Never waits, so it is callable from the

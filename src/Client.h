@@ -11,13 +11,13 @@
 // new one. PASSIVE_LEVEL only, called once from DriverUnload before the
 // device objects are torn down. See BlorgDrainHttpClient in Client.c.
 //
-VOID BlorgDrainHttpClient(void);
+VOID BlorgDrainHttpClient(VOID);
 
-NTSTATUS BlorgInitialiseHttpClient(void);
-void BlorgCleanupHttpClient(void);
+NTSTATUS BlorgInitialiseHttpClient(VOID);
+VOID BlorgCleanupHttpClient(VOID);
 
 NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRING* ServiceName, const ADDRINFOEXW* Hints, PADDRINFOEXW* RemoteAddrInfo);
-void BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo);
+VOID BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo);
 
 //
 // Completion callback signatures per operation. Exactly one of these is
@@ -46,7 +46,7 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
     PVOID CallerContext
 );
 
-void BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo);
+VOID BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo);
 
 NTSTATUS BlorgHttpGetFileInformation(
     const UNICODE_STRING* Path,
@@ -80,4 +80,4 @@ NTSTATUS BlorgHttpGetFileMdl(
     PVOID CallerContext
 );
 
-void BlorgFreeHttpFile(PFILE_BUFFER FileBuffer);
+VOID BlorgFreeHttpFile(PFILE_BUFFER FileBuffer);

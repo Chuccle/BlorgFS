@@ -184,8 +184,8 @@ _Dispatch_type_(IRP_MJ_CLEANUP)                  DRIVER_DISPATCH BlorgCleanup;
 _Dispatch_type_(IRP_MJ_QUERY_SECURITY)           DRIVER_DISPATCH BlorgQuerySecurity;
 _Dispatch_type_(IRP_MJ_SET_SECURITY)             DRIVER_DISPATCH BlorgSetSecurity;
 
-NTSTATUS BlorgInitializeSecurityDescriptor(void);
-VOID BlorgFreeSecurityDescriptor(void);
+NTSTATUS BlorgInitializeSecurityDescriptor(VOID);
+VOID BlorgFreeSecurityDescriptor(VOID);
 
 NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject);
 

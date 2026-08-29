@@ -61,10 +61,10 @@ NTSTATUS BlorgFsdRequeueRequest(PIRP Irp);
 
 NTSTATUS BlorgPrePostIrp(PVOID Context, PIRP Irp);
 
-void BlorgOplockPrePostIrp(PVOID Context, PIRP Irp);
+VOID BlorgOplockPrePostIrp(PVOID Context, PIRP Irp);
 
-void BlorgOplockComplete(PVOID Context, PIRP Irp);
+VOID BlorgOplockComplete(PVOID Context, PIRP Irp);
 
-NTSTATUS BlorgCreateWorkQueue(void);
+NTSTATUS BlorgCreateWorkQueue(VOID);
 
-void BlorgDestroyWorkQueue(void);
+VOID BlorgDestroyWorkQueue(VOID);

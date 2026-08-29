@@ -1166,6 +1166,11 @@ static NTSTATUS BlorgFileSystemCreate(PIRP Irp)
 //  status is known, and a create that pends is counted by whichever
 //  completion finishes it rather than twice.
 //
+//  The default case is unreachable through the I/O manager today -- only
+//  this driver's three device objects carry its major table -- but the
+//  cases above complete inside themselves, so a fourth kind would strand
+//  the IRP rather than fail it. Hence the unconditional completion.
+//
 NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -1210,12 +1215,6 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             break;
         }
 
-        //
-        // Unreachable through the I/O manager today (only this driver's
-        // three device objects carry its major table), but the cases above
-        // complete inside themselves, so a fourth kind would strand the IRP
-        // here rather than fail it. Complete unconditionally.
-        //
         default:
         {
             BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);

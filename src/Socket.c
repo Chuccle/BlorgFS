@@ -507,7 +507,15 @@ static NTSTATUS SocketAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP I
 
 ///////////////////////////////////////////////////////////////////////////////////////////////
 
-NTSTATUS BlorgInitialiseWskClient(void)
+//
+// Registers with WSK, captures the provider NPI, and brings up the socket
+// pool and its lookaside list.
+//
+// The pre-warm state is reset with plain stores rather than interlocked
+// ones: nothing can be in flight across an initialise, because the previous
+// teardown polled until there was not.
+//
+NTSTATUS BlorgInitialiseWskClient(VOID)
 {
     WSK_CLIENT_NPI wskClientNpi =
     {
@@ -537,10 +545,6 @@ NTSTATUS BlorgInitialiseWskClient(void)
 
     ExInitializeNPagedLookasideList(&AsyncContextLookaside, NULL, NULL, POOL_NX_ALLOCATION, sizeof(KSOCKET_ASYNC_CONTEXT), SOCKET_TAG, 0);
 
-    //
-    // Nothing can be in flight across an initialise -- the previous
-    // teardown polled until there was not -- so the reset is plain stores.
-    //
     SocketPrewarmRemaining = 0;
     SocketPrewarmInFlight = 0;
     SocketPrewarmShuttingDown = 0;
@@ -579,7 +583,7 @@ NTSTATUS BlorgInitialiseWskClient(void)
 // provider NPI, then deregisters. Order matters -- sockets must be
 // closed before the provider they were obtained from is released.
 //
-void BlorgCleanupWskClient(void)
+VOID BlorgCleanupWskClient(VOID)
 {
     BlorgCleanupWskSocketPool();
     WskReleaseProviderNPI(&WskRegistration);
@@ -614,7 +618,7 @@ void BlorgCleanupWskClient(void)
 // primitive -- the completing side is an interlocked decrement, not a
 // signal.
 //
-VOID BlorgCleanupWskSocketPool(void)
+VOID BlorgCleanupWskSocketPool(VOID)
 {
     KIRQL oldIrql;
 
@@ -684,7 +688,7 @@ NTSTATUS BlorgGetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRIN
 }
 
 // Frees an ADDRINFOEXW chain returned by BlorgGetWskAddrInfo.
-void BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo)
+VOID BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo)
 {
     WskProviderNpi.Dispatch->WskFreeAddressInfo(
         WskProviderNpi.Client,
@@ -1009,17 +1013,29 @@ static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN 
 // consumes it there) or after Running was cleared (so its own Pump call
 // becomes the new loop). No schedule drops a step by both paths.
 //
+// Every call publishes one owed step up front -- including the chain
+// re-entry from the completion routine, which arrives holding no Pending of
+// its own. Publishing before the Running check is what keeps both exits
+// correct: a loop already live consumes the publication in its normal
+// sweep, and a call that becomes the loop consumes it itself.
+//
+// Inside the loop, the teardown-latch check and the in-flight raise are one
+// locked decision -- see the state-block comment for why that pairing must
+// not become a bare read followed by an action. Once the raise has
+// happened the issue is unconditional even if teardown latches immediately
+// after: a step counted as in flight must go out, because only its
+// completion, or the synchronous-failure arm, brings the count back down.
+//
+// The tail is the gate-clear/recheck pattern. Running is released and
+// Pending re-read in one locked section, so a completion publishing during
+// that release either takes Running itself or is seen by the re-read. A
+// TRUE Pending is deliberately not consumed there -- the inner loop is the
+// only path that issues a connect, so the tail loops back and lets it.
+//
 static VOID SocketPrewarmPump(VOID)
 {
     KIRQL oldIrql;
 
-    //
-    // Every call publishes one owed step up front -- including the chain
-    // re-entry from StepComplete, which arrives holding no Pending of its
-    // own. Publishing before the Running check keeps both exits correct:
-    // if a loop is already live it consumes this publication in its normal
-    // sweep, and if this call becomes the loop it consumes it itself.
-    //
     KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
     SocketPrewarmPumpPending = TRUE;
     KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
@@ -1057,15 +1073,6 @@ static VOID SocketPrewarmPump(VOID)
                 break;
             }
 
-            //
-            // The latch check and the in-flight raise are one locked
-            // decision -- see the state-block comment for why this pairing
-            // must not be split into a bare read followed by an action.
-            // Once the raise has happened the issue is unconditional even
-            // if teardown latches immediately after: a step counted as
-            // in flight must go out, because only its completion (or the
-            // synchronous-failure arm below) brings the count back down.
-            //
             KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
 
             BOOLEAN latched = C_CAST(BOOLEAN, SocketPrewarmShuttingDown);
@@ -1098,20 +1105,6 @@ static VOID SocketPrewarmPump(VOID)
             }
         }
 
-        //
-        // Tail recheck: the original gate-clear/recheck pattern. Release
-        // Running and re-read Pending in one locked section so that a
-        // completion that publishes during our release either takes Running
-        // itself (sees Running=FALSE) or is visible to the re-read.
-        //
-        // When Pending was TRUE: someone published while we held Running.
-        // Clear Running and loop back so the inner loop picks it up.
-        // We must NOT consume Pending here (no Pending = FALSE), because
-        // the inner loop is the only path that issues a connect.
-        //
-        // When Pending was FALSE: no outstanding work. Clear Running and
-        // return.
-        //
         KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
         SocketPrewarmPumpRunning = FALSE;
         BOOLEAN pending = SocketPrewarmPumpPending;
@@ -1129,6 +1122,20 @@ static VOID SocketPrewarmPump(VOID)
 // a fill is running -- owed steps left, or the tail connect still in
 // flight -- is ignored rather than doubling the rate.
 //
+// Admission is one locked decision: not while teardown has latched, not
+// while another fill's steps are owed, not while its tail step is still in
+// flight, which is the state a finished budget leaves behind. Checking and
+// claiming under the same lock section is what makes this safe against a
+// concurrently running teardown on weakly ordered silicon -- see the
+// state-block comment above.
+//
+// Only the family-sized address is copied. The caller hands a PSOCKADDR at
+// an object sized for its family -- DriverEntry passes ai_addr, the sandbox
+// tests a stack SOCKADDR_IN -- so copying a full SOCKADDR_STORAGE would
+// read past its end. Every consumer of SocketPrewarmAddress (SockAddrEqual,
+// WskSocketConnect, the per-socket RemoteAddress copy) honours the family
+// size too.
+//
 VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 {
     if (!RemoteAddress || 0 == Count)
@@ -1136,14 +1143,6 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
         return;
     }
 
-    //
-    // Fill admission is one locked decision: not while teardown has latched,
-    // not while another fill's steps are owed, not while its tail step is
-    // still in flight (which is the state a finished budget leaves behind).
-    // Checking and claiming under the same lock section is what makes this
-    // safe against a concurrently-running teardown on weakly-ordered
-    // silicon -- see the state-block comment above.
-    //
     KIRQL oldIrql;
 
     KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
@@ -1158,14 +1157,6 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 
     SocketPrewarmRemaining = C_CAST(LONG, Count);
 
-    //
-    // Copy only the family-sized address. The caller hands a PSOCKADDR at
-    // an object sized for its family -- DriverEntry passes ai_addr, the
-    // sandbox tests a stack SOCKADDR_IN -- so copying the full
-    // SOCKADDR_STORAGE read past its end. Every consumer of
-    // SocketPrewarmAddress (SockAddrEqual, WskSocketConnect, the per-socket
-    // RemoteAddress copy) honors the family size too.
-    //
     ULONG addressLength = (AF_INET6 == RemoteAddress->sa_family)
         ? C_CAST(ULONG, sizeof(SOCKADDR_IN6))
         : C_CAST(ULONG, sizeof(SOCKADDR_IN));

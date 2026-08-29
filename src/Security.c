@@ -6,7 +6,7 @@
 //  self-relative SD; set-security is unimplemented.
 //
 
-NTSTATUS BlorgInitializeSecurityDescriptor(void)
+NTSTATUS BlorgInitializeSecurityDescriptor(VOID)
 {
     SECURITY_DESCRIPTOR absolute;
 
@@ -65,7 +65,7 @@ NTSTATUS BlorgInitializeSecurityDescriptor(void)
 // Frees the shared self-relative security descriptor, if allocated. Called
 // at driver unload.
 //
-VOID BlorgFreeSecurityDescriptor(void)
+VOID BlorgFreeSecurityDescriptor(VOID)
 {
     if (global.FileSecurityDescriptor)
     {
