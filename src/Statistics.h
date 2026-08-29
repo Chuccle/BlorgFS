@@ -265,6 +265,8 @@ typedef struct _BLORGFS_STATISTICS
     //
     ULONG64 ReadAheadShrinks;
     ULONG64 ReadAheadGrows;
+
+
     ULONG64 SpeculativeLatencySumUs;
     ULONG64 SpeculativeLatencyMaxUs;
     ULONG64 DemandLatencySumUs;

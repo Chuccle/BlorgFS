@@ -1,4 +1,4 @@
-# BlorgFS
+﻿# BlorgFS
 
 Kernel-mode Windows filesystem driver presenting an HTTP backend as a mounted
 volume (B:). Read-only. Async WSK networking, an optional hand-rolled TLS 1.3
@@ -506,6 +506,67 @@ configuration measured, including with read-ahead entirely suppressed, so
 it is a floor common to all of them and not evidence of anything. The
 metric that does discriminate is the count of reads over a frame, not the
 maximum.
+
+### Solving the sequential tail: it was fetch size all along
+
+The sequential tail is not a separate phenomenon. It is a direct function
+of how long the fetch a reader is blocked on takes, and that tracks fetch
+size:
+
+| fetch mean | reads over a frame |
+|---|---|
+| 13.1 ms (`PAGE_SIZE`) | 0.13% |
+| 19.8 ms (128 KB) | 0.345% |
+| 58.7 ms (512 KB) | 3.40% |
+| 51.2 ms (512 KB split four ways) | 4.38% |
+
+The frame interval being missed is 41.67 ms, so a granule whose fetch
+averages 58.7 ms misses it routinely and one averaging 19.8 ms almost never
+does. Nothing subtler is going on.
+
+The committed granularity is therefore **128 KB**, and the trade is a
+tenfold reduction in reads a viewer can see for 15% of sequential
+throughput -- 19.03 MB/s against 22.44, which is still an order of
+magnitude above any playback bitrate this volume serves. Full numbers and
+method are in `Driver.h` beside the constant.
+
+**Measure interleaved or not at all.** Every earlier comparison here was
+A-then-B in time, and the host drifts: the same 128 KB setting measured
+20.2 MB/s at 0.16% in one session and 12.6 MB/s at 1.8% an hour later. An
+ordered comparison attributes that drift to whichever setting ran second.
+The numbers above alternate 512/128/512/128 with a reboot per run, and the
+replicates came back at 3.37/3.42% and 0.34/0.35% -- tight enough to decide
+on, which none of the earlier ordered runs were. The reversal controls used
+before this protected against dataset bias and did nothing about drift.
+
+### Splitting the fetch: built, measured, removed
+
+Splitting one large fetch into concurrent range requests over partial MDLs
+was built to get a short stall and a large granule at once. It measured
+worse than not splitting, at every factor tried: mean fetch latency rose
+from 46.1 ms to 51.2 ms at four slices, and to 50-57 ms at two.
+
+The connection counters exclude the obvious explanation -- 100% pool reuse,
+no fresh connects, no retries, no timeouts -- and the arithmetic gives the
+real one. 51.2 ms across four slices is about 12.8 ms each, which is serial
+rather than concurrent. This guest has two processors, and four
+simultaneous WSK receives each running a completion and an HTTP parse
+cannot overlap on them. Concurrency is not a free lever here, and the code
+was removed rather than kept as something that costs requests and returns
+nothing.
+
+Recorded because the idea is a natural one to have again, and because
+READ_AHEAD_PARAMETERS.PipelinedRequestSize in ntifs.h describes exactly
+this and would invite it. On a guest with more processors the answer may
+differ; on this one it does not.
+
+The same section previously claimed the tail was a reader colliding with an
+in-flight read-ahead and inheriting its latency, on the grounds that the
+worst application read tracked the worst speculative fetch. That was two
+constants sharing a floor -- the maximum sits at 58-66 ms in every
+configuration, including with read-ahead suppressed outright -- and it is
+withdrawn. The count of reads over a frame is what discriminates; the
+maximum never did.
 
 ### What it is not
 

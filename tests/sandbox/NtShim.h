@@ -89,6 +89,7 @@ typedef long NTSTATUS;
 #define STATUS_REVISION_MISMATCH         C_CAST(NTSTATUS, 0xC0000059L)
 #define STATUS_CONNECTION_REFUSED        C_CAST(NTSTATUS, 0xC0000236L)
 #define STATUS_INVALID_NETWORK_RESPONSE  C_CAST(NTSTATUS, 0xC00000C3L)
+#define STATUS_NOT_SUPPORTED             C_CAST(NTSTATUS, 0xC00000BBL)
 
 typedef unsigned char  UCHAR;
 typedef unsigned short USHORT;
@@ -550,6 +551,21 @@ VOID MmProbeAndLockPages(PMDL Mdl, KPROCESSOR_MODE AccessMode, LOCK_OPERATION Op
 VOID MmUnlockPages(PMDL Mdl);
 VOID MmBuildMdlForNonPagedPool(PMDL Mdl);
 PVOID MmGetSystemAddressForMdlSafe(PMDL Mdl, ULONG Priority);
+
+//
+// A macro in the real WDK, so it is one here too rather than a symbol the
+// sandbox would have to export.
+//
+#define MmGetMdlVirtualAddress(Mdl) ((Mdl)->Base)
+
+//
+// Describes a slice of SourceMdl's pages without taking a second lock on
+// them. The model enforces that the slice lies inside the source, which is
+// the mistake this API invites: an offset computed against the wrong base
+// produces an MDL pointing at pages the request never locked, and in the
+// kernel that is a bugcheck a long way from the arithmetic that caused it.
+//
+VOID IoBuildPartialMdl(PMDL SourceMdl, PMDL TargetMdl, PVOID VirtualAddress, ULONG Length);
 
 VOID ShimFailNextMdlMapping(VOID);
 
