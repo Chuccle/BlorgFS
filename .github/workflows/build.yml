@@ -137,7 +137,17 @@ jobs:
     #
     # Run the binaries directly rather than tools\Invoke-BlorgChecks.ps1
     # -Tier Fast: the tier would rebuild everything the msbuild step above
-    # just produced. Keep this list in step with that script's Fast tier.
+    # just produced. Keep this list AND the filter below in step with that
+    # script's Fast tier.
+    #
+    # The filter is the same one Fast applies locally. *SchedTest.* is the
+    # systematic interleaving explorations and *StressTest.* the threaded
+    # sampling runs; together they were 546 of the 608 seconds this step
+    # used to take, and a single exhaustive proof was 518 of those. They are
+    # verification runs rather than regression tests, so they belong in
+    # verify.yml's nightly Proof job, which runs exactly what this excludes.
+    # Dropping them from here without adding them there would have quietly
+    # stopped running them.
     - name: Run sandbox test suites
       shell: pwsh
       run: |
@@ -175,7 +185,7 @@ jobs:
           }
 
           Write-Host "--- $suite ($path) ---"
-          & $path
+          & $path '--gtest_filter=-*SchedTest.*:*StressTest.*'
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::$suite failed with exit code $LASTEXITCODE"
             $failed += $suite
