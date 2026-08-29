@@ -84,6 +84,192 @@ static VOID ReadTrackStream(FCB* Fcb, ULONG64 Offset, ULONG Length)
     stream->End = Offset + Length;
 }
 
+//
+// Longest run of exactly-adjacent reads any one stream on this file has
+// managed. This is what separates a reader walking a file forwards from a
+// demuxer pulling short bursts out of interleaved tracks, and the two want
+// opposite read-ahead granularities.
+//
+static ULONG64 ReadLongestStreak(const FCB* Fcb)
+{
+    ULONG64 longest = 0;
+
+    for (ULONG i = 0; i < READ_STREAM_TRACKER_COUNT; ++i)
+    {
+        longest = (Fcb->Streams[i].Streak > longest) ? Fcb->Streams[i].Streak : longest;
+    }
+
+    return longest;
+}
+
+//
+// Read-ahead runs ahead of consumption by construction, so a window's
+// fetched total always includes some bytes whose reads have not happened
+// yet. That lead is bounded by a small multiple of the granule, and the
+// two versions of this policy that got it wrong are worth recording,
+// because they failed in opposite directions.
+//
+// The first compared fetched against consumed with no allowance at all,
+// over a fixed 256 KB window. At a 512 KB granule the lead is twice the
+// window, so on a sequential read -- true ratio 1.0 -- the measurement was
+// pure noise and the policy flapped 170 times, shrinking and growing in
+// equal numbers on a pattern that never changed.
+//
+// The second scaled the window to eight granules to drown the lead. At 512
+// KB that is a 4 MB window, which is larger than the entire demux run
+// consumes, so the policy never completed a window and never fired at all.
+//
+// The lead only distorts the comparison when the ratio is near one. At 27x
+// amplification a 1 MB lead against 99 MB fetched changes nothing; at 1.0x
+// it is the whole signal. So the window stays small enough to act within a
+// realistic run, and the lead is subtracted explicitly instead.
+//
+#define READ_AHEAD_ADAPT_WINDOW_GRANULES 2
+#define READ_AHEAD_ADAPT_WINDOW_FLOOR    (256ull * 1024ull)
+#define READ_AHEAD_ADAPT_LEAD_GRANULES   2
+
+//
+// Consecutive windows that must agree before the granule moves. One
+// window's ratio is not evidence -- see the flapping above -- and two
+// costs at most one extra window of the wrong granularity.
+//
+#define READ_AHEAD_ADAPT_AGREEMENT 2
+
+//
+// Amplification above which read-ahead is judged to be wasted, and below
+// which it is judged to be earning its keep. Measured: a dense sequential
+// reader runs at about 1.0 whatever the granularity, while the demux
+// pattern measures 27.5x at 512 KB, 10.7x at 64 KB and 1.4x at PAGE_SIZE.
+// The gap between the two thresholds is the hysteresis -- without it a
+// reader sitting near one number would be re-tuned on every window.
+//
+#define READ_AHEAD_ADAPT_WASTE_RATIO  2
+#define READ_AHEAD_ADAPT_EARNED_RATIO 1
+
+//
+// Adjacent reads a single stream must string together before the policy
+// will grow the granule. Amplification alone cannot justify growth: once
+// the granule is small BOTH a sequential reader and a demuxer measure
+// close to 1.0, so growing on that signal alone would push the demuxer
+// straight back to 27x. The burst length is what tells them apart, and the
+// captured trace bursts about four reads before jumping.
+//
+#define READ_AHEAD_ADAPT_GROW_STREAK  16
+
+//
+// Re-tunes Cc's read-ahead granularity for this file from what the reader
+// has actually been doing.
+//
+// The two ends of the range were both measured and both regress at the
+// other's workload: 512 KB gives sequential reads 27.1 MB/s against 16.1
+// at PAGE_SIZE, and costs the demux pattern 27.5x amplification, 46 reads
+// over a frame interval per 900, and half its throughput. No constant
+// serves both, which is what makes this adaptive rather than a better
+// default.
+//
+// It starts at whatever was configured and only moves on evidence, so a
+// workload that never trips a threshold behaves exactly as it does today.
+// Growth is deliberately harder to trigger than shrinking: over-fetching
+// is what produces visible stalls, and under-fetching only costs
+// throughput on a stream that will keep asking.
+//
+// PASSIVE_LEVEL, on a file object whose cache map is initialised -- the
+// caller is the cached-read path, which has both. CcSetReadAheadGranularity
+// is re-callable on a live file object; that is not documented and was
+// measured before this was built (README, "The granularity sweep").
+//
+static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
+{
+    //
+    // Zero means the configuration asked for Cc's own default and no call
+    // at all. Adapting would quietly override that, so it does not.
+    //
+    if (0 == global.ReadAheadGranularity || 0 == Fcb->ReadAheadGranularity)
+    {
+        return;
+    }
+
+    const ULONG current = Fcb->ReadAheadGranularity;
+
+    ULONG64 window = C_CAST(ULONG64, current) * READ_AHEAD_ADAPT_WINDOW_GRANULES;
+
+    if (window < READ_AHEAD_ADAPT_WINDOW_FLOOR)
+    {
+        window = READ_AHEAD_ADAPT_WINDOW_FLOOR;
+    }
+
+    if (Fcb->ReadAheadConsumedBytes < window)
+    {
+        return;
+    }
+
+    const ULONG64 consumed = Fcb->ReadAheadConsumedBytes;
+    const ULONG64 fetched = Fcb->ReadAheadFetchedBytes;
+
+    Fcb->ReadAheadConsumedBytes = 0;
+    Fcb->ReadAheadFetchedBytes = 0;
+
+    //
+    // This window's vote, before any decision: +1 that the granule is too
+    // large, -1 that it could be larger, 0 that this window says neither.
+    // An undecided window clears the tally rather than leaving a stale vote
+    // half of a future pair.
+    //
+    const ULONG64 lead = C_CAST(ULONG64, current) * READ_AHEAD_ADAPT_LEAD_GRANULES;
+
+    LONG vote = 0;
+
+    if (fetched > (consumed * READ_AHEAD_ADAPT_WASTE_RATIO) + lead)
+    {
+        vote = 1;
+    }
+    else if (fetched <= (consumed * READ_AHEAD_ADAPT_EARNED_RATIO) + lead &&
+             ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK)
+    {
+        vote = -1;
+    }
+
+    if (0 == vote)
+    {
+        Fcb->ReadAheadAgreement = 0;
+        return;
+    }
+
+    Fcb->ReadAheadAgreement = (Fcb->ReadAheadAgreement * vote > 0)
+        ? (Fcb->ReadAheadAgreement + vote)
+        : vote;
+
+    if (Fcb->ReadAheadAgreement > -READ_AHEAD_ADAPT_AGREEMENT &&
+        Fcb->ReadAheadAgreement < READ_AHEAD_ADAPT_AGREEMENT)
+    {
+        return;
+    }
+
+    Fcb->ReadAheadAgreement = 0;
+
+    const ULONG next = (vote > 0)
+        ? ((current > PAGE_SIZE) ? (current / 2) : PAGE_SIZE)
+        : ((current < global.ReadAheadGranularity) ? (current * 2) : global.ReadAheadGranularity);
+
+    if (next == current)
+    {
+        return;
+    }
+
+    Fcb->ReadAheadGranularity = next;
+
+    CcSetReadAheadGranularity(FileObject, next);
+
+    if (next < current)
+    {
+        BLORGFS_STAT_INC(ReadAheadShrinks);
+    }
+    else
+    {
+        BLORGFS_STAT_INC(ReadAheadGrows);
+    }
+}
+
 // Files the application-visible latency of one non-paging read.
 //
 // A zero stamp means a paging read, or an IRP completed by a path that
@@ -145,6 +331,23 @@ BOOLEAN BlorgFastIoRead(
     if (handled)
     {
         ReadRecordUserLatency(arrivedQpc);
+
+        //
+        // Fast I/O is where most application reads land -- buffered
+        // synchronous reads of a cached file never become an IRP at all --
+        // so the adaptive policy has to count them or its denominator is a
+        // small unrepresentative slice and every file looks like pure
+        // waste. FsRtlCopyRead returning TRUE means the cache map is
+        // initialised and this ran at PASSIVE_LEVEL, which is what
+        // CcSetReadAheadGranularity needs.
+        //
+        PFCB fcb = FileObject->FsContext;
+
+        if (fcb && BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(fcb))
+        {
+            fcb->ReadAheadConsumedBytes += IoStatus->Information;
+            ReadAdaptGranularity(fcb, FileObject);
+        }
     }
 
     return handled;
@@ -579,6 +782,15 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             }
 
             ReadTrackStream(fcb, C_CAST(ULONG64, startingByte.QuadPart), realLength);
+
+            //
+            // What read-ahead cost, for the adaptive policy. Counted on
+            // every paging read rather than only the speculative ones: a
+            // demand fault whose length was rounded up by the granule is
+            // over-fetching too, and attributing only Cc's own read-ahead
+            // would understate the waste it causes.
+            //
+            fcb->ReadAheadFetchedBytes += realLength;
         }
 
         Irp->Tail.Overlay.DriverContext[2] =
@@ -622,6 +834,10 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             if (0 != global.ReadAheadGranularity)
             {
                 CcSetReadAheadGranularity(IrpSp->FileObject, global.ReadAheadGranularity);
+                fcb->ReadAheadGranularity = global.ReadAheadGranularity;
+                fcb->ReadAheadFetchedBytes = 0;
+                fcb->ReadAheadConsumedBytes = 0;
+                fcb->ReadAheadAgreement = 0;
             }
         }
 
@@ -635,6 +851,16 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         BLORGFS_PRINT("Cached read.\n");
 
         BLORGFS_STAT_INC(ReadsCached);
+
+        //
+        // A cached read is the application asking for bytes, which is the
+        // denominator the policy compares fetches against. Evaluated here
+        // rather than at the fetch site because this is the path that runs
+        // at PASSIVE_LEVEL with the file object's cache map initialised,
+        // which CcSetReadAheadGranularity needs.
+        //
+        fcb->ReadAheadConsumedBytes += realLength;
+        ReadAdaptGranularity(fcb, IrpSp->FileObject);
 
         if (!FlagOn(IrpSp->MinorFunction, IRP_MN_MDL))
         {

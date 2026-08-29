@@ -255,6 +255,16 @@ typedef struct _BLORGFS_STATISTICS
     //
     ULONG64 ReadsSpeculative;            // Cc read-ahead: nobody is waiting
     ULONG64 ReadsDemand;                 // fault: an application is blocked
+
+    //
+    // Adaptive read-ahead granularity decisions. Both directions are
+    // counted because the failure modes are opposite and neither is
+    // visible in throughput alone: a policy that never shrinks is not
+    // adapting, and one that oscillates shows up as both counters climbing
+    // together over a workload whose pattern never changed.
+    //
+    ULONG64 ReadAheadShrinks;
+    ULONG64 ReadAheadGrows;
     ULONG64 SpeculativeLatencySumUs;
     ULONG64 SpeculativeLatencyMaxUs;
     ULONG64 DemandLatencySumUs;

@@ -323,6 +323,47 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // accuracy, never correctness, which is why they carry no lock.
     //
     READ_STREAM_TRACKER Streams[READ_STREAM_TRACKER_COUNT]; // Per-stream sequentiality state
+
+    //
+    // Adaptive read-ahead granularity state, and why it lives on the FCB
+    // rather than per file object.
+    //
+    // Cc's granularity is a per-file-object setting, so this state belongs
+    // there in principle. It cannot go there: only directory opens are
+    // given a CCB, and a file open leaves FileObject->FsContext2 NULL
+    // (Create.c). Putting it on the FCB means two handles on one file share
+    // one decision, and whichever file object issues the read that crosses
+    // an evaluation window is the one Cc is told about. For a media file
+    // opened once by a player that is exact; for two readers with opposite
+    // patterns it is a compromise, and the honest fix is a per-file-object
+    // context this driver does not currently create.
+    //
+    // Windowed rather than cumulative: the counters reset at every
+    // evaluation so the policy tracks what a reader is doing now, not what
+    // it averaged since open. A player that seeks from streaming into
+    // picking has to be able to change the answer.
+    //
+    // Unlocked for the same reason the trackers above are: concurrent
+    // readers can lose an increment, which costs a delayed adaptation and
+    // never correctness.
+    //
+    // Ordered widest-first so the ULONG does not sit before a ULONG64 and
+    // introduce implicit padding; Reserved closes the tail explicitly
+    // rather than widening ReadAheadGranularity to hide it.
+    ULONG64 ReadAheadFetchedBytes;  // Paging bytes fetched this window
+    ULONG64 ReadAheadConsumedBytes; // Bytes the application asked for this window
+    ULONG   ReadAheadGranularity;   // What Cc was last told, 0 = never set
+
+    //
+    // Consecutive windows voting the same way: positive to shrink, negative
+    // to grow, zero when the last window was undecided. The policy acts
+    // only on agreement, because a single window's ratio is not evidence.
+    // Read-ahead runs ahead of consumption by construction, so within one
+    // window fetched can exceed consumed even in a steady state that
+    // averages 1.0 -- which made a one-window policy flap 170 times on a
+    // sequential read whose pattern never changed.
+    //
+    LONG    ReadAheadAgreement;
 } FCB, * PFCB;
 
 CHECK_PADDING_BETWEEN(FCB, Header, NonPaged);
@@ -343,7 +384,11 @@ CHECK_PADDING_BETWEEN(FCB, OnReapList, TableBucketIndex);
 CHECK_PADDING_BETWEEN(FCB, TableBucketIndex, FileLock);
 CHECK_PADDING_BETWEEN(FCB, FileLock, LazyWriteThread);
 CHECK_PADDING_BETWEEN(FCB, LazyWriteThread, Streams);
-CHECK_PADDING_END(FCB, Streams);
+CHECK_PADDING_BETWEEN(FCB, Streams, ReadAheadFetchedBytes);
+CHECK_PADDING_BETWEEN(FCB, ReadAheadFetchedBytes, ReadAheadConsumedBytes);
+CHECK_PADDING_BETWEEN(FCB, ReadAheadConsumedBytes, ReadAheadGranularity);
+CHECK_PADDING_BETWEEN(FCB, ReadAheadGranularity, ReadAheadAgreement);
+CHECK_PADDING_END(FCB, ReadAheadAgreement);
 
 //
 // Per-directory context node. Extends COMMON_CONTEXT with child linkage and
