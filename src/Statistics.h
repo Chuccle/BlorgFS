@@ -554,6 +554,14 @@ VOID BlorgStatisticsRecordLatency(
 LONG64 BlorgStatisticsNow(VOID);
 
 //
+// Fetches in flight across the whole driver, derived from the monotone
+// counters rather than kept in a gauge. Summing every processor is a
+// reader's cost, so this is for decisions taken once per evaluation
+// window -- never per read.
+//
+LONG64 BlorgStatisticsFetchesActive(VOID);
+
+//
 // Files one outlier. Callable at <= DISPATCH_LEVEL, like everything else
 // on the completion chain, and cheap enough to call unconditionally
 // because the threshold test happens here rather than at every call site.

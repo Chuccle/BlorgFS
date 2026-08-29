@@ -109,7 +109,7 @@ PBLORGFS_STATISTICS BlorgStatisticsForCurrentProcessor(VOID)
 // is the outlier record, which by construction runs a handful of times per
 // measurement window.
 //
-static LONG64 StatisticsFetchesActive(VOID)
+LONG64 BlorgStatisticsFetchesActive(VOID)
 {
     ULONG64 issued = 0;
     ULONG64 settled = 0;
@@ -380,7 +380,7 @@ VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
         StatisticsAccumulate(&Out->Totals, StatisticsEntry(i));
     }
 
-    Out->FetchesActive = StatisticsFetchesActive();
+    Out->FetchesActive = BlorgStatisticsFetchesActive();
 
     Out->SlowFetchesSeen = 0;
 
@@ -506,7 +506,7 @@ VOID BlorgStatisticsRecordSlowFetch(
     slot->TtfbUs = StatisticsQpcToMicroseconds(TtfbQpc);
     slot->BodyUs = StatisticsQpcToMicroseconds(BodyQpc);
     slot->Bytes = Bytes;
-    slot->FetchesActive = StatisticsFetchesActive();
+    slot->FetchesActive = BlorgStatisticsFetchesActive();
     slot->ConnectionReused = ConnectionReused ? 1u : 0u;
 
 
