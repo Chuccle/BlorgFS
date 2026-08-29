@@ -32,7 +32,7 @@ VOID BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo);
 //  - DIRINFO / FILEINFO callbacks always run at PASSIVE_LEVEL (success
 //    and failure alike; the client bounces to a work item first). They
 //    may take push locks, enter critical regions, and touch paged data
-//    -- BlorgCreateComplete/BlorgDirComplete rely on this for the
+//    -- CreateComplete/DirCtrlComplete rely on this for the
 //    PathCache and DCB listing cache.
 //
 

@@ -80,7 +80,7 @@ VOID BlorgFreeSecurityDescriptor(VOID)
 // SeQuerySecurityDescriptorInfo, guarded by SEH since the buffer is
 // user-supplied.
 //
-static NTSTATUS BlorgVolumeQuerySecurity(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+static NTSTATUS SecurityQueryVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     SECURITY_INFORMATION securityInformation = IrpSp->Parameters.QuerySecurity.SecurityInformation;
     ULONG length = IrpSp->Parameters.QuerySecurity.Length;
@@ -108,7 +108,7 @@ static NTSTATUS BlorgVolumeQuerySecurity(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
 //
 // IRP_MJ_QUERY_SECURITY dispatch entry point: routes to
-// BlorgVolumeQuerySecurity for the volume device object and completes the
+// SecurityQueryVolume for the volume device object and completes the
 // IRP with the result (disk/FS-control device objects are unimplemented).
 //
 NTSTATUS BlorgQuerySecurity(PDEVICE_OBJECT DeviceObject, PIRP Irp)
@@ -120,7 +120,7 @@ NTSTATUS BlorgQuerySecurity(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     {
         case BlorgDeviceVolume:
         {
-            result = BlorgVolumeQuerySecurity(Irp, irpSp);
+            result = SecurityQueryVolume(Irp, irpSp);
             break;
         }
         case BlorgDeviceDisk:

@@ -130,7 +130,7 @@ inline NTSTATUS BlorgLockUserBuffer(PIRP Irp, LOCK_OPERATION Operation, ULONG Bu
 // SetFlag'd directly (wrong type/width). Small enough to inline, shared
 // so the cast dance exists in exactly one place.
 //
-inline void BlorgSetIrpContextFlag(PIRP Irp, ULONG_PTR Flag)
+inline VOID BlorgSetIrpContextFlag(PIRP Irp, ULONG_PTR Flag)
 {
     ULONG_PTR flags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
     SetFlag(flags, Flag);
@@ -145,14 +145,14 @@ inline void BlorgSetIrpContextFlag(PIRP Irp, ULONG_PTR Flag)
 // of the IRP -- an oplock break re-queues it through BlorgOplockComplete --
 // cannot act on the flag with the payload already gone.
 //
-inline void BlorgClearIrpContextFlag(PIRP Irp, ULONG_PTR Flag)
+inline VOID BlorgClearIrpContextFlag(PIRP Irp, ULONG_PTR Flag)
 {
     ULONG_PTR flags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
     ClearFlag(flags, Flag);
     Irp->Tail.Overlay.DriverContext[0] = C_CAST(PVOID, flags);
 }
 
-inline void BlorgCompleteRequest(
+inline VOID BlorgCompleteRequest(
     _In_opt_ PIRP Irp,
     NTSTATUS Status,
     CCHAR PriorityBoost

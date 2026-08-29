@@ -1,4 +1,4 @@
-//
+﻿//
 // Coverage for the real DirCtrl.c: BlorgVolumeDirectoryControl's
 // QUERY_DIRECTORY enumeration (MatchPattern, EnumerateDirectoryEntries, and
 // all three FILE_*_DIR_INFORMATION fill routines), NOTIFY_CHANGE_DIRECTORY
@@ -12,7 +12,7 @@
 // network. The regression test below is the exception: it drives a real
 // BlorgHttpGetDirectoryInfo call (scripted to stall, via SandboxSocket.h)
 // to prove a real second query sees a real outstanding fetch, not a
-// hand-built stand-in for one. BlorgDirComplete's *success* path --
+// hand-built stand-in for one. DirCtrlComplete's *success* path --
 // actually parsing a delivered FlatBuffers listing -- is still untested;
 // that's Client.c's HttpDeserializeDirectoryInfo gap, not duplicated here.
 //
@@ -95,7 +95,7 @@ protected:
     }
 
     //
-    // Publishes a listing on the DCB the way BlorgDirComplete would have --
+    // Publishes a listing on the DCB the way DirCtrlComplete would have --
     // every test that isn't specifically about the cache-miss path starts
     // from a warm directory so BlorgVolumeDirectoryControl never reaches
     // the network fetch at all. The listing's layout arithmetic lives in
@@ -469,7 +469,7 @@ TEST_F(DirCtrlTest, NonVolumeDeviceReturnsInvalidDeviceRequest)
 // fetch fails fast rather than genuinely stalling -- simpler to clean up
 // than a parked connection, and the state it leaves behind
 // (ccb->SearchPattern set, dcb->CachedListing still NULL, because
-// BlorgDirComplete's failure branch never publishes) is identical to the
+// DirCtrlComplete's failure branch never publishes) is identical to the
 // state a still-outstanding fetch would leave, since dcb->CachedListing
 // only ever transitions on a *successful* publish. A second
 // QUERY_DIRECTORY IRP on the same handle, issued right after (legal for a
@@ -486,7 +486,7 @@ TEST_F(DirCtrlTest, NonVolumeDeviceReturnsInvalidDeviceRequest)
 // dcb->CachedListing` (still NULL) and returned STATUS_NO_MORE_FILES --
 // confirmed directly against the real driver before the fix landed. The
 // fix drops the initialQuery/restartScan gate, so a second query in this
-// state now issues its own fetch too, which BlorgDirComplete's existing
+// state now issues its own fetch too, which DirCtrlComplete's existing
 // duplicate-fetch handling (see its header comment) already knows how to
 // resolve safely.
 //

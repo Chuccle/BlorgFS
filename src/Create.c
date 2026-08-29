@@ -373,7 +373,7 @@ typedef struct _CREATE_NET_CONTEXT
 //  fails (FSP threads tearing down), the stash is freed and the create is
 //  failed with the re-queue status rather than leaking the stash.
 //
-static VOID BlorgCreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* FileInfo, PVOID CallerContext)
+static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* FileInfo, PVOID CallerContext)
 {
     PCREATE_NET_CONTEXT netCtx = CallerContext;
     PIRP irp = netCtx->Irp;
@@ -548,11 +548,11 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 //  the same way it always has; the parent-listing probe pins the parent
 //  DCB by path (the root DCB is used directly -- it is never
 //  table-resident and never reaped) and reads CachedListing with
-//  ReadPointerAcquire, pairing with BlorgDirComplete's release write to
+//  ReadPointerAcquire, pairing with DirCtrlComplete's release write to
 //  order the listing's contents on weakly-ordered architectures (see
 //  DCB.CachedListing). If neither table nor path cache nor listing
 //  resolves the path, existence is verified on the remote store: on the
-//  first pass the lookup is issued asynchronously and BlorgCreateComplete
+//  first pass the lookup is issued asynchronously and CreateComplete
 //  stashes the result on the IRP and re-queues it with NET_DONE set, so
 //  on the second pass the result is already in hand and this function
 //  falls through to the existence checks and tree insert without another
@@ -565,7 +565,7 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 //  already seeded. The async completion needs its own copy of the
 //  resolved path (to seed the path cache), since filePath is freed before
 //  the completion runs. Once BlorgHttpGetFileInformation is issued,
-//  STATUS_PENDING means BlorgCreateComplete owns the IRP and netCtx and
+//  STATUS_PENDING means CreateComplete owns the IRP and netCtx and
 //  frees both; any other (synchronous) result means the completion never
 //  ran, so netCtx is freed here and the FSP worker loop completes the IRP
 //  with the returned status. The cold path re-searches the tree under the
@@ -939,7 +939,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         netCtx->Path.MaximumLength = filePath.String.Length;
         netCtx->Irp = Irp;
 
-        NTSTATUS issueResult = BlorgHttpGetFileInformation(&filePath.String, BlorgCreateComplete, netCtx);
+        NTSTATUS issueResult = BlorgHttpGetFileInformation(&filePath.String, CreateComplete, netCtx);
 
         if (filePath.IsAllocated)
         {
@@ -1139,7 +1139,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 //  IRP_MJ_CREATE handler for the disk device object: no real open
 //  semantics, just reports success.
 //
-static NTSTATUS BlorgDiskCreate(PIRP Irp)
+static NTSTATUS CreateDisk(PIRP Irp)
 {
     Irp->IoStatus.Information = FILE_OPENED;
     return STATUS_SUCCESS;
@@ -1149,7 +1149,7 @@ static NTSTATUS BlorgDiskCreate(PIRP Irp)
 //  IRP_MJ_CREATE handler for the file system device object: no real open
 //  semantics, just reports success.
 //
-static NTSTATUS BlorgFileSystemCreate(PIRP Irp)
+static NTSTATUS CreateFileSystem(PIRP Irp)
 {
     Irp->IoStatus.Information = FILE_OPENED;
     return STATUS_SUCCESS;
@@ -1204,13 +1204,13 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
         case BlorgDeviceDisk:
         {
-            result = BlorgDiskCreate(Irp);
+            result = CreateDisk(Irp);
             BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }
         case BlorgDeviceFileSystem:
         {
-            result = BlorgFileSystemCreate(Irp);
+            result = CreateFileSystem(Irp);
             BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             break;
         }

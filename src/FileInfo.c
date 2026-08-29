@@ -22,7 +22,7 @@
 // FileNetworkOpenInformation, which is the fast path the loader and
 // Explorer take.
 //
-static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+static NTSTATUS FileInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     FILE_INFORMATION_CLASS fileInfoClass = IrpSp->Parameters.QueryFile.FileInformationClass;
     ULONG inputLength = IrpSp->Parameters.QueryFile.Length;
@@ -275,7 +275,7 @@ static NTSTATUS BlorgVolumeQueryInformation(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
 //
 // IRP_MJ_QUERY_INFORMATION dispatch entry point: routes to
-// BlorgVolumeQueryInformation for the volume device, is a no-op (leaves
+// FileInfoQuery for the volume device, is a no-op (leaves
 // STATUS_INVALID_DEVICE_REQUEST) for the disk/FSDO devices, and always
 // completes the IRP synchronously.
 //
@@ -290,7 +290,7 @@ NTSTATUS BlorgQueryInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     {
         case BlorgDeviceVolume:
         {
-            result = BlorgVolumeQueryInformation(Irp, irpSp);
+            result = FileInfoQuery(Irp, irpSp);
             break;
         }
         case BlorgDeviceDisk:

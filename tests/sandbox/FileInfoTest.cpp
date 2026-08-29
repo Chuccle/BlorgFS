@@ -1,4 +1,4 @@
-//
+﻿//
 // Coverage for the real FileInfo.c and VolumeInfo.c: every FILE_XXX_INFORMATION
 // and FILE_FS_XXX_INFORMATION class the driver fills from the in-memory
 // FCB/DCB or reports statically, plus the dispatch-entry device-type
@@ -41,7 +41,7 @@ protected:
 
         //
         // Arbitrary and deliberately not any real FILE_* characteristic:
-        // BlorgVolumeQueryVolumeInformation copies this field through
+        // VolumeInfoQuery copies this field through
         // verbatim, so the assertion is a round trip, and a recognisable
         // sentinel makes that intent obvious where a mirrored real
         // constant would look like a second definition free to drift.
@@ -151,7 +151,7 @@ protected:
 };
 
 ///////////////////////////////////////////////////////////////////////////
-// BlorgQueryInformation / BlorgVolumeQueryInformation
+// BlorgQueryInformation / FileInfoQuery
 ///////////////////////////////////////////////////////////////////////////
 
 TEST_F(FileInfoTest, PositionInformationReportsCurrentByteOffset)
@@ -395,7 +395,7 @@ TEST_F(FileInfoTest, SetInformationIsAlwaysUnsupported)
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// BlorgQueryVolumeInformation / BlorgVolumeQueryVolumeInformation
+// BlorgQueryVolumeInformation / VolumeInfoQuery
 ///////////////////////////////////////////////////////////////////////////
 
 TEST_F(FileInfoTest, FsVolumeInformationReportsLabelAndSerial)

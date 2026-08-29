@@ -1,8 +1,8 @@
-//
+﻿//
 // Coverage for the real Read.c: BlorgRead/BlorgVolumeRead's dispatch of a
 // paging read into the direct-fetch path, the cached (Cc) path,
-// BlorgTrimReadToFileSize's end-of-file clamp shared by both, and
-// BlorgReadComplete's completion bookkeeping.
+// ReadTrimToFileSize's end-of-file clamp shared by both, and
+// ReadComplete's completion bookkeeping.
 //
 // DispatchSandbox links the real Client.c, so the direct-fetch tests
 // here script a real peer through SandboxSocket.h -- the same mechanism
@@ -259,7 +259,7 @@ TEST_F(ReadTest, NegativeByteOffsetIsRejectedBeforeAnyFetch)
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// End-of-file trim (BlorgTrimReadToFileSize), via the paging path
+// End-of-file trim (ReadTrimToFileSize), via the paging path
 ///////////////////////////////////////////////////////////////////////////
 
 TEST_F(ReadTest, PagingReadStartingAtEndOfFileReturnsEndOfFile)
@@ -418,7 +418,7 @@ TEST_F(ReadTest, PagingReadIssuesADirectFetchInline)
         << "the fetched body must land in the caller's MDL";
 
     //
-    // Paging reads carry none of BlorgReadComplete's non-paging bookkeeping
+    // Paging reads carry none of ReadComplete's non-paging bookkeeping
     // -- FO_FILE_FAST_IO_READ must stay clear.
     //
     EXPECT_FALSE(BooleanFlagOn(req->FileObject.Flags, FO_FILE_FAST_IO_READ));
@@ -446,7 +446,7 @@ TEST_F(ReadTest, FailedDirectFetchCompletesTheIrpWithAFailureStatus)
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// Non-paging bookkeeping, via BlorgReadComplete
+// Non-paging bookkeeping, via ReadComplete
 ///////////////////////////////////////////////////////////////////////////
 
 //
@@ -554,7 +554,7 @@ TEST_F(ReadTest, CachedReadMissWithWaitReachesFsdPostRequest)
 
 //
 // Every direct fetch this path issues is counted before the call, because
-// an issue that completes synchronously runs BlorgReadComplete -- and its
+// an issue that completes synchronously runs ReadComplete -- and its
 // matching decrement -- before the call returns. That leaves the
 // synchronous FAILURE case for this path to settle itself: the client's
 // contract is that a non-STATUS_PENDING return means the callback never

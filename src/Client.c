@@ -1191,12 +1191,12 @@ static NTSTATUS HttpEncryptRequestRecord(HTTP_CONTEXT* Ctx, PCHAR* SendBufferOut
 // HttpDispatch (success) and HttpComplete (failure/teardown).
 //
 //  - HttpOpFileRead never bounces: no deserialize step, and its
-//    callbacks (BlorgReadComplete) are contracted
+//    callbacks (ReadComplete) are contracted
 //    DISPATCH-safe. This is the read hot path -- no work-item queue, no
 //    context switch per chunk.
 //
-//  - The other operations' callbacks (BlorgDirComplete,
-//    BlorgCreateComplete, BlorgFileInfoComplete) take push locks inside
+//  - The other operations' callbacks (DirCtrlComplete,
+//    CreateComplete, BlorgFileInfoComplete) take push locks inside
 //    KeEnterCriticalRegion (PathCache, DCB listing cache) -- APC_LEVEL-
 //    or-below work -- and their bodies deserialize with flatcc (PASSIVE
 //    only), so they pay exactly one PASSIVE hop per request. A
