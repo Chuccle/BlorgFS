@@ -413,9 +413,15 @@ file, arms alternating with a guest reboot between runs.
 | random, 64 KB blocks | -- | stays 128 KB, never grows | 0.91x |
 | eight paced players at half the link | 0.19% missed, 13.4 ms worst | stays 128 KB | -- |
 | eight paced players AT the link | 0.5-33% missed, every configuration | -- | -- |
+| sequential then seeking, one handle | no cost, no unwind needed | keeps 512 KB | 0.56x |
+| sequential then **bursty**, one handle | **open defect, shrink never fires** | keeps 2 MB | **2.81x** |
+| two handles, a copy against a paced player | player missed 0 of 1200 | -- | -- |
 
-Six of the seven are at their best available answer. The last is not, and
-cannot be: eight players demanding 100% of a variable link miss deadlines in
+Eight of the ten are at their best available answer. Two are not. The
+sequential-into-bursty transition is an open defect, measured below: a
+granule grown for the first half over-fetches by 2.81x in the second and the
+shrink rule does not fire. The eight-players case is not a defect but a
+limit -- those players demanding 100% of a variable link miss deadlines in
 every arm measured -- pinned or adaptive, 128 KB or 512 KB, any ceiling --
 so granularity does not control it and nothing here is tuned for it.
 
@@ -483,12 +489,37 @@ it however large it was left. That also explains something observed earlier
 without being understood: demux and random fetched byte-identical totals at
 every ceiling from 512 KB to 16 MB.
 
-**The transition still untested is sequential into a bursty pattern.** Pure
-random is safe by construction because it never arms read-ahead; a demuxer
-does -- short adjacent runs, then a jump -- which is exactly the shape where
-a large granule measured twelve times worse. That case is what the shrink
-rule exists for, and it has been measured from a cold start but not as the
-second half of a transition.
+**Sequential into a BURSTY pattern is where it breaks, and this is an open
+defect.** Pure random is safe by construction because it never arms
+read-ahead. A demuxer does -- short adjacent runs, then a jump -- and it
+inherits whatever the sequential half grew to:
+
+| second phase | fetched vs consumed | shrinks | phase throughput |
+|---|---|---|---|
+| pure random | 0.56x | 0 | 13.56 MB/s |
+| bursty, 64 KB blocks, 1024 KB stride | **2.81-2.85x** | **0** | 8.70-9.04 MB/s |
+
+The bursty half inherits a 2 MB granule, over-fetches by about 173 MB, and
+**the shrink rule never fires**. It is the one measured case where this
+policy leaves both throughput and bandwidth on the floor.
+
+The arithmetic suggested the lead allowance was the cause. Shrinking needs
+`fetched > 2 * consumed + lead`, where the lead is two granules and the
+window is two granules of consumed bytes, so the lead is about equal to what
+was consumed and the effective trigger sits near 3x -- just above the 2.85x
+measured. Widening the window to four granules should have moved the trigger
+to 2.5x and caught it.
+
+**It did not.** The same run at a four-granule window still measured 2.81x
+with zero shrinks, so the explanation is wrong somewhere: either the windows
+are not completing -- the policy's `consumed` not accumulating as assumed on
+a pattern that misses cache -- or the policy's `fetched` differs from the
+`FetchBytes` delta reported here. The change was reverted rather than kept,
+because it costs adaptation latency everywhere and bought nothing measured.
+
+Resolving it needs the policy's own two counters exposed per window rather
+than inferred from totals, which is the next thing to build. Reproduce with
+`mixed <file> 200 64 1500 1024 4`.
 
 ### The granularity sweep, and why there is no right constant
 
