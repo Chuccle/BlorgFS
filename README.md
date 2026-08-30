@@ -572,47 +572,124 @@ replicates came back at 3.37/3.42% and 0.34/0.35%, tight enough to decide
 on, which none of the earlier ordered runs were. The reversal controls used
 before this protected against dataset bias and did nothing about drift.
 
-### Why the trade exists at all: 35% of a fetch is our own overhead
+### Why the trade exists at all: too few fetches in flight to cover ttfb
 
 Everything above tunes *around* per-fetch cost. A large granule is only
 better because it amortises a fixed cost over more bytes, so the size of
-that fixed cost decides how sharp the trade is. Measured, most of it is
-ours.
+that fixed cost decides how sharp the trade is.
 
-Decomposing a fetch (`FetchTtfb*`, `FetchBody*`, now in `--report`) against
-the same backend, from the same guest, with a usermode HTTP client doing
-128 KB keep-alive range GETs beside it:
+This section previously claimed that 35% of a fetch was this driver's own
+overhead, from a phase split against a usermode client:
 
 | per fetch | driver, 196 KB avg | usermode, same bytes |
 |---|---|---|
 | ttfb | 10.10 ms | 5.33 ms |
-| of which send | 0.88 ms | ~0 |
-| of which wait on peer | 9.21 ms | |
 | body transfer | 9.52 ms | ~7.5 ms |
-| **total** | **19.61 ms** | **~12.8 ms** |
 
-The driver's own measurable work is 12 us -- socket acquire 6 us, request
-build 6 us -- so none of the gap is there. It is concentrated before the
-first byte arrives: 1.9x on ttfb against 1.27x on transfer. The backend is
-the same in both columns, so the extra is this driver's path to posting a
-receive and observing the response, not the server thinking.
+**That comparison was invalid and the conclusion drawn from it was wrong.**
+The driver column was measured at a pipeline depth of ~2.7 fetches in
+flight; the usermode column was a strictly serial client, one request at a
+time. Sweeping the usermode client across concurrency, with completion
+stamped by polling the async handles so that no response is charged the
+drain time of its predecessors:
 
-**That is where "no regression on every workload" is, and it is not in the
-granule.** At usermode parity a 196 KB fetch would cost about 12.8 ms
-instead of 19.6, which at the measured pipeline depth of ~2.7 is roughly 41
-MB/s -- above what 512 KB achieves today -- while leaving every fetch far
-inside the 41.67 ms frame budget, which is what the tail is made of. The
-trade between throughput and stalls exists because fetches are expensive; it
-shrinks as they get cheaper and would not need arbitrating at parity.
+| concurrency | 1 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|
+| usermode ttfb, in guest | 6.05 ms | 9.78 ms | 12.46 ms | 17.73 ms | 22.41 ms |
 
-Candidates, in the order the measurement points at them: the receive is
-posted only after the send completes, which adds a scheduling hop on a
-two-processor guest; a fetch costs four pool allocations (context, receive
-buffer, request buffer, encoded path) plus an IRP and an MDL per socket
-operation; and the 0.88 ms send of a ~200 byte request is itself an order of
-magnitude more than it should be. None of that has been attempted -- it is
-recorded here because tuning the granule further is optimising the wrong
-term.
+At the driver's own depth of ~2.7 a usermode client sits near 11.6 ms
+against the driver's 9.5. There is no 35% gap. The driver is at or slightly
+better than a usermode client at matched depth, and the projected "41 MB/s
+at parity" was never available -- it was above the physical ceiling, which
+should have been the tell.
+
+The rise is not queueing inside the server either. Sweeping response body
+size from the host, so that neither this driver nor the guest network stack
+is in the path:
+
+| body | conc 1 | conc 2 | conc 3 | conc 4 | conc 6 |
+|---|---|---|---|---|---|
+| 256 B | 3.80 ms | 2.35 | 2.44 | 1.99 | 2.31 |
+| 8 KB | 2.05 ms | 2.11 | 2.70 | 3.17 | 3.48 |
+| 64 KB | 2.33 ms | 4.37 | 6.24 | 6.24 | 7.78 |
+
+At 256 bytes ttfb is flat in concurrency; the climb appears only as bodies
+grow, and minimum ttfb stays 1.3-2.3 ms at every point. A file small enough
+to be served from the backend's resident cache queues identically to one
+large enough to be streamed per request, so it is not the server's file
+handling. Concurrent response bodies contend for link bandwidth and delay
+later responses' headers. Time to first byte under load is a property of
+the link, not of this driver and not of the backend.
+
+### The ceiling: ~24-29 MB/s, and it is the network
+
+| measurement | MB/s |
+|---|---|
+| single stream, from the guest | 23.96 |
+| single stream, from the host | 23.70 |
+| 2 streams from the guest, aggregate | 21.30 |
+| 4 streams from the guest, aggregate | 21.21 |
+| 8 MB ranges, advancing (cold) | 28.45 |
+| 8 MB ranges, same range repeated (warm) | 29.30 |
+
+Host and guest are indistinguishable, so it is not the guest's virtual NIC.
+Aggregate does not rise with stream count -- four streams get a quarter each
+-- so it is not per-connection. Warm and cold ranges are identical, so it is
+not the backend's disk. It is the network path, and it is the same from
+anywhere.
+
+This agrees with the ~30 MB/s ceiling recorded under "Why this, and not more
+lookahead" below, measured independently at 16 streams, and extends it: the
+wall is already reached by a *single* connection, so concurrency divides it
+rather than growing it.
+
+It also settles a contradiction this document was carrying. That section
+measured the driver cold at 0.93-1.01x a usermode client while the section
+above claimed a 35% deficit against one. The 0.93-1.01x figure was right;
+the 35% came from comparing unequal pipeline depths.
+
+This bounds every throughput number here. The 512 KB constant's 27.4 MB/s on
+a lone sequential reader was already taking ~96% of the wall; there was
+never 40 MB/s to find.
+
+### What that leaves: depth, not granule
+
+Per-stream throughput is `granule / (ttfb + granule/bandwidth)`, multiplied
+by the number of fetches in flight and capped by the link:
+
+| granule | body at 28 MB/s | + ttfb | per slot | x2.7 depth | observed |
+|---|---|---|---|---|---|
+| 512 KB | 18.3 ms | 28.3 ms | 18.1 MB/s | capped at wall | 27.4 |
+| 128 KB | 4.6 ms | 14.6 ms | 8.8 MB/s | 23.7 MB/s | 19.5 |
+
+The small granule does not lose throughput because it is small. It loses
+because at a depth of ~2.7 there are not enough fetches in flight to cover
+each one's ttfb, so a fixed ~10 ms is amortised over 128 KB instead of over
+512 KB. At depth 4 a 128 KB granule reaches the wall on the arithmetic
+above, with every stall still one small granule long.
+
+That is the shape of "best of both worlds", and it is not the same lever as
+the fetch splitting removed below. Splitting divided a single *demanded*
+fetch into concurrent slices that were all needed at once, so the pieces
+only shared bandwidth with each other. Depth adds *speculative* fetches
+further ahead in the file, whose bytes will be consumed anyway. Concurrency
+on bytes that are already wanted is close to free; concurrency on bytes
+wanted right now just divides the same bandwidth finer.
+
+This is not in tension with "Why this, and not more lookahead" below, which
+rejects lookahead as a way to *add* throughput. It is rejected there because
+cold reads at a 512 KB granule already sit at the wall, and nothing on the
+fetch path can beat the wire. Depth here does not aim past the wall; it aims
+to reach it at a granule small enough to keep stalls short. The 128 KB
+configuration is at 19.5 MB/s against a ~28 MB/s ceiling, so unlike the
+512 KB case there is a gap, and it is the gap the small granule opened.
+
+Lookahead today is entirely Cc's read-ahead -- the driver's own prefetcher
+and its chunk budget are gone -- and Cc puts about 4 fetches in flight for a
+single stream, ~2.7 measured on average. Raising effective depth for a
+sequential reader without raising the granule is the untried lever, and it
+is the one the arithmetic points at. Nothing in this section has been
+attempted.
 
 ### Pipelining the receive: built, measured, reverted
 
@@ -651,12 +728,12 @@ the send completion may only stamp a timestamp and record a status -- never
 fail, retry, complete or kick. That is cheaper than a refcount and it is
 checkable by reading one routine.
 
-The gap it was aimed at is real and still unexplained: 9.5 ms against 5.3 ms
-to first byte, same guest, same backend, same keep-alive reuse, with the
-driver's own measurable work at 12 us. Ordering is now excluded. The
-remaining candidates are the four pool allocations per fetch, the IRP and
-MDL per socket operation, and the 0.73-0.88 ms spent sending a ~200 byte
-request.
+The gap it was aimed at turned out not to exist. The 9.5 ms against 5.3 ms
+compared this driver at a depth of ~2.7 against a serial usermode client;
+at matched depth the usermode client is slower. Ordering was excluded by
+the measurement above, and the premise was withdrawn by the one before it.
+Pipelining was aimed at a target that was not there, which is why it moved
+nothing.
 
 ### Splitting the fetch: built, measured, removed
 
