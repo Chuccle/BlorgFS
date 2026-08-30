@@ -1430,6 +1430,208 @@ static bool RunDemux(
 }
 
 //
+// A consumer with a deadline, which is the workload this harness did not
+// have. Every other mode here reads flat out, and a reader going flat out
+// is permanently at the read-ahead frontier: it consumes each granule the
+// instant Cc produces it, so it is maximally exposed to fetch latency and
+// the "over one frame" figure reported for it is hypothetical. A player is
+// normally behind the frontier, which is the condition under which the
+// driver was seen issuing 67 ms fetches while the reader saw 0.11 ms.
+//
+// Blocks are read on a fixed schedule rather than as fast as they arrive.
+// Block n is due at start + (n+1) * blockSize / rate, and the metric is how
+// many blocks missed their due time and by how much -- a viewer's hitch,
+// measured against a deadline that exists, rather than a read that happened
+// to take longer than a frame interval on a reader with no deadline.
+//
+// Choose blockSize and rate together so the interval is a frame: 64 KB at
+// 1536 KB/s is 41.67 ms, which is 24 fps at roughly a Blu-ray bitrate.
+//
+// A player that falls behind does not skip forward to catch up, and neither
+// does this: the schedule is absolute from the start, so sustained lateness
+// accumulates and shows up as a growing miss count instead of being hidden
+// by a reader that quietly drops its rate to whatever the link can deliver.
+//
+static bool RunPlayback(
+    const wchar_t* path,
+    unsigned long kbPerSecond,
+    DWORD blockSize,
+    double seconds,
+    unsigned long long* bytesOut,
+    double* secondsOut)
+{
+    HANDLE file = CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+
+    if (INVALID_HANDLE_VALUE == file)
+    {
+        PrintLastError("open workload file");
+        return false;
+    }
+
+    LARGE_INTEGER fileSize;
+
+    if (!GetFileSizeEx(file, &fileSize))
+    {
+        PrintLastError("GetFileSizeEx");
+        CloseHandle(file);
+        return false;
+    }
+
+    unsigned char* buffer = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, blockSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+
+    if (nullptr == buffer)
+    {
+        PrintLastError("VirtualAlloc");
+        CloseHandle(file);
+        return false;
+    }
+
+    HANDLE timer = CreateWaitableTimerExW(
+        nullptr,
+        nullptr,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+
+    if (nullptr == timer)
+    {
+        timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    }
+
+    if (nullptr == timer)
+    {
+        PrintLastError("CreateWaitableTimerEx");
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        CloseHandle(file);
+        return false;
+    }
+
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start;
+    LARGE_INTEGER now;
+
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+
+    const double interval =
+        static_cast<double>(blockSize) / (static_cast<double>(kbPerSecond) * 1024.0);
+
+    unsigned long long total = 0;
+    unsigned long long blocks = 0;
+    unsigned long long missed = 0;
+    double worstLateness = 0.0;
+    double latenessSum = 0.0;
+    long long offset = 0;
+
+    for (;;)
+    {
+        QueryPerformanceCounter(&now);
+
+        const double elapsed =
+            static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+        if (elapsed >= seconds)
+        {
+            break;
+        }
+
+        if (offset + static_cast<long long>(blockSize) > fileSize.QuadPart)
+        {
+            offset = 0;
+        }
+
+        const double due = static_cast<double>(blocks + 1) * interval;
+
+        OVERLAPPED overlapped = {};
+        overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
+        overlapped.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xFFFFFFFF);
+
+        DWORD read = 0;
+
+        if (!ReadFile(file, buffer, blockSize, &read, &overlapped))
+        {
+            PrintLastError("ReadFile");
+            break;
+        }
+
+        if (0 == read)
+        {
+            break;
+        }
+
+        QueryPerformanceCounter(&now);
+
+        const double completed =
+            static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+        if (completed > due)
+        {
+            const double lateness = completed - due;
+
+            ++missed;
+            latenessSum += lateness;
+
+            if (lateness > worstLateness)
+            {
+                worstLateness = lateness;
+            }
+        }
+
+        offset += read;
+        total += read;
+        ++blocks;
+
+        QueryPerformanceCounter(&now);
+
+        const double after =
+            static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+        const double next = static_cast<double>(blocks) * interval;
+
+        if (next > after)
+        {
+            LARGE_INTEGER dueTime;
+
+            dueTime.QuadPart = -static_cast<long long>((next - after) * 10000000.0);
+
+            if (SetWaitableTimer(timer, &dueTime, 0, nullptr, nullptr, FALSE))
+            {
+                WaitForSingleObject(timer, INFINITE);
+            }
+        }
+    }
+
+    QueryPerformanceCounter(&now);
+
+    CloseHandle(timer);
+    VirtualFree(buffer, 0, MEM_RELEASE);
+    CloseHandle(file);
+
+    printf("\n  playback schedule (%lu KB/s, %lu KB blocks, %.2f ms apart)\n",
+        kbPerSecond, blockSize / 1024, interval * 1000.0);
+    printf("    blocks                %12llu\n", blocks);
+    printf("    missed deadline       %12llu  (%.2f%%)\n",
+        missed,
+        (blocks > 0) ? ((static_cast<double>(missed) * 100.0) / static_cast<double>(blocks)) : 0.0);
+    printf("    worst lateness        %12.2f ms\n", worstLateness * 1000.0);
+    printf("    mean lateness of miss %12.2f ms\n",
+        (missed > 0) ? ((latenessSum / static_cast<double>(missed)) * 1000.0) : 0.0);
+
+    *bytesOut = total;
+    *secondsOut =
+        static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+    return true;
+}
+
+//
 // Metadata storm: enumerate a directory and open/close every entry,
 // repeated. This is the workload the path cache and the listing cache
 // exist for, so the number that matters in the report is the path cache
@@ -1716,6 +1918,14 @@ static void PrintUsage(void)
     printf("                                 dense track and measures read-ahead working;\n");
     printf("                                 raise it to measure what a granule costs when\n");
     printf("                                 most of it is skipped\n");
+    printf("  play <file> <KBps> <blockKB> <secs>\n");
+    printf("                                 a consumer with a deadline: blocks read on a\n");
+    printf("                                 fixed schedule rather than flat out, reporting\n");
+    printf("                                 deadline misses. Every other mode reads as fast\n");
+    printf("                                 as it can, which sits permanently at the\n");
+    printf("                                 read-ahead frontier and makes its 'over one\n");
+    printf("                                 frame' figure hypothetical. 64 KB at 1536 KB/s\n");
+    printf("                                 is a 41.67 ms frame\n");
     printf("  meta <dir> <passes>            enumerate + open every entry, repeatedly\n");
     printf("  streams <dir> <count> [secs] [unbuffered]\n");
     printf("                                 N concurrent sequential readers, one file each;\n");
@@ -1830,6 +2040,36 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
         ok = RunRandom(argv[2], blockKb * 1024, count, buffered, &bytes, &seconds);
         sprintf_s(label, "random read (%lu KB x %lu, %s)", blockKb, count,
             buffered ? "buffered" : "unbuffered");
+    }
+    else if (0 == wcscmp(argv[1], L"play"))
+    {
+        if (argc < 6)
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        const int parsedRate = _wtoi(argv[3]);
+        const int parsedBlockKb = _wtoi(argv[4]);
+        const double parsedSeconds = _wtof(argv[5]);
+
+        if (parsedRate <= 0 || parsedBlockKb <= 0 || parsedSeconds <= 0.0)
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        ok = RunPlayback(
+            argv[2],
+            static_cast<unsigned long>(parsedRate),
+            static_cast<DWORD>(parsedBlockKb) * 1024,
+            parsedSeconds,
+            &bytes,
+            &seconds);
+
+        sprintf_s(label, "playback (%d KB/s, %d KB blocks)", parsedRate, parsedBlockKb);
     }
     else if (0 == wcscmp(argv[1], L"demux"))
     {
@@ -2059,7 +2299,7 @@ int wmain(int argc, wchar_t** argv)
 
     if (0 == wcscmp(argv[1], L"seq") || 0 == wcscmp(argv[1], L"rand") ||
         0 == wcscmp(argv[1], L"meta") || 0 == wcscmp(argv[1], L"streams") ||
-        0 == wcscmp(argv[1], L"demux"))
+        0 == wcscmp(argv[1], L"demux") || 0 == wcscmp(argv[1], L"play"))
     {
         if (argc < 3)
         {

@@ -691,6 +691,73 @@ sequential reader without raising the granule is the untried lever, and it
 is the one the arithmetic points at. Nothing in this section has been
 attempted.
 
+### The workload with a deadline, which the harness did not have
+
+Every workload here reads flat out. `seq`, `rand`, `demux` and `streams` all
+consume as fast as the driver delivers, and a reader going flat out is
+permanently at the read-ahead frontier: it takes each granule the instant Cc
+produces it, so it is maximally exposed to fetch latency. The "over one
+frame (41 ms)" figure reported for such a reader is hypothetical -- it asks
+whether a viewer would have seen a hitch, of a reader that has no deadline.
+
+That matters because the whole adaptive granularity trade was arbitrated on
+that figure. `play` is the missing workload: blocks read on a fixed
+schedule, block n due at `start + (n+1) * block / rate`, counting blocks
+that missed their due time and by how much.
+
+At 3072 KB/s in 128 KB blocks -- a 41.67 ms frame at roughly a Blu-ray
+bitrate:
+
+| granule | missed | worst late | app mean | fetch mean / max | speculative : demand |
+|---|---|---|---|---|---|
+| 128 KB | 0 / 600 | 0.00 ms | 92 us | 16.1 / 66.8 ms | 340 : 1 |
+| 512 KB | 0 / 600 | 0.00 ms | 63 us | 41.0 / 55.1 ms | 115 : 1 |
+
+At 8192 KB/s, a 15.62 ms interval:
+
+| granule | missed | worst late | app mean | fetch mean / max | speculative : demand |
+|---|---|---|---|---|---|
+| 128 KB | 1 / 1600 | 1.35 ms | 59 us | 16.4 / 73.7 ms | 499 : 2 |
+| 512 KB | **11 / 1600** | **64.15 ms** | 128 us | 42.9 / 106.1 ms | 187 : 2 |
+
+Two things fall out, and they point opposite ways.
+
+**Cc absorbs almost everything.** 340 speculative fetches against one demand
+fetch: the path a user waits on is essentially never on the wire. The driver
+issued fetches of 66-106 ms throughout while the application saw means of
+59-128 us. This is the same effect recorded when the user-read timer was
+added -- 67 ms fetches behind a reader seeing 0.11 ms -- and it is why fetch
+latency is the wrong layer to draw conclusions from.
+
+**The tail protection is nonetheless real, above a rate.** At 3 MB/s the
+granule does not matter; both are perfect and 512 KB is marginally better.
+At 8 MB/s the 512 KB granule produces 11 missed deadlines with 64 ms worst
+lateness, against one miss 1.35 ms late at 128 KB. That is a hitch a viewer
+would see, on a consumer that genuinely has a deadline. The hypothesis that
+the greedy harness invented the tail is **wrong** above about 3 MB/s.
+
+So the adaptive policy is defensible, and the remaining compromise is
+narrower than it looked. It is one case: the greedy sequential reader --
+a file copy -- which wants 512 KB for 27.4 MB/s against 19.5, and which has
+no deadline to protect. The policy refuses to grow for it because it cannot
+tell a copy from a lone player, and it is right to be cautious given the
+8 MB/s row above.
+
+The signal that separates them is not sequentiality, amplification or
+transport load, all of which they share. It is **slack**: a paced consumer
+idles between reads -- 99% of wall clock at both rates above, since a read
+served from cache costs microseconds against a 15-41 ms interval -- and a
+copy never idles at all. Measured per stream as the gap between one read
+completing and the next arriving, that distinguishes "has a deadline" from
+"wants throughput" directly, where every signal the policy uses today is a
+proxy for it. Growing only for a stream with no slack would take the file
+copy to 512 KB while leaving both paced rates where they are.
+
+Not implemented, and the 8 MB/s row is the reason to be careful: a paced
+consumer whose rate rises until it stops idling would be reclassified as
+greedy exactly when it can least afford a large granule. A slack rule needs
+a floor that a starving player cannot fall through.
+
 ### Pipelining the receive: built, measured, reverted
 
 The phase split says a fetch spends about 9.5 ms before its first byte
