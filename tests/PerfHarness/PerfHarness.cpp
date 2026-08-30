@@ -848,11 +848,236 @@ static bool CollectStreamFiles(
 // from one that shares, and only the second one plays video without
 // stuttering.
 //
+//
+// A consumer's schedule, and what it missed.
+//
+// Reading flat out and reading to a deadline are different workloads, and
+// the difference is not a detail of the reader: a reader going flat out sits
+// permanently at the read-ahead frontier, taking each granule the instant Cc
+// produces it, while one on a schedule spends nearly all of its time asking
+// for nothing. Only the second can miss a deadline, and only the second is
+// what a player does.
+//
+// Block n is due at `start + (n+1) * interval` and the schedule is absolute,
+// so a consumer that falls behind accumulates lateness rather than quietly
+// dropping to whatever the link will give it. That is the point: a player
+// that cannot keep up stutters, it does not renegotiate its bitrate.
+//
+// Shared by play, demux and streams so that "paced" means one thing across
+// all three, and so a workload gains a deadline by holding one of these
+// rather than by growing its own copy of the arithmetic.
+//
+struct Pacer
+{
+    HANDLE Timer;
+    LARGE_INTEGER Frequency;
+    LARGE_INTEGER Start;
+
+    //
+    // Seconds between block due times. Zero means unpaced, in which case
+    // every call below is a no-op and the workload reads flat out.
+    //
+    double Interval;
+
+    unsigned long long Blocks;
+    unsigned long long Missed;
+    double WorstLateness;
+    double LatenessSum;
+};
+
+//
+// A high-resolution timer where the platform has one, because the default
+// timer granularity is ~15.6 ms against frame intervals of 15-42 ms. Falling
+// back to an ordinary timer keeps the workload runnable rather than exact;
+// the reported lateness shows when that has happened.
+//
+// Phase shifts this schedule within its own interval, so that N paced
+// readers started together do not all come due at the same instant.
+//
+// Eight streams in lockstep are not eight players: they are one burst of
+// eight demands every interval, with the transport idle between. Measured
+// in phase, eight streams at 1536 KB/s each missed 7.33% of their deadlines
+// with a 500 ms worst case while asking for 12 MB/s of a link that had just
+// delivered 21.7 -- a queueing artifact of the harness, not of the driver.
+//
+static bool PacerInit(Pacer* pacer, DWORD blockSize, unsigned long kbPerSecond, double phase)
+{
+    ZeroMemory(pacer, sizeof(*pacer));
+
+    QueryPerformanceFrequency(&pacer->Frequency);
+    QueryPerformanceCounter(&pacer->Start);
+
+    if (0 == kbPerSecond)
+    {
+        return true;
+    }
+
+    pacer->Interval =
+        static_cast<double>(blockSize) / (static_cast<double>(kbPerSecond) * 1024.0);
+
+    pacer->Start.QuadPart += static_cast<long long>(
+        phase * pacer->Interval * static_cast<double>(pacer->Frequency.QuadPart));
+
+    pacer->Timer = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+
+    if (nullptr == pacer->Timer)
+    {
+        pacer->Timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    }
+
+    if (nullptr == pacer->Timer)
+    {
+        PrintLastError("CreateWaitableTimerEx");
+        return false;
+    }
+
+    return true;
+}
+
+static void PacerDestroy(Pacer* pacer)
+{
+    if (pacer->Timer)
+    {
+        CloseHandle(pacer->Timer);
+        pacer->Timer = nullptr;
+    }
+}
+
+static double PacerElapsed(const Pacer* pacer)
+{
+    LARGE_INTEGER now;
+
+    QueryPerformanceCounter(&now);
+
+    return static_cast<double>(now.QuadPart - pacer->Start.QuadPart) /
+           static_cast<double>(pacer->Frequency.QuadPart);
+}
+
+//
+// When the block about to be read is due. Meaningless for an unpaced run,
+// which is why PacerComplete ignores it there.
+//
+static double PacerDue(const Pacer* pacer)
+{
+    return static_cast<double>(pacer->Blocks + 1) * pacer->Interval;
+}
+
+static void PacerComplete(Pacer* pacer, double due)
+{
+    if (pacer->Interval > 0.0)
+    {
+        const double completed = PacerElapsed(pacer);
+
+        if (completed > due)
+        {
+            const double lateness = completed - due;
+
+            ++pacer->Missed;
+            pacer->LatenessSum += lateness;
+
+            if (lateness > pacer->WorstLateness)
+            {
+                pacer->WorstLateness = lateness;
+            }
+        }
+    }
+
+    ++pacer->Blocks;
+}
+
+//
+// Sleeps until the next block's slot. Returns immediately when unpaced, and
+// when the reader is already late -- a consumer behind schedule does not get
+// to skip ahead, it just stops idling.
+//
+static void PacerWait(Pacer* pacer)
+{
+    if (0.0 == pacer->Interval || nullptr == pacer->Timer)
+    {
+        return;
+    }
+
+    const double next = static_cast<double>(pacer->Blocks) * pacer->Interval;
+    const double now = PacerElapsed(pacer);
+
+    if (next <= now)
+    {
+        return;
+    }
+
+    LARGE_INTEGER dueTime;
+
+    dueTime.QuadPart = -static_cast<long long>((next - now) * 10000000.0);
+
+    if (SetWaitableTimer(pacer->Timer, &dueTime, 0, nullptr, nullptr, FALSE))
+    {
+        WaitForSingleObject(pacer->Timer, INFINITE);
+    }
+}
+
+static void PacerReport(const Pacer* pacer, unsigned long kbPerSecond, DWORD blockSize)
+{
+    if (0.0 == pacer->Interval)
+    {
+        return;
+    }
+
+    printf("\n  playback schedule (%lu KB/s, %lu KB blocks, %.2f ms apart)\n",
+        kbPerSecond, blockSize / 1024, pacer->Interval * 1000.0);
+    printf("    blocks                %12llu\n", pacer->Blocks);
+    printf("    missed deadline       %12llu  (%.2f%%)\n",
+        pacer->Missed,
+        (pacer->Blocks > 0)
+            ? ((static_cast<double>(pacer->Missed) * 100.0) / static_cast<double>(pacer->Blocks))
+            : 0.0);
+    printf("    worst lateness        %12.2f ms\n", pacer->WorstLateness * 1000.0);
+    printf("    mean lateness of miss %12.2f ms\n",
+        (pacer->Missed > 0)
+            ? ((pacer->LatenessSum / static_cast<double>(pacer->Missed)) * 1000.0)
+            : 0.0);
+}
+
+//
+// Reads a `pace=<KBps>` token from anywhere in the trailing arguments,
+// yielding 0 when there is none.
+//
+// Scanned by name rather than taken as another positional, because both
+// demux and streams already end in name-matched flags at fixed indices and
+// Measure-BlorgReadAhead.ps1 passes --report into one of those slots.
+// Inserting a positional would silently re-map what existing callers mean.
+//
+static unsigned long ParsePaceKbPerSecond(int argc, wchar_t** argv, int from)
+{
+    for (int i = from; i < argc; ++i)
+    {
+        if (0 == wcsncmp(argv[i], L"pace=", 5))
+        {
+            const int parsed = _wtoi(argv[i] + 5);
+
+            if (parsed > 0)
+            {
+                return static_cast<unsigned long>(parsed);
+            }
+        }
+    }
+
+    return 0;
+}
+
 struct StreamResult
 {
     unsigned long long Bytes;
     std::vector<double> LatenciesMs;
     bool Ok;
+
+    //
+    // The stream's own schedule, so each reader is a player in its own
+    // right rather than N readers sharing one clock. Zeroed when unpaced.
+    //
+    unsigned long long Blocks;
+    unsigned long long Missed;
+    double WorstLateness;
 };
 
 struct StreamContext
@@ -870,6 +1095,17 @@ struct StreamContext
     // a comparison against a usermode HTTP client is actually asking about.
     //
     bool Unbuffered;
+
+    //
+    // Bytes per second this stream reads at, or zero to read flat out.
+    //
+    unsigned long PaceKbPerSecond;
+
+    //
+    // Where in the interval this stream's schedule sits, so concurrent
+    // readers are independent players rather than one synchronised burst.
+    //
+    double PacePhase;
 };
 
 static DWORD WINAPI StreamWorker(LPVOID parameter)
@@ -917,6 +1153,15 @@ static DWORD WINAPI StreamWorker(LPVOID parameter)
 
     ctx->Result->LatenciesMs.reserve(65536);
 
+    Pacer pacer;
+
+    if (!PacerInit(&pacer, streamReadSize, ctx->PaceKbPerSecond, ctx->PacePhase))
+    {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        CloseHandle(file);
+        return 0;
+    }
+
     for (;;)
     {
         LARGE_INTEGER now;
@@ -929,6 +1174,8 @@ static DWORD WINAPI StreamWorker(LPVOID parameter)
         {
             break;
         }
+
+        const double due = PacerDue(&pacer);
 
         LARGE_INTEGER readStart;
         QueryPerformanceCounter(&readStart);
@@ -954,8 +1201,16 @@ static DWORD WINAPI StreamWorker(LPVOID parameter)
             static_cast<double>(ctx->Frequency.QuadPart));
 
         ctx->Result->Bytes += read;
+
+        PacerComplete(&pacer, due);
+        PacerWait(&pacer);
     }
 
+    ctx->Result->Blocks = pacer.Blocks;
+    ctx->Result->Missed = pacer.Missed;
+    ctx->Result->WorstLateness = pacer.WorstLateness;
+
+    PacerDestroy(&pacer);
     VirtualFree(buffer, 0, MEM_RELEASE);
     CloseHandle(file);
 
@@ -980,6 +1235,7 @@ static bool RunStreams(
     unsigned long streamCount,
     double seconds,
     bool unbuffered,
+    unsigned long paceKbPerSecond,
     unsigned long long* bytesOut,
     double* secondsOut)
 {
@@ -1013,6 +1269,8 @@ static bool RunStreams(
         contexts[i].Start = start;
         contexts[i].Result = &results[i];
         contexts[i].Unbuffered = unbuffered;
+        contexts[i].PaceKbPerSecond = paceKbPerSecond;
+        contexts[i].PacePhase = static_cast<double>(i) / static_cast<double>(streamCount);
 
         threads[i] = CreateThread(nullptr, 0, StreamWorker, &contexts[i], 0, nullptr);
 
@@ -1067,6 +1325,36 @@ static bool RunStreams(
         ((static_cast<double>(total) / (1024.0 * 1024.0)) / elapsed) / static_cast<double>(streamCount));
     printf("    slowest / fastest     %12.2f / %.2f MB/s", slowest, fastest);
     printf("   (fairness %.2f)\n", (fastest > 0.0) ? (slowest / fastest) : 0.0);
+
+    if (paceKbPerSecond > 0)
+    {
+        unsigned long long blocks = 0;
+        unsigned long long missed = 0;
+        double worst = 0.0;
+        unsigned long starved = 0;
+
+        for (unsigned long i = 0; i < streamCount; ++i)
+        {
+            blocks += results[i].Blocks;
+            missed += results[i].Missed;
+
+            if (results[i].WorstLateness > worst)
+            {
+                worst = results[i].WorstLateness;
+            }
+
+            if (results[i].Missed > 0)
+            {
+                ++starved;
+            }
+        }
+
+        printf("\n  playback schedule (%lu KB/s per stream)\n", paceKbPerSecond);
+        printf("    blocks                %12llu\n", blocks);
+        printf("    missed deadline       %12llu  (%.2f%%)\n", missed, SafeRatio(missed, blocks));
+        printf("    worst lateness        %12.2f ms\n", worst * 1000.0);
+        printf("    streams that missed   %12lu of %lu\n", starved, streamCount);
+    }
     printf("    reads                 %12zu\n", all.size());
     printf("    latency p50           %12.3f ms\n", Percentile(all, 0.50));
     printf("    latency p95           %12.3f ms\n", Percentile(all, 0.95));
@@ -1340,6 +1628,7 @@ static bool RunDemux(
     unsigned long burst,
     unsigned long count,
     bool suppressReadAhead,
+    unsigned long paceKbPerSecond,
     unsigned long long* bytesOut,
     double* secondsOut)
 {
@@ -1395,8 +1684,19 @@ static bool RunDemux(
 
     unsigned long long total = 0;
 
+    Pacer pacer;
+
+    if (!PacerInit(&pacer, blockSize, paceKbPerSecond, 0.0))
+    {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        CloseHandle(file);
+        return false;
+    }
+
     for (unsigned long i = 0; i < count; ++i)
     {
+        const double due = PacerDue(&pacer);
+
         //
         // Track switches every `burst` reads, not every read: the reads
         // within a burst are adjacent, and the jump happens between bursts.
@@ -1442,10 +1742,15 @@ static bool RunDemux(
         //
         cursor[track] += lastOfBurst ? stride : blockSize;
         total += read;
+
+        PacerComplete(&pacer, due);
+        PacerWait(&pacer);
     }
 
     QueryPerformanceCounter(&end);
 
+    PacerReport(&pacer, paceKbPerSecond, blockSize);
+    PacerDestroy(&pacer);
     VirtualFree(buffer, 0, MEM_RELEASE);
     CloseHandle(file);
 
@@ -1520,60 +1825,26 @@ static bool RunPlayback(
         return false;
     }
 
-    HANDLE timer = CreateWaitableTimerExW(
-        nullptr,
-        nullptr,
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-        TIMER_ALL_ACCESS);
+    Pacer pacer;
 
-    if (nullptr == timer)
+    if (!PacerInit(&pacer, blockSize, kbPerSecond, 0.0))
     {
-        timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
-    }
-
-    if (nullptr == timer)
-    {
-        PrintLastError("CreateWaitableTimerEx");
         VirtualFree(buffer, 0, MEM_RELEASE);
         CloseHandle(file);
         return false;
     }
 
-    LARGE_INTEGER frequency;
-    LARGE_INTEGER start;
-    LARGE_INTEGER now;
-
-    QueryPerformanceFrequency(&frequency);
-    QueryPerformanceCounter(&start);
-
-    const double interval =
-        static_cast<double>(blockSize) / (static_cast<double>(kbPerSecond) * 1024.0);
-
     unsigned long long total = 0;
-    unsigned long long blocks = 0;
-    unsigned long long missed = 0;
-    double worstLateness = 0.0;
-    double latenessSum = 0.0;
     long long offset = 0;
 
-    for (;;)
+    while (PacerElapsed(&pacer) < seconds)
     {
-        QueryPerformanceCounter(&now);
-
-        const double elapsed =
-            static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
-
-        if (elapsed >= seconds)
-        {
-            break;
-        }
-
         if (offset + static_cast<long long>(blockSize) > fileSize.QuadPart)
         {
             offset = 0;
         }
 
-        const double due = static_cast<double>(blocks + 1) * interval;
+        const double due = PacerDue(&pacer);
 
         OVERLAPPED overlapped = {};
         overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
@@ -1592,67 +1863,22 @@ static bool RunPlayback(
             break;
         }
 
-        QueryPerformanceCounter(&now);
-
-        const double completed =
-            static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
-
-        if (completed > due)
-        {
-            const double lateness = completed - due;
-
-            ++missed;
-            latenessSum += lateness;
-
-            if (lateness > worstLateness)
-            {
-                worstLateness = lateness;
-            }
-        }
-
         offset += read;
         total += read;
-        ++blocks;
 
-        QueryPerformanceCounter(&now);
-
-        const double after =
-            static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
-
-        const double next = static_cast<double>(blocks) * interval;
-
-        if (next > after)
-        {
-            LARGE_INTEGER dueTime;
-
-            dueTime.QuadPart = -static_cast<long long>((next - after) * 10000000.0);
-
-            if (SetWaitableTimer(timer, &dueTime, 0, nullptr, nullptr, FALSE))
-            {
-                WaitForSingleObject(timer, INFINITE);
-            }
-        }
+        PacerComplete(&pacer, due);
+        PacerWait(&pacer);
     }
 
-    QueryPerformanceCounter(&now);
+    const double ran = PacerElapsed(&pacer);
 
-    CloseHandle(timer);
+    PacerReport(&pacer, kbPerSecond, blockSize);
+    PacerDestroy(&pacer);
     VirtualFree(buffer, 0, MEM_RELEASE);
     CloseHandle(file);
 
-    printf("\n  playback schedule (%lu KB/s, %lu KB blocks, %.2f ms apart)\n",
-        kbPerSecond, blockSize / 1024, interval * 1000.0);
-    printf("    blocks                %12llu\n", blocks);
-    printf("    missed deadline       %12llu  (%.2f%%)\n",
-        missed,
-        (blocks > 0) ? ((static_cast<double>(missed) * 100.0) / static_cast<double>(blocks)) : 0.0);
-    printf("    worst lateness        %12.2f ms\n", worstLateness * 1000.0);
-    printf("    mean lateness of miss %12.2f ms\n",
-        (missed > 0) ? ((latenessSum / static_cast<double>(missed)) * 1000.0) : 0.0);
-
     *bytesOut = total;
-    *secondsOut =
-        static_cast<double>(now.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+    *secondsOut = ran;
 
     return true;
 }
@@ -1957,6 +2183,10 @@ static void PrintUsage(void)
     printf("                                 N concurrent sequential readers, one file each;\n");
     printf("                                 'unbuffered' bypasses Cc so every read reaches the driver\n");
     printf("                                 reports aggregate, fairness and latency tail\n\n");
+    printf("  pace=<KBps>                    (demux, streams) read to a schedule instead of flat\n");
+    printf("                                 out, reporting missed deadlines. Without it those\n");
+    printf("                                 modes sit at the read-ahead frontier and cannot miss\n");
+    printf("                                 one, which is not what the player they stand for does\n");
     printf("  --report <path>                (any workload) also write key=value metrics\n");
     printf("                                 for Compare-BlorgMetrics.ps1; position-independent\n\n");
     printf("Workload commands reset the counters first, run, then report both the\n");
@@ -2130,6 +2360,7 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
         }
 
         const bool suppressReadAhead = (argc > 8) && (0 == wcscmp(argv[8], L"suppressra"));
+        const unsigned long paceKbPerSecond = ParsePaceKbPerSecond(argc, argv, 6);
 
         ok = RunDemux(argv[2],
             static_cast<unsigned long>(parsedTracks),
@@ -2138,6 +2369,7 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
             static_cast<unsigned long>(parsedBurst),
             static_cast<unsigned long>(parsedCount),
             suppressReadAhead,
+            paceKbPerSecond,
             &bytes, &seconds);
 
         sprintf_s(label, "demux (%d tracks, %d KB x%d burst, +%d KB x %d%s)",
@@ -2177,8 +2409,9 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
         }
 
         const bool unbuffered = (argc > 5) && (0 == wcscmp(argv[5], L"unbuffered"));
+        const unsigned long paceKbPerSecond = ParsePaceKbPerSecond(argc, argv, 4);
 
-        ok = RunStreams(argv[2], streamCount, runSeconds, unbuffered, &bytes, &seconds);
+        ok = RunStreams(argv[2], streamCount, runSeconds, unbuffered, paceKbPerSecond, &bytes, &seconds);
         sprintf_s(label, "concurrent streams (%lu x %.0f s%s)", streamCount, runSeconds,
             unbuffered ? ", unbuffered" : "");
     }
