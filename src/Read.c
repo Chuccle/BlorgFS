@@ -223,7 +223,6 @@ static ULONG64 ReadLongestStreak(const FCB* Fcb)
 // granule was eight times worse there; a second sweep put the same arm at
 // 2.56% and it does not replicate. Nothing here is tuned for that case.
 //
-#define READ_AHEAD_ADAPT_LOADED_MAX   (PAGE_SIZE * 128)
 
 //
 // Re-tunes Cc's read-ahead granularity for this file from what the reader
@@ -367,9 +366,9 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     // that raised the start above that maximum keeps its own value as the
     // ceiling rather than being quietly clamped down.
     //
-    const ULONG ceiling = (global.ReadAheadGranularity > READ_AHEAD_ADAPT_LOADED_MAX)
+    const ULONG ceiling = (global.ReadAheadGranularity > global.ReadAheadMaxGranularity)
         ? global.ReadAheadGranularity
-        : READ_AHEAD_ADAPT_LOADED_MAX;
+        : global.ReadAheadMaxGranularity;
 
     const ULONG next = (vote > 0)
         ? ((current > PAGE_SIZE) ? (current / 2) : PAGE_SIZE)

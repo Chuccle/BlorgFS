@@ -92,15 +92,14 @@
 // latency tracks fetch size. 58.7 ms misses a 41.67 ms frame routinely;
 // 19.8 ms almost never does.
 //
-// And that inverts under load, which is why no constant is right. At eight
-// streams a 128 KB fetch takes 41.8 ms -- on the threshold -- and measures
-// 28.9% against 512 KB's 13.7%, with throughput identical at 31 MB/s. A
-// granule serves many reads, so a smaller one makes more of them wait for
-// less time each, and which way that trades depends on where fetch latency
-// sits relative to the frame. Load moves it. So this value is where a file
-// starts; the policy shrinks it on measured waste and grows it toward
-// READ_AHEAD_ADAPT_LOADED_MAX when a reader is sequential and the
-// transport is busy.
+// That was once thought to invert under load -- at eight streams a 128 KB
+// fetch measured 28.9% over a frame against 512 KB's 13.7% -- and the policy
+// grew the granule whenever the transport was busy because of it. Those
+// numbers came from readers going flat out. Measured against consumers with
+// deadlines the ordering reverses, and the rule is gone (Read.c). So this
+// value is where a file starts; the policy shrinks it on measured waste and
+// grows it, up to ReadAheadMaxGranularity, only for a sequential reader that
+// never idles on a quiet transport -- a file copy, which has no frame to miss.
 //
 // Splitting one fetch into concurrent smaller requests was built to get
 // both at once and measured worse at every factor: mean fetch latency rose
@@ -112,6 +111,33 @@
 // again.
 //
 #define READ_AHEAD_GRANULARITY (PAGE_SIZE * 32)
+
+//
+// Largest granule the adaptive policy may grow to, overridable through
+// ReadAheadMaxGranularityKb. Only a greedy reader on a quiet transport
+// grows, so this bounds a file copy and nothing with a deadline.
+//
+// Swept against a link whose ceiling measures 28.45 MB/s, one boot and one
+// cold file per arm:
+//
+//   512 KB   23.05 MB/s   2 grows
+//   1 MB     27.34        3
+//   2 MB     28.38        4
+//   4 MB     27.91        5
+//
+// 4 MB buys nothing, so growth stops at 2 MB. It was written up as
+// reaching 99.8% of the link and that was wrong: the two figures came
+// from different sessions, and the path is WiFi. Alternating the driver
+// against a usermode client within one session puts it at 0.79-0.83 of
+// what that client gets, so about 20% is still on the table (README).
+// gain reproduces even where the host's drift moves the absolute figure.
+//
+// The sparse demux and random patterns fetched identical byte counts
+// at every one of those caps with zero grows, which is the check that this
+// bounds only the reader it is meant to: they never satisfy the streak
+// condition, so the ceiling is unreachable for them however high it is set.
+//
+#define READ_AHEAD_MAX_GRANULARITY (PAGE_SIZE * 512)
 
 #include "Structs.h"
 #include "Util.h"
@@ -297,6 +323,17 @@ extern struct GLOBAL
     // correlation into an experiment.
     //
     BOOLEAN ReadAheadAdapt;
+
+    //
+    // Largest granule the policy may grow to, in bytes, from the
+    // ReadAheadMaxGranularityKb registry value.
+    //
+    // Only a greedy reader on a quiet transport ever grows, so this bounds
+    // a file copy and nothing with a deadline. It is configurable because
+    // where a sequential reader stops gaining is a property of the link,
+    // not of this driver.
+    //
+    ULONG ReadAheadMaxGranularity;
 
     //
     //  A single self-relative security descriptor handed out (in the
