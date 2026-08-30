@@ -328,15 +328,35 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // Adaptive read-ahead granularity state, and why it lives on the FCB
     // rather than per file object.
     //
-    // Cc's granularity is a per-file-object setting, so this state belongs
-    // there in principle. It cannot go there: only directory opens are
-    // given a CCB, and a file open leaves FileObject->FsContext2 NULL
-    // (Create.c). Putting it on the FCB means two handles on one file share
-    // one decision, and whichever file object issues the read that crosses
-    // an evaluation window is the one Cc is told about. For a media file
-    // opened once by a player that is exact; for two readers with opposite
-    // patterns it is a compromise, and the honest fix is a per-file-object
-    // context this driver does not currently create.
+    // Cc splits this finer than it first appears. The shared cache map and
+    // the section live on SECTION_OBJECT_POINTERS, which is per FCB, but
+    // read-ahead state -- including the mask CcSetReadAheadGranularity
+    // writes -- lives in FILE_OBJECT.PrivateCacheMap, which is per handle.
+    // That is how Cc runs independent sequential detection for two handles
+    // reading one file at different offsets.
+    //
+    // The state stays here anyway, and the deciding reason is the shrink
+    // rule rather than the growth one. Read-ahead issued for one handle
+    // fills the shared cache, and a second handle consumes those pages with
+    // no paging read at all, so fetched-against-consumed is only coherent
+    // where the cache is shared: split per handle, the first reader looks
+    // wasteful and the second looks free. Amplification is what the shrink
+    // rule exists to catch, and moving it per handle would make it worse.
+    //
+    // Growth is self-correcting across handles. A handle Cc has not been
+    // told about issues reads sized by its own mask, so the
+    // honoured-against-current test in ReadAdaptGranularity fails for it
+    // and it does not grow -- it keeps the granularity it started with,
+    // which is the safe direction: a player sharing a file with a copy is
+    // left alone.
+    //
+    // What is NOT covered is the shrink direction. If a copy has grown this
+    // FCB to 2 MB and a demuxer on the same file then votes shrink, the new
+    // value is half of 2 MB and is set on the demuxer's handle, which was
+    // sitting at the starting granule -- so a shrink vote raises it. That
+    // needs two handles with opposite patterns on one file to reach, and
+    // fixing it properly needs per-file-object state, which means a CCB for
+    // file opens that this driver does not currently create.
     //
     // Windowed rather than cumulative: the counters reset at every
     // evaluation so the policy tracks what a reader is doing now, not what
