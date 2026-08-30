@@ -454,6 +454,52 @@ a busy transport was justified on readers with no deadline, growing for a
 seeking reader is where 27.5x amplification came from, and growing past what
 Cc will honour is how a ceiling gets fitted to one link.
 
+### What the means were hiding
+
+Latency was reported from the driver's power-of-two histogram, so a p99 of
+`<=32768 us` meant somewhere between 16 and 32 ms -- a band twice as wide as
+most of the differences being argued about here. Throughput had no
+distribution at all: every figure in this document is bytes over a whole
+run, which cannot tell a workload that ran evenly from one that stalled for
+two seconds and then raced.
+
+`Sampler` records exact per-read latencies and stamps bytes into 250 ms
+intervals, so each interval's rate is a sample. Both ends are reported --
+p1 as well as p99 -- because the interesting tail for latency is the high
+one and for throughput the low one, and carrying both stops the wrong end
+being quoted.
+
+Two competing handles, each owning half the file so neither reads what the
+other cached:
+
+| run | handle | latency p1/p50/p99 | throughput p1/p50/p99 MB/s | mean MB/s |
+|---|---|---|---|---|
+| copy vs copy | 0 | 0.004 / 0.006 / 0.039 ms | **2.00 / 13.00 / 9771** | 1361 |
+| copy vs copy | 1 | 0.003 / 0.004 / 0.025 ms | **0.00 / 10146 / 15412** | 7837 |
+| copy vs paced player | player | 0.011 / 0.021 / 0.254 ms | **3.00 / 3.00 / 3.00** | 2.99 |
+
+**Throughput p1 is 0.00-3.00 MB/s in every run**, against p99s in the
+thousands. There are quarter-second windows where a handle moves nothing at
+all, and latency maxima of 182-466 ms in the same runs agree. A mean of
+7837 MB/s is an average of cache hits and dead stalls, and it was the only
+number this harness produced before.
+
+**The paced player is flat at its target** -- p1, p50 and p99 all exactly
+3.00 MB/s, two misses in 1200, worst 5.63 ms -- while a copy hammers the same
+FCB. That is the shared-verdict hazard failing to materialise, and unlike
+the earlier run it is not a cache artifact, because the halves are disjoint.
+
+**Two identical copies took 5.75x different shares** (196 GB against 34 GB).
+Same workload, same file, disjoint halves, and no explanation yet. With two
+processors, two reader threads and the driver's own work, scheduling is as
+plausible as anything in the policy.
+
+**Competing handles are still not fully exercised.** Half of one of these
+files is about 168 MB and fits in guest RAM, so after the first pass both
+handles run cache-resident and stop touching the fetch path -- which is where
+the hazard being looked for actually lives. A working set larger than RAM is
+what that needs, and it has not been run.
+
 ### A reader that changes its mind
 
 Every workload above holds one pattern for its whole run, which left the

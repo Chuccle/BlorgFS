@@ -1237,6 +1237,102 @@ static double Percentile(std::vector<double>& sorted, double fraction)
     return sorted[index];
 }
 
+//
+// Exact percentiles for one workload's reads, and for its throughput over
+// time, which a single mean cannot show.
+//
+// The driver's own histogram answers latency in power-of-two buckets, so a
+// p99 reported as "<=32768 us" means somewhere between 16 and 32 ms. That is
+// wide enough to hide the difference between two arms that differ by a fifth,
+// which is the size of most differences measured here. These are exact.
+//
+// Throughput had no distribution at all: every figure was bytes over the
+// whole run. A workload that stalls for two seconds and then races reads
+// identically to one that runs evenly, and the two are not the same thing to
+// anyone waiting. Bytes are stamped into fixed intervals and each interval's
+// rate is a sample, so a p1 says what the worst moments looked like rather
+// than what the average hid.
+//
+// p1 is reported alongside p50 and p99 because for throughput the interesting
+// tail is the LOW one, and for latency it is the high one; carrying both ends
+// on both metrics costs nothing and stops the wrong end being quoted.
+//
+struct Sampler
+{
+    std::vector<double> LatenciesMs;
+
+    // Bytes accumulated in the interval currently open, and the closed ones.
+    std::vector<double> IntervalMbPerSec;
+    double IntervalSeconds;
+    unsigned long long IntervalBytes;
+    LARGE_INTEGER IntervalStart;
+    LARGE_INTEGER Frequency;
+};
+
+static void SamplerInit(Sampler* s, double intervalSeconds)
+{
+    s->LatenciesMs.clear();
+    s->IntervalMbPerSec.clear();
+    s->IntervalSeconds = intervalSeconds;
+    s->IntervalBytes = 0;
+    QueryPerformanceFrequency(&s->Frequency);
+    QueryPerformanceCounter(&s->IntervalStart);
+    s->LatenciesMs.reserve(65536);
+}
+
+//
+// Files one read and closes any intervals it completed. A read longer than
+// an interval closes several, and the empty ones are real: no bytes moved in
+// them, and that is exactly what a throughput p1 should see.
+//
+static void SamplerRecord(Sampler* s, double latencyMs, DWORD bytes, LARGE_INTEGER now)
+{
+    s->LatenciesMs.push_back(latencyMs);
+    s->IntervalBytes += bytes;
+
+    for (;;)
+    {
+        const double open = static_cast<double>(now.QuadPart - s->IntervalStart.QuadPart) /
+                            static_cast<double>(s->Frequency.QuadPart);
+
+        if (open < s->IntervalSeconds)
+        {
+            break;
+        }
+
+        s->IntervalMbPerSec.push_back(
+            (s->IntervalBytes / (1024.0 * 1024.0)) / s->IntervalSeconds);
+
+        s->IntervalBytes = 0;
+        s->IntervalStart.QuadPart +=
+            static_cast<long long>(s->IntervalSeconds * static_cast<double>(s->Frequency.QuadPart));
+    }
+}
+
+static void SamplerReport(Sampler* s, const char* what)
+{
+    std::sort(s->LatenciesMs.begin(), s->LatenciesMs.end());
+    std::sort(s->IntervalMbPerSec.begin(), s->IntervalMbPerSec.end());
+
+    printf("\n  %s: exact percentiles\n", what);
+
+    if (!s->LatenciesMs.empty())
+    {
+        printf("    latency p1/p50/p99    %10.3f / %.3f / %.3f ms   max %.3f\n",
+            Percentile(s->LatenciesMs, 0.01), Percentile(s->LatenciesMs, 0.50),
+            Percentile(s->LatenciesMs, 0.99), s->LatenciesMs.back());
+    }
+
+    if (!s->IntervalMbPerSec.empty())
+    {
+        printf("    throughput p1/p50/p99 %10.2f / %.2f / %.2f MB/s  (%zu x %.0f ms)\n",
+            Percentile(s->IntervalMbPerSec, 0.01), Percentile(s->IntervalMbPerSec, 0.50),
+            Percentile(s->IntervalMbPerSec, 0.99), s->IntervalMbPerSec.size(),
+            s->IntervalSeconds * 1000.0);
+    }
+}
+
+
 static bool RunStreams(
     const wchar_t* directory,
     unsigned long streamCount,
@@ -1925,6 +2021,9 @@ struct CompeteContext
     LARGE_INTEGER Start;
     CompeteMode Mode;
 
+    // Which half of the file this handle owns, so the two do not share data.
+    long long Half;
+
     // Bytes this half actually consumed, and what it missed if it was paced.
     unsigned long long Bytes;
     unsigned long long Blocks;
@@ -1976,8 +2075,19 @@ static DWORD WINAPI CompeteWorker(LPVOID parameter)
         return 0;
     }
 
-    const long long span = fileSize.QuadPart - static_cast<long long>(block) - 1;
-    long long cursor = 0;
+    //
+    // Each handle owns half the file, so neither is reading what the other
+    // just pulled into the cache. Sharing a range made both halves run at
+    // thousands of MB/s and never touched the fetch path, which is where the
+    // shared-FCB hazard this workload exists for actually lives.
+    //
+    const long long half = (fileSize.QuadPart - static_cast<long long>(block) - 1) / 2;
+    const long long base = ctx->Half * half;
+    const long long span = half;
+    long long cursor = base;
+
+    Sampler sampler;
+    SamplerInit(&sampler, 0.25);
     unsigned long long index = 0;
 
     for (;;)
@@ -2001,10 +2111,19 @@ static DWORD WINAPI CompeteWorker(LPVOID parameter)
 
         DWORD read = 0;
 
+        LARGE_INTEGER readStart;
+        QueryPerformanceCounter(&readStart);
+
         if (!ReadFile(file, buffer, block, &read, &overlapped) || 0 == read)
         {
             break;
         }
+
+        LARGE_INTEGER readEnd;
+        QueryPerformanceCounter(&readEnd);
+
+        SamplerRecord(&sampler, 1000.0 * static_cast<double>(readEnd.QuadPart - readStart.QuadPart) /
+            static_cast<double>(ctx->Frequency.QuadPart), read, readEnd);
 
         ctx->Bytes += read;
         ++index;
@@ -2018,14 +2137,16 @@ static DWORD WINAPI CompeteWorker(LPVOID parameter)
             cursor += block;
         }
 
-        if (span > 0 && cursor > span)
+        if (span > 0 && (cursor - base) > span)
         {
-            cursor = 0;
+            cursor = base;
         }
 
         PacerComplete(&pacer, due);
         PacerWait(&pacer);
     }
+
+        SamplerReport(&sampler, (0 == ctx->Half) ? "handle 0" : "handle 1");
 
     ctx->Blocks = pacer.Blocks;
     ctx->Missed = pacer.Missed;
@@ -2071,6 +2192,7 @@ static bool RunCompete(
         contexts[i].Frequency = frequency;
         contexts[i].Start = start;
         contexts[i].Mode = (0 == i) ? CompeteMode::Sequential : mode;
+        contexts[i].Half = i;
 
         threads[i] = CreateThread(nullptr, 0, CompeteWorker, &contexts[i], 0, nullptr);
 
