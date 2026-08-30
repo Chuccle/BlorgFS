@@ -665,6 +665,14 @@ static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICO
         }
     }
 
+    ULONG slackGrowthValue = 0;
+
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadSlackGrowth", REG_DWORD, &slackGrowthValue, sizeof(slackGrowthValue), &actualSize)))
+    {
+        global.ReadAheadSlackGrowth = (0 != slackGrowthValue);
+        BLORGFS_LOG("DriverReadRegistryConfig() - slack-driven growth: %lu\n", slackGrowthValue);
+    }
+
     UCHAR pinValue[TLS_HASH_LEN];
 
     if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"TlsPin", REG_BINARY, pinValue, sizeof(pinValue), &actualSize))
@@ -994,6 +1002,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     hostString.Buffer = hostBuffer;
 
     global.ReadAheadGranularity = READ_AHEAD_GRANULARITY;
+    global.ReadAheadSlackGrowth = TRUE;
 
     DriverReadRegistryConfig(RegistryPath, &portString, &hostString);
 

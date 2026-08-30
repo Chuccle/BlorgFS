@@ -260,6 +260,30 @@ extern struct GLOBAL
     ULONG ReadAheadGranularity;
 
     //
+    // Whether the adaptive policy may grow the granule for a consumer that
+    // never idles, as well as for a loaded transport.
+    //
+    // A file copy and a lone player are identical in every other signal the
+    // policy has -- both sequential, both amplification 1.0, both alone on
+    // the transport -- and they want opposite granules, so without this the
+    // policy assumes player and the copy pays 27.4 MB/s down to 19.5.
+    //
+    // Consulted only while the transport is quiet -- see
+    // READ_AHEAD_ADAPT_QUIET_DEPTH. Once it is busy the loaded rule has sole
+    // authority, because a stream starving at the link ceiling stops idling
+    // and would read as greedy exactly when a larger granule would hurt it.
+    //
+    // On by default, and still switchable at runtime through the
+    // ReadAheadSlackGrowth registry value, because the only comparison shape
+    // that has held up on this host is alternating the two with a guest
+    // reboot between each. Measured that way with the arm order alternating
+    // as well: a greedy sequential reader goes 19.04 to 22.52 MB/s with the
+    // arms not overlapping, while paced playback misses no deadline in
+    // either arm and never grows at all.
+    //
+    BOOLEAN ReadAheadSlackGrowth;
+
+    //
     //  A single self-relative security descriptor handed out (in the
     //  requested portions) for every IRP_MJ_QUERY_SECURITY. BlorgFS does not
     //  store per-file security -- the volume is a read-only public share --

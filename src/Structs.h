@@ -361,6 +361,18 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     //
     LONG64  ReadIdleLastEndQpc;
 
+    //
+    // This window's split between the consumer not asking and the driver
+    // serving, in performance-counter ticks. Kept as ticks rather than
+    // microseconds because only their ratio is ever read, and the ratio is
+    // the same in either unit.
+    //
+    // Reset with the byte counters at every evaluation, for the same
+    // reason: the policy acts on what a reader is doing now.
+    //
+    ULONG64 ReadIdleTicks;
+    ULONG64 ReadBusyTicks;
+
     ULONG   ReadAheadGranularity;   // What Cc was last told, 0 = never set
 
     //
@@ -396,7 +408,9 @@ CHECK_PADDING_BETWEEN(FCB, LazyWriteThread, Streams);
 CHECK_PADDING_BETWEEN(FCB, Streams, ReadAheadFetchedBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadFetchedBytes, ReadAheadConsumedBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadConsumedBytes, ReadIdleLastEndQpc);
-CHECK_PADDING_BETWEEN(FCB, ReadIdleLastEndQpc, ReadAheadGranularity);
+CHECK_PADDING_BETWEEN(FCB, ReadIdleLastEndQpc, ReadIdleTicks);
+CHECK_PADDING_BETWEEN(FCB, ReadIdleTicks, ReadBusyTicks);
+CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadAheadGranularity);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadGranularity, ReadAheadAgreement);
 CHECK_PADDING_END(FCB, ReadAheadAgreement);
 
