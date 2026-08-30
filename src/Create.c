@@ -157,6 +157,16 @@ static inline NTSTATUS BreakHandleOplockOnSharingViolation(POPLOCK Oplock, PIRP 
 //  this create from the top, releasing the resource so the re-drive starts
 //  from a clean slate. On success wires FsContext/Vpb/SectionObjectPointer
 //  onto the file object.
+//  Clears the FCB's read-ahead idle stamp on every open, which is not
+//  bookkeeping but a correctness fix. An FCB outlives its handles -- a
+//  closed file is parked on the delayed close list and revived on re-open
+//  -- so a stale stamp charges the first read of a new session the gap
+//  since the last read of the previous one. Measured, that was a single
+//  402-second sample reported as a consumer idling 99.7% of a run lasting
+//  seconds. Cleared on every open rather than only the first: a second
+//  handle arriving mid-session costs one lost sample, where keeping the
+//  stamp risks a fabricated one, and the statistics block's standard is
+//  that a counter may be lossy and may never be invented.
 //
 static inline NTSTATUS OpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PFCB Fcb)
 {
@@ -180,18 +190,6 @@ static inline NTSTATUS OpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const 
 
     const BOOLEAN firstOpen = (1 == InterlockedIncrement64(&Fcb->RefCount));
 
-    //
-    // An FCB outlives its handles -- a closed file is parked on the delayed
-    // close list and revived on re-open -- so a stale read stamp would
-    // charge the first read of a new session the gap since the last read of
-    // the previous one. Measured, that was a single 402-second sample
-    // reported as a consumer idling 99.7% of a run lasting seconds.
-    //
-    // Cleared on every open rather than only the first: a second handle
-    // arriving mid-session costs one lost sample, where keeping the stamp
-    // risks a fabricated one, and this block's standard is that a counter
-    // may be lossy and may never be invented.
-    //
     Fcb->ReadIdleLastEndQpc = 0;
 
     NTSTATUS result = ApplyShareAccess(FileObject, DesiredAccess, ShareAccess, &Fcb->ShareAccess, firstOpen);

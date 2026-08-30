@@ -228,28 +228,6 @@ static ULONG64 ReadLongestStreak(const FCB* Fcb)
 //
 
 //
-// Re-tunes Cc's read-ahead granularity for this file from what the reader
-// has actually been doing.
-//
-// The two ends of the range were both measured and both regress at the
-// other's workload: 512 KB gives sequential reads 27.1 MB/s against 16.1
-// at PAGE_SIZE, and costs the demux pattern 27.5x amplification, 46 reads
-// over a frame interval per 900, and half its throughput. No constant
-// serves both, which is what makes this adaptive rather than a better
-// default.
-//
-// It starts at whatever was configured and only moves on evidence, so a
-// workload that never trips a threshold behaves exactly as it does today.
-// Growth is deliberately harder to trigger than shrinking: over-fetching
-// is what produces visible stalls, and under-fetching only costs
-// throughput on a stream that will keep asking.
-//
-// PASSIVE_LEVEL, on a file object whose cache map is initialised -- the
-// caller is the cached-read path, which has both. CcSetReadAheadGranularity
-// is re-callable on a live file object; that is not documented and was
-// measured before this was built (README, "The granularity sweep").
-//
-//
 // Whether this window's consumer never stopped asking.
 //
 // A player reading a frame every 41.67 ms spends nearly all of that
@@ -273,12 +251,74 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
     return (Fcb->ReadIdleTicks * 100) < (total * READ_AHEAD_ADAPT_GREEDY_IDLE_PERCENT);
 }
 
+//
+// Re-tunes Cc's read-ahead granularity for this file from what the reader
+// has actually been doing.
+//
+// The two ends of the range were both measured and both regress at the
+// other's workload: 512 KB gives sequential reads 27.1 MB/s against 16.1
+// at PAGE_SIZE, and costs the demux pattern 27.5x amplification, 46 reads
+// over a frame interval per 900, and half its throughput. No constant
+// serves both, which is what makes this adaptive rather than a better
+// default.
+//
+// It starts at whatever was configured and only moves on evidence, so a
+// workload that never trips a threshold behaves exactly as it does today.
+// A configured granularity of zero means the caller asked for Cc's own
+// default and no call at all, which adapting would quietly override, so
+// nothing here runs in that case.
+//
+// The window's vote is +1 that the granule is too large, -1 that it could
+// be larger, 0 that this window says neither; an undecided window clears
+// the tally rather than leaving half a pair behind.
+//
+// GROWTH -- one reader qualifies, and three things must hold together.
+//
+// Sequential alone is not enough: a lone reader walking a file forwards
+// has a long streak and an amplification of 1.0, and growing for a lone
+// PLAYER costs it deadlines. Greedy is what distinguishes the file copy,
+// which wants the large granule and has no frame to miss, and it is
+// consulted only on a quiet transport (READ_AHEAD_ADAPT_QUIET_DEPTH),
+// because a stream starving at the link ceiling stops idling and would
+// read as greedy exactly when a larger granule would hurt it most.
+//
+// Growth is tested BEFORE amplification and is deliberately not subject to
+// it. The amplification comparison used to gate this and was costing the
+// throughput it was meant to protect: a reader that consumes everything it
+// is given has an amplification of 1.0 by construction, so the only thing
+// the comparison could detect on it was read-ahead's own lead running past
+// the window, which it does irregularly. Each time it did, the window
+// voted zero and reset the agreement and growth stalled wherever it had
+// reached -- measured, the same workload grew four times in one run and
+// twice in another, 28.58 MB/s against 25.05.
+//
+// Growth also stops once Cc declines to honour the granule, which is what
+// makes the ceiling portable rather than fitted to one link. Cc caps its
+// read-ahead somewhere of its own choosing, around 1.1 MB here, and past
+// that a larger granule changes nothing it will act on: the same file was
+// fetched in 418, 413, 421 and 412 requests at ceilings of 2, 4, 8 and
+// 16 MB. Comparing the window's largest paging read against the granule
+// asked for is two byte counts, which is why it works where measuring
+// throughput did not -- a rate-based ceiling was built twice and reverted
+// both times (README), because the marginal gain per doubling is about 11%
+// and the link moves by tens of percent.
+//
+// SHRINKING is what guards every other pattern, and it consults
+// amplification alone. Wasted bytes are wasted whether or not anyone has a
+// deadline, so nothing about the consumer enters into it.
+//
+// The configured value is where a file starts, not the range it may move
+// in: growth is allowed above it up to ReadAheadMaxGranularity, and a
+// configuration that raised the start above that maximum keeps its own
+// value as the ceiling rather than being quietly clamped down.
+//
+// PASSIVE_LEVEL, on a file object whose cache map is initialised -- the
+// caller is the cached-read path, which has both. CcSetReadAheadGranularity
+// is re-callable on a live file object; that is not documented and was
+// measured before this was built (README, "The granularity sweep").
+//
 static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 {
-    //
-    // Zero means the configuration asked for Cc's own default and no call
-    // at all. Adapting would quietly override that, so it does not.
-    //
     if (0 == global.ReadAheadGranularity || 0 == Fcb->ReadAheadGranularity ||
         !global.ReadAheadAdapt)
     {
@@ -301,12 +341,11 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 
     const ULONG64 consumed = Fcb->ReadAheadConsumedBytes;
     const ULONG64 fetched = Fcb->ReadAheadFetchedBytes;
+    const ULONG honoured = Fcb->ReadMaxPagingBytes;
 
     const BOOLEAN greedy = global.ReadAheadSlackGrowth &&
                            BlorgStatisticsFetchesActive() < READ_AHEAD_ADAPT_QUIET_DEPTH &&
                            ReadIsGreedy(Fcb);
-
-    const ULONG honoured = Fcb->ReadMaxPagingBytes;
 
     Fcb->ReadAheadConsumedBytes = 0;
     Fcb->ReadAheadFetchedBytes = 0;
@@ -314,12 +353,6 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     Fcb->ReadIdleTicks = 0;
     Fcb->ReadBusyTicks = 0;
 
-    //
-    // This window's vote, before any decision: +1 that the granule is too
-    // large, -1 that it could be larger, 0 that this window says neither.
-    // An undecided window clears the tally rather than leaving a stale vote
-    // half of a future pair.
-    //
     const ULONG64 lead = C_CAST(ULONG64, current) * READ_AHEAD_ADAPT_LEAD_GRANULES;
 
     LONG vote = 0;
@@ -327,41 +360,6 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     if (greedy && honoured >= current &&
         ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK)
     {
-        //
-        // Sequential AND greedy, tested before amplification rather than
-        // after it, and deliberately not subject to it.
-        //
-        // Sequential alone is not enough: a lone reader walking a file
-        // forwards also has a long streak and amplification of 1.0, and
-        // growing for a lone PLAYER costs it deadlines. Greedy is what
-        // distinguishes the file copy, which wants the large granule and
-        // has no frame to miss, and it is consulted only on a quiet
-        // transport -- see READ_AHEAD_ADAPT_QUIET_DEPTH.
-        //
-        // The amplification test used to gate this too, and it was costing
-        // the throughput it was meant to protect. A reader that consumes
-        // everything it is given has an amplification of 1.0 by
-        // construction, so the only thing the comparison could detect on it
-        // was read-ahead's own lead running past the window -- which it
-        // does irregularly. Each time it did, the window voted zero and
-        // reset the agreement, so growth stalled at whatever granule it had
-        // reached: measured, the same workload grew four times in one run
-        // and twice in another, for 28.58 MB/s against 25.05.
-        //
-        // Growth also stops once Cc declines to honour the granule, which
-        // is what makes the ceiling portable rather than fitted. Cc caps
-        // its read-ahead somewhere of its own choosing -- around 1.1 MB
-        // here -- and past that a larger granule changes nothing it will
-        // act on: the same file fetched in 418, 413, 421 and 412 requests
-        // at ceilings of 2, 4, 8 and 16 MB.
-        //
-        // This is a comparison of two byte counts, which is why it works
-        // where measuring throughput did not. A rate-based version was
-        // built twice and reverted both times (README): the marginal gain
-        // per doubling is about 11% and the link moves by tens of percent,
-        // so no threshold separated them. How far Cc is willing to read
-        // has no such noise, and it is what actually bounds the range.
-        //
         vote = -1;
     }
     else if (fetched > (consumed * READ_AHEAD_ADAPT_WASTE_RATIO) + lead)
@@ -387,14 +385,6 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 
     Fcb->ReadAheadAgreement = 0;
 
-    //
-    // The configured value is where a file starts, not the range it may
-    // move in. Growth is allowed above it up to the loaded maximum,
-    // because the workload that wants a larger granule is the saturated
-    // one and it is not the one the default is chosen for. A configuration
-    // that raised the start above that maximum keeps its own value as the
-    // ceiling rather than being quietly clamped down.
-    //
     const ULONG ceiling = (global.ReadAheadGranularity > global.ReadAheadMaxGranularity)
         ? global.ReadAheadGranularity
         : global.ReadAheadMaxGranularity;
