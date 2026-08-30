@@ -155,6 +155,42 @@ static ULONG64 ReadLongestStreak(const FCB* Fcb)
 #define READ_AHEAD_ADAPT_GROW_STREAK  16
 
 //
+// Percent of a window a consumer must spend NOT asking before it is taken
+// to have a deadline. Below this it is treated as greedy, and greedy is the
+// case growth is safe for: a file copy has no frame to miss and wants every
+// byte per second it can get.
+//
+// The measured separation is not close. Every workload that reads flat out
+// lands between 0.02% and 2.07% idle; every paced one between 92.06% and
+// 99.91%, the low end of that being eight players already missing 6.57% of
+// their deadlines at the link ceiling. Anything from 10 to 90 classifies
+// all of them correctly, so this sits low in the empty band rather than in
+// the middle: misreading a player as greedy costs a visible stutter, and
+// misreading a copy as a player costs throughput nobody is waiting on.
+//
+#define READ_AHEAD_ADAPT_GREEDY_IDLE_PERCENT 25
+
+//
+// Fetches in flight below which a greedy consumer is taken to be alone on
+// the transport, and above which slack is not consulted at all.
+//
+// Slack exists to catch the lone reader that is a file copy. It has nothing
+// to say once the transport is busy, where the loaded rule already decides,
+// and consulting it there is actively harmful: a stream starving at the
+// link ceiling stops idling, so it reads as greedy exactly when it is a
+// player that can least afford a larger granule. Measured, that is not
+// hypothetical -- with slack ungated the paced eight-stream case grew 13.2
+// times a run against 5.8 with it off.
+//
+// Sized from the measured depths rather than from LOAD_DEPTH: a single
+// stream puts about 4 fetches in flight and averages 2.7, while sixteen
+// concurrent streams put 21-28. Six separates those with room on both
+// sides, and leaves a band between it and LOAD_DEPTH where neither rule
+// fires, which is the conservative direction.
+//
+#define READ_AHEAD_ADAPT_QUIET_DEPTH 6
+
+//
 // The granule the policy may grow to under load, and the depth that counts
 // as load. Growth needs both, and the reason is that the right granule
 // depends on how busy the transport is -- which neither a constant nor an
@@ -209,6 +245,30 @@ static ULONG64 ReadLongestStreak(const FCB* Fcb)
 // is re-callable on a live file object; that is not documented and was
 // measured before this was built (README, "The granularity sweep").
 //
+//
+// Whether this window's consumer never stopped asking.
+//
+// A player reading a frame every 41.67 ms spends nearly all of that
+// interval idle, because a read served from cache costs microseconds. A
+// file copy issues its next read the instant the last returns. That is the
+// only signal measured here which separates them: they match on
+// sequentiality, on amplification, and on transport load.
+//
+// A window with no idle sample at all is not greedy by default -- it is
+// unmeasured, and the first read after an open always is.
+//
+static BOOLEAN ReadIsGreedy(const FCB* Fcb)
+{
+    const ULONG64 total = Fcb->ReadIdleTicks + Fcb->ReadBusyTicks;
+
+    if (0 == total || 0 == Fcb->ReadIdleTicks)
+    {
+        return FALSE;
+    }
+
+    return (Fcb->ReadIdleTicks * 100) < (total * READ_AHEAD_ADAPT_GREEDY_IDLE_PERCENT);
+}
+
 static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 {
     //
@@ -237,8 +297,14 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     const ULONG64 consumed = Fcb->ReadAheadConsumedBytes;
     const ULONG64 fetched = Fcb->ReadAheadFetchedBytes;
 
+    const BOOLEAN greedy = global.ReadAheadSlackGrowth &&
+                           BlorgStatisticsFetchesActive() < READ_AHEAD_ADAPT_QUIET_DEPTH &&
+                           ReadIsGreedy(Fcb);
+
     Fcb->ReadAheadConsumedBytes = 0;
     Fcb->ReadAheadFetchedBytes = 0;
+    Fcb->ReadIdleTicks = 0;
+    Fcb->ReadBusyTicks = 0;
 
     //
     // This window's vote, before any decision: +1 that the granule is too
@@ -256,12 +322,19 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     }
     else if (fetched <= (consumed * READ_AHEAD_ADAPT_EARNED_RATIO) + lead &&
              ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK &&
-             BlorgStatisticsFetchesActive() >= READ_AHEAD_ADAPT_LOAD_DEPTH)
+             (BlorgStatisticsFetchesActive() >= READ_AHEAD_ADAPT_LOAD_DEPTH || greedy))
     {
         //
-        // Sequential AND loaded. Sequential alone is not enough: a lone
-        // reader walking a file forwards also has a long streak and
-        // amplification of 1.0, and growing for it is the 3.40% case above.
+        // Sequential AND (loaded OR greedy). Sequential alone is not
+        // enough: a lone reader walking a file forwards also has a long
+        // streak and amplification of 1.0, and growing for a lone PLAYER is
+        // the 3.40% case above.
+        //
+        // Greedy is what distinguishes the lone reader that is a file copy,
+        // which wants the large granule and has no frame to miss, and it is
+        // consulted only on a quiet transport. Loaded stays and keeps sole
+        // authority once the transport is busy, so the multi-stream case
+        // behaves exactly as it did before slack existed.
         //
         vote = -1;
     }
@@ -371,8 +444,11 @@ static VOID ReadRecordUserLatency(FCB* Fcb, LONG64 ArrivedQpc)
                 &statsBlock->ReadIdleMaxUs,
                 statsBlock->ReadIdleBuckets,
                 ArrivedQpc - lastEnd);
+
+            Fcb->ReadIdleTicks += C_CAST(ULONG64, ArrivedQpc - lastEnd);
         }
 
+        Fcb->ReadBusyTicks += C_CAST(ULONG64, completedQpc - ArrivedQpc);
         Fcb->ReadIdleLastEndQpc = completedQpc;
     }
 }

@@ -837,6 +837,72 @@ The amplification shrink rule composes with all of this and is unaffected:
 wasted bytes are wasted whether or not anyone has a deadline, which is what
 keeps the demux pattern protected however it is classified.
 
+### Growing on slack: on by default
+
+The adaptive policy grows the granule for a consumer that never idles as
+well as for a loaded transport. `ReadIsGreedy` in Read.c compares a window's
+idle ticks against its service ticks, greedy below 25%, and it is consulted
+only while fewer than `READ_AHEAD_ADAPT_QUIET_DEPTH` fetches are in flight.
+`ReadAheadSlackGrowth` (registry) still switches it off.
+
+Two rounds with the switch alternating, a guest reboot between every run,
+**and the arm order alternating between rounds**:
+
+| workload | slack | MB/s | missed | worst | grows |
+|---|---|---|---|---|---|
+| seq, greedy | 0 | 19.04 | -- | -- | 0.0 |
+| seq, greedy | 1 | **22.52** | -- | -- | 2.0 |
+| play 3072 | 0 | 3.00 | 0.00% | 0.00 ms | 0 |
+| play 3072 | 1 | 3.00 | 0.00% | 0.00 ms | 0 |
+| demux paced 3072 | 0 | 3.00 | 0.78% | 89.22 ms | 0 |
+| demux paced 3072 | 1 | 3.00 | 0.17% | 50.95 ms | 0 |
+| streams x8 paced 3072 | 0 | 23.73 | 27.81% | 1347.86 ms | 8.0 |
+| streams x8 paced 3072 | 1 | 23.95 | 6.11% | 397.48 ms | 11.0 |
+
+The sequential case is what this exists for: +18%, `min(slack=1) = 22.44`
+above `max(slack=0) = 19.73` so the arms do not overlap, and the mechanism
+observed rather than inferred -- exactly two grows in every switch-on run
+and none in any switch-off run. Paced playback misses no deadline in either
+arm and never grows.
+
+An earlier sweep put the same gain at +38%, from four rounds that alternated
+the arms but always ran slack=0 first. Fixing the order took it to +18%, so
+**half of that first number was warm-up**. It is recorded because the
+correction is the useful part: alternating the configuration is not enough
+if the order within a round is fixed.
+
+Two rows carry no claim. Demux differs in slack's favour with **zero grows
+in both arms**, so the policy cannot have caused it. And the eight-stream
+grow counts range from 0 to 16 *within a single arm*, so that workload's
+variance swamps any difference between arms; the gate means slack cannot
+fire while the transport is busy, which is where that workload lives, but
+indistinguishable in noisy data is not the same as identical.
+
+### The loaded rule is not settled, and predates this
+
+Sorting the earlier eight at-the-wall stream runs by how far the granule
+grew rather than by which arm they came from:
+
+| grows | missed |
+|---|---|
+| 0, 0 | 1.09%, 3.57% |
+| 7, 7 | 6.06%, 4.55% |
+| 14-16 | 74.97%, 4.81%, 17.37%, 7.39% |
+
+More growth goes with more missed deadlines, and those grows come from the
+**loaded** term, which predates slack entirely. If it holds, the case for
+growing under load was made on greedy readers -- the same wrong-layer
+mistake as measuring a frame budget against a reader with no deadline.
+
+It is confounded: a stream starving at the ceiling stops idling, and a
+starving window can trip either term, so growth may be the consequence of a
+bad run rather than its cause. Separating them needs the granule pinned per
+arm rather than adapted, which is a different experiment.
+
+Slack is on regardless because the quiet-transport gate keeps it out of that
+question: it fires for the lone reader and is silent exactly where the
+loaded rule is in doubt.
+
 ### Pipelining the receive: built, measured, reverted
 
 The phase split says a fetch spends about 9.5 ms before its first byte
