@@ -460,6 +460,13 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
         t.DemandLatencyMaxUs);
     printf("    granularity shrink/grow%11llu / %llu\n",
         t.ReadAheadShrinks, t.ReadAheadGrows);
+    printf("    adapt windows         %12llu  (%llu shrink votes, %llu grow votes)\n",
+        t.ReadAdaptWindows, t.ReadAdaptVotesShrink, t.ReadAdaptVotesGrow);
+    printf("    adapt window bytes    %12llu consumed / %llu fetched  (%.2fx)\n",
+        t.ReadAdaptWindowConsumed, t.ReadAdaptWindowFetched,
+        (t.ReadAdaptWindowConsumed > 0)
+            ? (static_cast<double>(t.ReadAdaptWindowFetched) / static_cast<double>(t.ReadAdaptWindowConsumed))
+            : 0.0);
     printf("    user bytes            %12llu\n", t.UserFileReadBytes);
     printf("    non-cached bytes      %12llu\n", t.NonCachedReadBytes);
 

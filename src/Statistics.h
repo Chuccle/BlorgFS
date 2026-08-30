@@ -266,6 +266,26 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ReadAheadShrinks;
     ULONG64 ReadAheadGrows;
 
+    //
+    // What the adaptive policy saw, as opposed to what it did.
+    //
+    // A grow or a shrink is the end of a chain -- a window completing, a
+    // vote, two votes agreeing -- and when the chain does not reach the end
+    // the counters above are silent about which link broke. These say
+    // whether windows are completing at all, how they voted, and the bytes
+    // the vote was computed from, which is the difference between a policy
+    // that decided not to act and one that never got the chance.
+    //
+    // Added because a bursty reader inheriting a grown granule over-fetched
+    // by 2.81x without a single shrink, and reasoning from the totals could
+    // not say why.
+    //
+    ULONG64 ReadAdaptWindows;
+    ULONG64 ReadAdaptVotesShrink;
+    ULONG64 ReadAdaptVotesGrow;
+    ULONG64 ReadAdaptWindowConsumed;
+    ULONG64 ReadAdaptWindowFetched;
+
 
     ULONG64 SpeculativeLatencySumUs;
     ULONG64 SpeculativeLatencyMaxUs;
@@ -443,7 +463,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
 
-#define BLORGFS_STATISTICS_VERSION 11
+#define BLORGFS_STATISTICS_VERSION 12
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

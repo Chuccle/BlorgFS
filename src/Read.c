@@ -122,9 +122,22 @@ static ULONG64 ReadLongestStreak(const FCB* Fcb)
 // it is the whole signal. So the window stays small enough to act within a
 // realistic run, and the lead is subtracted explicitly instead.
 //
+// The lead is one granule, not two, and the difference is a defect it was
+// hiding. At two the allowance equals a whole window -- the window floor
+// is two granules of consumed bytes -- so shrinking needed 3x
+// amplification before it could conclude anything. A reader that inherits
+// a grown granule and starts seeking measured 2.80x and cast ZERO shrink
+// votes across 90 completed windows, wasting about 170 MB while the policy
+// watched. The counters that showed this are ReadAdapt* in Statistics.h.
+//
+// At one granule the trigger is 2.5x, and a sequential reader is still
+// clear of it by a whole granule: its fetched is at most consumed plus the
+// two granules read-ahead can be running ahead by, which is four granules
+// at the window floor, against a threshold of five.
+//
 #define READ_AHEAD_ADAPT_WINDOW_GRANULES 2
 #define READ_AHEAD_ADAPT_WINDOW_FLOOR    (256ull * 1024ull)
-#define READ_AHEAD_ADAPT_LEAD_GRANULES   2
+#define READ_AHEAD_ADAPT_LEAD_GRANULES   1
 
 //
 // Consecutive windows that must agree before the granule moves. One
@@ -272,6 +285,21 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
 // be larger, 0 that this window says neither; an undecided window clears
 // the tally rather than leaving half a pair behind.
 //
+// WASTE IS TESTED FIRST, and the ordering is load-bearing. It was the
+// other way round for one commit, so that growth could be freed from the
+// amplification gate, and that reordering was a defect: a bursty reader
+// inheriting a grown granule stayed greedy, and ReadLongestStreak takes
+// the maximum across trackers while ReadClaimStream evicts the coldest, so
+// the streak left behind by the sequential half is the last thing ever
+// evicted and never decays. The grow arm therefore stayed true and the
+// else-if meant waste was never evaluated at all -- 56 grow votes and zero
+// shrink votes across 89 windows, at 2.82x amplification.
+//
+// Testing waste first does not put the old gate back. What blocked growth
+// was the EARNED comparison, which a reader consuming everything sits
+// exactly on; the WASTE comparison is a bar at two and a half times, and a
+// sequential reader measures 1.04x.
+//
 // GROWTH -- one reader qualifies, and three things must hold together.
 //
 // Sequential alone is not enough: a lone reader walking a file forwards
@@ -353,18 +381,31 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     Fcb->ReadIdleTicks = 0;
     Fcb->ReadBusyTicks = 0;
 
+    BLORGFS_STAT_INC(ReadAdaptWindows);
+    BLORGFS_STAT_ADD(ReadAdaptWindowConsumed, consumed);
+    BLORGFS_STAT_ADD(ReadAdaptWindowFetched, fetched);
+
     const ULONG64 lead = C_CAST(ULONG64, current) * READ_AHEAD_ADAPT_LEAD_GRANULES;
 
     LONG vote = 0;
 
-    if (greedy && honoured >= current &&
+    if (fetched > (consumed * READ_AHEAD_ADAPT_WASTE_RATIO) + lead)
+    {
+        vote = 1;
+    }
+    else if (greedy && honoured >= current &&
         ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK)
     {
         vote = -1;
     }
-    else if (fetched > (consumed * READ_AHEAD_ADAPT_WASTE_RATIO) + lead)
+
+    if (vote > 0)
     {
-        vote = 1;
+        BLORGFS_STAT_INC(ReadAdaptVotesShrink);
+    }
+    else if (vote < 0)
+    {
+        BLORGFS_STAT_INC(ReadAdaptVotesGrow);
     }
 
     if (0 == vote)

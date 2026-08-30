@@ -414,15 +414,12 @@ file, arms alternating with a guest reboot between runs.
 | eight paced players at half the link | 0.19% missed, 13.4 ms worst | stays 128 KB | -- |
 | eight paced players AT the link | 0.5-33% missed, every configuration | -- | -- |
 | sequential then seeking, one handle | no cost, no unwind needed | keeps 512 KB | 0.56x |
-| sequential then **bursty**, one handle | **open defect, shrink never fires** | keeps 2 MB | **2.81x** |
+| sequential then **bursty**, one handle | shrinks 30 times, oscillates | unwinds from 2 MB | **1.87x** |
 | two handles, a copy against a paced player | player missed 0 of 1200 | -- | -- |
 
-Eight of the ten are at their best available answer. Two are not. The
-sequential-into-bursty transition is an open defect, measured below: a
-granule grown for the first half over-fetches by 2.81x in the second and the
-shrink rule does not fire. The eight-players case is not a defect but a
-limit -- those players demanding 100% of a variable link miss deadlines in
-every arm measured -- pinned or adaptive, 128 KB or 512 KB, any ceiling --
+Nine of the ten are at their best available answer. The tenth is not a
+defect but a limit -- eight players demanding 100% of a variable link miss
+deadlines in every arm measured -- pinned or adaptive, 128 KB or 512 KB, any ceiling --
 so granularity does not control it and nothing here is tuned for it.
 
 **The sequential figure is a ratio, not a rate, and that is deliberate.**
@@ -489,37 +486,58 @@ it however large it was left. That also explains something observed earlier
 without being understood: demux and random fetched byte-identical totals at
 every ceiling from 512 KB to 16 MB.
 
-**Sequential into a BURSTY pattern is where it breaks, and this is an open
-defect.** Pure random is safe by construction because it never arms
-read-ahead. A demuxer does -- short adjacent runs, then a jump -- and it
-inherits whatever the sequential half grew to:
+**Sequential into a BURSTY pattern was broken, and the cause was an ordering
+mistake made in this branch.** Pure random is safe by construction because it
+never arms read-ahead. A demuxer does -- short adjacent runs, then a jump --
+and it inherits whatever the sequential half grew to:
 
 | second phase | fetched vs consumed | shrinks | phase throughput |
 |---|---|---|---|
 | pure random | 0.56x | 0 | 13.56 MB/s |
-| bursty, 64 KB blocks, 1024 KB stride | **2.81-2.85x** | **0** | 8.70-9.04 MB/s |
+| bursty, before the fix | **2.82x** | **0** | 7.43 MB/s |
+| bursty, after | **1.87x** | 30 | 7.80 MB/s |
 
-The bursty half inherits a 2 MB granule, over-fetches by about 173 MB, and
-**the shrink rule never fires**. It is the one measured case where this
-policy leaves both throughput and bandwidth on the floor.
+Two guesses failed before the counters were added, and both are worth
+recording because the arithmetic looked convincing each time. Widening the
+window to four granules should have moved the shrink trigger from 3x to
+2.5x and caught the 2.82x; it changed nothing. Halving the lead allowance
+should have done the same; it also changed nothing.
 
-The arithmetic suggested the lead allowance was the cause. Shrinking needs
-`fetched > 2 * consumed + lead`, where the lead is two granules and the
-window is two granules of consumed bytes, so the lead is about equal to what
-was consumed and the effective trigger sits near 3x -- just above the 2.85x
-measured. Widening the window to four granules should have moved the trigger
-to 2.5x and caught it.
+`ReadAdapt*` in Statistics.h answered it in one run: **56 grow votes, zero
+shrink votes, across 89 completed windows.** The windows were completing and
+the vote was never being cast, because the shrink test was not being reached
+at all:
 
-**It did not.** The same run at a four-granule window still measured 2.81x
-with zero shrinks, so the explanation is wrong somewhere: either the windows
-are not completing -- the policy's `consumed` not accumulating as assumed on
-a pattern that misses cache -- or the policy's `fetched` differs from the
-`FetchBytes` delta reported here. The change was reverted rather than kept,
-because it costs adaptation latency everywhere and bought nothing measured.
+```
+if (greedy && honoured >= current && streak >= GROW_STREAK)  vote = -1;
+else if (fetched > consumed * WASTE + lead)                  vote =  1;
+```
 
-Resolving it needs the policy's own two counters exposed per window rather
-than inferred from totals, which is the next thing to build. Reproduce with
-`mixed <file> 200 64 1500 1024 4`.
+A bursty reader going flat out is greedy, and `ReadLongestStreak` takes the
+maximum across trackers while `ReadClaimStream` evicts the coldest -- so the
+streak the sequential half left behind is the last thing ever evicted and
+never decays. The grow arm stayed true, and `else if` meant waste was never
+evaluated.
+
+The reordering came from the commit that freed growth from the amplification
+gate. Removing the EARNED comparison was the part that mattered; putting
+growth first was gratuitous, and it disabled the shrink rule for exactly the
+pattern that rule exists to catch. Waste is tested first again, and the lead
+stays at one granule so the trigger sits at 2.5x rather than 3x.
+
+Testing waste first does not restore the gate that was removed. What blocked
+growth was the EARNED comparison, which a reader consuming everything sits
+exactly on. The WASTE comparison is a bar at two and a half times, and a
+sequential reader measures 1.00-1.04x -- it cast zero shrink votes across
+125 windows after the change.
+
+**One residual, recorded rather than fixed.** The bursty phase now shows 26
+grows against 30 shrinks: the stale streak still lets growth win a window
+whenever amplification dips under the bar, so the granule oscillates rather
+than settling. The net is strongly positive -- 2.82x down to 1.87x, about
+90 MB of wasted bandwidth recovered -- but a tracker whose streak decayed
+when its stream stopped being used would settle instead of bouncing.
+Reproduce either state with `mixed <file> 200 64 1500 1024 4`.
 
 ### The granularity sweep, and why there is no right constant
 
