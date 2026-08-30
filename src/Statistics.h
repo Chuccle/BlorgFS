@@ -294,6 +294,31 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 UserReadLatencyMaxUs;
     ULONG64 UserReadLatencyBuckets[BLORGFS_STATISTICS_LATENCY_BUCKETS];
 
+    //
+    // The gap between one application-visible read completing on a file and
+    // the next arriving on it -- how long the consumer was not asking for
+    // anything.
+    //
+    // A consumer with a deadline idles: a player reading a frame every
+    // 41.67 ms spends almost all of that interval asking for nothing, since
+    // a read served from cache costs microseconds. A file copy never idles,
+    // because its next read is issued the instant the last one returns.
+    // The two are otherwise indistinguishable to the read-ahead policy --
+    // both sequential, both amplification 1.0, both alone on the transport
+    // -- and they want opposite granules, so this is the signal that
+    // separates them.
+    //
+    // Instrumentation only. Nothing reads these to make a decision, and the
+    // trap that has to be answered before anything does is visible in the
+    // distribution rather than the mean: a player whose bitrate rises until
+    // it stops idling looks like a copy exactly when a large granule would
+    // hurt it most.
+    //
+    ULONG64 ReadIdleSamples;
+    ULONG64 ReadIdleSumUs;
+    ULONG64 ReadIdleMaxUs;
+    ULONG64 ReadIdleBuckets[BLORGFS_STATISTICS_LATENCY_BUCKETS];
+
     // --- HTTP chunk fetches --------------------------------------------
     ULONG64 FetchesIssued;               // every range GET the driver makes
     ULONG64 FetchesCompleted;
@@ -418,7 +443,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
 
-#define BLORGFS_STATISTICS_VERSION 10
+#define BLORGFS_STATISTICS_VERSION 11
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

@@ -753,10 +753,53 @@ completing and the next arriving, that distinguishes "has a deadline" from
 proxy for it. Growing only for a stream with no slack would take the file
 copy to 512 KB while leaving both paced rates where they are.
 
-Not implemented, and the 8 MB/s row is the reason to be careful: a paced
-consumer whose rate rises until it stops idling would be reclassified as
-greedy exactly when it can least afford a large granule. A slack rule needs
-a floor that a starving player cannot fall through.
+Measured, as instrumentation only -- `ReadIdle*` in the statistics block,
+the gap from one application-visible read completing on a file to the next
+arriving on it, reported by the harness as an idle share of wall clock:
+
+| workload | idle share | idle p50 |
+|---|---|---|
+| greedy sequential, buffered | 0.09% | <=2 us |
+| streams x8 | 0.03% | <=2 us |
+| demux, 4 tracks, burst 4 | 0.53% | -- |
+| rand 64 KB buffered | 2.07% | <=2 us |
+| paced 8 MB/s | 94.99% | <=16 ms |
+| paced 3 MB/s | 99.85% | <=65 ms |
+
+Three orders of magnitude apart with nothing in between. Every greedy
+workload lands under 2.1% and every paced one above 94%, so any threshold
+from 10% to 90% classifies all six correctly. As a discriminator this is
+about as clean as a runtime signal gets, and it is the only one measured
+here that separates a file copy from a player -- sequentiality,
+amplification and transport load are all shared between them.
+
+Nothing reads these to make a decision. Three things have to be answered
+first, and two of them are new:
+
+- **A starving player stops idling.** Its rate rises until it is asking
+  continuously, at which point it looks exactly like a copy -- and that is
+  when a large granule hurts it most. A slack rule needs a floor a
+  struggling player cannot fall through, which probably means pairing slack
+  with whether demand rate responds to delivery rate: a copy's does, a
+  player's does not.
+
+- **The harness stops representing production the moment the policy keys on
+  this.** `demux` and `streams` read flat out, so they measure 0.53% and
+  0.03% -- but a real demuxer is inside a player and a real eight-stream
+  load is eight players, and both would measure above 94%. The workloads
+  would be classified greedy while the things they stand for are not. A
+  slack-driven policy cannot be validated against them as they are; paced
+  variants would have to exist first.
+
+- **Run-to-run variance is larger than the effect on some cells.** The
+  8 MB/s paced case missed 1 deadline in 1600 in one run and 65 in another
+  at the same granule, and greedy sequential measured 12.56 MB/s here
+  against 19.5 elsewhere. Any decision taken on these numbers needs the
+  interleaved-with-reboot shape, not two runs compared across a session.
+
+The amplification shrink rule composes with all of this and is unaffected:
+wasted bytes are wasted whether or not anyone has a deadline, which is what
+keeps the demux pattern protected however it is classified.
 
 ### Pipelining the receive: built, measured, reverted
 
