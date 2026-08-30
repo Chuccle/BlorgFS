@@ -306,8 +306,11 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
                            BlorgStatisticsFetchesActive() < READ_AHEAD_ADAPT_QUIET_DEPTH &&
                            ReadIsGreedy(Fcb);
 
+    const ULONG honoured = Fcb->ReadMaxPagingBytes;
+
     Fcb->ReadAheadConsumedBytes = 0;
     Fcb->ReadAheadFetchedBytes = 0;
+    Fcb->ReadMaxPagingBytes = 0;
     Fcb->ReadIdleTicks = 0;
     Fcb->ReadBusyTicks = 0;
 
@@ -321,7 +324,8 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 
     LONG vote = 0;
 
-    if (greedy && ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK)
+    if (greedy && honoured >= current &&
+        ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK)
     {
         //
         // Sequential AND greedy, tested before amplification rather than
@@ -343,6 +347,20 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
         // reset the agreement, so growth stalled at whatever granule it had
         // reached: measured, the same workload grew four times in one run
         // and twice in another, for 28.58 MB/s against 25.05.
+        //
+        // Growth also stops once Cc declines to honour the granule, which
+        // is what makes the ceiling portable rather than fitted. Cc caps
+        // its read-ahead somewhere of its own choosing -- around 1.1 MB
+        // here -- and past that a larger granule changes nothing it will
+        // act on: the same file fetched in 418, 413, 421 and 412 requests
+        // at ceilings of 2, 4, 8 and 16 MB.
+        //
+        // This is a comparison of two byte counts, which is why it works
+        // where measuring throughput did not. A rate-based version was
+        // built twice and reverted both times (README): the marginal gain
+        // per doubling is about 11% and the link moves by tens of percent,
+        // so no threshold separated them. How far Cc is willing to read
+        // has no such noise, and it is what actually bounds the range.
         //
         vote = -1;
     }
@@ -962,6 +980,11 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             // would understate the waste it causes.
             //
             fcb->ReadAheadFetchedBytes += realLength;
+
+            if (realLength > fcb->ReadMaxPagingBytes)
+            {
+                fcb->ReadMaxPagingBytes = realLength;
+            }
         }
 
         Irp->Tail.Overlay.DriverContext[2] =
