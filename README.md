@@ -1036,6 +1036,51 @@ Random reads fetch *less* than they consume, because some of what they ask
 for is already resident. Nothing here is above 1.2x, and none of it moved
 when the growth ceiling was raised four-fold.
 
+### What made the ceiling portable: asking Cc, not the clock
+
+Both rate-based tuners failed on the same thing -- an 11% marginal effect
+cannot be seen through 30% noise. The signal that works is not a rate at
+all.
+
+Cc does not read ahead in whatever size it is told. It caps somewhere of its
+own choosing, around 1.1 MB here, and the cap sweep shows it plainly: the
+same 465 MB file was fetched in 418, 413, 421 and 412 requests at ceilings
+of 2, 4, 8 and 16 MB. Four ceilings spanning 8x, and the request count does
+not move. Everything above ~1 MB was inert.
+
+So growth now stops when Cc declines to honour the granule -- the largest
+paging read seen in the window against the granule asked for. Two byte
+counts, no clock, no noise:
+
+| | cap 2 MB | cap 16 MB |
+|---|---|---|
+| seq, ratio to usermode | **1.01** | **1.01** |
+| seq grows / shrinks | 4 / 0 | 5 / 0 |
+| play 3072 missed | 0.09% | 0.00% |
+| demux sparse fetched | 223 MB, 0 grows | 223 MB, 0 grows |
+| rand 64 KB fetched | 85 MB, 0 grows | 85 MB, 0 grows |
+| streams x8 paced missed | 1.58% | 1.94% |
+
+An eight-fold change in the configured bound moves the ratio not at all, and
+the grow count by one step instead of the three the fixed ceiling took
+(4, 5, 6, 7 at 2, 4, 8, 16 MB). The ceiling is now mostly a safety bound
+rather than the operative limit, which is what portability means here: on a
+system where Cc reads further, the policy follows it, and on one where it
+reads less, the policy stops earlier -- without either being configured.
+
+It is not perfectly bound-independent. The test uses the largest paging read
+in the window, which is permissive: one oversized read admits another
+doubling, which is why 16 MB reached five grows and 2 MB four. Both landed
+at ratio 1.01, so the extra step cost nothing here, and a stricter statistic
+would be tuning against a single environment again.
+
+**Amplification cannot regress through this, and not by luck.** Growth
+requires a greedy consumer AND sixteen consecutive exactly-adjacent reads.
+A seeking reader has neither, which is why demux and random fetched
+byte-identical totals with zero grows at every ceiling tried across the
+whole sweep series. The new gate only narrows growth further, so it cannot
+reach them.
+
 ### A self-tuning ceiling: built twice, measured, reverted
 
 The growth ceiling is a constant fitted to one link, and where a sequential

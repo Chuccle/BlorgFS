@@ -385,6 +385,24 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // sequential read whose pattern never changed.
     //
     LONG    ReadAheadAgreement;
+
+    //
+    // Largest paging read Cc has issued on this file during the current
+    // window, which is how far it is willing to honour the granule.
+    //
+    // Cc does not read ahead in whatever size it is told. Measured, it caps
+    // around 1.1 MB however high the granularity goes: the fetch count for
+    // one 465 MB file was 418, 413, 421 and 412 at ceilings of 2, 4, 8 and
+    // 16 MB. Growth past that point changes nothing it can act on, and this
+    // is what lets the policy notice.
+    //
+    ULONG   ReadMaxPagingBytes;
+
+    //
+    // Closes the tail explicitly rather than widening a neighbour, which is
+    // this file's rule for satisfying CHECK_PADDING_END.
+    //
+    ULONG   ReadAheadReserved;
 } FCB, * PFCB;
 
 CHECK_PADDING_BETWEEN(FCB, Header, NonPaged);
@@ -412,7 +430,9 @@ CHECK_PADDING_BETWEEN(FCB, ReadIdleLastEndQpc, ReadIdleTicks);
 CHECK_PADDING_BETWEEN(FCB, ReadIdleTicks, ReadBusyTicks);
 CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadAheadGranularity);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadGranularity, ReadAheadAgreement);
-CHECK_PADDING_END(FCB, ReadAheadAgreement);
+CHECK_PADDING_BETWEEN(FCB, ReadAheadAgreement, ReadMaxPagingBytes);
+CHECK_PADDING_BETWEEN(FCB, ReadMaxPagingBytes, ReadAheadReserved);
+CHECK_PADDING_END(FCB, ReadAheadReserved);
 
 //
 // Per-directory context node. Extends COMMON_CONTEXT with child linkage and
