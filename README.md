@@ -1036,6 +1036,56 @@ Random reads fetch *less* than they consume, because some of what they ask
 for is already resident. Nothing here is above 1.2x, and none of it moved
 when the growth ceiling was raised four-fold.
 
+### A self-tuning ceiling: built twice, measured, reverted
+
+The growth ceiling is a constant fitted to one link, and where a sequential
+reader stops gaining is a property of the link rather than of this driver.
+2 MB suits a 2 ms, ~28 MB/s WiFi path; a 50 ms path needs a granule several
+times larger before time-to-first-byte is amortised at all. So the ceiling
+should be measured, not configured.
+
+It was built that way: after each doubling, the next window's rate is
+compared against the window before it, and a doubling that fails is stepped
+back, ending the climb for that file. Rates compare as `bytes1*ticks2`
+against `bytes2*ticks1`, exact in integers with no counter frequency needed.
+
+**Both versions regressed sequential throughput and neither is in the tree.**
+
+| | seq MB/s | ratio to usermode | grows | shrinks |
+|---|---|---|---|---|
+| fixed 2 MB ceiling | ~32 | 1.02 | 4-7 | 0 |
+| keep only if 10% better | 18.20 / 18.89 | 0.68 / 0.76 | 1.0 | 1.0 |
+| revert only if 10% worse | 19.21 / 23.87 | 0.77 / 0.80 | 1.5-2.0 | 1.0 |
+
+The first version had the test backwards, and the cap sweep says why: 512 KB
+to 2 MB is two doublings worth 23% together, so the marginal gain is about
+11% per step. Requiring more than 10% improvement per doubling, against a
+link whose own noise is tens of percent, fails every trial on its first
+judgement -- growth stopped after one step, 40% down.
+
+Inverting it to stop only on measured harm should have been safe, because
+its failure mode is climbing to the bound, which is what the fixed ceiling
+already does. It still settled after one or two steps, because a 10% dip
+between adjacent windows happens by chance: the same configuration measured
+14.36 and 24.07 MB/s in consecutive rounds.
+
+**The conclusion is about the signal, not the threshold.** Per-window
+throughput cannot resolve an 11% marginal effect on a medium that moves by
+30%, and no margin fixes that -- a threshold loose enough to survive the
+noise is loose enough to never fire. Locating the knee needs either a stable
+link or a signal that is not end-to-end throughput.
+
+The ttfb/body ratio was the obvious alternative and does not work either.
+It stays near 2.5 whether the granule is 512 KB or 2 MB, because
+time-to-first-byte grows with the granule too -- concurrent fetches queue
+behind each other's bodies, so the thing that would signal "stop growing"
+scales with the growth.
+
+What this leaves is an honest constant with its provenance recorded:
+2 MB, measured on this link, with the sweep that chose it and a registry
+override (`ReadAheadMaxGranularityKb`) for a link where it is wrong. The
+work is in `git stash` if a stable link ever makes the measurement possible.
+
 ### Pipelining the receive: built, measured, reverted
 
 The phase split says a fetch spends about 9.5 ms before its first byte
