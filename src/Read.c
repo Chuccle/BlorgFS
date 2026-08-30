@@ -134,15 +134,18 @@ static ULONG64 ReadLongestStreak(const FCB* Fcb)
 #define READ_AHEAD_ADAPT_AGREEMENT 2
 
 //
-// Amplification above which read-ahead is judged to be wasted, and below
-// which it is judged to be earning its keep. Measured: a dense sequential
-// reader runs at about 1.0 whatever the granularity, while the demux
-// pattern measures 27.5x at 512 KB, 10.7x at 64 KB and 1.4x at PAGE_SIZE.
-// The gap between the two thresholds is the hysteresis -- without it a
-// reader sitting near one number would be re-tuned on every window.
+// Amplification above which read-ahead is judged to be wasted. Measured: a
+// dense sequential reader runs at about 1.0 whatever the granularity, while
+// the demux pattern measures 27.5x at 512 KB, 10.7x at 64 KB and 1.4x at
+// PAGE_SIZE.
+//
+// There was a second threshold below which read-ahead was judged to be
+// earning its keep, and growth was gated on it. It is gone: the only reader
+// that grows now is a greedy sequential one, whose amplification is 1.0 by
+// construction, so the comparison could only ever detect read-ahead's own
+// lead overshooting the window and stall the growth it was gating.
 //
 #define READ_AHEAD_ADAPT_WASTE_RATIO  2
-#define READ_AHEAD_ADAPT_EARNED_RATIO 1
 
 //
 // Adjacent reads a single stream must string together before the policy
@@ -318,26 +321,34 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 
     LONG vote = 0;
 
-    if (fetched > (consumed * READ_AHEAD_ADAPT_WASTE_RATIO) + lead)
-    {
-        vote = 1;
-    }
-    else if (fetched <= (consumed * READ_AHEAD_ADAPT_EARNED_RATIO) + lead &&
-             ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK &&
-             greedy)
+    if (greedy && ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK)
     {
         //
-        // Sequential AND greedy. Sequential alone is not enough: a lone
-        // reader walking a file forwards also has a long streak and
-        // amplification of 1.0, and growing for a lone PLAYER costs it
-        // deadlines.
+        // Sequential AND greedy, tested before amplification rather than
+        // after it, and deliberately not subject to it.
         //
-        // Greedy is what distinguishes the lone reader that is a file copy,
-        // which wants the large granule and has no frame to miss. It is the
-        // only reason left to grow, and it is consulted only on a quiet
+        // Sequential alone is not enough: a lone reader walking a file
+        // forwards also has a long streak and amplification of 1.0, and
+        // growing for a lone PLAYER costs it deadlines. Greedy is what
+        // distinguishes the file copy, which wants the large granule and
+        // has no frame to miss, and it is consulted only on a quiet
         // transport -- see READ_AHEAD_ADAPT_QUIET_DEPTH.
         //
+        // The amplification test used to gate this too, and it was costing
+        // the throughput it was meant to protect. A reader that consumes
+        // everything it is given has an amplification of 1.0 by
+        // construction, so the only thing the comparison could detect on it
+        // was read-ahead's own lead running past the window -- which it
+        // does irregularly. Each time it did, the window voted zero and
+        // reset the agreement, so growth stalled at whatever granule it had
+        // reached: measured, the same workload grew four times in one run
+        // and twice in another, for 28.58 MB/s against 25.05.
+        //
         vote = -1;
+    }
+    else if (fetched > (consumed * READ_AHEAD_ADAPT_WASTE_RATIO) + lead)
+    {
+        vote = 1;
     }
 
     if (0 == vote)
