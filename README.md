@@ -614,6 +614,50 @@ magnitude more than it should be. None of that has been attempted -- it is
 recorded here because tuning the granule further is optimising the wrong
 term.
 
+### Pipelining the receive: built, measured, reverted
+
+The phase split says a fetch spends about 9.5 ms before its first byte
+against a usermode client's 5.3 ms, and the obvious suspect was ordering:
+the receive was posted from the send *completion*, so a send-completion DPC
+stood between a response already sitting in the socket buffer and anyone
+asking for it. Posting the receive as soon as the send was issued should
+have removed it.
+
+It did not. Measured with a runtime switch so the two orderings could
+alternate with a reboot each -- the only comparison shape that has held up
+on this host:
+
+| | ttfb | fetch | MB/s | reads over a frame |
+|---|---|---|---|---|
+| receive posted at send-issue | 9.54 ms | 20.38 ms | 16.28 | 0.498% |
+| receive posted at send-completion | **8.96 ms** | **19.48 ms** | **17.64** | **0.448%** |
+
+Consistently worse across both interleaved pairs, and the `wait` phase --
+the one it exists to shrink -- went up rather than down (7.93/9.61 against
+7.23/9.19). A pre-posted receive that does not reduce time-to-headers means
+the send-completion DPC was never what the request was waiting on. Reverted.
+
+Two things worth keeping from it. The sandbox caught a use-after-free in the
+first version within one run: posting the receive *before* the send reads as
+tidier and is wrong, because a receive can complete synchronously -- the
+scripted peer does, and WSK may -- running the request to completion and
+freeing the context before the send is issued. ASan named the line, and 23
+allocation-failure scenarios failed beside it.
+
+And if this is ever attempted again, the invariant that made two outstanding
+operations safe without reference counting the whole state machine was
+ownership: from the moment the receive is posted it owns the context, and
+the send completion may only stamp a timestamp and record a status -- never
+fail, retry, complete or kick. That is cheaper than a refcount and it is
+checkable by reading one routine.
+
+The gap it was aimed at is real and still unexplained: 9.5 ms against 5.3 ms
+to first byte, same guest, same backend, same keep-alive reuse, with the
+driver's own measurable work at 12 us. Ordering is now excluded. The
+remaining candidates are the four pool allocations per fetch, the IRP and
+MDL per socket operation, and the 0.73-0.88 ms spent sending a ~200 byte
+request.
+
 ### Splitting the fetch: built, measured, removed
 
 Splitting one large fetch into concurrent range requests over partial MDLs
