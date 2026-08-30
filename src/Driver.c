@@ -665,6 +665,18 @@ static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICO
         }
     }
 
+    ULONG maxGranularityKb = 0;
+
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadMaxGranularityKb", REG_DWORD, &maxGranularityKb, sizeof(maxGranularityKb), &actualSize)))
+    {
+        const ULONG maxGranularity = maxGranularityKb * 1024;
+
+        if (maxGranularity >= PAGE_SIZE && 0 == (maxGranularity & (maxGranularity - 1)))
+        {
+            global.ReadAheadMaxGranularity = maxGranularity;
+        }
+    }
+
     ULONG adaptValue = 0;
 
     if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadAdapt", REG_DWORD, &adaptValue, sizeof(adaptValue), &actualSize)))
@@ -1011,6 +1023,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     global.ReadAheadGranularity = READ_AHEAD_GRANULARITY;
     global.ReadAheadSlackGrowth = TRUE;
     global.ReadAheadAdapt = TRUE;
+    global.ReadAheadMaxGranularity = READ_AHEAD_MAX_GRANULARITY;
 
     DriverReadRegistryConfig(RegistryPath, &portString, &hostString);
 

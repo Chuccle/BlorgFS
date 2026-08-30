@@ -948,6 +948,94 @@ So it is recorded rather than fixed. Fixing it needs a signal that separates
 one starving consumer from one greedy one, and neither slack nor depth is
 that signal.
 
+### Reaching the ceiling, without paying for it anywhere else
+
+Growth stopped at 512 KB, which is where a sequential reader stopped too.
+`ReadAheadMaxGranularityKb` makes that bound configurable, and sweeping it
+one boot and one cold file per arm -- the Windows cache survives a counter
+reset, so any workload after the first on a file measures Cc rather than
+this driver:
+
+| cap | seq MB/s | grows |
+|---|---|---|
+| 512 KB | 23.05 | 2 |
+| 1 MB | 27.34 | 3 |
+| 2 MB | **28.38** | 4 |
+| 4 MB | 27.91 | 5 |
+
+4 MB buys nothing, so 2 MB is the default now.
+
+**This was written up as reaching 99.8% of the link and that was wrong.**
+The 28.38 came from the guest in one sweep; the 28.45 "ceiling" came from
+the host in a different session. The path to the backend is WiFi -- an
+Intel AX200 at a 649 Mbps link rate, 2 ms away -- so the ceiling is a
+variable medium, and comparing two numbers taken hours apart says nothing.
+That is the same cross-session error this document warns about twice
+elsewhere.
+
+Measured properly, by alternating the driver and a usermode client within
+one session so each pair sees the same medium, on a different cold file
+each time:
+
+| pair | driver | usermode | ratio |
+|---|---|---|---|
+| ep 01 | 20.74 MB/s | 25.31 | 0.82 |
+| ep 02 | 19.83 | 23.94 | 0.83 |
+| ep 03 | 18.87 | 23.82 | 0.79 |
+
+**The driver reaches about 0.8 of what a usermode client gets on the same
+link at the same moment**, consistently across three pairs. The granule
+sweep above is still valid -- it was internally consistent, one boot per arm
+-- and 2 MB is still the right cap. But the remaining gap is roughly 20%,
+not nothing.
+
+The shape of it is worth stating because it is not mysterious. The usermode
+client issues ONE request for the whole file and pays time-to-first-byte
+once. The driver pays it per granule: at 2 MB and ~25 MB/s that is an 80 ms
+body behind a ~10 ms ttfb, about 11% overhead, which is the right order for
+the gap. Closing it means overlapping a fetch's ttfb with the previous
+fetch's body rather than making the granule larger -- 4 MB already showed no
+gain.
+
+The check that matters is not the sequential column but the other two: the
+sparse demux pattern fetched **223 MB at every one of those caps** and the
+random pattern **85 MB**, both with zero grows. A higher ceiling is
+unreachable for them because they never satisfy the streak condition, so
+raising it cannot cost them anything.
+
+Confirmed against the previous default across every workload, each on its
+own cold file:
+
+| workload | 512 KB cap | 2 MB cap | fetched |
+|---|---|---|---|
+| seq, greedy | 19.91 MB/s | **26.59 MB/s** | 466 MB both |
+
+| play 3072 | 0.00% missed | 0.00% missed | 76 MB both |
+| demux sparse, stride 1024 | 10.77 MB/s | 10.82 | 223 MB both |
+| rand 64 KB buffered | 10.30 MB/s | 10.39 | 85 MB both |
+| streams x8 paced 3072 | 2.62% missed, 144 ms | 1.23%, 95 ms | -- |
+
+### Amplification, and why it stopped being a problem
+
+The granule was once a constant, and a constant large enough for sequential
+reads cost the demux pattern 27.5x amplification -- 512 KB fetched to serve
+a fraction of it. That is what made the trade look unavoidable.
+
+It is not a trade any more, because the large granule is no longer a
+constant. 128 KB is the floor every file starts at, and the only reader that
+ever leaves it is a sequential one that never idles. Measured against
+consumption, on cold files:
+
+| pattern | fetched | consumed | amplification |
+|---|---|---|---|
+| sparse demux, 64 KB blocks, 1024 KB stride | 223 MB | 187.5 MB | 1.19x |
+| random, 64 KB blocks | 85 MB | 93.75 MB | 0.91x |
+| sequential, greedy | 466 MB | 465.6 MB | 1.00x |
+
+Random reads fetch *less* than they consume, because some of what they ask
+for is already resident. Nothing here is above 1.2x, and none of it moved
+when the growth ceiling was raised four-fold.
+
 ### Pipelining the receive: built, measured, reverted
 
 The phase split says a fetch spends about 9.5 ms before its first byte
