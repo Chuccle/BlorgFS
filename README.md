@@ -398,6 +398,59 @@ sequential streaming. `ReadAheadGranularityKb` in the service's
 `Parameters` key exists to sweep that trade without a rebuild per point;
 zero means never call `CcSetReadAheadGranularity` and leave Cc's default.
 
+### Where each workload stands
+
+The read-ahead policy is one rule per direction, and this is what it
+produces. Everything below was measured on cold files, one workload per
+file, arms alternating with a guest reboot between runs.
+
+| workload | result | granule | amplification |
+|---|---|---|---|
+| sequential, greedy (file copy) | **ratio 1.01 to a usermode client** | grows to 2 MB | 1.00x |
+| paced playback, 3 MB/s | **0.00% of deadlines missed** | stays 128 KB, never grows | -- |
+| paced playback, 8 MB/s | 1 miss in 1600, 1.35 ms late | stays 128 KB | -- |
+| paced demux, 4 tracks | 0.17% missed | stays 128 KB, never grows | 1.19x |
+| random, 64 KB blocks | -- | stays 128 KB, never grows | 0.91x |
+| eight paced players at half the link | 0.19% missed, 13.4 ms worst | stays 128 KB | -- |
+| eight paced players AT the link | 0.5-33% missed, every configuration | -- | -- |
+
+Six of the seven are at their best available answer. The last is not, and
+cannot be: eight players demanding 100% of a variable link miss deadlines in
+every arm measured -- pinned or adaptive, 128 KB or 512 KB, any ceiling --
+so granularity does not control it and nothing here is tuned for it.
+
+**The sequential figure is a ratio, not a rate, and that is deliberate.**
+The path to the backend is WiFi, so absolute MB/s moves by tens of percent
+between runs and a number like "28 MB/s" means nothing without saying when.
+Alternating the driver against a usermode client within one session, each
+pair seeing the same medium, puts the driver at 0.96-1.10 across eight runs,
+mean 1.02. There is no headroom left against what a plain HTTP client gets
+from the same link.
+
+**Amplification stopped being a trade rather than being balanced.** It was
+the price of a constant granule large enough for sequential reads -- 27.5x
+on the demux pattern at 512 KB. With 128 KB as the floor every file starts
+at, and growth reserved for a reader that is both sequential and never idle,
+nothing that seeks ever leaves the floor: the sparse demux and random
+patterns fetched byte-identical totals at every ceiling from 512 KB to
+16 MB, with zero grows in all of them. Random fetches *less* than it
+consumes, because part of what it asks for is already resident.
+
+The rules that produce this, in full:
+
+- **Shrink** when a window fetched more than twice what it consumed. This
+  guards every pattern and consults nothing about the consumer, because
+  wasted bytes are wasted whether or not anyone has a deadline.
+- **Grow** only when the consumer never idles (a copy, not a player), the
+  transport is quiet, sixteen reads have been exactly adjacent, and Cc is
+  still honouring the granule it was last given.
+
+Each condition earns its place by a measured failure without it, recorded in
+the sections below: growing for a lone player costs it deadlines, growing on
+a busy transport was justified on readers with no deadline, growing for a
+seeking reader is where 27.5x amplification came from, and growing past what
+Cc will honour is how a ceiling gets fitted to one link.
+
 ### The granularity sweep, and why there is no right constant
 
 That trade has now been measured rather than assumed, and the answer is
