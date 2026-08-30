@@ -1884,6 +1884,178 @@ static bool RunPlayback(
 }
 
 //
+// A reader that changes its mind: sequential, then seeking, on one handle.
+//
+// Every other workload here holds one pattern for its whole run, so nothing
+// measured what the adaptive policy costs while it is catching up. That is
+// the interesting moment: a granule grown for a file copy is exactly wrong
+// for the seek that follows it, and the policy only unwinds on evidence --
+// two agreeing windows per halving, and a window is two granules wide, so
+// the bytes it takes to come back down scale with how far it went up.
+//
+// The phases are counted separately against the driver's own counters,
+// snapshotted between them, because the question is not the wall clock of
+// either half but what the seeking half fetched against what it consumed
+// while the granule was still large.
+//
+// Offsets come from a fixed linear congruential sequence rather than rand(),
+// so the same run is comparable across arms.
+//
+static bool RunMixed(
+    const wchar_t* path,
+    unsigned long sequentialMb,
+    DWORD blockSize,
+    unsigned long randomCount,
+    unsigned long long* bytesOut,
+    double* secondsOut)
+{
+    HANDLE control = CreateFileW(
+        BLORGFS_FSDO_USERMODE_PATH, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+
+    if (INVALID_HANDLE_VALUE == control)
+    {
+        PrintLastError("open the driver control device");
+        return false;
+    }
+
+    HANDLE file = CreateFileW(
+        path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (INVALID_HANDLE_VALUE == file)
+    {
+        PrintLastError("open workload file");
+        CloseHandle(control);
+        return false;
+    }
+
+    LARGE_INTEGER fileSize;
+
+    if (!GetFileSizeEx(file, &fileSize))
+    {
+        PrintLastError("GetFileSizeEx");
+        CloseHandle(file);
+        CloseHandle(control);
+        return false;
+    }
+
+    unsigned char* buffer = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, blockSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+
+    if (nullptr == buffer)
+    {
+        PrintLastError("VirtualAlloc");
+        CloseHandle(file);
+        CloseHandle(control);
+        return false;
+    }
+
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start;
+    LARGE_INTEGER afterSequential;
+    LARGE_INTEGER end;
+
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+
+    const unsigned long long sequentialTarget =
+        static_cast<unsigned long long>(sequentialMb) * 1024ull * 1024ull;
+
+    unsigned long long sequentialBytes = 0;
+
+    while (sequentialBytes < sequentialTarget)
+    {
+        DWORD read = 0;
+
+        if (!ReadFile(file, buffer, blockSize, &read, nullptr) || 0 == read)
+        {
+            break;
+        }
+
+        sequentialBytes += read;
+    }
+
+    QueryPerformanceCounter(&afterSequential);
+
+    BLORGFS_STATISTICS_RESPONSE mid = {};
+
+    if (!QueryDriverStatistics(control, &mid))
+    {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        CloseHandle(file);
+        CloseHandle(control);
+        return false;
+    }
+
+    const long long span = fileSize.QuadPart - static_cast<long long>(blockSize) - 1;
+    unsigned long long randomBytes = 0;
+    unsigned long long cursor = 2246822519ull;
+
+    for (unsigned long i = 0; i < randomCount; ++i)
+    {
+        cursor = (cursor * 6364136223846793005ull) + 1442695040888963407ull;
+
+        const long long offset = (span > 0)
+            ? static_cast<long long>((cursor >> 16) % static_cast<unsigned long long>(span))
+            : 0;
+
+        OVERLAPPED overlapped = {};
+        overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
+        overlapped.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xFFFFFFFF);
+
+        DWORD read = 0;
+
+        if (!ReadFile(file, buffer, blockSize, &read, &overlapped) || 0 == read)
+        {
+            break;
+        }
+
+        randomBytes += read;
+    }
+
+    QueryPerformanceCounter(&end);
+
+    BLORGFS_STATISTICS_RESPONSE after = {};
+    const bool haveAfter = QueryDriverStatistics(control, &after);
+
+    VirtualFree(buffer, 0, MEM_RELEASE);
+    CloseHandle(file);
+    CloseHandle(control);
+
+    const double sequentialSeconds =
+        static_cast<double>(afterSequential.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+    const double randomSeconds =
+        static_cast<double>(end.QuadPart - afterSequential.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+    printf("\n  phase split (one handle, sequential then seeking)\n");
+    printf("    sequential            %12.1f MB in %.2f s  (%.2f MB/s)\n",
+        sequentialBytes / (1024.0 * 1024.0), sequentialSeconds,
+        (sequentialSeconds > 0.0) ? ((sequentialBytes / (1024.0 * 1024.0)) / sequentialSeconds) : 0.0);
+    printf("    random                %12.1f MB in %.2f s  (%.2f MB/s)\n",
+        randomBytes / (1024.0 * 1024.0), randomSeconds,
+        (randomSeconds > 0.0) ? ((randomBytes / (1024.0 * 1024.0)) / randomSeconds) : 0.0);
+
+    if (haveAfter)
+    {
+        const unsigned long long fetched = after.Totals.FetchBytes - mid.Totals.FetchBytes;
+        const unsigned long long grows = after.Totals.ReadAheadGrows - mid.Totals.ReadAheadGrows;
+        const unsigned long long shrinks = after.Totals.ReadAheadShrinks - mid.Totals.ReadAheadShrinks;
+
+        printf("    random phase fetched  %12.1f MB for %.1f MB consumed  (%.2fx)\n",
+            fetched / (1024.0 * 1024.0), randomBytes / (1024.0 * 1024.0),
+            (randomBytes > 0) ? (static_cast<double>(fetched) / static_cast<double>(randomBytes)) : 0.0);
+        printf("    grow/shrink           %12llu / %llu in random phase  (%llu / %llu by end of sequential)\n",
+            grows, shrinks, mid.Totals.ReadAheadGrows, mid.Totals.ReadAheadShrinks);
+    }
+
+    *bytesOut = sequentialBytes + randomBytes;
+    *secondsOut = sequentialSeconds + randomSeconds;
+
+    return true;
+}
+
+//
 // Metadata storm: enumerate a directory and open/close every entry,
 // repeated. This is the workload the path cache and the listing cache
 // exist for, so the number that matters in the report is the path cache
@@ -2178,6 +2350,11 @@ static void PrintUsage(void)
     printf("                                 read-ahead frontier and makes its 'over one\n");
     printf("                                 frame' figure hypothetical. 64 KB at 1536 KB/s\n");
     printf("                                 is a 41.67 ms frame\n");
+    printf("  mixed <file> <seqMB> <blockKB> <count>\n");
+    printf("                                 read seqMB sequentially then count random blocks\n");
+    printf("                                 on the SAME handle, reporting each phase and what\n");
+    printf("                                 the random half fetched while the granule was\n");
+    printf("                                 still sized for the sequential half\n");
     printf("  meta <dir> <passes>            enumerate + open every entry, repeatedly\n");
     printf("  streams <dir> <count> [secs] [unbuffered]\n");
     printf("                                 N concurrent sequential readers, one file each;\n");
@@ -2326,6 +2503,37 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
             &seconds);
 
         sprintf_s(label, "playback (%d KB/s, %d KB blocks)", parsedRate, parsedBlockKb);
+    }
+    else if (0 == wcscmp(argv[1], L"mixed"))
+    {
+        if (argc < 6)
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        const int parsedSeqMb = _wtoi(argv[3]);
+        const int parsedBlockKb = _wtoi(argv[4]);
+        const int parsedCount = _wtoi(argv[5]);
+
+        if (parsedSeqMb <= 0 || parsedBlockKb <= 0 || parsedCount <= 0)
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        ok = RunMixed(
+            argv[2],
+            static_cast<unsigned long>(parsedSeqMb),
+            static_cast<DWORD>(parsedBlockKb) * 1024,
+            static_cast<unsigned long>(parsedCount),
+            &bytes,
+            &seconds);
+
+        sprintf_s(label, "mixed (%d MB sequential, then %d KB x %d random)",
+            parsedSeqMb, parsedBlockKb, parsedCount);
     }
     else if (0 == wcscmp(argv[1], L"demux"))
     {
@@ -2558,7 +2766,8 @@ int wmain(int argc, wchar_t** argv)
 
     if (0 == wcscmp(argv[1], L"seq") || 0 == wcscmp(argv[1], L"rand") ||
         0 == wcscmp(argv[1], L"meta") || 0 == wcscmp(argv[1], L"streams") ||
-        0 == wcscmp(argv[1], L"demux") || 0 == wcscmp(argv[1], L"play"))
+        0 == wcscmp(argv[1], L"demux") || 0 == wcscmp(argv[1], L"play") ||
+        0 == wcscmp(argv[1], L"mixed"))
     {
         if (argc < 3)
         {

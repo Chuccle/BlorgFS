@@ -451,6 +451,45 @@ a busy transport was justified on readers with no deadline, growing for a
 seeking reader is where 27.5x amplification came from, and growing past what
 Cc will honour is how a ceiling gets fitted to one link.
 
+### A reader that changes its mind
+
+Every workload above holds one pattern for its whole run, which left the
+interesting moment unmeasured: a granule grown for a file copy is exactly
+wrong for the seek that follows it, and the policy only unwinds on evidence
+-- two agreeing windows per halving, a window being two granules wide, so
+the bytes it takes to come down scale with how far it went up. From 2 MB
+that is about 15 MB consumed before the granule is back at the floor.
+
+`mixed` reads sequentially then seeks, on one handle, counting the phases
+separately against the driver's own counters:
+
+| | mixed, 200 MB seq then 1500 x 64 KB random | control, pure random, cold |
+|---|---|---|
+| random-phase throughput | 13.56 MB/s | 8.90 MB/s |
+| random phase fetched | 52.4 MB for 93.8 MB consumed (**0.56x**) | 87.6 MB for 93.8 MB (0.93x) |
+| grows / shrinks in random phase | **0 / 0** | 0 / 0 |
+| granule entering the random phase | 512 KB | 128 KB |
+
+**The inherited granule costs nothing, and the slow unwind never has to
+happen.** The random phase entered at 512 KB and did not over-fetch: 52.4 MB
+against roughly 53 MB of genuinely uncached demand, so about 1.0x once the
+sequential phase's cached 200 MB is accounted for. No window ever voted
+shrink.
+
+The reason is structural rather than lucky. `CcSetReadAheadGranularity` only
+sizes read-ahead, and Cc arms read-ahead only when its own sequential
+detector fires. A seeking reader never arms it, so the granule is inert for
+it however large it was left. That also explains something observed earlier
+without being understood: demux and random fetched byte-identical totals at
+every ceiling from 512 KB to 16 MB.
+
+**The transition still untested is sequential into a bursty pattern.** Pure
+random is safe by construction because it never arms read-ahead; a demuxer
+does -- short adjacent runs, then a jump -- which is exactly the shape where
+a large granule measured twelve times worse. That case is what the shrink
+rule exists for, and it has been measured from a cold start but not as the
+second half of a transition.
+
 ### The granularity sweep, and why there is no right constant
 
 That trade has now been measured rather than assumed, and the answer is
