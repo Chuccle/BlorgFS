@@ -783,13 +783,49 @@ first, and two of them are new:
   with whether demand rate responds to delivery rate: a copy's does, a
   player's does not.
 
-- **The harness stops representing production the moment the policy keys on
-  this.** `demux` and `streams` read flat out, so they measure 0.53% and
-  0.03% -- but a real demuxer is inside a player and a real eight-stream
-  load is eight players, and both would measure above 94%. The workloads
-  would be classified greedy while the things they stand for are not. A
-  slack-driven policy cannot be validated against them as they are; paced
-  variants would have to exist first.
+  How close that gets is now measurable rather than hypothetical: eight
+  players missing 6.57% of their deadlines at the link ceiling still measure
+  92.06% idle, because a consumer that is occasionally late is still mostly
+  waiting on its own schedule. The signal degrades toward greedy only under
+  sustained starvation, which leaves more headroom above the threshold than
+  the worry assumed -- but the direction of the failure is unchanged.
+
+- **The harness had to start representing production before the policy
+  could key on this**, and now does. `demux` and `streams` take an optional
+  `pace=<KBps>`, sharing one `Pacer` with `play` so that paced means one
+  thing across all three. Paced, they land where the things they stand for
+  do:
+
+  | workload | idle share | missed | worst late |
+  |---|---|---|---|
+  | demux, unpaced | 0.10% | -- | -- |
+  | demux, paced 3072 KB/s | 99.91% | 1 / 3000 (0.03%) | 0.05 ms |
+  | streams x8, unpaced | 0.02% | -- | -- |
+  | streams x8, paced 1536 KB/s each | 98.94% | 9 / 4800 (0.19%) | 13.41 ms |
+  | streams x8, paced 3072 KB/s each | 92.06% | 631 / 9600 (6.57%) | 208.87 ms |
+
+  The last row is eight players demanding 24 MB/s of a link that delivers
+  24-29. It delivered 23.98 at fairness 1.00 and every one of the eight
+  still stuttered, which is what running a deadline workload at the wall
+  looks like -- and it is the case where the granule choice matters most,
+  so it is the one a policy change has to be judged on.
+
+  Two harness bugs had to be fixed to get those numbers, and both had
+  produced confident nonsense first:
+
+  - An FCB outlives its handles on the delayed close list, so the first read
+    of a run was charged the gap since the *previous* run's last read on
+    that file. Unpaced demux reported 99.70% idle from one 402-second
+    sample, in a run lasting seconds. The stamp is now cleared on open.
+
+  - Eight paced streams started together came due at the same instant, which
+    is one burst of eight demands per interval rather than eight players.
+    In phase they missed 7.33% of deadlines with a 500 ms worst case while
+    asking for 12 MB/s of a link that had just delivered 21.7. Staggered by
+    `i/N` of the interval, the same configuration misses 0.19% at 13.41 ms.
+
+  The second is worth keeping in mind beyond this harness: synchronised
+  arrivals make a link look saturated at half its capacity.
 
 - **Run-to-run variance is larger than the effect on some cells.** The
   8 MB/s paced case missed 1 deadline in 1600 in one run and 65 in another
