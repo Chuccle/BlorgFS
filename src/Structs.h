@@ -352,6 +352,15 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // rather than widening ReadAheadGranularity to hide it.
     ULONG64 ReadAheadFetchedBytes;  // Paging bytes fetched this window
     ULONG64 ReadAheadConsumedBytes; // Bytes the application asked for this window
+
+    //
+    // When the last application-visible read on this file completed, so the
+    // next one's arrival can be charged the gap. Zero until the first read
+    // finishes, which is why the first read on a file records no idle
+    // sample rather than one measured from an unrelated origin.
+    //
+    LONG64  ReadIdleLastEndQpc;
+
     ULONG   ReadAheadGranularity;   // What Cc was last told, 0 = never set
 
     //
@@ -386,7 +395,8 @@ CHECK_PADDING_BETWEEN(FCB, FileLock, LazyWriteThread);
 CHECK_PADDING_BETWEEN(FCB, LazyWriteThread, Streams);
 CHECK_PADDING_BETWEEN(FCB, Streams, ReadAheadFetchedBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadFetchedBytes, ReadAheadConsumedBytes);
-CHECK_PADDING_BETWEEN(FCB, ReadAheadConsumedBytes, ReadAheadGranularity);
+CHECK_PADDING_BETWEEN(FCB, ReadAheadConsumedBytes, ReadIdleLastEndQpc);
+CHECK_PADDING_BETWEEN(FCB, ReadIdleLastEndQpc, ReadAheadGranularity);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadGranularity, ReadAheadAgreement);
 CHECK_PADDING_END(FCB, ReadAheadAgreement);
 

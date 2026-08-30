@@ -510,6 +510,32 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
         PrintLatencyHistogram(t.UserReadLatencyBuckets);
     }
 
+    if (t.ReadIdleSamples > 0)
+    {
+        printf("\n  consumer idle between reads (gap from one read ending to the next arriving)\n");
+        printf("    samples               %12llu\n", t.ReadIdleSamples);
+        printf("    mean                  %12llu us\n",
+            t.ReadIdleSumUs / t.ReadIdleSamples);
+        printf("    max                   %12llu us\n", t.ReadIdleMaxUs);
+
+        const unsigned long long busy = t.UserReadLatencySumUs;
+        const unsigned long long idle = t.ReadIdleSumUs;
+
+        printf("    idle share of wall    %12.2f%%  (idle %llu us, serving %llu us)\n",
+            SafeRatio(idle, idle + busy), idle, busy);
+
+        LatencyPercentiles g = ComputePercentiles(t.ReadIdleBuckets);
+
+        if (g.Samples > 0)
+        {
+            printf("    p50 / p90 / p99       <=%llu / <=%llu / <=%llu us\n",
+                g.P50UpperUs, g.P90UpperUs, g.P99UpperUs);
+        }
+
+        printf("\n  consumer idle distribution\n");
+        PrintLatencyHistogram(t.ReadIdleBuckets);
+    }
+
     printf("\n  chunk fetches\n");
     printf("    direct issued         %12llu\n", t.FetchesIssued);
     printf("    completed / failed    %12llu / %llu\n", t.FetchesCompleted, t.FetchesFailed);

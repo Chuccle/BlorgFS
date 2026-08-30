@@ -319,13 +319,22 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     }
 }
 
-// Files the application-visible latency of one non-paging read.
+// Files the application-visible latency of one non-paging read, and the
+// gap since the previous one on the same file.
 //
 // A zero stamp means a paging read, or an IRP completed by a path that
 // never took one; either way nobody was waiting on it and there is nothing
 // to record.
 //
-static VOID ReadRecordUserLatency(LONG64 ArrivedQpc)
+// The gap is measured to this read's arrival rather than its completion,
+// so it is the time the consumer spent not asking rather than the time it
+// spent waiting. Those differ by exactly the service time, and it is the
+// first that says whether there is a deadline behind the reads.
+//
+// The FCB is optional because the latency half predates it and holds for
+// any non-paging read; without one the idle half is simply not recorded.
+//
+static VOID ReadRecordUserLatency(FCB* Fcb, LONG64 ArrivedQpc)
 {
     if (0 == ArrivedQpc)
     {
@@ -339,13 +348,33 @@ static VOID ReadRecordUserLatency(LONG64 ArrivedQpc)
         return;
     }
 
+    const LONG64 completedQpc = BlorgStatisticsNow();
+
     statsBlock->UserReadSamples++;
 
     BlorgStatisticsRecordLatency(
         &statsBlock->UserReadLatencySumUs,
         &statsBlock->UserReadLatencyMaxUs,
         statsBlock->UserReadLatencyBuckets,
-        BlorgStatisticsNow() - ArrivedQpc);
+        completedQpc - ArrivedQpc);
+
+    if (Fcb)
+    {
+        const LONG64 lastEnd = Fcb->ReadIdleLastEndQpc;
+
+        if (0 != lastEnd && ArrivedQpc > lastEnd)
+        {
+            statsBlock->ReadIdleSamples++;
+
+            BlorgStatisticsRecordLatency(
+                &statsBlock->ReadIdleSumUs,
+                &statsBlock->ReadIdleMaxUs,
+                statsBlock->ReadIdleBuckets,
+                ArrivedQpc - lastEnd);
+        }
+
+        Fcb->ReadIdleLastEndQpc = completedQpc;
+    }
 }
 
 //
@@ -379,7 +408,14 @@ BOOLEAN BlorgFastIoRead(
 
     if (handled)
     {
-        ReadRecordUserLatency(arrivedQpc);
+        PFCB fcb = FileObject->FsContext;
+
+        if (fcb && BLORGFS_FCB_SIGNATURE != GET_NODE_TYPE(fcb))
+        {
+            fcb = NULL;
+        }
+
+        ReadRecordUserLatency(fcb, arrivedQpc);
 
         //
         // Fast I/O is where most application reads land -- buffered
@@ -390,9 +426,7 @@ BOOLEAN BlorgFastIoRead(
         // initialised and this ran at PASSIVE_LEVEL, which is what
         // CcSetReadAheadGranularity needs.
         //
-        PFCB fcb = FileObject->FsContext;
-
-        if (fcb && BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(fcb))
+        if (fcb)
         {
             fcb->ReadAheadConsumedBytes += IoStatus->Information;
             ReadAdaptGranularity(fcb, FileObject);
@@ -441,7 +475,7 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
     {
         BLORGFS_PRINT("ReadComplete: http read failed: %8lx\n", Status);
         BLORGFS_STAT_INC(FetchesFailed);
-        ReadRecordUserLatency(arrivedQpc);
+        ReadRecordUserLatency(NULL, arrivedQpc);
         BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
@@ -493,7 +527,7 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
         SetFlag(irpSp->FileObject->Flags, FO_FILE_FAST_IO_READ);
     }
 
-    ReadRecordUserLatency(arrivedQpc);
+    ReadRecordUserLatency(NULL, arrivedQpc);
 
     BlorgCompleteRequest(irp, STATUS_SUCCESS, IO_DISK_INCREMENT);
 }
@@ -1047,7 +1081,14 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
             if (STATUS_PENDING != result)
             {
-                ReadRecordUserLatency(arrivedQpc);
+                PFCB fcb = irpSp->FileObject ? irpSp->FileObject->FsContext : NULL;
+
+                if (fcb && BLORGFS_FCB_SIGNATURE != GET_NODE_TYPE(fcb))
+                {
+                    fcb = NULL;
+                }
+
+                ReadRecordUserLatency(fcb, arrivedQpc);
                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
 
