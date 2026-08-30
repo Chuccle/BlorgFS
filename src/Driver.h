@@ -284,6 +284,21 @@ extern struct GLOBAL
     BOOLEAN ReadAheadSlackGrowth;
 
     //
+    // Whether the granule adapts at all. Cleared through the
+    // ReadAheadAdapt registry value, which pins it at whatever
+    // ReadAheadGranularity holds.
+    //
+    // This exists to make one question answerable. The policy's loaded rule
+    // grows the granule when the transport is busy, and the case for it was
+    // made on readers going flat out; the paced multi-stream runs hint that
+    // more growth goes with more missed deadlines. Adaptation is a feedback
+    // loop, so that cannot be separated while the granule is free to move --
+    // a starving run grows, and a grown run may starve. Pinning it turns the
+    // correlation into an experiment.
+    //
+    BOOLEAN ReadAheadAdapt;
+
+    //
     //  A single self-relative security descriptor handed out (in the
     //  requested portions) for every IRP_MJ_QUERY_SECURITY. BlorgFS does not
     //  store per-file security -- the volume is a read-only public share --

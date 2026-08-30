@@ -191,37 +191,39 @@ static ULONG64 ReadLongestStreak(const FCB* Fcb)
 #define READ_AHEAD_ADAPT_QUIET_DEPTH 6
 
 //
-// The granule the policy may grow to under load, and the depth that counts
-// as load. Growth needs both, and the reason is that the right granule
-// depends on how busy the transport is -- which neither a constant nor an
-// amplification-driven policy can see.
+// The granule the policy may grow to.
 //
-// Reads over a frame interval are roughly the share of application reads
-// that have to wait for a fetch, times the chance that wait exceeds the
-// frame. A granule serves many reads, so halving it roughly doubles how
-// many wait while halving how long each waits. Which way that trades
-// depends entirely on where fetch latency sits relative to 41.67 ms, and
-// load moves it:
+// There used to be a second reason to grow, and it was wrong. The policy
+// also grew whenever the transport was busy, on the argument that a
+// saturated link makes a small granule's extra waits visible while a large
+// one makes fewer reads wait at all -- measured as 28.9% of reads over a
+// frame at 128 KB against 13.7% at 512 KB, eight streams.
 //
-//   one stream    128 KB fetches 19.8 ms   0.345% over a frame
-//                 512 KB fetches 58.7 ms   3.40%
-//   eight streams 128 KB fetches 41.8 ms   28.9%
-//                 512 KB fetches 102.5 ms  13.7%
+// Those numbers came from readers going flat out, which have no deadline
+// and sit permanently at the read-ahead frontier. Pinning the granule and
+// measuring against consumers that read to a schedule reverses it, over two
+// sweeps of two rounds each:
 //
-// Unloaded, a 128 KB fetch lands comfortably under the frame, so the extra
-// waits cost nothing and the small granule wins by a factor of ten. At
-// eight streams the link is saturated and a 128 KB fetch takes 41.8 ms --
-// sitting exactly on the threshold -- so nearly every one of those extra
-// waits is now visible, and the large granule wins by making far fewer
-// reads wait at all. Throughput is identical either way at that point
-// (31.3 MB/s), so this is a latency decision, not a bandwidth one.
+//                            pin 128 KB      pin 512 KB
+//   play 3072                0.00% missed    0.04%
+//   demux paced 3072         0.39%           4.76%
+//   streams x8 paced 1536    0.33%           1.73%
 //
-// Depth separates the two cleanly: about 1.6 to 2.8 fetches in flight for a
-// single reader against 21 to 28 at eight streams, so the threshold sits
-// well clear of both.
+// The large granule is twelve times worse on the demux pattern and five
+// times worse on eight paced streams at half the link. The load rule was
+// answering a question no consumer with a deadline was asking, so it is
+// gone: growth now happens only for a reader with no deadline at all, on a
+// quiet transport, which is the case it was ever right for.
+//
+// One row is deliberately absent. Eight paced streams demanding the whole
+// link miss between 0.5% and 33% of their deadlines in EVERY arm, pinned or
+// adaptive, small granule or large -- a workload sitting at 100% of a link
+// is unstable however it is fetched, and no granularity policy controls it.
+// An earlier reading of two runs per arm made it look like the large
+// granule was eight times worse there; a second sweep put the same arm at
+// 2.56% and it does not replicate. Nothing here is tuned for that case.
 //
 #define READ_AHEAD_ADAPT_LOADED_MAX   (PAGE_SIZE * 128)
-#define READ_AHEAD_ADAPT_LOAD_DEPTH   8
 
 //
 // Re-tunes Cc's read-ahead granularity for this file from what the reader
@@ -275,7 +277,8 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     // Zero means the configuration asked for Cc's own default and no call
     // at all. Adapting would quietly override that, so it does not.
     //
-    if (0 == global.ReadAheadGranularity || 0 == Fcb->ReadAheadGranularity)
+    if (0 == global.ReadAheadGranularity || 0 == Fcb->ReadAheadGranularity ||
+        !global.ReadAheadAdapt)
     {
         return;
     }
@@ -322,19 +325,18 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     }
     else if (fetched <= (consumed * READ_AHEAD_ADAPT_EARNED_RATIO) + lead &&
              ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK &&
-             (BlorgStatisticsFetchesActive() >= READ_AHEAD_ADAPT_LOAD_DEPTH || greedy))
+             greedy)
     {
         //
-        // Sequential AND (loaded OR greedy). Sequential alone is not
-        // enough: a lone reader walking a file forwards also has a long
-        // streak and amplification of 1.0, and growing for a lone PLAYER is
-        // the 3.40% case above.
+        // Sequential AND greedy. Sequential alone is not enough: a lone
+        // reader walking a file forwards also has a long streak and
+        // amplification of 1.0, and growing for a lone PLAYER costs it
+        // deadlines.
         //
         // Greedy is what distinguishes the lone reader that is a file copy,
-        // which wants the large granule and has no frame to miss, and it is
-        // consulted only on a quiet transport. Loaded stays and keeps sole
-        // authority once the transport is busy, so the multi-stream case
-        // behaves exactly as it did before slack existed.
+        // which wants the large granule and has no frame to miss. It is the
+        // only reason left to grow, and it is consulted only on a quiet
+        // transport -- see READ_AHEAD_ADAPT_QUIET_DEPTH.
         //
         vote = -1;
     }

@@ -878,30 +878,75 @@ variance swamps any difference between arms; the gate means slack cannot
 fire while the transport is busy, which is where that workload lives, but
 indistinguishable in noisy data is not the same as identical.
 
-### The loaded rule is not settled, and predates this
+### The loaded rule is settled, and it is gone
 
-Sorting the earlier eight at-the-wall stream runs by how far the granule
-grew rather than by which arm they came from:
+The policy also grew the granule whenever the transport was busy. That rule
+predated slack and its case was this, from the granularity sweep:
 
-| grows | missed |
+|  | 128 KB | 512 KB |
+|---|---|---|
+| one stream | 0.345% over a frame | 3.40% |
+| eight streams | 28.9% | 13.7% |
+
+Loaded, the large granule looked like it won by a factor of two. Every
+number in that table came from a reader going flat out.
+
+Pinning the granule -- `ReadAheadAdapt=0` in the registry, so the feedback
+loop cannot confound the arms -- and running consumers that read to a
+schedule reverses it. Two sweeps, two rounds each, arm order rotating:
+
+| paced workload | pin 128 KB | pin 512 KB |
+|---|---|---|
+| play 3072 | 0.00% missed | 0.04% |
+| demux paced 3072 | 0.39% | 4.76% |
+| streams x8 paced 1536 | 0.33% | 1.73% |
+
+Twelve times worse on the demux pattern, five times worse on eight paced
+streams at half the link. So the rule is removed, and growth now happens for
+exactly one reason: a sequential consumer that never idles, on a quiet
+transport.
+
+With it gone, the adaptive policy records **zero grows on every paced
+workload that is not at the link ceiling** -- it is pin128 for those --
+while still growing twice for a greedy sequential reader:
+
+| | adaptive | pin 128 KB | pin 512 KB |
+|---|---|---|---|
+| seq, greedy, cold | **22.52 MB/s** | 16.48 | 20.26 |
+| play 3072 | 0.00% | 0.00% | 0.00% |
+| demux paced 3072 | 0.17% | 0.41% | 1.02% |
+| streams x8 paced 1536 | 0.26% | 0.11% | 1.00% |
+
+**One workload is not tuned for and cannot be.** Eight paced streams
+demanding the whole link miss between 0.5% and 33% of their deadlines in
+every arm -- pinned or adaptive, small granule or large:
+
+| arm | per-run missed, pooled over both sweeps |
 |---|---|
-| 0, 0 | 1.09%, 3.57% |
-| 7, 7 | 6.06%, 4.55% |
-| 14-16 | 74.97%, 4.81%, 17.37%, 7.39% |
+| pin 128 KB | 2.30%, 3.48%, 0.52%, 33.12% |
+| pin 512 KB | 19.31%, 26.92%, 3.43%, 1.68% |
 
-More growth goes with more missed deadlines, and those grows come from the
-**loaded** term, which predates slack entirely. If it holds, the case for
-growing under load was made on greedy readers -- the same wrong-layer
-mistake as measuring a frame budget against a reader with no deadline.
+A consumer asking for 100% of a link is unstable however it is fetched, and
+granularity does not control it. An earlier reading of two runs per arm made
+the large granule look eight times worse there and it was written up that
+way; the second sweep put the same arm at 2.56% and the claim was withdrawn.
+Two runs of a workload whose spread is 0.5% to 33% is not a measurement.
 
-It is confounded: a stream starving at the ceiling stops idling, and a
-starving window can trip either term, so growth may be the consequence of a
-bad run rather than its cause. Separating them needs the granule pinned per
-arm rather than adapted, which is a different experiment.
+That row is also the one place the slack rule misfires, and it is worth
+being exact about. Eight paced streams run only 3 to 8 fetches in flight --
+they idle 92% of the time, so they are nowhere near the 21-28 a greedy
+eight-stream load puts up -- which straddles `READ_AHEAD_ADAPT_QUIET_DEPTH`.
+When they starve at the ceiling they stop idling, and the policy grows: 8.5
+times a run, against zero on every other paced workload. This is exactly the
+failure predicted when slack was first measured -- a player that cannot keep
+up looks like a copy -- and depth cannot separate the two here, because a
+lone copy runs 2.7 to 4 in flight and these run 3 to 8.
 
-Slack is on regardless because the quiet-transport gate keeps it out of that
-question: it fires for the lone reader and is silent exactly where the
-loaded rule is in doubt.
+It does not show up as harm: adaptive missed 10.07% on that row against
+pin128's 16.82% and pin512's 2.56%, all three inside the same 0.5-33% spread.
+So it is recorded rather than fixed. Fixing it needs a signal that separates
+one starving consumer from one greedy one, and neither slack nor depth is
+that signal.
 
 ### Pipelining the receive: built, measured, reverted
 
