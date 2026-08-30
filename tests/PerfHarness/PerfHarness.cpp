@@ -1884,6 +1884,248 @@ static bool RunPlayback(
 }
 
 //
+// Two handles on ONE file, with patterns that want opposite granules.
+//
+// The read-ahead policy keeps its state on the FCB, which every handle to a
+// file shares, while Cc keeps the granularity itself in each handle's
+// PrivateCacheMap. The reasoning for that split is in Structs.h; what it
+// predicts is a hazard this workload exists to look for. One handle's
+// verdict is applied to whichever file object closed the window, so a copy
+// that grows the shared verdict and a seeking reader that shrinks it are
+// writing to one number and reading it back for different consumers.
+//
+// The greedy half is always a sequential reader going flat out -- the copy.
+// The other half is the argument: another copy (same workload, so the two
+// should agree), a bursty demuxer (opposite, and the pattern a large
+// granule punishes), or a paced player (opposite, and the one with a
+// deadline to miss).
+//
+// Each half reports its own throughput, and the driver's grow and shrink
+// counts say whether the shared verdict moved at all.
+//
+enum class CompeteMode
+{
+    Sequential,
+    Bursty,
+    Paced
+};
+
+struct CompeteContext
+{
+    const wchar_t* Path;
+    double DeadlineSeconds;
+    LARGE_INTEGER Frequency;
+    LARGE_INTEGER Start;
+    CompeteMode Mode;
+
+    // Bytes this half actually consumed, and what it missed if it was paced.
+    unsigned long long Bytes;
+    unsigned long long Blocks;
+    unsigned long long Missed;
+    double WorstLateness;
+};
+
+static DWORD WINAPI CompeteWorker(LPVOID parameter)
+{
+    CompeteContext* ctx = static_cast<CompeteContext*>(parameter);
+
+    HANDLE file = CreateFileW(
+        ctx->Path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (INVALID_HANDLE_VALUE == file)
+    {
+        PrintLastError("open competing handle");
+        return 0;
+    }
+
+    LARGE_INTEGER fileSize;
+
+    if (!GetFileSizeEx(file, &fileSize))
+    {
+        PrintLastError("GetFileSizeEx");
+        CloseHandle(file);
+        return 0;
+    }
+
+    const DWORD block = kWorkloadReadSize;
+
+    unsigned char* buffer = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, block, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+
+    if (nullptr == buffer)
+    {
+        PrintLastError("VirtualAlloc");
+        CloseHandle(file);
+        return 0;
+    }
+
+    Pacer pacer;
+
+    if (!PacerInit(&pacer, block, (CompeteMode::Paced == ctx->Mode) ? 3072u : 0u, 0.0))
+    {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        CloseHandle(file);
+        return 0;
+    }
+
+    const long long span = fileSize.QuadPart - static_cast<long long>(block) - 1;
+    long long cursor = 0;
+    unsigned long long index = 0;
+
+    for (;;)
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+
+        const double elapsed = static_cast<double>(now.QuadPart - ctx->Start.QuadPart) /
+                               static_cast<double>(ctx->Frequency.QuadPart);
+
+        if (elapsed >= ctx->DeadlineSeconds)
+        {
+            break;
+        }
+
+        const double due = PacerDue(&pacer);
+
+        OVERLAPPED overlapped = {};
+        overlapped.Offset = static_cast<DWORD>(cursor & 0xFFFFFFFF);
+        overlapped.OffsetHigh = static_cast<DWORD>((cursor >> 32) & 0xFFFFFFFF);
+
+        DWORD read = 0;
+
+        if (!ReadFile(file, buffer, block, &read, &overlapped) || 0 == read)
+        {
+            break;
+        }
+
+        ctx->Bytes += read;
+        ++index;
+
+        if (CompeteMode::Bursty == ctx->Mode)
+        {
+            cursor += (0 == (index % 4)) ? (1024 * 1024) : block;
+        }
+        else
+        {
+            cursor += block;
+        }
+
+        if (span > 0 && cursor > span)
+        {
+            cursor = 0;
+        }
+
+        PacerComplete(&pacer, due);
+        PacerWait(&pacer);
+    }
+
+    ctx->Blocks = pacer.Blocks;
+    ctx->Missed = pacer.Missed;
+    ctx->WorstLateness = pacer.WorstLateness;
+
+    PacerDestroy(&pacer);
+    VirtualFree(buffer, 0, MEM_RELEASE);
+    CloseHandle(file);
+
+    return 0;
+}
+
+static bool RunCompete(
+    const wchar_t* path,
+    CompeteMode mode,
+    double seconds,
+    unsigned long long* bytesOut,
+    double* secondsOut)
+{
+    HANDLE control = CreateFileW(
+        BLORGFS_FSDO_USERMODE_PATH, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+
+    if (INVALID_HANDLE_VALUE == control)
+    {
+        PrintLastError("open the driver control device");
+        return false;
+    }
+
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER start;
+
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+
+    CompeteContext contexts[2] = {};
+    HANDLE threads[2] = {};
+
+    for (int i = 0; i < 2; ++i)
+    {
+        contexts[i].Path = path;
+        contexts[i].DeadlineSeconds = seconds;
+        contexts[i].Frequency = frequency;
+        contexts[i].Start = start;
+        contexts[i].Mode = (0 == i) ? CompeteMode::Sequential : mode;
+
+        threads[i] = CreateThread(nullptr, 0, CompeteWorker, &contexts[i], 0, nullptr);
+
+        if (!threads[i])
+        {
+            PrintLastError("CreateThread");
+            CloseHandle(control);
+            return false;
+        }
+    }
+
+    WaitForMultipleObjects(2, threads, TRUE, INFINITE);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        CloseHandle(threads[i]);
+    }
+
+    LARGE_INTEGER end;
+    QueryPerformanceCounter(&end);
+
+    BLORGFS_STATISTICS_RESPONSE after = {};
+    const bool haveAfter = QueryDriverStatistics(control, &after);
+
+    CloseHandle(control);
+
+    const double ran =
+        static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+    const char* names[2] = { "sequential (copy)", nullptr };
+    names[1] = (CompeteMode::Sequential == mode) ? "sequential (copy)"
+             : (CompeteMode::Bursty == mode) ? "bursty (demuxer)"
+             : "paced 3072 (player)";
+
+    printf("\n  competing handles on one file\n");
+
+    for (int i = 0; i < 2; ++i)
+    {
+        printf("    handle %d  %-20s %8.2f MB  %7.2f MB/s\n",
+            i, names[i], contexts[i].Bytes / (1024.0 * 1024.0),
+            (ran > 0.0) ? ((contexts[i].Bytes / (1024.0 * 1024.0)) / ran) : 0.0);
+    }
+
+    if (CompeteMode::Paced == mode)
+    {
+        printf("    player missed         %12llu of %llu  (worst %.2f ms)\n",
+            contexts[1].Missed, contexts[1].Blocks, contexts[1].WorstLateness * 1000.0);
+    }
+
+    if (haveAfter)
+    {
+        printf("    granule grow/shrink   %12llu / %llu\n",
+            after.Totals.ReadAheadGrows, after.Totals.ReadAheadShrinks);
+    }
+
+    *bytesOut = contexts[0].Bytes + contexts[1].Bytes;
+    *secondsOut = ran;
+
+    return true;
+}
+
+//
 // A reader that changes its mind: sequential, then seeking, on one handle.
 //
 // Every other workload here holds one pattern for its whole run, so nothing
@@ -1906,6 +2148,8 @@ static bool RunMixed(
     unsigned long sequentialMb,
     DWORD blockSize,
     unsigned long randomCount,
+    DWORD stride,
+    unsigned long burst,
     unsigned long long* bytesOut,
     double* secondsOut)
 {
@@ -1992,13 +2236,33 @@ static bool RunMixed(
     unsigned long long randomBytes = 0;
     unsigned long long cursor = 2246822519ull;
 
+    long long burstCursor = static_cast<long long>(sequentialBytes);
+
     for (unsigned long i = 0; i < randomCount; ++i)
     {
         cursor = (cursor * 6364136223846793005ull) + 1442695040888963407ull;
 
-        const long long offset = (span > 0)
-            ? static_cast<long long>((cursor >> 16) % static_cast<unsigned long long>(span))
-            : 0;
+        long long offset;
+
+        if (burst > 0)
+        {
+            const bool lastOfBurst = (0 == ((i + 1) % burst));
+
+            offset = burstCursor;
+            burstCursor += lastOfBurst ? static_cast<long long>(stride)
+                                       : static_cast<long long>(blockSize);
+
+            if (span > 0 && burstCursor > span)
+            {
+                burstCursor = 0;
+            }
+        }
+        else
+        {
+            offset = (span > 0)
+                ? static_cast<long long>((cursor >> 16) % static_cast<unsigned long long>(span))
+                : 0;
+        }
 
         OVERLAPPED overlapped = {};
         overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
@@ -2350,11 +2614,19 @@ static void PrintUsage(void)
     printf("                                 read-ahead frontier and makes its 'over one\n");
     printf("                                 frame' figure hypothetical. 64 KB at 1536 KB/s\n");
     printf("                                 is a 41.67 ms frame\n");
-    printf("  mixed <file> <seqMB> <blockKB> <count>\n");
+    printf("  mixed <file> <seqMB> <blockKB> <count> [strideKB] [burst]\n");
     printf("                                 read seqMB sequentially then count random blocks\n");
     printf("                                 on the SAME handle, reporting each phase and what\n");
     printf("                                 the random half fetched while the granule was\n");
     printf("                                 still sized for the sequential half\n");
+    printf("                                 with strideKB and burst the second phase is bursty\n");
+    printf("                                 rather than random -- the pattern that DOES arm Cc\n");
+    printf("                                 read-ahead, so the granule it inherits can matter\n");
+    printf("  compete <file> seq|bursty|paced <secs>\n");
+    printf("                                 two handles on ONE file: a sequential copy against\n");
+    printf("                                 another copy, a demuxer, or a paced player. They\n");
+    printf("                                 share one FCB and so one policy verdict, which is\n");
+    printf("                                 the hazard this measures\n");
     printf("  meta <dir> <passes>            enumerate + open every entry, repeatedly\n");
     printf("  streams <dir> <count> [secs] [unbuffered]\n");
     printf("                                 N concurrent sequential readers, one file each;\n");
@@ -2504,6 +2776,45 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
 
         sprintf_s(label, "playback (%d KB/s, %d KB blocks)", parsedRate, parsedBlockKb);
     }
+    else if (0 == wcscmp(argv[1], L"compete"))
+    {
+        if (argc < 5)
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        CompeteMode mode = CompeteMode::Sequential;
+
+        if (0 == wcscmp(argv[3], L"bursty"))
+        {
+            mode = CompeteMode::Bursty;
+        }
+        else if (0 == wcscmp(argv[3], L"paced"))
+        {
+            mode = CompeteMode::Paced;
+        }
+        else if (0 != wcscmp(argv[3], L"seq"))
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        const double parsedSeconds = _wtof(argv[4]);
+
+        if (!(parsedSeconds > 0.0))
+        {
+            PrintUsage();
+            CloseHandles(&handles);
+            return 1;
+        }
+
+        ok = RunCompete(argv[2], mode, parsedSeconds, &bytes, &seconds);
+
+        sprintf_s(label, "compete (sequential against %ws, %.0f s)", argv[3], parsedSeconds);
+    }
     else if (0 == wcscmp(argv[1], L"mixed"))
     {
         if (argc < 6)
@@ -2524,16 +2835,22 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
             return 1;
         }
 
+        const int parsedStrideKb = (argc > 6) ? _wtoi(argv[6]) : 0;
+        const int parsedBurst = (argc > 7) ? _wtoi(argv[7]) : 0;
+
         ok = RunMixed(
             argv[2],
             static_cast<unsigned long>(parsedSeqMb),
             static_cast<DWORD>(parsedBlockKb) * 1024,
             static_cast<unsigned long>(parsedCount),
+            static_cast<DWORD>((parsedStrideKb > 0) ? parsedStrideKb : parsedBlockKb) * 1024,
+            static_cast<unsigned long>((parsedBurst > 0) ? parsedBurst : 0),
             &bytes,
             &seconds);
 
-        sprintf_s(label, "mixed (%d MB sequential, then %d KB x %d random)",
-            parsedSeqMb, parsedBlockKb, parsedCount);
+        sprintf_s(label, "mixed (%d MB sequential, then %d KB x %d %s)",
+            parsedSeqMb, parsedBlockKb, parsedCount,
+            (parsedBurst > 0) ? "bursty" : "random");
     }
     else if (0 == wcscmp(argv[1], L"demux"))
     {
@@ -2767,7 +3084,7 @@ int wmain(int argc, wchar_t** argv)
     if (0 == wcscmp(argv[1], L"seq") || 0 == wcscmp(argv[1], L"rand") ||
         0 == wcscmp(argv[1], L"meta") || 0 == wcscmp(argv[1], L"streams") ||
         0 == wcscmp(argv[1], L"demux") || 0 == wcscmp(argv[1], L"play") ||
-        0 == wcscmp(argv[1], L"mixed"))
+        0 == wcscmp(argv[1], L"mixed") || 0 == wcscmp(argv[1], L"compete"))
     {
         if (argc < 3)
         {
