@@ -469,6 +469,20 @@ typedef struct _HTTP_CONTEXT
     // peer. A usermode client's TTFB is the second of those, so only the
     // second is a like-for-like comparison.
     //
+    //
+    // QPC stamp taken the moment WskSend has accepted the buffer and
+    // returned STATUS_PENDING, splitting the send span once more.
+    //
+    // Real playback put the send at 5.1 ms mean and 164.7 ms max for a
+    // request of about two hundred bytes, and made the worst
+    // time-to-first-byte almost entirely send. Two very different things
+    // were inside that one number: this driver building and submitting the
+    // request, and the stack accepting it and delivering the completion.
+    // The first would be an allocation or a lock; the second is TCP and DPC
+    // scheduling under a saturated link, and they call for opposite fixes.
+    //
+    LONG64 SendIssuedQpc;
+
     LONG64 SendDoneQpc;
 
     //
@@ -1315,6 +1329,8 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
                 WSK_FLAG_NODELAY,
                 HttpOnSend,
                 Ctx);
+
+            Ctx->SendIssuedQpc = BlorgStatisticsNow();
 
             if (STATUS_PENDING != result)
             {
@@ -2590,6 +2606,24 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
                 &statsBlock->FetchWaitMaxUs,
                 NULL,
                 Ctx->HeadersQpc - Ctx->SendDoneQpc);
+        }
+
+        if (0 != Ctx->SendIssuedQpc && 0 != Ctx->SendQpc)
+        {
+            BlorgStatisticsRecordLatency(
+                &statsBlock->FetchSendSubmitSumUs,
+                &statsBlock->FetchSendSubmitMaxUs,
+                NULL,
+                Ctx->SendIssuedQpc - Ctx->SendQpc);
+        }
+
+        if (0 != Ctx->SendDoneQpc && 0 != Ctx->SendIssuedQpc)
+        {
+            BlorgStatisticsRecordLatency(
+                &statsBlock->FetchSendSettleSumUs,
+                &statsBlock->FetchSendSettleMaxUs,
+                NULL,
+                Ctx->SendDoneQpc - Ctx->SendIssuedQpc);
         }
 
         BlorgStatisticsRecordLatency(

@@ -443,6 +443,78 @@ figure measured after anything else has touched the share says very little.
 Still not stressed: a tree far wider than this share, or many processes
 opening at once, would post more than 117.
 
+### Real playback, and where the residual stutter actually is
+
+The synthetic workloads all read one pattern flat out or to a schedule. A
+real player with subtitles and seeking does neither, and two captures of one
+-- `reset`, play, `stats` -- say more about what is left than any of them.
+
+| | original diagnosis | capture 1 | capture 2 |
+|---|---|---|---|
+| reads over one frame | 7.10% | 5.21% | **4.77%** |
+| amplification | 22x | 0.62x | **0.46x** |
+| sequential share of paging | 70.4% | 68.6% | 63.9% |
+
+**The amplification the branch set out to fix is fixed.** 22x to under 0.5x --
+read-ahead now fetches half of what the application consumes.
+
+**The read-ahead policy is correctly inert during playback**, which is the
+point of it. Across 1543 evaluation windows it cast 5 shrink votes and zero
+grow votes, and both are right: there is nothing to shrink at 0.46x, and the
+consumer idles 92% of wall so `ReadIsGreedy` refuses to grow for it. The
+granule stays at 128 KB. An earlier worry that a slow consumer would never
+complete a window was wrong -- windows complete in abundance.
+
+**What is left is not read-ahead.** 394 of 646 fetches are DEMAND fetches --
+someone blocked -- because seeks defeat Cc's prediction, and a demand fetch
+averages 25.6 ms against a 41.67 ms frame. Decomposed:
+
+| phase | mean | share of a fetch |
+|---|---|---|
+| acquire | 7 us | ~0% |
+| send | 2.7 ms | 9% |
+| wait, the server thinking | 8.3 ms | 27% |
+| **body, bytes on the wire** | **20.3 ms** | **65%** |
+
+Two thirds of a demand fetch is ~290 KB crossing a 24-29 MB/s WiFi link with
+a viewer waiting. No policy fixes that.
+
+### The send, split
+
+The send looked like the largest unexplained slice: 5.1 ms mean and 164.7 ms
+max for a request of about two hundred bytes. `FetchSendSubmit*` and
+`FetchSendSettle*` split it at the point WskSend accepts the buffer, because
+this driver building the request and the stack delivering the completion
+would need opposite fixes.
+
+It is almost entirely settle -- 2537 us of 2701 mean, and 185846 of 185900
+max. Submit, which is everything this driver does, is 163 us.
+
+The maximum is not the network. Its outlier record reads `send 185900,
+wait 15, activ 0`: the response headers arrived 15 microseconds after the
+send completed, so the request had reached the server long before, and
+nothing else was in flight. That is a completion delivered late in a
+two-processor guest, most plausibly the VM being descheduled.
+
+The mean is real and reproducible. Paced against greedy, same build, cold:
+
+| workload | idle share | settle mean |
+|---|---|---|
+| greedy sequential | 0.08% | 868 us |
+| paced 3 MB/s | 99.89% | 2042 us |
+| paced 1.5 MB/s | 99.82% | 2058 us |
+
+**An idle connection costs about 1.2 ms on the next send's completion**, and
+the two paced rates agree to within 1%, so it tracks idleness rather than
+rate. Real playback's 2537 us sits in that band.
+
+**It was written up here first as "roughly half the latency the user waits
+on", which was wrong.** That compared the send against time-to-first-byte
+rather than against the fetch. Against the fetch it is 9%, and the idle
+penalty alone is under 5% -- removing it entirely would not move a 41.67 ms
+frame budget. Recorded because the effect is real and reproducible, not
+because it is the stutter.
+
 ### The full matrix
 
 Every workload, one reboot per case so none inherits the previous one's
