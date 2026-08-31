@@ -368,8 +368,8 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // never correctness.
     //
     // Ordered widest-first so the ULONG does not sit before a ULONG64 and
-    // introduce implicit padding; Reserved closes the tail explicitly
-    // rather than widening ReadAheadGranularity to hide it.
+    // introduce implicit padding; ReadLastStreamIndex closes the tail
+    // explicitly rather than widening ReadAheadGranularity to hide it.
     ULONG64 ReadAheadFetchedBytes;  // Paging bytes fetched this window
     ULONG64 ReadAheadConsumedBytes; // Bytes the application asked for this window
 

@@ -443,6 +443,72 @@ figure measured after anything else has touched the share says very little.
 Still not stressed: a tree far wider than this share, or many processes
 opening at once, would post more than 117.
 
+### The full matrix
+
+Every workload, one reboot per case so none inherits the previous one's
+guest cache, and every case on a file no other case touches. Latency and
+throughput percentiles are exact (`Sampler`), not from the driver's
+power-of-two histogram. Amplification is fetched bytes against what the
+workload consumed.
+
+| case | MB/s | amp | latency p1/p50/p99 ms | tput p1/p50/p99 MB/s | missed | grow/shrink |
+|---|---|---|---|---|---|---|
+| A1 sequential | 26.94 | 1.00x | 0.004 / 0.007 / 58.1 | 0.00 / 31.75 / 34.75 | -- | 4 / 0 |
+| A2 random 64 KB | 10.18 | 0.90x | 0.006 / 6.21 / 12.3 | 8.50 / 9.75 / 12.00 | -- | 0 / 0 |
+| A3 bursty demux | 22.11 | 0.72x | 0.004 / 0.006 / 14.8 | 6.25 / 8.00 / 8.75 | -- | 0 / 0 |
+| A4 mixed seq to random | 24.57 | 0.88x | 0.003 / 0.007 / 55.5 | 13.25 / 23.50 / 40.00 | -- | 4 / 0 |
+| A5 mixed seq to bursty | 22.64 | 1.19x | 0.004 / 0.006 / 55.8 | 5.25 / 9.00 / 48.25 | -- | 4 / 4 |
+| A6 paced 3 MB/s | 3.00 | 1.01x | 0.021 / 0.038 / 0.217 | 3.00 / 3.00 / 3.00 | 0.83% | 0 / 0 |
+| A7 paced 8 MB/s | 8.00 | 1.01x | 0.011 / 0.031 / 23.3 | 4.00 / 8.00 / 9.00 | 3.88% | 2 / 0 |
+| B1 one FCB, seq + seq | 32.25 | 1.01x | 0.004 / 0.006 / 81.1 | 0.00 / 31.75 / 48.50 | -- | 4 / 0 |
+| B2 one FCB, seq + bursty | 25.39 | 1.08x | 0.021 / **20.4** / **207** | 0.25 / 1.50 / 5.25 | -- | 4 / 0 |
+| B3 one FCB, seq + paced | 24.21 | 1.01x | 0.004 / 0.020 / 68.5 | 1.00 / 3.00 / 4.00 | 9.38% | 3 / 0 |
+| C1 eight FCBs, greedy | 24.71 | 1.00x | -- | -- | -- | 0 / 0 |
+| C2 eight FCBs, paced | 23.96 | 1.01x | -- | -- | 6.45% | 3 / 0 |
+| E0 driver reference | **28.38** | 1.00x | 0.003 / 0.006 / 61.3 | 9.75 / 31.75 / 47.75 | -- | 4 / 0 |
+| E1 usermode reference | **28.58** | -- | -- | -- | -- | -- |
+
+**The ceiling: 28.38 against 28.58, a ratio of 0.993**, on two files nothing
+else in the matrix reads, each on its own cold boot. There is no headroom
+left against what a plain HTTP client gets from this link.
+
+**Amplification is solved across the board.** Nothing exceeds 1.19x, and
+that worst case is the seq-to-bursty transition unwinding a grown granule.
+Random and demux fetch LESS than they consume -- part of their demand is
+already resident. The policy grows only where growth is wanted: four grows
+on every sequential case, zero on random and bursty, and four grows against
+four shrinks on the transition as it re-adapts.
+
+**Paced playback on a genuinely cold file misses 0.83% at 3 MB/s and 3.88%
+at 8 MB/s.** Every earlier figure in this document said zero, and every one
+of those was measured on a file some previous run had already pulled through
+the backend. Throughput holds at p1 = p50 = p99 = 3.00 MB/s, so the misses
+are the cold-start transient rather than a failure to keep rate -- but zero
+was wrong, and it was wrong because of test hygiene rather than anything in
+the driver.
+
+**Where the tail actually lives.** Two cases dominate it, and both are
+contention rather than policy:
+
+- B2, a demuxer sharing one FCB with a copy: p50 20.4 ms and p99 207 ms
+  against 0.006 ms p50 when it runs alone. The copy takes the link.
+- B3 and C2, paced consumers against a saturated link: 9.38% and 6.45%
+  missed. The growth-on/growth-off arms measured earlier put the copy at
+  21-27 MB/s of a 24-29 MB/s link either way, so bandwidth is what starves
+  them, not the granule.
+
+Throughput p1 reaching 0.00 MB/s on A1 and B1 is the same story seen from
+the other end: quarter-second windows where a greedy reader gets nothing
+while the link serves something else.
+
+**Two gaps in the matrix itself.** The eight-FCB cases report the harness's
+own p50/p95/p99 rather than `Sampler`'s p1 and throughput distribution, so
+their rows are blank above. And the backend's page cache is not controlled
+by any of this -- it cannot be from the guest -- so absolute figures are
+against unknown backend warmth. The E0/E1 pair is the number to trust,
+because both halves of it were measured minutes apart on files of equal
+coldness.
+
 ### Where each workload stands
 
 The read-ahead policy is one rule per direction, and this is what it
