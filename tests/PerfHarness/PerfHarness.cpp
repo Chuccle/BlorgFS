@@ -581,6 +581,10 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
                 t.FetchPreSendSumUs / t.FetchSplitSamples, t.FetchPreSendMaxUs);
             printf("      send mean / max     %12llu / %llu us\n",
                 t.FetchSendSumUs / t.FetchSplitSamples, t.FetchSendMaxUs);
+            printf("        submit mean / max %12llu / %llu us\n",
+                t.FetchSendSubmitSumUs / t.FetchSplitSamples, t.FetchSendSubmitMaxUs);
+            printf("        settle mean / max %12llu / %llu us\n",
+                t.FetchSendSettleSumUs / t.FetchSplitSamples, t.FetchSendSettleMaxUs);
             printf("      wait mean / max     %12llu / %llu us\n",
                 t.FetchWaitSumUs / t.FetchSplitSamples, t.FetchWaitMaxUs);
             printf("      ttfb mean / max     %12llu / %llu us\n",

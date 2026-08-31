@@ -455,6 +455,22 @@ typedef struct _BLORGFS_STATISTICS
     //
     ULONG64 FetchSendSumUs;
     ULONG64 FetchSendMaxUs;
+
+    //
+    // The send split in two, because the whole of it was 5.1 ms mean and
+    // 164.7 ms max during real playback for a request of about two hundred
+    // bytes -- and the worst time-to-first-byte was almost entirely send.
+    //
+    // Submit is this driver building the request and WskSend accepting it.
+    // Settle is the stack acknowledging it and the completion being
+    // delivered. An allocation or a lock shows up in the first; TCP and DPC
+    // scheduling under a saturated link show up in the second, and nothing
+    // could tell them apart while they shared one counter.
+    //
+    ULONG64 FetchSendSubmitSumUs;
+    ULONG64 FetchSendSubmitMaxUs;
+    ULONG64 FetchSendSettleSumUs;
+    ULONG64 FetchSendSettleMaxUs;
     ULONG64 FetchWaitSumUs;
     ULONG64 FetchWaitMaxUs;
 
@@ -494,7 +510,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
 
-#define BLORGFS_STATISTICS_VERSION 13
+#define BLORGFS_STATISTICS_VERSION 14
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {
