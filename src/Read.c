@@ -47,20 +47,18 @@ static BOOLEAN ReadIsSequential(const FCB* Fcb, ULONG64 Offset)
 // array: the match test and the coldest scan share the loop, with no early
 // exit to mispredict.
 //
-static READ_STREAM_TRACKER* ReadClaimStream(FCB* Fcb, ULONG64 Offset)
+static ULONG ReadClaimStream(FCB* Fcb, ULONG64 Offset)
 {
-    READ_STREAM_TRACKER* match = NULL;
-    READ_STREAM_TRACKER* coldest = &Fcb->Streams[0];
+    ULONG match = READ_STREAM_TRACKER_COUNT;
+    ULONG coldest = 0;
 
     for (ULONG i = 0; i < READ_STREAM_TRACKER_COUNT; ++i)
     {
-        READ_STREAM_TRACKER* tracker = &Fcb->Streams[i];
-
-        match = (Offset == tracker->End) ? tracker : match;
-        coldest = (tracker->Streak < coldest->Streak) ? tracker : coldest;
+        match = (Offset == Fcb->Streams[i].End) ? i : match;
+        coldest = (Fcb->Streams[i].Streak < Fcb->Streams[coldest].Streak) ? i : coldest;
     }
 
-    return match ? match : coldest;
+    return (READ_STREAM_TRACKER_COUNT != match) ? match : coldest;
 }
 
 //
@@ -76,28 +74,33 @@ static READ_STREAM_TRACKER* ReadClaimStream(FCB* Fcb, ULONG64 Offset)
 //
 static VOID ReadTrackStream(FCB* Fcb, ULONG64 Offset, ULONG Length)
 {
-    READ_STREAM_TRACKER* stream = ReadClaimStream(Fcb, Offset);
+    const ULONG index = ReadClaimStream(Fcb, Offset);
+    READ_STREAM_TRACKER* stream = &Fcb->Streams[index];
 
     stream->Streak = (Offset == stream->End) ? stream->Streak + 1 : 1;
     stream->End = Offset + Length;
+
+    Fcb->ReadLastStreamIndex = index;
 }
 
 //
-// Longest run of exactly-adjacent reads any one stream on this file has
-// managed. This is what separates a reader walking a file forwards from a
-// demuxer pulling short bursts out of interleaved tracks, and the two want
-// opposite read-ahead granularities.
+// How long a run the stream this file is CURRENTLY on has managed.
 //
-static ULONG64 ReadLongestStreak(const FCB* Fcb)
+// This used to be the maximum across all trackers, which is a different
+// question and the wrong one. ReadClaimStream replaces the coldest tracker,
+// so a long streak left behind by a finished sequential phase is the last
+// thing ever evicted, and a reader that had turned bursty went on measuring
+// as sequential for the rest of the file -- which kept the growth arm true
+// and, because it is tested first, stopped the shrink rule from ever being
+// evaluated.
+//
+// Asking about the current stream reacts on the first read of a new
+// pattern, and a demuxer's bursts of four never approach the sixteen that
+// growth requires.
+//
+static ULONG64 ReadCurrentStreak(const FCB* Fcb)
 {
-    ULONG64 longest = 0;
-
-    for (ULONG i = 0; i < READ_STREAM_TRACKER_COUNT; ++i)
-    {
-        longest = (Fcb->Streams[i].Streak > longest) ? Fcb->Streams[i].Streak : longest;
-    }
-
-    return longest;
+    return Fcb->Streams[Fcb->ReadLastStreamIndex].Streak;
 }
 
 //
@@ -288,7 +291,7 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
 // WASTE IS TESTED FIRST, and the ordering is load-bearing. It was the
 // other way round for one commit, so that growth could be freed from the
 // amplification gate, and that reordering was a defect: a bursty reader
-// inheriting a grown granule stayed greedy, and ReadLongestStreak takes
+// inheriting a grown granule stayed greedy, and the streak test took
 // the maximum across trackers while ReadClaimStream evicts the coldest, so
 // the streak left behind by the sequential half is the last thing ever
 // evicted and never decays. The grow arm therefore stayed true and the
@@ -394,7 +397,7 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
         vote = 1;
     }
     else if (greedy && honoured >= current &&
-        ReadLongestStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK)
+        ReadCurrentStreak(Fcb) >= READ_AHEAD_ADAPT_GROW_STREAK)
     {
         vote = -1;
     }
