@@ -414,7 +414,7 @@ file, arms alternating with a guest reboot between runs.
 | eight paced players at half the link | 0.19% missed, 13.4 ms worst | stays 128 KB | -- |
 | eight paced players AT the link | 0.5-33% missed, every configuration | -- | -- |
 | sequential then seeking, one handle | no cost, no unwind needed | keeps 512 KB | 0.56x |
-| sequential then **bursty**, one handle | shrinks 30 times, oscillates | unwinds from 2 MB | **1.87x** |
+| sequential then **bursty**, one handle | settles, no oscillation | unwinds from 2 MB | **1.56x** |
 | two handles, a copy against a paced player | player missed 0 of 1200 | -- | -- |
 
 Nine of the ten are at their best available answer. The tenth is not a
@@ -494,11 +494,30 @@ Same workload, same file, disjoint halves, and no explanation yet. With two
 processors, two reader threads and the driver's own work, scheduling is as
 plausible as anything in the policy.
 
-**Competing handles are still not fully exercised.** Half of one of these
-files is about 168 MB and fits in guest RAM, so after the first pass both
-handles run cache-resident and stop touching the fetch path -- which is where
-the hazard being looked for actually lives. A working set larger than RAM is
-what that needs, and it has not been run.
+**Above RAM, the picture changes completely.** Half of a 450 MB file fits in
+4 GB of guest memory, so both handles went cache-resident after the first
+pass and never touched the fetch path. Repeated on a 22 GB file -- halves of
+11 GB, which cannot be cached -- the throughputs drop from thousands of MB/s
+to tens, and the contention becomes real:
+
+| pairing | the copy | the other half | other's latency p50 / p99 |
+|---|---|---|---|
+| copy vs paced player | 23.32 MB/s | 2.99 MB/s, **180 of 1200 missed**, worst 217 ms | 0.021 / 98.6 ms |
+| copy vs bursty | 50.50 MB/s | 1.59 MB/s | 7.51 / 213.7 ms |
+| copy vs copy | 58.95 MB/s | 22.60 MB/s | 0.006 / 30.3 ms |
+
+A player sharing a file with a copy misses 15% of its deadlines once neither
+can be served from cache. **What that does NOT establish is a policy fault.**
+The copy alone takes 23 MB/s of a link that measures 24-29, so the player is
+starved of bandwidth before any granularity decision enters into it, and any
+two consumers of a saturated link would do the same. Separating the two needs
+an arm where the copy is present but forbidden to grow, which has not been
+run.
+
+The asymmetry between identical copies survives the change of scale: 58.95
+against 22.60 MB/s, 2.6x where the cached runs showed 5.75x. Still
+unexplained, and with two processors and two reader threads scheduling
+remains as likely as anything in the driver.
 
 ### A reader that changes its mind
 
@@ -577,13 +596,26 @@ exactly on. The WASTE comparison is a bar at two and a half times, and a
 sequential reader measures 1.00-1.04x -- it cast zero shrink votes across
 125 windows after the change.
 
-**One residual, recorded rather than fixed.** The bursty phase now shows 26
-grows against 30 shrinks: the stale streak still lets growth win a window
-whenever amplification dips under the bar, so the granule oscillates rather
-than settling. The net is strongly positive -- 2.82x down to 1.87x, about
-90 MB of wasted bandwidth recovered -- but a tracker whose streak decayed
-when its stream stopped being used would settle instead of bouncing.
-Reproduce either state with `mixed <file> 200 64 1500 1024 4`.
+**The oscillation it left behind is fixed too, by asking a different
+question.** The first fix left the bursty phase bouncing -- 26 grows against
+30 shrinks -- because the growth arm consulted the LONGEST streak across
+trackers, and the stale one from the sequential half is the last thing
+ReadClaimStream ever evicts. What growth wants to know is whether the stream
+it is on right now is long, not whether any stream on the file ever was.
+`ReadCurrentStreak` answers that from `ReadLastStreamIndex`, which the read
+path records anyway.
+
+Decaying the streaks was the obvious alternative and would have broken
+growth: at the starting granule a window holds about four reads, so a
+decayed streak could never reach the sixteen growth requires.
+
+| | amplification | grows / shrinks | phase throughput |
+|---|---|---|---|
+| original defect | 2.82x | 0 / 0 | 7.43 MB/s |
+| waste tested first | 1.87x | 26 / 30, oscillating | 13.07 MB/s |
+| **current stream's streak** | **1.56x** | **0 / 4**, settles | **15.51 MB/s** |
+
+Reproduce with `mixed <file> 200 64 1500 1024 4`.
 
 ### The granularity sweep, and why there is no right constant
 

@@ -419,10 +419,26 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     ULONG   ReadMaxPagingBytes;
 
     //
-    // Closes the tail explicitly rather than widening a neighbour, which is
-    // this file's rule for satisfying CHECK_PADDING_END.
+    // Which tracker the last read on this file matched, so the growth rule
+    // can ask what THIS stream is doing rather than what any stream on the
+    // file has ever done.
     //
-    ULONG   ReadAheadReserved;
+    // The distinction is a defect's worth. Taking the maximum streak across
+    // trackers meant a sequential phase left a high streak behind that
+    // ReadClaimStream could never evict -- it replaces the COLDEST, and the
+    // stale one is the hottest -- so a reader that turned bursty still
+    // measured as sequential indefinitely.
+    //
+    // Decaying the streaks instead would have broken growth: at the
+    // starting granule a window holds about four reads, so a decayed streak
+    // could never reach the sixteen that growth requires. Naming the
+    // current stream costs one ULONG, needs no decay, and reacts on the
+    // first read of a new pattern.
+    //
+    // It also closes the tail explicitly, which is what the field it
+    // replaced was doing.
+    //
+    ULONG   ReadLastStreamIndex;
 } FCB, * PFCB;
 
 CHECK_PADDING_BETWEEN(FCB, Header, NonPaged);
@@ -451,8 +467,8 @@ CHECK_PADDING_BETWEEN(FCB, ReadIdleTicks, ReadBusyTicks);
 CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadAheadGranularity);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadGranularity, ReadAheadAgreement);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadAgreement, ReadMaxPagingBytes);
-CHECK_PADDING_BETWEEN(FCB, ReadMaxPagingBytes, ReadAheadReserved);
-CHECK_PADDING_END(FCB, ReadAheadReserved);
+CHECK_PADDING_BETWEEN(FCB, ReadMaxPagingBytes, ReadLastStreamIndex);
+CHECK_PADDING_END(FCB, ReadLastStreamIndex);
 
 //
 // Per-directory context node. Extends COMMON_CONTEXT with child linkage and
