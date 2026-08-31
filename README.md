@@ -398,6 +398,51 @@ sequential streaming. `ReadAheadGranularityKb` in the service's
 `Parameters` key exists to sweep that trade without a rebuild per point;
 zero means never call `CcSetReadAheadGranularity` and leave Cc's default.
 
+### The FSP pool, which had never been measured either
+
+`FSP_THREAD_COUNT` is `min(max(4 x cores, 8), 16)`, and the argument behind
+it is sound -- the pool absorbs blocking rather than CPU, a blocked worker
+costs nothing, so small machines keep a floor. But the number came from
+reasoning, and nothing could have contradicted it. The only counter was
+`ReadsPosted`, which is **zero in every read workload**, because the PASSIVE
+bypass keeps reads off the queue entirely. What uses the queue is the
+metadata path, and no read benchmark touches it.
+
+There is no standard constant to copy. In-box filesystems mostly do not run
+a private pool at all -- they post to the system worker queues and let the
+kernel size them -- but that is closed off here, because posted work waits
+on an HTTP round trip and blocking a system worker thread is not allowed.
+Once the pool is yours, the convention that applies is the one this driver
+already used for `SocketMaxPoolSize`: size it from measured peak
+concurrency. That comment records what guessing cost the last time -- a flat
+32 justified by an internal notion of pipeline depth, 35-47 fresh connects a
+run at 473-660 ms each, p99 635-704 ms, fairness 0.23.
+
+`FspPosts` and `FspDispatches` make the same measurement possible here. Two
+monotone counters, no gauge: depth is their difference, computed by the
+reader, which is the resolution this block already reached for fetches in
+flight.
+
+| workload (cold path cache) | posts / dispatches | outstanding at end |
+|---|---|---|
+| metadata storm, 8 passes (601 creates) | 29 / 29 | 0 |
+| metadata storm, 30 passes (2251 creates) | 117 / 117 | 0 |
+| sequential read | 0 / 0 | 0 |
+
+117 posts across a run against a pool of eight, with the queue empty again
+by the end. That bounds the work rather than recording the worst instant,
+and the bound is what the convention allows: a high-water mark needs an
+interlocked global, and this block does not write shared state on any path.
+One was written here first and removed for exactly that reason.
+
+**The first version of this measurement was warm, and wrong.** It reported
+11 and 30 posts at an 87-100% path-cache hit rate, because something had run
+before it. Cold, the hit rate is 3-12% and the posts quadruple. A metadata
+figure measured after anything else has touched the share says very little.
+
+Still not stressed: a tree far wider than this share, or many processes
+opening at once, would post more than 117.
+
 ### Where each workload stands
 
 The read-ahead policy is one rule per direction, and this is what it
@@ -539,9 +584,19 @@ The advantage moves with the half, not the handle:
 | swapped | 25.84 (half 1) | 25.72 (half 0) |
 
 Whichever handle owns the FIRST half wins when there is a difference at all,
-and two of the four runs show none. The backend opens and seeks per request
-(see the server note), so reading near the start of a 22 GB file beats
-seeking eleven gigabytes in. Nothing in the read-ahead policy is involved.
+and two of the four runs show none. Nothing in the read-ahead policy is
+involved -- but the attribution offered here first, that a per-request
+`ServeFile` seek makes the start of a 22 GB file cheaper than a point eleven
+gigabytes in, is the weaker of the two available explanations.
+
+The backend holds no block cache of its own: files above 8 MB
+(`max_resident_file_bytes`) are cached only as the decision to stream them,
+so every range GET reads through the backend HOST's page cache. The first
+half of that file is what every run in this document has touched, and the
+second half is what almost nothing has. Residency explains an advantage that
+follows the offset at least as well as seek geometry does, and better than
+seek geometry explains it on any modern storage. Distinguishing them needs
+the backend's cache dropped between arms, which nothing here has done.
 
 ### A reader that changes its mind
 

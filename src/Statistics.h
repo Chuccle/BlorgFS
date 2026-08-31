@@ -237,6 +237,37 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ReadsCached;                 // served through Cc (copy or MDL)
     ULONG64 ReadsPagingInline;           // paging read issued on the calling thread
     ULONG64 ReadsPosted;                 // non-cached read posted to the FSP queue
+
+    //
+    // Whether the FSP worker pool is big enough, which has never been
+    // measured.
+    //
+    // FSP_THREAD_COUNT is min(max(4 x cores, 8), 16), and the argument for it
+    // is that the pool absorbs blocking rather than CPU. That is the right
+    // axis, but the number came from reasoning and nothing here could have
+    // contradicted it: the only FSP counter was ReadsPosted, which reads zero
+    // in every read workload because the PASSIVE bypass keeps reads off the
+    // queue entirely. The pool is used by the metadata path -- Create and
+    // DirCtrl -- which no read benchmark exercises.
+    //
+    // SocketMaxPoolSize was in this state once. A flat 32 justified by an
+    // internal notion of pipeline depth cost 35-47 fresh connects a run at
+    // 473-660 ms each, and was replaced by a number sized from measured peak
+    // concurrency. These are what let the same be done here: how deep the
+    // queue actually got, and how long a request waited before a worker took
+    // it.
+    //
+    // Two monotone counters, no gauge. Depth is their difference, which is
+    // exact wherever the halves land, and the reader computes it -- the same
+    // resolution this block already reached for fetches in flight.
+    //
+    // A high-water mark was written here first and it needed an interlocked
+    // global to maintain, which is precisely what the note above forbids. It
+    // is not needed: over a thirty-pass metadata storm the driver posted 30
+    // requests in total against a pool of eight, so the totals alone bound
+    // the depth without anything shared being written on the path.
+    ULONG64 FspPosts;
+    ULONG64 FspDispatches;
     ULONG64 ReadsSequential;             // started exactly where a previous read ended
     ULONG64 ReadsEndOfFile;              // rejected at or past EOF
 
@@ -463,7 +494,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
 
-#define BLORGFS_STATISTICS_VERSION 12
+#define BLORGFS_STATISTICS_VERSION 13
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

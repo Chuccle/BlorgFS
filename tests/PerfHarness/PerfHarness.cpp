@@ -447,6 +447,18 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    cached                %12llu\n", t.ReadsCached);
     printf("    paging (inline)       %12llu\n", t.ReadsPagingInline);
     printf("    posted to FSP         %12llu\n", t.ReadsPosted);
+    //
+    // Clamped, for the reason BlorgStatisticsFetchesActive clamps: the merge
+    // walks processors in order, so a post counted on one and its dispatch
+    // counted on another read later makes dispatches exceed posts globally.
+    // Unsigned subtraction would print that as 2^64.
+    //
+    const unsigned long long queued =
+        (t.FspPosts > t.FspDispatches) ? (t.FspPosts - t.FspDispatches) : 0;
+
+    printf("    FSP posts / dispatch  %12llu / %llu  (%llu still queued, pool %s)\n",
+        t.FspPosts, t.FspDispatches, queued,
+        (t.FspPosts > 0) ? "exercised" : "never queued");
     printf("    sequential            %12llu  (%.1f%% of paging)\n",
         t.ReadsSequential, SafeRatio(t.ReadsSequential, t.ReadsPagingInline));
     printf("    end-of-file           %12llu\n", t.ReadsEndOfFile);
