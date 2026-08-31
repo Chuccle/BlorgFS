@@ -2163,6 +2163,7 @@ static bool RunCompete(
     const wchar_t* path,
     CompeteMode mode,
     double seconds,
+    bool swapHalves,
     unsigned long long* bytesOut,
     double* secondsOut)
 {
@@ -2192,7 +2193,7 @@ static bool RunCompete(
         contexts[i].Frequency = frequency;
         contexts[i].Start = start;
         contexts[i].Mode = (0 == i) ? CompeteMode::Sequential : mode;
-        contexts[i].Half = i;
+        contexts[i].Half = swapHalves ? (1 - i) : i;
 
         threads[i] = CreateThread(nullptr, 0, CompeteWorker, &contexts[i], 0, nullptr);
 
@@ -2231,9 +2232,10 @@ static bool RunCompete(
 
     for (int i = 0; i < 2; ++i)
     {
-        printf("    handle %d  %-20s %8.2f MB  %7.2f MB/s\n",
+        printf("    handle %d  %-20s %8.2f MB  %7.2f MB/s  (half %lld)\n",
             i, names[i], contexts[i].Bytes / (1024.0 * 1024.0),
-            (ran > 0.0) ? ((contexts[i].Bytes / (1024.0 * 1024.0)) / ran) : 0.0);
+            (ran > 0.0) ? ((contexts[i].Bytes / (1024.0 * 1024.0)) / ran) : 0.0,
+            contexts[i].Half);
     }
 
     if (CompeteMode::Paced == mode)
@@ -2940,7 +2942,9 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
             return 1;
         }
 
-        ok = RunCompete(argv[2], mode, parsedSeconds, &bytes, &seconds);
+        const bool swapHalves = (argc > 5) && (0 == wcscmp(argv[5], L"swap"));
+
+        ok = RunCompete(argv[2], mode, parsedSeconds, swapHalves, &bytes, &seconds);
 
         sprintf_s(label, "compete (sequential against %ws, %.0f s)", argv[3], parsedSeconds);
     }

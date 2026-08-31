@@ -506,18 +506,42 @@ to tens, and the contention becomes real:
 | copy vs bursty | 50.50 MB/s | 1.59 MB/s | 7.51 / 213.7 ms |
 | copy vs copy | 58.95 MB/s | 22.60 MB/s | 0.006 / 30.3 ms |
 
-A player sharing a file with a copy misses 15% of its deadlines once neither
-can be served from cache. **What that does NOT establish is a policy fault.**
-The copy alone takes 23 MB/s of a link that measures 24-29, so the player is
-starved of bandwidth before any granularity decision enters into it, and any
-two consumers of a saturated link would do the same. Separating the two needs
-an arm where the copy is present but forbidden to grow, which has not been
-run.
+**The 15% figure did not replicate and is withdrawn.** Four further runs of
+the same pairing missed 0, 0, 0 and 10 of 1200. One run in twelve produced
+180; it was an outlier, and quoting it as a property was wrong.
 
-The asymmetry between identical copies survives the change of scale: 58.95
-against 22.60 MB/s, 2.6x where the cached runs showed 5.75x. Still
-unexplained, and with two processors and two reader threads scheduling
-remains as likely as anything in the driver.
+**What growth actually costs the player, measured directly.** Forbidding
+growth while leaving the copy in place separates the copy's bandwidth from
+its granularity decision:
+
+| slack growth | the copy | player misses of 1200 |
+|---|---|---|
+| off | 21.63, 20.99 MB/s | 0, 0 |
+| on | **26.11, 27.01 MB/s** | 0, 10 (worst 88 ms) |
+
+The copy gains about 25% and the player pays between nothing and ten misses.
+That is the policy working as intended rather than a fairness fault, and it
+is the answer to whether `READ_AHEAD_ADAPT_QUIET_DEPTH` needs to become
+adaptive: the gate is fragile -- a lone reader runs 2.7 to 4 fetches in
+flight and eight paced streams run 3 to 8, so the two distributions overlap
+-- but what it is guarding against costs ten missed deadlines in twelve
+hundred. Fixed at six, documented, and not worth machinery.
+
+**The asymmetry between identical copies is the backend, not this driver.**
+`compete` takes a `swap` argument that inverts which handle owns which half.
+The advantage moves with the half, not the handle:
+
+| run | handle 0 | handle 1 |
+|---|---|---|
+| normal | 67.87 MB/s (half 0) | 44.23 MB/s (half 1) |
+| swapped | 56.70 MB/s (half 1) | **79.88 MB/s (half 0)** |
+| normal | 12.39 (half 0) | 12.40 (half 1) |
+| swapped | 25.84 (half 1) | 25.72 (half 0) |
+
+Whichever handle owns the FIRST half wins when there is a difference at all,
+and two of the four runs show none. The backend opens and seeks per request
+(see the server note), so reading near the start of a 22 GB file beats
+seeking eleven gigabytes in. Nothing in the read-ahead policy is involved.
 
 ### A reader that changes its mind
 
