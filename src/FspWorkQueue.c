@@ -27,6 +27,27 @@
 // stacks and wake-burst width on machines that cannot run the full pool
 // concurrently anyway.
 //
+// Measured at last. A metadata storm from a cold path cache posts 29
+// requests over eight passes and 117 over thirty -- 2250 creates -- against
+// a pool of eight workers, and the queue is empty again by the end of each.
+// A sequential read posts nothing at all.
+//
+// The first measurement of this said 11 and 30, and was taken on a warm
+// path cache: 87% to 100% hits, so almost nothing reached the network or
+// this queue. Cold, the hit rate is 3% to 12% and the posts quadruple. A
+// metadata number measured after anything else has run says little.
+//
+// No high-water mark is kept. One was written here and removed: maintaining
+// it needs an interlocked global, which the statistics block refuses, and
+// FspPosts against FspDispatches bounds the work without writing anything
+// shared on the path. What that buys is a bound rather than a peak -- 117
+// posts spread across a run cannot have queued eight workers deep for long,
+// but the exact worst instant is not recorded, deliberately.
+//
+// Left as it is rather than trimmed. Being oversized costs thread stacks
+// and nothing else, and the failure direction of an undersized pool is a
+// stall on the create path that no read benchmark would show.
+//
 #define FSP_THREAD_COUNT 16
 #define FSP_THREAD_COUNT_MIN 8
 
@@ -222,6 +243,11 @@ Return Value:
 
         PIRP irp = IoCsqRemoveNextIrp(&FspQueue.Csq, NULL);
 
+        if (irp)
+        {
+            BLORGFS_STAT_INC(FspDispatches);
+        }
+
         while (irp)
         {
             NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
@@ -277,6 +303,11 @@ Return Value:
             IoSetTopLevelIrp(NULL);
 
             irp = IoCsqRemoveNextIrp(&FspQueue.Csq, NULL);
+
+            if (irp)
+            {
+                BLORGFS_STAT_INC(FspDispatches);
+            }
         }
 
     }
@@ -284,12 +315,6 @@ Return Value:
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
-//
-//  Local support routine. Queues Irp to the FSP workers and wakes one.
-//  Every major that gets posted carries a file object, so this asserts
-//  rather than silently skipping the insert -- a skipped insert would
-//  strand an IRP its poster already reported as STATUS_PENDING.
-//
 static VOID AddToWorkqueue(
     PIRP Irp
 )
@@ -298,6 +323,10 @@ static VOID AddToWorkqueue(
 
     IoCsqInsertIrp(&FspQueue.Csq, Irp, NULL);
     KeSetEvent(&FspQueue.WorkEvent, EVENT_INCREMENT, FALSE);
+
+
+    BLORGFS_STAT_INC(FspPosts);
+
 }
 
 NTSTATUS BlorgPrePostIrp(
@@ -649,11 +678,21 @@ VOID BlorgDestroyWorkQueue(VOID)
 
     PIRP irp = IoCsqRemoveNextIrp(&FspQueue.Csq, NULL);
 
+    if (irp)
+    {
+        BLORGFS_STAT_INC(FspDispatches);
+    }
+
     while (irp)
     {
         FspDiscardPendingIrpContext(irp);
 
         BlorgCompleteRequest(irp, STATUS_CANCELLED, IO_NO_INCREMENT);
         irp = IoCsqRemoveNextIrp(&FspQueue.Csq, NULL);
+
+        if (irp)
+        {
+            BLORGFS_STAT_INC(FspDispatches);
+        }
     }
 }
