@@ -482,6 +482,7 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    user bytes            %12llu\n", t.UserFileReadBytes);
     printf("    non-cached bytes      %12llu\n", t.NonCachedReadBytes);
 
+
     //
     // What the application waited, as opposed to what the driver did.
     //
@@ -1083,160 +1084,6 @@ static unsigned long ParsePaceKbPerSecond(int argc, wchar_t** argv, int from)
 
     return 0;
 }
-
-struct StreamResult
-{
-    unsigned long long Bytes;
-    std::vector<double> LatenciesMs;
-    bool Ok;
-
-    //
-    // The stream's own schedule, so each reader is a player in its own
-    // right rather than N readers sharing one clock. Zeroed when unpaced.
-    //
-    unsigned long long Blocks;
-    unsigned long long Missed;
-    double WorstLateness;
-};
-
-struct StreamContext
-{
-    const wchar_t* Path;
-    double DeadlineSeconds;
-    LARGE_INTEGER Frequency;
-    LARGE_INTEGER Start;
-    StreamResult* Result;
-
-    //
-    // Opens the stream with FILE_FLAG_NO_BUFFERING, so every read goes to
-    // the driver instead of being served by Cc. Buffered numbers measure
-    // the filesystem; unbuffered ones measure the transport, which is what
-    // a comparison against a usermode HTTP client is actually asking about.
-    //
-    bool Unbuffered;
-
-    //
-    // Bytes per second this stream reads at, or zero to read flat out.
-    //
-    unsigned long PaceKbPerSecond;
-
-    //
-    // Where in the interval this stream's schedule sits, so concurrent
-    // readers are independent players rather than one synchronised burst.
-    //
-    double PacePhase;
-};
-
-static DWORD WINAPI StreamWorker(LPVOID parameter)
-{
-    StreamContext* ctx = static_cast<StreamContext*>(parameter);
-    ctx->Result->Ok = false;
-    ctx->Result->Bytes = 0;
-
-    DWORD streamFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
-
-    if (ctx->Unbuffered)
-    {
-        streamFlags |= FILE_FLAG_NO_BUFFERING;
-    }
-
-    HANDLE file = CreateFileW(ctx->Path, GENERIC_READ, FILE_SHARE_READ, nullptr,
-        OPEN_EXISTING, streamFlags, nullptr);
-
-    if (INVALID_HANDLE_VALUE == file)
-    {
-        PrintLastError("open stream file");
-        return 0;
-    }
-
-    //
-    // Unbuffered streams read 512 KB blocks rather than the 64 KB an
-    // application would issue. With Cc bypassed there is no read-ahead to
-    // cluster small reads, so 64 KB would leave only 64 KB per stream in
-    // flight and measure request overhead instead of transport -- and the
-    // usermode client this is compared against issues 512 KB.
-    //
-    const DWORD streamReadSize = ctx->Unbuffered
-        ? ((512u * 1024u + kSectorAlignment - 1) & ~(kSectorAlignment - 1))
-        : kWorkloadReadSize;
-
-    unsigned char* buffer = static_cast<unsigned char*>(
-        VirtualAlloc(nullptr, streamReadSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-
-    if (!buffer)
-    {
-        PrintLastError("allocate stream buffer");
-        CloseHandle(file);
-        return 0;
-    }
-
-    ctx->Result->LatenciesMs.reserve(65536);
-
-    Pacer pacer;
-
-    if (!PacerInit(&pacer, streamReadSize, ctx->PaceKbPerSecond, ctx->PacePhase))
-    {
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        CloseHandle(file);
-        return 0;
-    }
-
-    for (;;)
-    {
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-
-        const double elapsed = static_cast<double>(now.QuadPart - ctx->Start.QuadPart) /
-                               static_cast<double>(ctx->Frequency.QuadPart);
-
-        if (elapsed >= ctx->DeadlineSeconds)
-        {
-            break;
-        }
-
-        const double due = PacerDue(&pacer);
-
-        LARGE_INTEGER readStart;
-        QueryPerformanceCounter(&readStart);
-
-        DWORD read = 0;
-
-        if (!ReadFile(file, buffer, streamReadSize, &read, nullptr))
-        {
-            PrintLastError("stream read");
-            break;
-        }
-
-        if (0 == read)
-        {
-            break;
-        }
-
-        LARGE_INTEGER readEnd;
-        QueryPerformanceCounter(&readEnd);
-
-        ctx->Result->LatenciesMs.push_back(
-            1000.0 * static_cast<double>(readEnd.QuadPart - readStart.QuadPart) /
-            static_cast<double>(ctx->Frequency.QuadPart));
-
-        ctx->Result->Bytes += read;
-
-        PacerComplete(&pacer, due);
-        PacerWait(&pacer);
-    }
-
-    ctx->Result->Blocks = pacer.Blocks;
-    ctx->Result->Missed = pacer.Missed;
-    ctx->Result->WorstLateness = pacer.WorstLateness;
-
-    PacerDestroy(&pacer);
-    VirtualFree(buffer, 0, MEM_RELEASE);
-    CloseHandle(file);
-
-    ctx->Result->Ok = true;
-    return 0;
-}
-
 static double Percentile(std::vector<double>& sorted, double fraction)
 {
     if (sorted.empty())
@@ -1344,6 +1191,190 @@ static void SamplerReport(Sampler* s, const char* what)
     }
 }
 
+//
+// One timed read. Wrapping ReadFile is what lets every workload report the
+// same exact percentiles without each loop growing its own stopwatch.
+//
+static bool SamplerRead(
+    Sampler* s,
+    HANDLE file,
+    void* buffer,
+    DWORD length,
+    DWORD* read,
+    OVERLAPPED* overlapped)
+{
+    LARGE_INTEGER start;
+    QueryPerformanceCounter(&start);
+
+    const BOOL ok = ReadFile(file, buffer, length, read, overlapped);
+
+    LARGE_INTEGER done;
+    QueryPerformanceCounter(&done);
+
+    if (ok && *read > 0)
+    {
+        SamplerRecord(s, 1000.0 * static_cast<double>(done.QuadPart - start.QuadPart) /
+            static_cast<double>(s->Frequency.QuadPart), *read, done);
+    }
+
+    return (0 != ok);
+}
+
+struct StreamResult
+{
+    unsigned long long Bytes;
+    std::vector<double> LatenciesMs;
+    bool Ok;
+
+    //
+    // The stream's own schedule, so each reader is a player in its own
+    // right rather than N readers sharing one clock. Zeroed when unpaced.
+    //
+    unsigned long long Blocks;
+    unsigned long long Missed;
+    double WorstLateness;
+};
+
+struct StreamContext
+{
+    const wchar_t* Path;
+    double DeadlineSeconds;
+    LARGE_INTEGER Frequency;
+    LARGE_INTEGER Start;
+    StreamResult* Result;
+
+    //
+    // Opens the stream with FILE_FLAG_NO_BUFFERING, so every read goes to
+    // the driver instead of being served by Cc. Buffered numbers measure
+    // the filesystem; unbuffered ones measure the transport, which is what
+    // a comparison against a usermode HTTP client is actually asking about.
+    //
+    bool Unbuffered;
+
+    //
+    // Bytes per second this stream reads at, or zero to read flat out.
+    //
+    unsigned long PaceKbPerSecond;
+
+    //
+    // Where in the interval this stream's schedule sits, so concurrent
+    // readers are independent players rather than one synchronised burst.
+    //
+    double PacePhase;
+};
+
+static DWORD WINAPI StreamWorker(LPVOID parameter)
+{
+    StreamContext* ctx = static_cast<StreamContext*>(parameter);
+    ctx->Result->Ok = false;
+    ctx->Result->Bytes = 0;
+
+    DWORD streamFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
+
+    if (ctx->Unbuffered)
+    {
+        streamFlags |= FILE_FLAG_NO_BUFFERING;
+    }
+
+    HANDLE file = CreateFileW(ctx->Path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, streamFlags, nullptr);
+
+    if (INVALID_HANDLE_VALUE == file)
+    {
+        PrintLastError("open stream file");
+        return 0;
+    }
+
+    //
+    // Unbuffered streams read 512 KB blocks rather than the 64 KB an
+    // application would issue. With Cc bypassed there is no read-ahead to
+    // cluster small reads, so 64 KB would leave only 64 KB per stream in
+    // flight and measure request overhead instead of transport -- and the
+    // usermode client this is compared against issues 512 KB.
+    //
+    const DWORD streamReadSize = ctx->Unbuffered
+        ? ((512u * 1024u + kSectorAlignment - 1) & ~(kSectorAlignment - 1))
+        : kWorkloadReadSize;
+
+    unsigned char* buffer = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, streamReadSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+
+    if (!buffer)
+    {
+        PrintLastError("allocate stream buffer");
+        CloseHandle(file);
+        return 0;
+    }
+
+    ctx->Result->LatenciesMs.reserve(65536);
+
+    Pacer pacer;
+
+    if (!PacerInit(&pacer, streamReadSize, ctx->PaceKbPerSecond, ctx->PacePhase))
+    {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        CloseHandle(file);
+        return 0;
+    }
+
+    Sampler sampler;
+    SamplerInit(&sampler, 0.25);
+
+    for (;;)
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+
+        const double elapsed = static_cast<double>(now.QuadPart - ctx->Start.QuadPart) /
+                               static_cast<double>(ctx->Frequency.QuadPart);
+
+        if (elapsed >= ctx->DeadlineSeconds)
+        {
+            break;
+        }
+
+        const double due = PacerDue(&pacer);
+
+        LARGE_INTEGER readStart;
+        QueryPerformanceCounter(&readStart);
+
+        DWORD read = 0;
+
+        if (!SamplerRead(&sampler, file, buffer, streamReadSize, &read, nullptr))
+        {
+            PrintLastError("stream read");
+            break;
+        }
+
+        if (0 == read)
+        {
+            break;
+        }
+
+        LARGE_INTEGER readEnd;
+        QueryPerformanceCounter(&readEnd);
+
+        ctx->Result->LatenciesMs.push_back(
+            1000.0 * static_cast<double>(readEnd.QuadPart - readStart.QuadPart) /
+            static_cast<double>(ctx->Frequency.QuadPart));
+
+        ctx->Result->Bytes += read;
+
+        PacerComplete(&pacer, due);
+        PacerWait(&pacer);
+    }
+
+    ctx->Result->Blocks = pacer.Blocks;
+    ctx->Result->Missed = pacer.Missed;
+    ctx->Result->WorstLateness = pacer.WorstLateness;
+
+    PacerDestroy(&pacer);
+    VirtualFree(buffer, 0, MEM_RELEASE);
+    CloseHandle(file);
+
+    ctx->Result->Ok = true;
+    return 0;
+}
 
 static bool RunStreams(
     const wchar_t* directory,
@@ -1527,11 +1558,14 @@ static bool RunSequential(const wchar_t* path, bool unbuffered, unsigned long lo
 
     unsigned long long total = 0;
 
+    Sampler sampler;
+    SamplerInit(&sampler, 0.25);
+
     for (;;)
     {
         DWORD read = 0;
 
-        if (!ReadFile(file, buffer, readSize, &read, nullptr))
+        if (!SamplerRead(&sampler, file, buffer, readSize, &read, nullptr))
         {
             PrintLastError("ReadFile");
             break;
@@ -1552,6 +1586,8 @@ static bool RunSequential(const wchar_t* path, bool unbuffered, unsigned long lo
 
     *bytesOut = total;
     *secondsOut = static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+    SamplerReport(&sampler, "sequential");
 
     return true;
 }
@@ -1639,6 +1675,9 @@ static bool RunRandom(
 
     unsigned long long total = 0;
 
+    Sampler sampler;
+    SamplerInit(&sampler, 0.25);
+
     for (unsigned long i = 0; i < count; ++i)
     {
         unsigned long long block = (static_cast<unsigned long long>(rand()) * RAND_MAX + rand()) % blocks;
@@ -1652,7 +1691,7 @@ static bool RunRandom(
 
         DWORD read = 0;
 
-        if (!ReadFile(file, buffer, alignedBlock, &read, &overlapped))
+        if (!SamplerRead(&sampler, file, buffer, alignedBlock, &read, &overlapped))
         {
             if (ERROR_HANDLE_EOF != GetLastError())
             {
@@ -1671,6 +1710,8 @@ static bool RunRandom(
 
     *bytesOut = total;
     *secondsOut = static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+    SamplerReport(&sampler, "random");
 
     return true;
 }
@@ -1808,6 +1849,9 @@ static bool RunDemux(
         return false;
     }
 
+    Sampler sampler;
+    SamplerInit(&sampler, 0.25);
+
     for (unsigned long i = 0; i < count; ++i)
     {
         const double due = PacerDue(&pacer);
@@ -1839,7 +1883,7 @@ static bool RunDemux(
 
         DWORD read = 0;
 
-        if (!ReadFile(file, buffer, blockSize, &read, &overlapped))
+        if (!SamplerRead(&sampler, file, buffer, blockSize, &read, &overlapped))
         {
             if (ERROR_HANDLE_EOF != GetLastError())
             {
@@ -1871,6 +1915,8 @@ static bool RunDemux(
 
     *bytesOut = total;
     *secondsOut = static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(frequency.QuadPart);
+
+    SamplerReport(&sampler, "demux");
 
     return true;
 }
@@ -1952,6 +1998,9 @@ static bool RunPlayback(
     unsigned long long total = 0;
     long long offset = 0;
 
+    Sampler sampler;
+    SamplerInit(&sampler, 0.25);
+
     while (PacerElapsed(&pacer) < seconds)
     {
         if (offset + static_cast<long long>(blockSize) > fileSize.QuadPart)
@@ -1967,7 +2016,7 @@ static bool RunPlayback(
 
         DWORD read = 0;
 
-        if (!ReadFile(file, buffer, blockSize, &read, &overlapped))
+        if (!SamplerRead(&sampler, file, buffer, blockSize, &read, &overlapped))
         {
             PrintLastError("ReadFile");
             break;
@@ -1994,6 +2043,8 @@ static bool RunPlayback(
 
     *bytesOut = total;
     *secondsOut = ran;
+
+    SamplerReport(&sampler, "playback");
 
     return true;
 }
@@ -2351,11 +2402,14 @@ static bool RunMixed(
 
     unsigned long long sequentialBytes = 0;
 
+    Sampler sampler;
+    SamplerInit(&sampler, 0.25);
+
     while (sequentialBytes < sequentialTarget)
     {
         DWORD read = 0;
 
-        if (!ReadFile(file, buffer, blockSize, &read, nullptr) || 0 == read)
+        if (!SamplerRead(&sampler, file, buffer, blockSize, &read, nullptr) || 0 == read)
         {
             break;
         }
@@ -2413,7 +2467,7 @@ static bool RunMixed(
 
         DWORD read = 0;
 
-        if (!ReadFile(file, buffer, blockSize, &read, &overlapped) || 0 == read)
+        if (!SamplerRead(&sampler, file, buffer, blockSize, &read, &overlapped) || 0 == read)
         {
             break;
         }
@@ -2458,6 +2512,8 @@ static bool RunMixed(
 
     *bytesOut = sequentialBytes + randomBytes;
     *secondsOut = sequentialSeconds + randomSeconds;
+
+    SamplerReport(&sampler, "mixed");
 
     return true;
 }
@@ -3135,6 +3191,19 @@ static int RunWorkloadCommand(int argc, wchar_t** argv, const wchar_t* drive, co
     if (QueryDriverStatistics(handles.Control, &stats))
     {
         PrintDriverStatistics(stats);
+
+        //
+        // Amplification against what the WORKLOAD consumed, not against the
+        // driver's UserFileReadBytes. That counter sees only reads that reach
+        // it as an IRP, and buffered reads of a cached file are served by fast
+        // I/O and never become one -- it reads 64 KB whatever the workload did,
+        // which made a first attempt at this report 6909x.
+        //
+        printf("    amplification         %12.2fx  (%llu fetched / %llu consumed)\n",
+            (bytes > 0)
+                ? (static_cast<double>(stats.Totals.NonCachedReadBytes) / static_cast<double>(bytes))
+                : 0.0,
+            stats.Totals.NonCachedReadBytes, bytes);
 
         if (reportPath)
         {
