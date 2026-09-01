@@ -106,7 +106,7 @@ function Invoke-GuestPowerShell([string]$Command) {
 #
 # `sc stop` cannot provide that reset: it wedges in STOP_PENDING because
 # nothing dismounts a self-mounted volume, and the service then cannot be
-# started again without a reboot (see deploy/DEBUGGING.md). Rebooting is
+# started again without a reboot (see AGENTS.md, "Debugging the VM"). Rebooting is
 # slower but it is the only reset that actually works, and a sweep that
 # silently measured a wedged driver would be worse than a slow one.
 #
