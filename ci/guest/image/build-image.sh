@@ -109,6 +109,10 @@ xml="$(<"$HERE/autounattend.xml.in")"
 xml="${xml//@ADMIN_PASSWORD@/$password}"
 xml="${xml//@IMAGE_INDEX@/$WINDOWS_IMAGE_INDEX}"
 printf '%s\n' "$xml" > "$cfg/autounattend.xml"
+# Setup silently ignores an answer file that is not well-formed XML and
+# waits at its language screen, which only shows up as a timeout.
+python3 -c 'import sys, xml.dom.minidom as m; m.parse(sys.argv[1])' "$cfg/autounattend.xml" \
+    || die "autounattend.xml is not well-formed XML"
 cp "$HERE/Setup-GoldenImage.ps1" "$cfg/"
 cp "$WORK/id_ed25519.pub" "$cfg/authorized_keys"
 cp "$openssh_zip" "$cfg/OpenSSH-Win64.zip"
