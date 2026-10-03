@@ -17,11 +17,16 @@
 #
 # Environment (all optional):
 #   WINDOWS_ISO_URL      install ISO (default: Server 2022 evaluation, en-US)
-#   WINDOWS_ISO_SHA256   pin the ISO; checked when set
 #   WINDOWS_IMAGE_INDEX  index in install.wim (default 1: Standard Core)
 #   VIRTIO_ISO_URL       virtio-win ISO, for the QEMU guest agent; set to
 #                        "none" to skip the agent
 #   OPENSSH_ZIP_URL      Win32-OpenSSH release zip
+#   *_SHA256             the pin for each of the three (below)
+#
+# Every input is pinned by SHA-256, so the same recipe always builds from
+# the same bytes and a moved download fails the build instead of silently
+# changing the guest. An input with an empty pin is used and its hash
+# printed ("input ... sha256=..."), ready to be pinned here.
 #   BUILD_TIMEOUT_MIN    give up on Windows Setup after this (default 120)
 # plus the GUEST_* settings in host/lib.sh. Output: $GUEST_IMAGE_DIR/golden.qcow2
 # and the SSH key it trusts, $GUEST_IMAGE_DIR/id_ed25519.
@@ -35,6 +40,9 @@ WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://go.microsoft.com/fwlink/p/?LinkID=21
 WINDOWS_IMAGE_INDEX="${WINDOWS_IMAGE_INDEX:-1}"
 VIRTIO_ISO_URL="${VIRTIO_ISO_URL:-https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso}"
 OPENSSH_ZIP_URL="${OPENSSH_ZIP_URL:-https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip}"
+WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256:-}"
+VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256:-}"
+OPENSSH_ZIP_SHA256="${OPENSSH_ZIP_SHA256:-}"
 BUILD_TIMEOUT_MIN="${BUILD_TIMEOUT_MIN:-120}"
 
 iso_src="$WINDOWS_ISO_URL"
@@ -57,29 +65,35 @@ WORK="$GUEST_IMAGE_DIR/build"
 DOWNLOADS="$GUEST_HOME/downloads"
 mkdir -p "$WORK" "$DOWNLOADS"
 
-# Local path or URL -> local path. URLs are cached under downloads/ so a
-# retried build does not fetch a 5 GB ISO twice.
+# Local path or URL -> local path, checked against its pin. URLs are cached
+# under downloads/ so a retried build does not fetch a 5 GB ISO twice.
 fetch() {
-    local src="$1" name="$2"
-    if [[ -f "$src" ]]; then echo "$src"; return; fi
-    local dest="$DOWNLOADS/$name"
-    if [[ ! -s "$dest" ]]; then
-        note "downloading $name"
-        curl -fL --retry 4 --retry-delay 5 -o "$dest.part" "$src"
-        mv "$dest.part" "$dest"
+    local src="$1" name="$2" pin="$3" path="$1" from="$1"
+    if [[ ! -f "$src" ]]; then
+        path="$DOWNLOADS/$name"
+        if [[ ! -s "$path" ]]; then
+            note "downloading $name"
+            from="$(curl -fL --retry 4 --retry-delay 5 -o "$path.part" -w '%{url_effective}' "$src")"
+            mv "$path.part" "$path"
+        fi
     fi
-    echo "$dest"
+    local sum
+    sum="$(sha256sum "$path" | cut -d' ' -f1)"
+    note "input $name sha256=$sum from $from"
+    if [[ -z "$pin" ]]; then
+        echo "::warning title=Unpinned image input::$name sha256=$sum is not pinned in build-image.sh" >&2
+    elif [[ "$sum" != "$pin" ]]; then
+        die "$name is not the pinned input (sha256 $sum, pinned $pin)"
+    fi
+    echo "$path"
 }
 
-iso="$(fetch "$iso_src" windows.iso)"
-if [[ -n "${WINDOWS_ISO_SHA256:-}" ]]; then
-    echo "$WINDOWS_ISO_SHA256  $iso" | sha256sum -c - >/dev/null || die "install ISO does not match WINDOWS_ISO_SHA256"
-fi
+iso="$(fetch "$iso_src" windows.iso "$WINDOWS_ISO_SHA256")"
 virtio=""
 if [[ "$virtio_src" != "none" ]]; then
-    virtio="$(fetch "$virtio_src" virtio-win.iso)"
+    virtio="$(fetch "$virtio_src" virtio-win.iso "$VIRTIO_ISO_SHA256")"
 fi
-openssh_zip="$(fetch "$OPENSSH_ZIP_URL" OpenSSH-Win64.zip)"
+openssh_zip="$(fetch "$OPENSSH_ZIP_URL" OpenSSH-Win64.zip "$OPENSSH_ZIP_SHA256")"
 
 # A fresh key and password per image. Both only ever reach a guest that
 # listens on this host's loopback, but there is no reason to share them

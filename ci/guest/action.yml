@@ -1,0 +1,100 @@
+name: BlorgFS test guest host
+description: >
+  Turns a Linux runner into a KVM host with the golden Windows image and a
+  package to test: the setup shared by guest-runtime.yml and
+  guest-session.yml. Expects GUEST_HOME and PACKAGE_ARTIFACT in the job env.
+
+inputs:
+  package-run-id:
+    description: "Build BlorgFS run to take the package from; default: the newest on this branch, then on the default branch"
+    default: ''
+  save-image:
+    description: Save a newly built golden image to the cache (never from untrusted code)
+    default: 'false'
+
+outputs:
+  found:
+    description: "'true' when a package was found and unpacked into ./package"
+    value: ${{ steps.pkg.outputs.found }}
+
+runs:
+  using: composite
+  steps:
+  - name: Find the package
+    id: pkg
+    shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      EXPLICIT_RUN: ${{ inputs.package-run-id }}
+      BRANCHES: ${{ github.head_ref || github.ref_name }} ${{ github.event.repository.default_branch }}
+    run: |
+      set -euo pipefail
+      has_package() {
+        gh api "repos/$REPO/actions/runs/$1/artifacts" \
+          --jq ".artifacts[] | select(.name == \"$PACKAGE_ARTIFACT\" and .expired == false) | .id" | grep -q .
+      }
+      run_id=""
+      if [[ -n "$EXPLICIT_RUN" ]]; then
+        has_package "$EXPLICIT_RUN" && run_id="$EXPLICIT_RUN"
+      else
+        for branch in $BRANCHES; do
+          for id in $(gh run list -R "$REPO" -w build.yml --status success -L 30 --branch "$branch" --json databaseId --jq '.[].databaseId'); do
+            if has_package "$id"; then run_id="$id"; break 2; fi
+          done
+        done
+      fi
+      if [[ -z "$run_id" ]]; then
+        echo "::notice title=No package::No Build BlorgFS run with a $PACKAGE_ARTIFACT artifact was found; nothing to test."
+        echo "found=false" >> "$GITHUB_OUTPUT"
+        exit 0
+      fi
+      echo "Testing the package from https://github.com/$REPO/actions/runs/$run_id"
+      gh run download "$run_id" -R "$REPO" -n "$PACKAGE_ARTIFACT" -D package
+      cat package/manifest.json
+      echo "found=true" >> "$GITHUB_OUTPUT"
+
+  - name: Prepare the KVM host
+    shell: bash
+    run: |
+      "$GITHUB_ACTION_PATH/host/install-host-deps.sh"
+      sudo mkdir -p "$GUEST_HOME"
+      sudo chown "$(id -u):$(id -g)" "$GUEST_HOME"
+      # Leave the runner ~2.5 GB; the guest gets the rest, 2-6 GB.
+      mem=$(( $(free -m | awk '/^Mem:/ {print $2}') - 2560 ))
+      (( mem > 6144 )) && mem=6144
+      (( mem < 2048 )) && mem=2048
+      # The evaluation image expires 180 days after it is built; keying
+      # the cache by quarter rebuilds it long before that.
+      {
+        echo "GUEST_MEM_MB=$mem"
+        echo "GUEST_CPUS=$(nproc)"
+        echo "IMAGE_QUARTER=$(date -u +%Y)-q$(( ($(date -u +%-m) - 1) / 3 + 1 ))"
+      } >> "$GITHUB_ENV"
+      df -h "$GUEST_HOME"; free -m; nproc
+
+  # The key is the image recipe (inputs pinned by hash in build-image.sh)
+  # and the quarter: the same key always means the same image.
+  - name: Restore the golden image
+    id: image
+    uses: actions/cache/restore@v5
+    with:
+      path: ${{ env.GUEST_HOME }}/image
+      key: blorgfs-guest-image-${{ hashFiles('ci/guest/image/**', 'ci/guest/host/lib.sh') }}-${{ env.IMAGE_QUARTER }}
+
+  # First run of a quarter, or after the recipe changed: a full unattended
+  # Windows install. ~20-30 min under KVM; much longer means it is stuck on
+  # a screen, which the log shows (SCREEN lines).
+  - name: Build the golden image
+    if: steps.image.outputs.cache-hit != 'true'
+    shell: bash
+    env:
+      BUILD_TIMEOUT_MIN: '50'
+    run: '"$GITHUB_ACTION_PATH/image/build-image.sh"'
+
+  - name: Save the golden image
+    if: steps.image.outputs.cache-hit != 'true' && inputs.save-image == 'true'
+    uses: actions/cache/save@v5
+    with:
+      path: ${{ env.GUEST_HOME }}/image
+      key: ${{ steps.image.outputs.cache-primary-key }}

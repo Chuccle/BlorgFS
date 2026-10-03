@@ -7,8 +7,10 @@ name: Guest runtime tests
 #   ci/guest/run-guest-tests.sh --package <unpacked artifact>
 # See "Cloud test guest" in AGENTS.md.
 #
-# Input is the blorg-package-windows-x64 artifact from build.yml, never a
-# build of its own: what is tested is exactly what ships.
+# A fixed test: the package from build.yml (never a build of its own, so
+# what is tested is exactly what ships), a golden image built from pinned
+# inputs, and the suites in the repo. Nothing here takes commands from
+# outside the commit; acting in the guest by hand is guest-session.yml.
 
 on:
   # Every successful build, on any branch or PR, gets a guest run against
@@ -16,13 +18,13 @@ on:
   workflow_run:
     workflows: [ "Build BlorgFS" ]
     types: [ completed ]
-  # Changes to the rig itself are tested by the rig, against the newest
-  # package available.
+  # Changes to the rig itself are tested by the rig.
   pull_request:
     branches: [ master ]
     paths:
       - 'ci/guest/**'
       - 'tools/Test-BlorgCorrectness.ps1'
+      - 'tests/guest-suites/**'
       - '.github/workflows/guest-runtime.yml'
   workflow_dispatch:
     inputs:
@@ -34,18 +36,16 @@ on:
         description: 'Driver Verifier on BlorgFS.sys'
         type: boolean
         default: true
-      session:
-        description: 'Agent session: bash run against the live guest after the tests, with guestctl on PATH; output in guest-results/session/ (see ci/guest/run-session.sh)'
-        required: false
-        default: ''
 
 permissions:
   contents: read
   actions: read
 
+# Queued, not cancelled: a cancelled first-of-the-quarter image build is
+# 30 minutes thrown away and never cached.
 concurrency:
   group: guest-runtime-${{ github.event.workflow_run.head_branch || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   guest:
@@ -82,133 +82,47 @@ jobs:
       continue-on-error: true
       run: git submodule update --init third_party/schemas
 
-    - name: Find the package
-      id: pkg
-      env:
-        GH_TOKEN: ${{ github.token }}
-        REPO: ${{ github.repository }}
-        EXPLICIT_RUN: ${{ github.event.workflow_run.id || inputs.package_run_id }}
-        PREFER_BRANCH: ${{ github.head_ref || github.ref_name }}
-      run: |
-        set -euo pipefail
-        has_package() {
-          gh api "repos/$REPO/actions/runs/$1/artifacts" \
-            --jq ".artifacts[] | select(.name == \"$PACKAGE_ARTIFACT\" and .expired == false) | .id" | grep -q .
-        }
-        run_id=""
-        if [[ -n "$EXPLICIT_RUN" ]]; then
-          has_package "$EXPLICIT_RUN" && run_id="$EXPLICIT_RUN"
-        else
-          # Newest successful build that produced a package: this branch's
-          # first, then anyone's -- until the package job is on master, a
-          # rig change can still be tested against a PR's package.
-          for scope in "--branch $PREFER_BRANCH" ""; do
-            # shellcheck disable=SC2086
-            for id in $(gh run list -R "$REPO" -w build.yml --status success -L 30 $scope --json databaseId --jq '.[].databaseId'); do
-              if has_package "$id"; then run_id="$id"; break 2; fi
-            done
-          done
-        fi
-        if [[ -z "$run_id" ]]; then
-          echo "::notice title=No package::No Build BlorgFS run with a $PACKAGE_ARTIFACT artifact was found; nothing to test."
-          echo "found=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        echo "Testing the package from https://github.com/$REPO/actions/runs/$run_id"
-        echo "found=true" >> "$GITHUB_OUTPUT"
-        echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-
-    - name: Download the package
-      if: steps.pkg.outputs.found == 'true'
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        gh run download "${{ steps.pkg.outputs.run_id }}" -R "${{ github.repository }}" -n "$PACKAGE_ARTIFACT" -D package
-        cat package/manifest.json
-
-    - name: Prepare the KVM host
-      if: steps.pkg.outputs.found == 'true'
-      run: |
-        ci/guest/host/install-host-deps.sh
-        sudo mkdir -p "$GUEST_HOME"
-        sudo chown "$(id -u):$(id -g)" "$GUEST_HOME"
-        # Leave the runner ~2.5 GB; the guest gets the rest, 2-6 GB.
-        mem=$(( $(free -m | awk '/^Mem:/ {print $2}') - 2560 ))
-        (( mem > 6144 )) && mem=6144
-        (( mem < 2048 )) && mem=2048
-        # The evaluation image expires 180 days after it is built; keying
-        # the cache by quarter rebuilds it long before that.
-        {
-          echo "GUEST_MEM_MB=$mem"
-          echo "GUEST_CPUS=$(nproc)"
-          echo "IMAGE_QUARTER=$(date -u +%Y)-q$(( ($(date -u +%-m) - 1) / 3 + 1 ))"
-        } >> "$GITHUB_ENV"
-        df -h "$GUEST_HOME"; free -m; nproc
-
-    - name: Restore the golden image
-      if: steps.pkg.outputs.found == 'true'
-      id: image
-      uses: actions/cache/restore@v5
+    - name: Set up the KVM host
+      id: host
+      uses: ./ci/guest
       with:
-        path: ${{ env.GUEST_HOME }}/image
-        key: blorgfs-guest-image-${{ hashFiles('ci/guest/image/**', 'ci/guest/host/lib.sh') }}-${{ env.IMAGE_QUARTER }}
-
-    # First run of a quarter, or after the image recipe changed: a full
-    # unattended Windows install, roughly 30-60 minutes.
-    - name: Build the golden image
-      if: steps.pkg.outputs.found == 'true' && steps.image.outputs.cache-hit != 'true'
-      # An unattended install takes ~20-30 min under KVM; much longer means
-      # it is stuck on a screen, which the log shows (SCREEN lines).
-      env:
-        BUILD_TIMEOUT_MIN: 50
-      run: ci/guest/image/build-image.sh
-
-    - name: Save the golden image
-      if: steps.pkg.outputs.found == 'true' && steps.image.outputs.cache-hit != 'true' && env.UNTRUSTED_TRIGGER != 'true'
-      uses: actions/cache/save@v5
-      with:
-        path: ${{ env.GUEST_HOME }}/image
-        key: ${{ steps.image.outputs.cache-primary-key }}
-
-    # A session runs against the guest the tests leave up. PRs that change
-    # the rig run the probe session, which exercises every guestctl channel.
-    - name: Choose the agent session
-      if: steps.pkg.outputs.found == 'true'
-      env:
-        SESSION: ${{ inputs.session }}
-      run: |
-        if [[ -n "$SESSION" ]]; then
-          printf '%s\n' "$SESSION" > "$RUNNER_TEMP/session.sh"
-          echo "SESSION_SCRIPT=$RUNNER_TEMP/session.sh" >> "$GITHUB_ENV"
-        elif [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-          echo "SESSION_SCRIPT=$PWD/ci/guest/session-probe.sh" >> "$GITHUB_ENV"
-        fi
+        package-run-id: ${{ github.event.workflow_run.id || inputs.package_run_id }}
+        save-image: ${{ env.UNTRUSTED_TRIGGER != 'true' }}
 
     - name: Run the tests in the guest
-      if: steps.pkg.outputs.found == 'true'
+      if: steps.host.outputs.found == 'true'
       run: |
         args=(--package package --out guest-results)
-        [[ -n "${SESSION_SCRIPT:-}" ]] && args+=(--keep)
+        # A rig change also checks every way of acting in the guest, with
+        # the fixed probe script in the repo, so it keeps the guest up.
+        [[ "$GITHUB_EVENT_NAME" == "pull_request" ]] && args+=(--keep)
         [[ "${{ inputs.verifier }}" == "false" ]] && args+=(--no-verifier)
         # Contract and behavioural suites, when the repo carries them.
         [[ -d tests/guest-suites ]] && args+=(--suites tests/guest-suites)
         ci/guest/run-guest-tests.sh "${args[@]}"
 
-    - name: Agent session
-      if: always() && steps.pkg.outputs.found == 'true' && env.SESSION_SCRIPT != ''
-      run: ci/guest/run-session.sh --out guest-results "$SESSION_SCRIPT"
+    - name: Check the guestctl channels
+      if: github.event_name == 'pull_request' && steps.host.outputs.found == 'true'
+      run: ci/guest/run-session.sh --out guest-results ci/guest/session-probe.sh
 
     - name: Power off the guest
-      if: always() && steps.pkg.outputs.found == 'true'
-      run: ci/guest/host/guestctl down
+      if: always() && github.event_name == 'pull_request' && steps.host.outputs.found == 'true'
+      run: ci/guest/host/guestctl down || true
 
     - name: Upload results
-      if: always() && steps.pkg.outputs.found == 'true'
+      if: always() && steps.host.outputs.found == 'true'
       uses: actions/upload-artifact@v7
       with:
         name: guest-results
+        path: guest-results/
+        if-no-files-found: warn
+
+    - name: Upload the image build's screens
+      if: failure()
+      uses: actions/upload-artifact@v7
+      with:
+        name: guest-image-build
         path: |
-          guest-results/
           ${{ env.GUEST_HOME }}/image/build/install/screens/
           ${{ env.GUEST_HOME }}/image/build/install/qemu.log
-        if-no-files-found: warn
+        if-no-files-found: ignore

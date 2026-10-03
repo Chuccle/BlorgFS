@@ -1,0 +1,88 @@
+name: Guest session
+
+# Acting in the test guest from a remote Claude Code or Codex session that
+# has no KVM of its own: dispatch this with a bash script, and it runs
+# against a live guest with the package installed, B: mounted and the
+# server answering. Manual only -- it never runs on a push or PR and gates
+# nothing; the CI verdict is guest-runtime.yml's, which takes no commands.
+#
+#   gh workflow run guest-session.yml -f session='guestctl ssh "dir B:\"'
+#
+# The transcript comes back in the job log, the step summary, a
+# "blorg guest-session" check annotation, and the guest-session artifact.
+# See ci/guest/run-session.sh, and "Cloud test guest" in AGENTS.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      session:
+        description: 'bash run against the live guest, with guestctl on PATH and $SESSION_OUT for files to return'
+        required: true
+        default: '. ci/guest/session-probe.sh'
+      package_run_id:
+        description: 'Build BlorgFS run to take the package from (default: newest with one)'
+        required: false
+        default: ''
+      verifier:
+        description: 'Driver Verifier on BlorgFS.sys'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    name: Guest session (KVM)
+    env:
+      GUEST_HOME: /mnt/blorgfs-guest
+      PACKAGE_ARTIFACT: blorg-package-windows-x64
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Check out the schemas submodule
+      continue-on-error: true
+      run: git submodule update --init third_party/schemas
+
+    - name: Set up the KVM host
+      id: host
+      uses: ./ci/guest
+      with:
+        package-run-id: ${{ inputs.package_run_id }}
+        save-image: 'true'
+
+    # The same run as guest-runtime.yml, left up (--keep) for the session.
+    - name: Bring up the guest with the package
+      if: steps.host.outputs.found == 'true'
+      continue-on-error: true
+      run: |
+        args=(--package package --out guest-results --keep)
+        [[ "${{ inputs.verifier }}" == "false" ]] && args+=(--no-verifier)
+        [[ -d tests/guest-suites ]] && args+=(--suites tests/guest-suites)
+        ci/guest/run-guest-tests.sh "${args[@]}"
+
+    - name: Session
+      env:
+        SESSION: ${{ inputs.session }}
+      run: |
+        printf '%s\n' "$SESSION" > "$RUNNER_TEMP/session.sh"
+        ci/guest/run-session.sh --out guest-results "$RUNNER_TEMP/session.sh"
+
+    - name: Power off the guest
+      if: always()
+      run: ci/guest/host/guestctl down || true
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: guest-session
+        path: guest-results/
+        if-no-files-found: warn

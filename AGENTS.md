@@ -385,7 +385,7 @@ test directory.
 
 ## Continuous integration
 
-Four workflows, split by what a failure should cost you.
+Five workflows, split by what a failure should cost you.
 
 | Workflow | Runs on | What it does |
 |---|---|---|
@@ -393,6 +393,7 @@ Four workflows, split by what a failure should cost you.
 | `verify.yml` | 03:00 UTC daily, or on demand | CBMC proofs and extended fuzz/interleaving runs. |
 | `codeql.yml` | Saturdays 23:41 UTC, on demand, and on any PR touching its own config | CodeQL with the pinned Microsoft driver query packs. |
 | `guest-runtime.yml` | after every successful build, on PRs touching `ci/guest/`, on demand | Loads the built package into a Windows guest under KVM and runs the runtime tests. See [Cloud test guest](#cloud-test-guest). |
+| `guest-session.yml` | on demand only | Runs a remote session's script against a live guest. Gates nothing. |
 
 The daily and weekly ones are deliberately not gates: a CBMC regression or
 a new CodeQL finding is worth waking up to, not worth blocking a merge that
@@ -681,6 +682,7 @@ guest without a human.
 
 ```
 ci/guest/
+  action.yml                  CI host setup shared by the two workflows
   image/build-image.sh        golden Windows image, unattended, once per host
   image/Setup-GoldenImage.ps1   (runs in the guest during that build)
   host/guestctl               the control CLI: boot, ssh, push/pull, reboot,
@@ -776,17 +778,20 @@ golden image. Inline `guestctl ssh` commands pass through Windows argv
 parsing on the way to `powershell.exe -c`, which mangles double quotes: use
 single quotes inline, or `guestctl ps` for anything longer than a line.
 
-**From an agent with no KVM of its own** (a cloud session, say), dispatch
-`guest-runtime.yml` with a `session` input: bash that runs against the live
-guest after the tests, with `guestctl` on `PATH` and `$SESSION_OUT` for
-files to bring back. The `guest-results` artifact then holds
-`session/transcript.txt` (every command echoed, with its output) and
-whatever the script wrote to `$SESSION_OUT`, alongside the test results.
-`ci/guest/session-probe.sh` is a worked example that uses every channel
-once; PRs touching the rig run it. For example:
+**From a remote Claude Code or Codex session with no KVM of its own**,
+dispatch `guest-session.yml` with a `session` input: bash that runs against
+a live guest with the package installed, with `guestctl` on `PATH` and
+`$SESSION_OUT` for files to bring back. It is manual only and gates
+nothing; CI's verdict comes from `guest-runtime.yml`, which takes no
+commands. The transcript (every command echoed, with its output) comes back
+in the job log, the step summary and a `blorg guest-session` check
+annotation; the `guest-session` artifact also holds whatever the script
+wrote to `$SESSION_OUT`. `ci/guest/session-probe.sh` is a worked example
+that uses every channel once (the input's default); PRs touching the rig
+run it as a fixed check. For example:
 
 ```bash
-gh workflow run guest-runtime.yml -f session='
+gh workflow run guest-session.yml -f session='
 guestctl ssh "Get-Service BlorgFS"
 guestctl pull C:/Windows/INF/setupapi.dev.log "$SESSION_OUT/"
 guestctl screenshot "$SESSION_OUT/screen.png"'
@@ -800,8 +805,9 @@ reboot or a revert, because `sc stop BlorgFS` wedges in `STOP_PENDING`.
 ### The golden image
 
 Windows Server 2022 Standard **Server Core**, from Microsoft's public
-180-day evaluation ISO (override with `WINDOWS_ISO_URL`; pin with
-`WINDOWS_ISO_SHA256`). Built unattended: `autounattend.xml` on a generated
+180-day evaluation ISO (override with `WINDOWS_ISO_URL`). Every input (the
+ISO, virtio-win, the OpenSSH zip) is pinned by SHA-256 in `build-image.sh`,
+so one recipe always builds from the same bytes. Built unattended: `autounattend.xml` on a generated
 config ISO, then `Setup-GoldenImage.ps1` on first logon installs OpenSSH
 (from the Win32-OpenSSH release zip, since Server Core's own capability
 needs Windows Update), the QEMU guest agent (from the virtio-win ISO), turns
@@ -828,10 +834,14 @@ only opens a guest bound to the runner's loopback.
 
 `guest-runtime.yml` runs after every successful `Build BlorgFS` run, on the
 package that run produced; on PRs touching the rig, against the newest
-package available; and on demand (`package_run_id`, `verifier`). The guest
-runs on the stock `ubuntu-latest` runner, which exposes KVM. It uploads
-`guest-results` (results, logs, diagnostics, screenshot, and the image
-build's screenshots if the image was built). It needs no secrets.
+package from that branch or master; and on demand (`package_run_id`,
+`verifier`). It is a fixed test: the shipped package, an image from pinned
+inputs, the suites in the commit, no commands from outside it. The verdict
+is a `blorg guest-verdict` check annotation and `guest-results/verdict.txt`.
+Runs queue rather than cancel, so an image build is never thrown away. The
+guest runs on the stock `ubuntu-latest` runner, which exposes KVM. It
+uploads `guest-results` (results, logs, diagnostics, screenshot), and the
+image build's screens if a run fails. It needs no secrets.
 
 ### A host that outlives a CI job
 
