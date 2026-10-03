@@ -107,7 +107,7 @@ setup_flatcc() {
     note "building flatcc (driver-side schema compiler)"
     cmake -S "$REPO/third_party/flatcc" -B "$CACHE/flatcc-build" -DCMAKE_BUILD_TYPE=Release \
         -DFLATCC_TEST=OFF ${BLORG_CMAKE_GENERATOR:+-G "$BLORG_CMAKE_GENERATOR"} >/dev/null &&
-    cmake --build "$CACHE/flatcc-build" -j"$(nproc)" >/dev/null
+    cmake --build "$CACHE/flatcc-build" -j"$(nproc)" >/dev/null 2>&1
 }
 
 # The same codegen build.yml runs, so the driver sources see the same headers.
@@ -136,7 +136,7 @@ setup_flatc() {
     note "building flatc (server-side schema compiler)"
     cmake -S "$srv/buildtools/flatbuffers" -B "$CACHE/flatc-build" -DCMAKE_BUILD_TYPE=Release \
         -DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATLIB=OFF -DFLATBUFFERS_BUILD_FLATHASH=OFF >/dev/null &&
-    cmake --build "$CACHE/flatc-build" --target flatc -j"$(nproc)" >/dev/null || return 1
+    cmake --build "$CACHE/flatc-build" --target flatc -j"$(nproc)" >/dev/null 2>&1 || return 1
     mkdir -p "$CACHE/flatc"
     cp "$CACHE/flatc-build/flatc" "$CACHE/flatc/flatc"
     echo "$rev" > "$CACHE/flatc/.rev"
