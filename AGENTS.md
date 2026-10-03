@@ -28,6 +28,7 @@ occasionally, not every session.
 | [Documentation discipline](#documentation-discipline) | Where findings go, and how to keep docs from going stale |
 | [Conventions](#conventions) | Naming, style, and hard rules |
 | [Build and test tiers](#build-and-test-tiers) | How to build and run the regression tiers |
+| [Remote agents: building, deploying and testing from Linux](#remote-agents-building-deploying-and-testing-from-linux) | `tools/agent/blorg`: what a Linux cloud session can check locally, and how it reaches a Windows build and a real kernel |
 | [Continuous integration](#continuous-integration) | What each CI workflow gates |
 | [Sanitizers](#sanitizers) | ASan/KASAN requirements |
 | [Deploying to a VM](#deploying-to-a-vm) | The deploy pipeline and its quirks |
@@ -48,6 +49,7 @@ a task needs it.
 | Do this | Command | Detail |
 |---|---|---|
 | Build + test (default gate) | `powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Fast` | [Build and test tiers](#build-and-test-tiers) |
+| From a Linux session: quick compile check, then Windows build + guest tests | `tools/agent/blorg check`, then `tools/agent/blorg ci remote` | [Remote agents](#remote-agents-building-deploying-and-testing-from-linux) |
 | Deploy to the dev VM | `.\deploy\Deploy-ToVM.ps1 -Configuration Release` | [Deploying to a VM](#deploying-to-a-vm) |
 | Benchmark (Release, Verifier off) | `powershell -File deploy/Deploy-ToVM.ps1 -ForBenchmark` | [Measuring performance](#measuring-performance) |
 | Accept new perf baseline | `powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Perf -PerfFile <path> -UpdateBaseline` | [Measuring performance](#measuring-performance) |
@@ -455,6 +457,103 @@ A deadlocked schedule drains its parked threads serially through the baton
 rather than releasing them all at once, so an abandoned run exits cleanly
 instead of corrupting every replay after it. `SchedulerAudit` in
 `NodeTableSchedTest.cpp` pins both properties.
+
+## Remote agents: building, deploying and testing from Linux
+
+A cloud agent session (Claude Code on the web, Codex, any Linux container)
+has no MSVC, no WDK and, usually, no `/dev/kvm`. `tools/agent/blorg` is the
+one entrypoint that gets such a session as close to Windows as it can, and
+says plainly where each check really runs. `blorg doctor` reports what the
+current session can reach; `blorg help` lists every command.
+
+| Where | Command | What it proves | Needs |
+|---|---|---|---|
+| This Linux session | `tools/agent/blorg check` | The driver compiles (every `ClCompile` in `BlorgFS.vcxproj`, clang against the WDK's own kernel headers), schema pins agree, server-rs tests + clippy pass, server-rs type-checks for `x86_64-pc-windows-msvc` | clang, cmake, cargo, nuget.org |
+| GitHub-hosted Windows | `tools/agent/blorg ci remote` | The real MSVC/PREfast build and `Invoke-BlorgChecks` tier, then the package in a real Windows kernel (guest runtime tests) | A GitHub token that can dispatch workflows |
+| GitHub, full CI | `tools/agent/blorg ci build`, then `ci guest` | Exactly what a PR gets: `build.yml`'s matrix and package, then `guest-runtime.yml` on it | as above |
+| The KVM host | `tools/agent/blorg win build`, `win test` | Same as `ci remote`, but incremental in a persistent build VM: minutes, not a clean runner each time | `/dev/kvm` here, `BLORG_KVM_SSH=user@host`, or `ci remote --runner kvm` |
+
+**The Linux tier is not the gate.** It catches what a compile catches —
+typos, undeclared or misused kernel APIs, type errors, header breakage — in
+seconds, from the WDK/SDK NuGet packages pinned in `src/packages.config`
+and with the defines and include paths read out of `BlorgFS.vcxproj`. It
+does not run PREfast, does not link, does not run the usermode sandbox
+suites, and clang's diagnostics are not cl's. Use it to iterate; before
+calling a change done, get `-Tier Fast` from a Windows build (`ci remote`,
+`win build`, or a PR's `build.yml`).
+
+**Getting results back without a token.** A Claude Code session on the
+web pushes through its own git credential and drives GitHub through the
+GitHub MCP tools; `gh` may or may not be authenticated. Pushing the branch
+is always enough: `build.yml` builds it and `guest-runtime.yml` tests every
+successful build. `actions_run_trigger` (workflow `agent-remote.yml`,
+inputs `action`, `tier`, `runner`) and `get_job_logs` are the MCP
+equivalents of `blorg ci remote`. Any other environment sets
+`BLORG_GH_TOKEN` to a fine-grained token on this repository with Actions
+read/write and Contents read.
+
+**server-rs from here.** `blorg` finds server-rs as `third_party/server-rs`
+(the package pin) or a sibling checkout `../server-rs`. It builds `flatc`
+from server-rs's own pinned flatbuffers (the generated Rust must match the
+crate) into `~/.cache/blorg`. `blorg server-exe` produces a Windows
+`server-rs.exe`: with `cargo-xwin` (the MSVC target, as shipped) when the
+session can reach Microsoft's download CDN, otherwise with mingw-w64 —
+fine for iterating, but the package always ships the MSVC build from CI.
+Cloud sessions typically run as root, which defeats permission-based tests;
+server-rs's `test_permission_denied` detects that and says so instead of
+failing.
+
+### Setting up a session
+
+`tools/agent/session-start.sh` warms everything `blorg check` needs
+(roughly 270 MB of WDK/SDK headers, flatcc, flatc) and prints `doctor`.
+Put `bash BlorgFS/tools/agent/session-start.sh` (path relative to where the
+environment clones the repo) in the agent environment's setup script —
+Claude Code on the web and Codex cloud both have one. Nothing depends on
+it having run: each command fetches what it is missing.
+
+NuGet's CDN drops long HTTP/2 downloads through some egress proxies, so
+`blorg` fetches packages over HTTP/1.1. If `aka.ms` and
+`download.visualstudio.microsoft.com` are blocked by the session's network
+policy, `cargo-xwin` cannot fetch the MSVC CRT and `server-exe` falls back
+to mingw.
+
+### The build VM
+
+The test guest (see the cloud test guest section) is deliberately
+toolchain-free. The build VM is a second guest on the same KVM host, booted
+from a *layer* — a qcow2 overlay on the golden image with VS Build Tools
+(C++ x64 + Spectre libraries), CMake, nuget.exe, MinGit and rustup added by
+`ci/agent/build-vm/Install-BuildToolchain.ps1`. The golden image is never
+written, so the test guest keeps testing exactly what CI ships. The WDK is
+not installed in the layer; it comes from NuGet, as in `build.yml`.
+
+- `ci/agent/host/setup-kvm-host.sh` prepares a host once: QEMU, the golden
+  image, the layer (`ci/agent/build-vm/build-layer.sh`, rebuild it with
+  `--force` whenever the golden image is rebuilt) and, with
+  `--runner-token`, a self-hosted Actions runner labelled `blorg-kvm`.
+- `blorg win build` ships the working tree, including uncommitted and
+  untracked files and the git metadata the package script reads, into the
+  build VM's persistent checkout (`C:\src\BlorgFS`) and runs
+  `ci/agent/build-vm/Invoke-GuestBuild.ps1`: flatcc codegen, NuGet restore,
+  `Invoke-BlorgChecks.ps1 -Tier <tier>`, then — once the package tooling
+  is on the branch — the driver in solution layout, server-rs with cargo,
+  and `New-BlorgPackage.ps1`. Results land in `out/win/`
+  (`build-summary.txt`, `logs/`) and the package in `out/package/`.
+- `blorg win test` hands `out/package` to `ci/guest/run-guest-tests.sh`,
+  i.e. a fresh test guest; results in `out/guest-results/`.
+- The build VM listens on host port 2223 (test guest: 2222), keeps 8 GB by
+  default (`BLORG_BUILD_MEM_MB`), and survives between builds; `blorg win
+  up --fresh` discards it.
+- A file deleted on the host is not deleted in the build VM's checkout.
+  MSBuild compiles only what the project lists, so this is harmless unless
+  a stale header shadows a moved one.
+
+BlorgFS is public. A self-hosted runner on a public repository runs any
+workflow a branch or fork PR points at it, so register one only with
+"Require approval for all external contributors" set under
+Settings > Actions > General, and keep that host for this rig alone.
+`agent-remote.yml` only sends work to `blorg-kvm` from `workflow_dispatch`.
 
 ## Deploying to a VM
 

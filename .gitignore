@@ -389,3 +389,6 @@ FodyWeavers.xsd
 blorgfs.env
 deploy/blorgfs.env
 .env
+
+# tools/agent/blorg results (build VM output, packages, CI downloads)
+/out/

@@ -1,0 +1,181 @@
+name: Agent remote build
+
+# The Windows end of tools/agent/blorg, for coding agents (and people)
+# working from a Linux session that cannot run MSVC or the WDK. An agent
+# dispatches this with `blorg ci remote` (or the GitHub API/MCP directly)
+# and reads the results back; see "Remote agents" in AGENTS.md.
+#
+#   runner=hosted  a GitHub-hosted Windows runner: a clean build of the ref
+#                  with ci/agent/build-vm/Invoke-GuestBuild.ps1. Its package
+#                  is uploaded under the same name build.yml uses, so
+#                  `blorg ci guest --package-run <this run>` tests it.
+#   runner=kvm     the self-hosted KVM host (label blorg-kvm, set up with
+#                  ci/agent/host/setup-kvm-host.sh): an incremental build in
+#                  the persistent build VM, then, for build-test, the guest
+#                  runtime tests on that package, all on one machine.
+#
+# On pull requests it runs only the parts that need no secrets or special
+# hardware -- the Linux tier and a hosted Build-tier pass -- so a change to
+# this tooling is tested by the tooling.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'build, or build-test (kvm: also run the guest tests here)'
+        type: choice
+        options: [ build, build-test ]
+        default: build-test
+      tier:
+        description: 'Invoke-BlorgChecks.ps1 tier'
+        type: choice
+        options: [ Build, Fast, Proof, All ]
+        default: Fast
+      runner:
+        description: 'hosted (GitHub Windows runner) or kvm (self-hosted blorg-kvm host)'
+        type: choice
+        options: [ hosted, kvm ]
+        default: hosted
+  # Changes to this tooling, or to what its driver check reads.
+  pull_request:
+    branches: [ master ]
+    paths:
+      - 'tools/agent/**'
+      - 'ci/agent/**'
+      - 'src/BlorgFS.vcxproj'
+      - 'src/packages.config'
+      - '.github/workflows/agent-remote.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  # The Linux tier agents run locally: the driver compiled against the real
+  # WDK headers with clang, schema pins, and server-rs when it is pinned
+  # here. It reads its flags from BlorgFS.vcxproj, so a project change
+  # re-runs it.
+  linux-tier:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: Linux tier (blorg check)
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+
+    - name: Cache blorg downloads and builds
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/blorg
+        key: blorg-linux-${{ hashFiles('src/packages.config') }}-${{ hashFiles('.gitmodules') }}
+
+    - name: Run the Linux tier
+      run: tools/agent/blorg check
+
+  hosted:
+    if: github.event_name == 'pull_request' || inputs.runner == 'hosted'
+    runs-on: windows-latest
+    name: Windows build (hosted)
+    timeout-minutes: 120
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      shell: pwsh
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
+
+    - name: Checkout repository and submodules
+      uses: actions/checkout@v6
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+        submodules: recursive
+
+    - name: Cache NuGet packages
+      uses: actions/cache@v5
+      with:
+        path: ./packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+
+    # A PR checks that the script works, at the cheapest tier.
+    - name: Build, check and package
+      shell: pwsh
+      env:
+        TIER: ${{ github.event_name == 'pull_request' && 'Build' || inputs.tier }}
+      run: |
+        powershell -NoProfile -ExecutionPolicy Bypass -File ci/agent/build-vm/Invoke-GuestBuild.ps1 `
+          -Source . -Tier $env:TIER -OutDir agent-out
+        exit $LASTEXITCODE
+
+    - name: Summary
+      if: always()
+      shell: pwsh
+      run: |
+        if (Test-Path agent-out\build-summary.txt) {
+          "## Agent remote build (hosted)`n`n``````n$(Get-Content agent-out\build-summary.txt -Raw)``````" >> $env:GITHUB_STEP_SUMMARY
+        }
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: agent-build
+        path: |
+          agent-out/build-summary.txt
+          agent-out/logs/
+        if-no-files-found: warn
+
+    # Same name as build.yml's, so guest-runtime.yml takes it by run id.
+    - name: Upload package
+      if: success() && hashFiles('agent-out/package/manifest.json') != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: blorg-package-windows-x64
+        path: agent-out/package/
+
+  kvm:
+    if: github.event_name == 'workflow_dispatch' && inputs.runner == 'kvm'
+    runs-on: [ self-hosted, blorg-kvm ]
+    name: Build VM + guest (KVM host)
+    timeout-minutes: 240
+    # One build VM and one test guest per host.
+    concurrency:
+      group: blorg-kvm-host
+      cancel-in-progress: false
+    steps:
+    - name: Checkout repository and submodules
+      uses: actions/checkout@v6
+      with:
+        token: ${{ secrets.GH_PAT }}
+        submodules: recursive
+
+    - name: Build in the build VM
+      run: tools/agent/blorg win build --tier "${{ inputs.tier }}"
+
+    - name: Test in a fresh guest
+      if: inputs.action == 'build-test'
+      run: tools/agent/blorg win test
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: agent-kvm-results
+        path: |
+          out/win/build-summary.txt
+          out/win/logs/
+          out/guest-results/
+        if-no-files-found: warn
+
+    - name: Upload package
+      if: always() && hashFiles('out/package/manifest.json') != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: blorg-package-windows-x64
+        path: out/package/
