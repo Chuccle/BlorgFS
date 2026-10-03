@@ -431,9 +431,11 @@ each red alone. A schema change therefore lands as: schemas first, then
 server-rs adopting it, then one BlorgFS PR moving both pins.
 
 **What the package is.** `build.yml`'s `server` job runs
-`tools/Build-BlorgServer.ps1`, which builds server-rs from the pinned
-commit (flatc built from server-rs's own `buildtools/flatbuffers`, then
-`cargo build --release --locked`), and the `package` job runs
+`tools/Build-BlorgServer.ps1` once per platform, building server-rs from
+the pinned commit (flatc built from server-rs's own
+`buildtools/flatbuffers`, then `cargo build --release --locked`) as a static
+`x86_64-unknown-linux-musl` binary and an `x86_64-pc-windows-msvc` one, and
+the `package` job runs
 `tools/New-BlorgPackage.ps1` over that and the Release driver build. Those
 two scripts are the only recipe: anything else that needs a package should
 dispatch `build.yml` (it takes `workflow_dispatch` on any ref, with an
@@ -445,12 +447,17 @@ manifest.json   version, and the blorgfs / server_rs / schemas commits,
                 signer thumbprint, SHA-256 of every file
 driver/         BlorgFS.sys, BlorgFS.inf, BlorgFS.cat, BlorgFS.cer,
                 Install-BlorgFS.ps1, Uninstall-BlorgFS.ps1
-server/         server-rs.exe
+server/         linux-x64/server-rs        where the backend really runs
+                windows-x64/server-rs.exe  single-machine fallback
 ```
 
 It is uploaded as **`blorg-package-windows-x64`** -- a fixed name, so test
 infrastructure can fetch the latest package without knowing the version.
-`driver\Install-BlorgFS.ps1` runs as is from the unpacked artifact. The INF
+`driver\Install-BlorgFS.ps1` runs as is from the unpacked artifact.
+Artifact and release zips drop the Unix executable bit, so `chmod +x
+server/linux-x64/server-rs` after unpacking. The Linux build is the one to
+test against: the Windows one runs on loopback beside the driver, on a
+case-insensitive filesystem, which hides real-deployment behaviour. The INF
 is the staged one from `x64\Release\BlorgFS\` (see "Deploying to a VM" for
 why the root INF does not match the catalog), and on Windows the script
 checks that the `.sys` and `.cat` are signed by the packaged `.cer`.

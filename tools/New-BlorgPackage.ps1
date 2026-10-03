@@ -4,14 +4,20 @@
 
 .DESCRIPTION
     The package is what a test guest (or a person) installs: the test-signed
-    driver as an installable unit, the server binary built from the
-    server-rs commit this repo pins, and a manifest.json that says exactly
-    which commits went in. Layout:
+    driver as an installable unit, the server built from the server-rs
+    commit this repo pins, and a manifest.json that says exactly which
+    commits went in. Layout:
 
         manifest.json
         driver\BlorgFS.sys, BlorgFS.inf, BlorgFS.cat, BlorgFS.cer,
                Install-BlorgFS.ps1, Uninstall-BlorgFS.ps1
-        server\server-rs.exe
+        server\linux-x64\server-rs        static (musl); the real deployment
+        server\windows-x64\server-rs.exe  for running beside the driver
+
+    The server is shipped for both platforms because the backend normally
+    runs on Linux while the driver runs on Windows; the Windows build is the
+    fallback for a single-machine setup. Artifact zips drop the Unix
+    executable bit, so `chmod +x` the Linux binary after unpacking.
 
     driver\ is self-contained: Install-BlorgFS.ps1 defaults to the INF and
     cert next to itself, so `driver\Install-BlorgFS.ps1` works as is.
@@ -27,8 +33,9 @@
     an install against a mismatched cert fails in the guest with a far less
     useful error.
 
-.PARAMETER ServerExe
-    The built server-rs binary to include.
+.PARAMETER ServerDir
+    Built servers, one subdirectory per platform (linux-x64, windows-x64),
+    each as tools\Build-BlorgServer.ps1 left it. Both are required.
 
 .PARAMETER OutDir
     Directory to assemble into. Created; must not already contain a package.
@@ -43,11 +50,10 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string]$ServerExe,
+    [Parameter(Mandatory)][string]$ServerDir,
     [Parameter(Mandatory)][string]$OutDir,
     [ValidateSet("Release", "Debug")][string]$Configuration = "Release",
     [ValidateSet("x64")][string]$Platform = "x64",
-    [string]$ServerTarget = "x86_64-pc-windows-msvc",
     [switch]$Release,
     [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent)
 )
@@ -98,8 +104,19 @@ foreach ($script in @("Install-BlorgFS.ps1", "Uninstall-BlorgFS.ps1")) {
     Copy-Item (Join-Path $RepoRoot "deploy/$script") (Join-Path $driverOut $script)
 }
 
-if (-not (Test-Path $ServerExe)) { throw "Server binary not found at '$ServerExe'" }
-Copy-Item $ServerExe (Join-Path $serverOut (Split-Path $ServerExe -Leaf))
+# Platform directory -> the Rust target and binary name build.yml builds.
+$serverPlatforms = [ordered]@{
+    "linux-x64"   = @{ target = "x86_64-unknown-linux-musl"; binary = "server-rs" }
+    "windows-x64" = @{ target = "x86_64-pc-windows-msvc"; binary = "server-rs.exe" }
+}
+$serverTargets = [ordered]@{}
+foreach ($serverPlatform in $serverPlatforms.Keys) {
+    $binary = Join-Path $ServerDir "$serverPlatform/$($serverPlatforms[$serverPlatform].binary)"
+    if (-not (Test-Path $binary)) { throw "Server binary for $serverPlatform not found at '$binary'" }
+    $dest = New-Item -ItemType Directory -Path (Join-Path $serverOut $serverPlatform)
+    Copy-Item $binary $dest
+    $serverTargets[$serverPlatform] = $serverPlatforms[$serverPlatform].target
+}
 
 $signer = $null
 if ($IsWindows -or $env:OS -eq "Windows_NT") {
@@ -130,7 +147,7 @@ $manifest = [ordered]@{
     version    = $version
     components = [ordered]@{
         blorgfs   = [ordered]@{ commit = $blorgCommit; configuration = $Configuration; platform = $Platform; signing = "test"; signer = $signer }
-        server_rs = [ordered]@{ commit = $pins.ServerRs; version = $serverCrateVersion; target = $ServerTarget }
+        server_rs = [ordered]@{ commit = $pins.ServerRs; version = $serverCrateVersion; targets = $serverTargets }
         schemas   = [ordered]@{ commit = $pins.DriverSchemas }
     }
     files      = $files

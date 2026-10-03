@@ -20,11 +20,19 @@
     Copies the binary (and its .pdb on Windows) into OutDir and returns the
     binary's path.
 
+    flatc always runs on the build machine, so it is built for the host;
+    only cargo cross-compiles, when -Target is given.
+
 .PARAMETER ServerRoot
     The server-rs checkout, with submodules. Defaults to third_party/server-rs.
 
 .PARAMETER FlatcDir
     Where flatc lives, or is built into if missing.
+
+.PARAMETER Target
+    Rust target triple to build for. Defaults to the host. The package's
+    Linux server is x86_64-unknown-linux-musl: static, so it runs on any
+    distribution (needs musl-tools on the build machine).
 
 .PARAMETER OutDir
     Where to copy the built binary.
@@ -33,6 +41,7 @@
 param(
     [string]$ServerRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) "third_party/server-rs"),
     [string]$FlatcDir = (Join-Path ([System.IO.Path]::GetTempPath()) "blorg-flatc"),
+    [string]$Target,
     [Parameter(Mandatory)][string]$OutDir
 )
 
@@ -40,6 +49,8 @@ $ErrorActionPreference = "Stop"
 
 $onWindows = $IsWindows -or $env:OS -eq "Windows_NT"
 $exe = if ($onWindows) { ".exe" } else { "" }
+# The binary's suffix follows the target, flatc's follows the host.
+$targetExe = if ($Target) { if ($Target -like "*-windows-*") { ".exe" } else { "" } } else { $exe }
 
 $flatbuffers = Join-Path $ServerRoot "buildtools/flatbuffers"
 if (-not (Test-Path (Join-Path $flatbuffers "CMakeLists.txt"))) {
@@ -73,17 +84,24 @@ if (Test-Path $flatc) {
 # different version cannot be the one that runs.
 $env:PATH = "$FlatcDir$([System.IO.Path]::PathSeparator)$env:PATH"
 
-Write-Host "==> cargo build --release --locked in $ServerRoot"
+$cargoArgs = @("build", "--release", "--locked")
+if ($Target) {
+    rustup target add $Target | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "rustup target add $Target failed with exit code $LASTEXITCODE" }
+    $cargoArgs += @("--target", $Target)
+}
+
+Write-Host "==> cargo $($cargoArgs -join ' ') in $ServerRoot"
 Push-Location $ServerRoot
 try {
-    cargo build --release --locked | Out-Host
+    cargo @cargoArgs | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
 }
 
-$release = Join-Path $ServerRoot "target/release"
-$binary = Join-Path $release "server-rs$exe"
+$release = if ($Target) { Join-Path $ServerRoot "target/$Target/release" } else { Join-Path $ServerRoot "target/release" }
+$binary = Join-Path $release "server-rs$targetExe"
 if (-not (Test-Path $binary)) { throw "cargo reported success but $binary is missing" }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null

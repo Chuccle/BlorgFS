@@ -56,7 +56,8 @@ BlorgFS ships together with its backend,
 [server-rs](https://github.com/Chuccle/server-rs), pinned as the
 `third_party/server-rs` submodule. `build.yml` builds both and publishes one
 package as the `blorg-package-windows-x64` artifact: the test-signed driver
-with its install scripts, `server-rs.exe`, and a `manifest.json` recording
+with its install scripts, server-rs for Linux and Windows, and a
+`manifest.json` recording
 the version and the exact commits. CI fails if the driver and the pinned
 server compile different schemas. A `v*` tag matching `VERSION` publishes the
 same package as a GitHub release. Details in AGENTS.md.

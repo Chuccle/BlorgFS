@@ -367,9 +367,22 @@ jobs:
       shell: pwsh
       run: ./tools/Test-BlorgPackagePins.ps1 | Out-Null
 
+  # The server, for both platforms the package ships: Linux is where the
+  # backend actually runs (static musl, so any distribution), Windows is the
+  # single-machine fallback beside the driver. Both are built by the same
+  # script from the same pin.
   server:
-    runs-on: windows-latest
-    name: Build server-rs (windows x64)
+    strategy:
+      matrix:
+        include:
+          - platform: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - platform: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    name: Build server-rs (${{ matrix.platform }})
 
     steps:
     - name: Detect if Dependabot
@@ -393,10 +406,9 @@ jobs:
       run: echo "flatc_hash=$(git -C third_party/server-rs/buildtools/flatbuffers rev-parse HEAD)" >> $env:GITHUB_OUTPUT
 
     - name: Cache flatc build
-      id: cache_flatc
       uses: actions/cache@v5
       with:
-        path: ${{ runner.temp }}\flatc
+        path: ${{ runner.temp }}/flatc
         key: ${{ runner.os }}-flatc-${{ steps.flatc_hash.outputs.flatc_hash }}
 
     - name: Cache cargo registry and build
@@ -407,19 +419,26 @@ jobs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           third_party/server-rs/target/
-        key: ${{ runner.os }}-server-cargo-${{ hashFiles('third_party/server-rs/Cargo.lock') }}
+        key: ${{ runner.os }}-${{ matrix.target }}-server-cargo-${{ hashFiles('third_party/server-rs/Cargo.lock') }}
+
+    - name: Install musl tools
+      if: matrix.platform == 'linux-x64'
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
 
     # The one recipe for the server (flatc from server-rs's own submodule,
     # then cargo --locked). Anything else that builds a package should call
     # this script too, so every package's server is built the same way.
     - name: Build server-rs
       shell: pwsh
-      run: ./tools/Build-BlorgServer.ps1 -FlatcDir "$env:RUNNER_TEMP\flatc" -OutDir "$env:RUNNER_TEMP\server-bin"
+      run: |
+        ./tools/Build-BlorgServer.ps1 -Target ${{ matrix.target }} `
+          -FlatcDir (Join-Path $env:RUNNER_TEMP 'flatc') `
+          -OutDir (Join-Path $env:RUNNER_TEMP 'server-bin')
 
     - name: Upload server binary
       uses: actions/upload-artifact@v7
       with:
-        name: server-rs-windows-x64
+        name: server-rs-${{ matrix.platform }}
         path: ${{ runner.temp }}/server-bin/
         if-no-files-found: error
 
@@ -453,11 +472,18 @@ jobs:
         name: BlorgFS-Release-x64
         path: ${{ github.workspace }}
 
-    - name: Download server build
+    # One directory per platform, the layout New-BlorgPackage.ps1 expects.
+    - name: Download Linux server build
+      uses: actions/download-artifact@v5
+      with:
+        name: server-rs-linux-x64
+        path: ${{ runner.temp }}/server-bin/linux-x64
+
+    - name: Download Windows server build
       uses: actions/download-artifact@v5
       with:
         name: server-rs-windows-x64
-        path: ${{ runner.temp }}\server-bin
+        path: ${{ runner.temp }}/server-bin/windows-x64
 
     - name: Assemble package
       id: package
@@ -471,7 +497,7 @@ jobs:
           $release = $true
         }
         $version = ./tools/New-BlorgPackage.ps1 `
-          -ServerExe (Join-Path $env:RUNNER_TEMP 'server-bin\server-rs.exe') `
+          -ServerDir (Join-Path $env:RUNNER_TEMP 'server-bin') `
           -OutDir package -Release:$release
         echo "version=$version" >> $env:GITHUB_OUTPUT
         Get-Content package\manifest.json
@@ -494,5 +520,5 @@ jobs:
         $ErrorActionPreference = 'Stop'
         $zip = "blorg-${{ steps.package.outputs.version }}-windows-x64.zip"
         Compress-Archive -Path package\* -DestinationPath $zip
-        gh release create $env:GITHUB_REF_NAME $zip package\manifest.json --title "blorg $env:GITHUB_REF_NAME" --notes "Test-signed driver and server-rs, built together. See manifest.json for the exact commits."
+        gh release create $env:GITHUB_REF_NAME $zip package\manifest.json --title "blorg $env:GITHUB_REF_NAME" --notes "Test-signed driver, and server-rs for Linux and Windows, built together. See manifest.json for the exact commits. Run chmod +x on server/linux-x64/server-rs after unpacking."
         if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
