@@ -7,8 +7,9 @@ name: Guest
 #   tools/blorg guest test --package <unpacked artifact>
 # See "Package and test guest" in AGENTS.md.
 #
-# build.yml calls this as its last job, on the package it just built, so
-# every push and PR is tested in the guest. Dispatch it directly to test an
+# build.yml calls this alongside its build jobs: the guest boots while the
+# driver builds, then tests the package that run produces, so every push
+# and PR is tested in the guest. Dispatch it directly to test an
 # existing build's package again, optionally running a `script` against
 # the guest afterwards; the script never changes the verdict above it.
 
@@ -57,29 +58,6 @@ jobs:
       with:
         persist-credentials: false
 
-    # Called from build.yml: the package this run just built.
-    - name: Download this run's package
-      if: github.event_name != 'workflow_dispatch' && inputs.package_run_id == ''
-      uses: actions/download-artifact@v5
-      with:
-        name: ${{ env.PACKAGE_ARTIFACT }}
-        path: package
-
-    - name: Download an earlier build's package
-      if: github.event_name == 'workflow_dispatch' || inputs.package_run_id != ''
-      env:
-        GH_TOKEN: ${{ github.token }}
-        REPO: ${{ github.repository }}
-        RUN_ID: ${{ inputs.package_run_id }}
-      run: |
-        set -euo pipefail
-        if [[ -z "$RUN_ID" ]]; then
-          RUN_ID="$(gh run list -R "$REPO" -w build.yml --status success --branch "$GITHUB_REF_NAME" -L 1 --json databaseId --jq '.[0].databaseId')"
-          [[ -n "$RUN_ID" ]] || { echo "::error::no successful Build BlorgFS run on $GITHUB_REF_NAME"; exit 1; }
-        fi
-        echo "Testing the package from https://github.com/$REPO/actions/runs/$RUN_ID"
-        gh run download "$RUN_ID" -R "$REPO" -n "$PACKAGE_ARTIFACT" -D package
-
     - name: Prepare the KVM host
       run: |
         tools/blorg guest host-setup
@@ -122,12 +100,58 @@ jobs:
         path: ${{ env.GUEST_HOME }}/image
         key: ${{ steps.image.outputs.cache-primary-key }}
 
+    # The guest boots while build.yml is still building, so the boot costs
+    # nothing on the critical path. Called from build.yml, the package is
+    # this run's: wait for its Package job, then take the artifact.
+    - name: Boot the guest
+      run: tools/blorg guest up --fresh
+
+    - name: Wait for this run's package
+      if: github.event_name != 'workflow_dispatch' && inputs.package_run_id == ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        for _ in $(seq 1 360); do
+          state="$(gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+                   --jq '[.jobs[] | select(.name == "Package")][0] | "\(.status) \(.conclusion // "")"' || true)"
+          case "$state" in
+            "completed success") exit 0 ;;
+            completed*) echo "::error::the Package job finished '${state#completed }'; nothing to test"; exit 1 ;;
+          esac
+          sleep 10
+        done
+        echo "::error::no package after an hour"; exit 1
+
+    - name: Download this run's package
+      if: github.event_name != 'workflow_dispatch' && inputs.package_run_id == ''
+      uses: actions/download-artifact@v5
+      with:
+        name: ${{ env.PACKAGE_ARTIFACT }}
+        path: package
+
+    - name: Download an earlier build's package
+      if: github.event_name == 'workflow_dispatch' || inputs.package_run_id != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        RUN_ID: ${{ inputs.package_run_id }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$RUN_ID" ]]; then
+          RUN_ID="$(gh run list -R "$REPO" -w build.yml --status success --branch "$GITHUB_REF_NAME" -L 1 --json databaseId --jq '.[0].databaseId')"
+          [[ -n "$RUN_ID" ]] || { echo "::error::no successful Build BlorgFS run on $GITHUB_REF_NAME"; exit 1; }
+        fi
+        echo "Testing the package from https://github.com/$REPO/actions/runs/$RUN_ID"
+        gh run download "$RUN_ID" -R "$REPO" -n "$PACKAGE_ARTIFACT" -D package
+
     - name: Run the tests in the guest
       env:
         VERIFIER: ${{ inputs.verifier }}
       run: |
         # --keep: the self-test and any script below act on this guest.
-        args=(--package package --out guest-results --suites tests/guest-suites --keep)
+        args=(--package package --out guest-results --suites tests/guest-suites --booted --keep)
         [[ "$VERIFIER" == "false" ]] && args+=(--no-verifier)
         tools/blorg guest test "${args[@]}"
 

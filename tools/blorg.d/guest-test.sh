@@ -7,7 +7,7 @@
 #
 #   blorg guest test --package DIR [--out DIR] [--suites DIR]
 #                    [--server-bin PATH]
-#                    [--no-verifier] [--kernel-dump] [--keep]
+#                    [--no-verifier] [--kernel-dump] [--keep] [--booted]
 #
 #   --package DIR   the unpacked blorg-package-windows-x64 artifact
 #                   (manifest.json, driver/, server/)
@@ -21,6 +21,9 @@
 #   --kernel-dump   bring MEMORY.DMP back too after a bugcheck (large)
 #   --keep          leave the guest (and the host's server-rs) running
 #                   afterwards, to investigate with blorg guest ...
+#   --booted        use the guest already running instead of booting one:
+#                   for a guest just started with `blorg guest up --fresh`,
+#                   so the boot can overlap with fetching the package
 #
 # Exit: 0 pass, 1 fail (tests failed or the guest bugchecked), 2 the rig
 # itself broke before a verdict existed.
@@ -34,7 +37,7 @@
 
 guest_test() (
     set +e -uo pipefail
-package="" out="$PWD/guest-results" suites="" verifier=1 kernel_dump=0 keep=0
+package="" out="$PWD/guest-results" suites="" verifier=1 kernel_dump=0 keep=0 booted=0
 server_bin="" server_pid=""
 SERVER_PORT="${SERVER_PORT:-18080}"
 while (( $# )); do
@@ -46,6 +49,7 @@ while (( $# )); do
         --kernel-dump) kernel_dump=1; shift ;;
         --server-bin)  server_bin="$2"; shift 2 ;;
         --keep)        keep=1; shift ;;
+        --booted)      booted=1; shift ;;
         *) echo "blorg guest test: unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
@@ -124,8 +128,13 @@ done
 curl -fsS "http://127.0.0.1:$SERVER_PORT/healthcheck" >/dev/null || rig_fail "server-rs did not answer /healthcheck"
 endstep
 
-step "Booting a fresh guest"
-"$BLORG" guest up --fresh || rig_fail "guest did not boot"
+if (( booted )); then
+    step "Using the running guest"
+    "$BLORG" guest wait 600 || rig_fail "--booted, but no guest is answering"
+else
+    step "Booting a fresh guest"
+    "$BLORG" guest up --fresh || rig_fail "guest did not boot"
+fi
 endstep
 
 step "Deploying the bundle"

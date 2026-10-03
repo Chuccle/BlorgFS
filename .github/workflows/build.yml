@@ -51,6 +51,16 @@ jobs:
         token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
         submodules: recursive
 
+    # The handshake test's openssl takes over a minute to install. Start it
+    # now, in its own console, so it installs while the driver builds
+    # rather than after.
+    - name: Start installing openssl
+      if: matrix.config == 'Release'
+      shell: pwsh
+      run: |
+        $p = Start-Process choco -ArgumentList 'install', 'openssl', '-y', '--no-progress' -WindowStyle Hidden -PassThru
+        "OPENSSL_INSTALL_PID=$($p.Id)" >> $env:GITHUB_ENV
+
     - name: Get flatcc commit hash
       id: flatcc_hash
       shell: pwsh
@@ -247,6 +257,9 @@ jobs:
       if: matrix.config == 'Release'
       shell: pwsh
       run: |
+        # Started in the background at the top of the job; a plain install
+        # if that did not finish (a no-op if it did).
+        if ($env:OPENSSL_INSTALL_PID) { Wait-Process -Id $env:OPENSSL_INSTALL_PID -ErrorAction SilentlyContinue }
         choco install openssl -y --no-progress | Out-Null
 
         # The runner image ships its own openssl.exe earlier on PATH than
@@ -385,20 +398,35 @@ jobs:
       run: git submodule update --init --recursive third_party/server-rs
 
     - name: Check the driver and server compile the same schema
-      run: tools/blorg pins
+      id: pins
+      run: echo "server_rs=$(git rev-parse HEAD:third_party/server-rs)" >> "$GITHUB_OUTPUT" && tools/blorg pins
 
-    - name: Cache flatc and cargo
+    # Keyed by the server-rs pin. An unchanged pin restores the built
+    # binaries (blorg keeps them in its cache) and the build below is a
+    # copy; only a new pin needs cargo, restored from the previous pin so
+    # just what changed recompiles.
+    - name: Cache server-rs binaries
+      id: server_cache
+      uses: actions/cache@v5
+      with:
+        path: .blorg-cache/
+        key: ${{ runner.os }}-server-bin-${{ steps.pins.outputs.server_rs }}
+        restore-keys: ${{ runner.os }}-server-bin-
+
+    - name: Cache cargo
+      if: steps.server_cache.outputs.cache-hit != 'true'
       uses: actions/cache@v5
       with:
         path: |
-          .blorg-cache/
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           third_party/server-rs/target/
-        key: ${{ runner.os }}-server-${{ hashFiles('third_party/server-rs/Cargo.lock') }}-${{ hashFiles('.gitmodules') }}
+        key: ${{ runner.os }}-server-cargo-${{ steps.pins.outputs.server_rs }}
+        restore-keys: ${{ runner.os }}-server-cargo-
 
     - name: Install cross linkers
+      if: steps.server_cache.outputs.cache-hit != 'true'
       run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-mingw-w64-x86-64
 
     # Static musl for Linux, where the backend runs; mingw for Windows (it
@@ -487,6 +515,7 @@ jobs:
 
   # The packaged driver in a real Windows kernel, against the packaged Linux
   # server. Part of every build so a broken driver/server pairing fails here.
+  # No `needs`: it starts with the build and boots the guest meanwhile, then
+  # waits for the package job.
   guest:
-    needs: package
     uses: ./.github/workflows/guest.yml

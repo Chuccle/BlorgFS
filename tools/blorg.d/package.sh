@@ -56,8 +56,12 @@ server_flatc() {
 # blorg server [--out DIR] [linux-x64|windows-x64 ...]: cross-builds the
 # pinned server-rs (cargo build --release --locked, default features) into
 # DIR/<platform>/. Default: both platforms into out/server.
+#
+# A clean server-rs checkout's binaries are kept in the cache, keyed by its
+# commit, the target and the compiler, so an unchanged pin is a copy rather
+# than a build. A checkout with local changes is always built.
 cmd_server() {
-    local out="$OUT/server" want=() srv flatc t plat triple bin
+    local out="$OUT/server" want=() srv flatc="" t plat triple bin rev="" key
     while (( $# )); do
         case "$1" in
             --out) out="$2"; shift 2 ;;
@@ -65,15 +69,25 @@ cmd_server() {
         esac
     done
     srv="$(server_dir)" || die "no server-rs checkout (git submodule update --init --recursive third_party/server-rs)"
-    flatc="$(server_flatc "$srv")"
+    [[ -z "$(git -C "$srv" status --porcelain --untracked-files=no 2>/dev/null)" ]] &&
+        rev="$(git -C "$srv" rev-parse HEAD 2>/dev/null)"
     for t in "${SERVER_TARGETS[@]}"; do
         IFS=: read -r plat triple bin <<<"$t"
         (( ${#want[@]} == 0 )) || [[ " ${want[*]} " == *" $plat "* ]] || continue
+        mkdir -p "$out/$plat"
+        key=""
+        [[ -n "$rev" ]] && key="$CACHE/server-rs/${rev:0:12}-$triple-$(rustc -V | sha256sum | cut -c1-8)"
+        if [[ -n "$key" && -f "$key/$bin" ]]; then
+            note "server-rs for $plat: cached build of ${rev:0:12}"
+            cp "$key/$bin" "$out/$plat/"
+            continue
+        fi
         hdr "server-rs for $plat ($triple)"
+        [[ -n "$flatc" ]] || flatc="$(server_flatc "$srv")"
         rustup target add "$triple" >/dev/null 2>&1 || true
         (cd "$srv" && PATH="$flatc:$PATH" cargo build --release --locked --target "$triple") || return 1
-        mkdir -p "$out/$plat"
         cp "$srv/target/$triple/release/$bin" "$out/$plat/"
+        [[ -n "$key" ]] && mkdir -p "$key" && cp "$srv/target/$triple/release/$bin" "$key/"
     done
     note "servers in $out"
 }
