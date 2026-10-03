@@ -3,8 +3,12 @@ name: Build BlorgFS
 on:
   push:
     branches: [ master ]
+    # A v* tag builds the same package and publishes it as a release; the
+    # tag must match VERSION (checked in the package job).
+    tags: [ 'v*' ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -308,6 +312,10 @@ jobs:
           Get-Content "$serverLog.err" -ErrorAction SilentlyContinue | Write-Host
         }
 
+    # BlorgFS/ is the staged driver package (stamped INF + catalog); the
+    # package job below needs it, since only that INF matches the catalog.
+    # The binlog's comment used to sit on its path line, inside the block
+    # scalar, so the pattern never matched and the log was never uploaded.
     - name: Upload build artifacts
       uses: actions/upload-artifact@v7
       with:
@@ -316,5 +324,189 @@ jobs:
           ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/BlorgFS.*
           ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/*.inf
           ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/*.cat
-          ${{ github.workspace }}/msbuild.binlog # Upload the build log
+          ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/BlorgFS/
+          ${{ github.workspace }}/msbuild.binlog
         if-no-files-found: warn
+  # The combined package: this driver plus the server-rs commit pinned at
+  # third_party/server-rs, versioned together. See "Packaging" in AGENTS.md.
+  #
+  # pins is cheap and runs on Linux so a schema skew between the two fails in
+  # seconds, before either Windows build has finished.
+  pins:
+    runs-on: ubuntu-latest
+    name: Package pins
+
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      shell: pwsh
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+
+    # Not recursive: the check reads server-rs's schemas gitlink, it does not
+    # need the schema itself or server-rs's flatbuffers checkout.
+    - name: Check out the pinned server-rs
+      run: git submodule update --init third_party/server-rs
+
+    - name: Check the driver and server compile the same schema
+      shell: pwsh
+      run: ./tools/Test-BlorgPackagePins.ps1 | Out-Null
+
+  server:
+    runs-on: windows-latest
+    name: Build server-rs (windows x64)
+
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      shell: pwsh
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+
+    # Only server-rs and its own submodules (schemas, flatbuffers); the
+    # driver's third_party is not needed here.
+    - name: Check out the pinned server-rs
+      run: git submodule update --init --recursive third_party/server-rs
+
+    - name: Get flatbuffers commit hash
+      id: flatc_hash
+      shell: pwsh
+      run: echo "flatc_hash=$(git -C third_party/server-rs/buildtools/flatbuffers rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+    - name: Cache flatc build
+      id: cache_flatc
+      uses: actions/cache@v5
+      with:
+        path: ${{ runner.temp }}\flatc
+        key: ${{ runner.os }}-flatc-${{ steps.flatc_hash.outputs.flatc_hash }}
+
+    # server-rs's build.rs shells out to flatc, and the generated code must
+    # match its flatbuffers crate version -- so flatc is built from server-rs's
+    # own pinned submodule, exactly as server-rs's CI does on Linux.
+    - name: Build flatc
+      if: steps.cache_flatc.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $build = Join-Path $env:RUNNER_TEMP 'flatc-build'
+        cmake -S third_party/server-rs/buildtools/flatbuffers -B $build `
+          -DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATLIB=OFF -DFLATBUFFERS_BUILD_FLATHASH=OFF
+        if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
+        cmake --build $build --config Release --target flatc
+        if ($LASTEXITCODE -ne 0) { throw "flatc build failed with exit code $LASTEXITCODE" }
+        $dest = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'flatc')
+        Copy-Item (Join-Path $build 'Release\flatc.exe') $dest
+
+    - name: Put flatc on PATH
+      shell: pwsh
+      run: |
+        $dir = Join-Path $env:RUNNER_TEMP 'flatc'
+        if (-not (Test-Path (Join-Path $dir 'flatc.exe'))) { throw "flatc.exe missing from $dir" }
+        echo $dir >> $env:GITHUB_PATH
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          third_party/server-rs/target/
+        key: ${{ runner.os }}-server-cargo-${{ hashFiles('third_party/server-rs/Cargo.lock') }}
+
+    # Default features, as server-rs ships them. --locked so the package is
+    # built from exactly the dependency set server-rs's own CI tested.
+    - name: Build server-rs
+      working-directory: third_party/server-rs
+      run: cargo build --release --locked
+
+    - name: Upload server binary
+      uses: actions/upload-artifact@v7
+      with:
+        name: server-rs-windows-x64
+        path: |
+          third_party/server-rs/target/release/server-rs.exe
+          third_party/server-rs/target/release/server_rs.pdb
+        if-no-files-found: error
+
+  package:
+    needs: [build, server, pins]
+    runs-on: windows-latest
+    name: Package
+    # contents: write is only exercised on a v* tag, to publish the release.
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      shell: pwsh
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $env:GITHUB_OUTPUT
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+
+    - name: Check out the pinned server-rs
+      run: git submodule update --init third_party/server-rs
+
+    # Restores x64\Release\... exactly as the build job left it.
+    - name: Download driver build
+      uses: actions/download-artifact@v5
+      with:
+        name: BlorgFS-Release-x64
+        path: ${{ github.workspace }}
+
+    - name: Download server build
+      uses: actions/download-artifact@v5
+      with:
+        name: server-rs-windows-x64
+        path: ${{ runner.temp }}\server-bin
+
+    - name: Assemble package
+      id: package
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $release = $false
+        if ($env:GITHUB_REF -like 'refs/tags/v*') {
+          $expected = "v$((Get-Content VERSION -Raw).Trim())"
+          if ($env:GITHUB_REF_NAME -ne $expected) { throw "Tag $env:GITHUB_REF_NAME does not match VERSION (expected $expected)" }
+          $release = $true
+        }
+        $version = ./tools/New-BlorgPackage.ps1 `
+          -ServerExe (Join-Path $env:RUNNER_TEMP 'server-bin\server-rs.exe') `
+          -OutDir package -Release:$release
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+        Get-Content package\manifest.json
+
+    # Stable name on purpose: the Windows test guest pulls this artifact by
+    # name. The version lives in manifest.json, not in the artifact name.
+    - name: Upload package
+      uses: actions/upload-artifact@v7
+      with:
+        name: blorg-package-windows-x64
+        path: package/
+        if-no-files-found: error
+
+    - name: Publish release
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $zip = "blorg-${{ steps.package.outputs.version }}-windows-x64.zip"
+        Compress-Archive -Path package\* -DestinationPath $zip
+        gh release create $env:GITHUB_REF_NAME $zip package\manifest.json --title "blorg $env:GITHUB_REF_NAME" --notes "Test-signed driver and server-rs, built together. See manifest.json for the exact commits."
+        if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }

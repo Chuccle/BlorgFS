@@ -20,7 +20,9 @@ tests/         everything that verifies it
 tools/         tiered check runner, metric comparison, crash triage,
                differential correctness harness
 deploy/        VM deploy pipeline (see AGENTS.md)
-third_party/   submodules: flatcc, picohttpparser, schemas, googletest
+third_party/   submodules: flatcc, picohttpparser, schemas, googletest,
+               and server-rs (the backend this driver ships with)
+VERSION        the combined package version (see "Packaging" below)
 ```
 
 ## Building and testing
@@ -47,6 +49,17 @@ and PR to `master` at the Fast tier, `verify.yml` runs CBMC proofs and
 extended fuzz/interleaving coverage nightly, and `codeql.yml` runs weekly
 (and on PRs touching its own config) with the pinned Microsoft driver query
 packs.
+
+## Packaging
+
+BlorgFS ships together with its backend,
+[server-rs](https://github.com/Chuccle/server-rs), pinned as the
+`third_party/server-rs` submodule. `build.yml` builds both and publishes one
+package as the `blorg-package-windows-x64` artifact: the test-signed driver
+with its install scripts, `server-rs.exe`, and a `manifest.json` recording
+the version and the exact commits. CI fails if the driver and the pinned
+server compile different schemas. A `v*` tag matching `VERSION` publishes the
+same package as a GitHub release. Details in AGENTS.md.
 
 ## Deploying to a VM
 
