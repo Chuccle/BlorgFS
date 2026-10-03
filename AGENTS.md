@@ -442,7 +442,10 @@ server/         linux-x64/server-rs        static (musl); where the backend runs
 
 `build.yml` builds it on every push and PR and uploads it as the artifact
 `blorg-package-windows-x64`. Only the driver job runs on Windows; the pins
-check, both server builds and the packaging run on Linux:
+check, both server builds and the packaging run on Linux. `blorg server`
+keeps the binaries of a clean server-rs checkout in its cache, keyed by
+commit, target and compiler, and CI caches that by the pin, so an unchanged
+pin costs a copy rather than a build:
 
 | Command | Does |
 |---|---|
@@ -560,8 +563,9 @@ has inbox drivers for both.
 ### The guest in CI
 
 `guest.yml` runs the same commands on a GitHub Linux runner. `build.yml`
-calls it as its last job on the package it just built, so every push and
-PR is tested in the guest. It caches the golden image keyed by
+calls it alongside its build jobs, so every push and PR is tested in the
+guest: the guest boots while the driver builds, then waits for the
+`Package` job and tests that package (`blorg guest test --booted`). It caches the golden image keyed by
 `tools/blorg guest image-key` (a hash of the image's own inputs, so a
 change to the tests reuses it) and the calendar quarter (so the evaluation
 never expires under a cached image); a miss costs one unattended install in
