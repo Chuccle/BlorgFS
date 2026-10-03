@@ -86,7 +86,9 @@ jobs:
       id: host
       uses: ./ci/guest
       with:
-        package-run-id: ${{ github.event.workflow_run.id || inputs.package_run_id }}
+        # Until build.yml's package job (#63) is on master, a rig PR has no
+        # package of its own: pin #63's build. Remove once #63 is merged.
+        package-run-id: ${{ github.event.workflow_run.id || inputs.package_run_id || (github.event_name == 'pull_request' && '37157505659') || '' }}
         save-image: ${{ env.UNTRUSTED_TRIGGER != 'true' }}
 
     - name: Run the tests in the guest
