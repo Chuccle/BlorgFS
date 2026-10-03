@@ -104,7 +104,7 @@ jobs:
         ci/guest/run-guest-tests.sh "${args[@]}"
 
     - name: Check the guestctl channels
-      if: github.event_name == 'pull_request' && steps.host.outputs.found == 'true'
+      if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.host.outputs.found == 'true' }}
       run: ci/guest/run-session.sh --out guest-results ci/guest/session-probe.sh
 
     - name: Power off the guest

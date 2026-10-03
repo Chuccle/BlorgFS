@@ -123,9 +123,11 @@ function Invoke-Step {
         try {
             $r = & $Body $log
             if ($r -is [array]) { $r = $r[-1] }
-            if ($r -eq 'skip') { $status = 'skip'; $detail = 'not applicable' }
-            elseif ($r -is [string]) { $status = 'fail'; $detail = $r }
-            elseif ($r) { $status = 'pass' }
+            # Strings first: `$true -eq 'skip'` is true in PowerShell.
+            if ($r -is [string]) {
+                if ($r -eq 'skip') { $status = 'skip'; $detail = 'not applicable' }
+                else { $status = 'fail'; $detail = $r }
+            } elseif ($r) { $status = 'pass' }
         } catch {
             $detail = $_.Exception.Message
         }
@@ -151,7 +153,10 @@ function Invoke-ChildScript {
         if ($v -is [switch] -or $v -is [bool]) { if ($v) { $argList += "-$k" } }
         else { $argList += "-$k"; $argList += "$v" }
     }
-    & powershell.exe @argList 2>&1 | Write-StepLog -Log $Log
+    # Under 'Stop', Windows PowerShell 5.1 turns the child's first stderr
+    # line into a terminating error; the exit code is the result here.
+    $ErrorActionPreference = 'Continue'
+    & powershell.exe @argList 2>&1 | ForEach-Object { "$_" } | Write-StepLog -Log $Log
     return $LASTEXITCODE
 }
 
@@ -194,7 +199,11 @@ try {
 
     Invoke-Step 'install' {
         param($log)
-        $code = Invoke-ChildScript $log (Join-Path $package 'driver\Install-BlorgFS.ps1') @{
+        # Paths passed explicitly: under `powershell -File`, Windows
+        # PowerShell 5.1 leaves $PSScriptRoot empty in param() defaults.
+        $driver = Join-Path $package 'driver'
+        $code = Invoke-ChildScript $log (Join-Path $driver 'Install-BlorgFS.ps1') @{
+            InfPath = (Join-Path $driver 'BlorgFS.inf'); CertPath = (Join-Path $driver 'BlorgFS.cer')
             RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive
         }
         if ($code -eq 2) { return 'test signing is off (Install-BlorgFS.ps1 exit 2) -- Prepare-Guest.ps1 and a reboot should have handled this' }
@@ -217,7 +226,8 @@ try {
         $exe = @((Join-Path $package 'tests\VolumeTester.exe'), (Join-Path $BundleDir 'tests\VolumeTester.exe')) |
             Where-Object { Test-Path $_ } | Select-Object -First 1
         if (-not $exe) { 'VolumeTester.exe not in the package' | Set-Content $log; return 'skip' }
-        & $exe 2>&1 | Write-StepLog -Log $log
+        $ErrorActionPreference = 'Continue'   # see Invoke-ChildScript
+        & $exe 2>&1 | ForEach-Object { "$_" } | Write-StepLog -Log $log
         if ($LASTEXITCODE -ne 0) { return "VolumeTester exited $LASTEXITCODE" }
         $true
     } | Out-Null
