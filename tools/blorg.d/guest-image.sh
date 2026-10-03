@@ -81,7 +81,10 @@ fetch() {
         path="$DOWNLOADS/$name"
         if [[ ! -s "$path" ]]; then
             note "downloading $name"
-            from="$(curl -fL --retry 4 --retry-delay 5 -o "$path.part" -w '%{url_effective}' "$src")"
+            # A stalled transfer (under 100 KB/s for a minute) fails and is
+            # retried rather than hanging the build.
+            from="$(curl -fL --retry 4 --retry-delay 5 --speed-limit 102400 --speed-time 60 \
+                    -o "$path.part" -w '%{url_effective}' "$src")"
             mv "$path.part" "$path"
         fi
     fi
@@ -169,8 +172,12 @@ while guest_running; do
             if [[ "$sum" != "${last_sum:-}" ]]; then
                 echo "SCREEN $(printf %03d "$shot") t=$(( SECONDS - start ))s png-base64 $(base64 -w0 "$png")"
                 last_sum="$sum"
+                last_change=$SECONDS
             fi
         fi
+        # A heartbeat every two minutes, so a slow install and a stuck one
+        # read differently in the log.
+        note "installing: $(( (SECONDS - start) / 60 )) min, screen unchanged for $(( (SECONDS - ${last_change:-$start}) / 60 )) min"
         shot=$(( shot + 1 ))
     fi
     sleep 10
