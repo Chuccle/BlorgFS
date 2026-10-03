@@ -1,4 +1,5 @@
-# The default agent session: touches every way of acting in the guest once,
+# shellcheck shell=bash
+# The example session: touches every way of acting in the guest once,
 # and fails if any of them does not work. Run by guest-runtime.yml on PRs
 # that change the rig, and a worked example of a `session` script.
 # Runs under run-session.sh (guestctl on PATH, $SESSION_OUT set).

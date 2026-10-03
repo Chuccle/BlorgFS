@@ -3,9 +3,9 @@ name: Guest runtime tests
 # Loads the packaged driver into a real Windows kernel and tests it against
 # the packaged server. The Windows guest runs under KVM/QEMU on a Linux
 # runner, driven by ci/guest/ -- the same scripts run on any KVM host, so a
-# red run here reproduces on a developer's or agent's machine with
+# red run here reproduces on any Linux machine with KVM with
 #   ci/guest/run-guest-tests.sh --package <unpacked artifact>
-# See "Cloud test guest" in AGENTS.md.
+# See ci/guest/README.md.
 #
 # A fixed test: the package from build.yml (never a build of its own, so
 # what is tested is exactly what ships), a golden image built from pinned

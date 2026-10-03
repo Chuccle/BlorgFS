@@ -19,8 +19,8 @@
 #   --no-verifier   run without Driver Verifier on BlorgFS.sys
 #   --kernel-dump   bring MEMORY.DMP back too after a bugcheck (large)
 #   --keep          leave the guest (and the host's server-rs) running
-#                   afterwards, for an agent or a person to investigate with
-#                   host/guestctl or run-session.sh
+#                   afterwards, to investigate with host/guestctl or
+#                   run-session.sh
 #
 # Exit: 0 pass, 1 fail (tests failed or the guest bugchecked), 2 the rig
 # itself broke before a verdict existed.
@@ -214,7 +214,7 @@ print("\n".join(lines))
 
 def annotate(level, title, text):
     # Workflow-command escaping; an annotation is readable through the
-    # checks API by agents that cannot download logs or artifacts.
+    # checks API from places that cannot download logs or artifacts.
     body = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
     print(f"::{level} title={title}::{body}")
 

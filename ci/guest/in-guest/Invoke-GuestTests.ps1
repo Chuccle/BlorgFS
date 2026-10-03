@@ -39,7 +39,7 @@
     (run-guest-tests.sh).
 
     The driver is not stopped at the end: there is no dismount handler, so
-    `sc stop` wedges in STOP_PENDING (AGENTS.md). Runs end by discarding the
+    `sc stop` wedges in STOP_PENDING. Runs end by discarding the
     guest's disk instead.
 
     Exit code 0 only when the verdict is "pass".

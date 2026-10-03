@@ -13,7 +13,7 @@
       - Test signing on (a reboot to apply, if it was off).
       - Driver Verifier's standard checks on BlorgFS.sys, or off with
         -NoVerifier. Correctness runs want it on; benchmark runs must not
-        have it (see "Measuring performance" in AGENTS.md). Either change
+        have it (Verifier skews timings). Either change
         needs a reboot.
       - Old crash dumps cleared, and the time recorded, so the diagnostics
         afterwards only ever report crashes from this run.

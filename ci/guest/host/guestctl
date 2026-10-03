@@ -2,11 +2,10 @@
 #
 # guestctl -- drive the BlorgFS Windows test guest on a KVM/QEMU host.
 #
-# This is the one interface to the guest, for CI and for agents alike: an
-# agent with a shell on the host can boot the guest, act inside it over
-# SSH, snapshot and revert it, and look at its screen, without a human.
-# It is the cloud/Linux counterpart of deploy/Deploy-ToVM.ps1's vmrun
-# workflow; see "Cloud test guest" in AGENTS.md.
+# The one interface to the guest, for CI and for a person at a shell on
+# the host alike: boot the guest, act inside it over SSH, snapshot and
+# revert it, and look at its screen. It is the Linux/KVM counterpart of
+# deploy/Deploy-ToVM.ps1's vmrun workflow; see ci/guest/README.md.
 #
 # Commands:
 #   up [--fresh]              boot the guest (a fresh disk from the golden

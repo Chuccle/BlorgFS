@@ -1,7 +1,7 @@
 name: Guest session
 
-# Acting in the test guest from a remote Claude Code or Codex session that
-# has no KVM of its own: dispatch this with a bash script, and it runs
+# Acting in the test guest from somewhere with no KVM of its own: dispatch
+# this with a bash script of guestctl commands, and it runs
 # against a live guest with the package installed, B: mounted and the
 # server answering. Manual only -- it never runs on a push or PR and gates
 # nothing; the CI verdict is guest-runtime.yml's, which takes no commands.
@@ -10,7 +10,7 @@ name: Guest session
 #
 # The transcript comes back in the job log, the step summary, a
 # "blorg guest-session" check annotation, and the guest-session artifact.
-# See ci/guest/run-session.sh, and "Cloud test guest" in AGENTS.md.
+# See ci/guest/run-session.sh and ci/guest/README.md.
 
 on:
   workflow_dispatch:

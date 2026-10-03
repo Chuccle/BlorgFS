@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Runs an agent's script against the live guest and keeps everything it
-# produced: the way a remote agent with no KVM of its own acts in the guest.
-# The agent dispatches guest-runtime.yml with a `session` script, and reads
-# the transcript and files back from the guest-results artifact, or from
-# the job log, which carries the transcript and any screenshots (base64).
+# Runs a script of guestctl commands against the live guest and keeps
+# everything it produced. guest-session.yml uses it to act in the guest
+# from somewhere with no KVM: the transcript and files come back in the
+# guest-session artifact, and the job log carries the transcript and any
+# screenshots (base64).
 #
 #   run-session.sh --out DIR SCRIPT
 #
@@ -13,7 +13,7 @@
 # (run-guest-tests.sh --keep): the package installed, B: mounted, the
 # server answering. If no guest is running, a fresh one is booted.
 # Commands are echoed (bash -x) into the transcript, so it reads as a log
-# of what the agent did and what came back.
+# of what was done and what came back.
 #
 # Exit: the script's own exit code.
 
@@ -41,15 +41,15 @@ bash -x "$script" 2>&1 | tee "$SESSION_OUT/transcript.txt"
 rc=${PIPESTATUS[0]}
 echo "exit=$rc" >> "$SESSION_OUT/transcript.txt"
 
-# Images into the job log too, base64: an agent that can read the log but
-# not download the artifact (an egress proxy in the way) still sees them.
+# Images into the job log too, base64: readable where the log is but the
+# artifact cannot be downloaded (an egress proxy in the way).
 for png in "$SESSION_OUT"/*.png; do
     [[ -f "$png" ]] && echo "SCREEN $(basename "$png") png-base64 $(base64 -w0 "$png")"
 done
 
 if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-    # The transcript's tail as a check annotation, for agents that can read
-    # the checks API but not logs or artifacts. Workflow-command escaping;
+    # The transcript's tail as a check annotation, for readers of the
+    # checks API that cannot reach logs or artifacts. Workflow-command escaping;
     # capped well under the annotation size limit.
     body="$(tail -c 30000 "$SESSION_OUT/transcript.txt" | sed 's/%/%25/g; s/\r/%0D/g' | awk 'BEGIN{ORS="%0A"} {print}')"
     if (( rc == 0 )); then level=notice; else level=error; fi
@@ -58,7 +58,7 @@ fi
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
-        echo "## Agent session: exit $rc"
+        echo "## Guest session: exit $rc"
         echo
         echo '```'
         tail -n 200 "$SESSION_OUT/transcript.txt"

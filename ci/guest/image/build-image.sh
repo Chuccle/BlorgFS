@@ -155,8 +155,8 @@ while guest_running; do
         png="$GUEST_RUN_DIR/screens/$(printf %03d "$shot").png"
         guest_qmp screendump "{\"filename\": \"$png\", \"format\": \"png\"}" >/dev/null 2>&1 || true
         # Also into the log, base64, whenever the screen changed: a log is
-        # readable from places an artifact download is not (an agent behind
-        # an egress proxy), and a stuck install is diagnosed by its screen.
+        # readable from places an artifact download is not (behind an
+        # egress proxy), and a stuck install is diagnosed by its screen.
         if [[ -s "$png" ]]; then
             sum="$(sha256sum "$png" | cut -c1-16)"
             if [[ "$sum" != "${last_sum:-}" ]]; then

@@ -9,7 +9,7 @@
     driver straight away:
 
       - OpenSSH server, key-only, PowerShell as the default shell. This is
-        the channel guestctl and agents use to act in the guest.
+        the channel guestctl uses to act in the guest.
       - QEMU guest agent (when the virtio-win ISO is attached), the fallback
         channel for when the guest network is what broke.
       - Driver Verifier's standard checks on BlorgFS.sys, the default for

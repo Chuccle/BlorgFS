@@ -2,8 +2,8 @@
 //
 // The guest itself always runs under KVM/QEMU (ci/guest/host); this only
 // provides somewhere with KVM that stays up, for when a GitHub runner's
-// lifetime is too short: an agent iterating on a driver bug, a guest kept
-// at a snapshot between sessions, or a self-hosted runner with more cores.
+// lifetime is too short: iterating on a driver bug, a guest kept at a
+// snapshot between sessions, or a self-hosted runner with more cores.
 //
 // Dsv5 sizes support nested virtualization, which is what exposes /dev/kvm
 // inside the VM. Only SSH is reachable, and only from allowedSshSource.
