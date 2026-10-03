@@ -212,6 +212,15 @@ with open(os.path.join(out, "verdict.txt"), "w") as f:
     f.write("\n".join(lines) + "\n")
 print("\n".join(lines))
 
+def annotate(level, title, text):
+    # Workflow-command escaping; an annotation is readable through the
+    # checks API by agents that cannot download logs or artifacts.
+    body = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{level} title={title}::{body}")
+
+if os.environ.get("GITHUB_ACTIONS"):
+    annotate("notice" if verdict == "pass" else "error", "blorg guest-verdict", "\n".join(lines))
+
 summary = os.environ.get("GITHUB_STEP_SUMMARY")
 if summary:
     icon = {"pass": "✅", "fail": "❌", "skip": "⏭️"}

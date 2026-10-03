@@ -47,6 +47,15 @@ for png in "$SESSION_OUT"/*.png; do
     [[ -f "$png" ]] && echo "SCREEN $(basename "$png") png-base64 $(base64 -w0 "$png")"
 done
 
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    # The transcript's tail as a check annotation, for agents that can read
+    # the checks API but not logs or artifacts. Workflow-command escaping;
+    # capped well under the annotation size limit.
+    body="$(tail -c 30000 "$SESSION_OUT/transcript.txt" | sed 's/%/%25/g; s/\r/%0D/g' | awk 'BEGIN{ORS="%0A"} {print}')"
+    if (( rc == 0 )); then level=notice; else level=error; fi
+    echo "::$level title=blorg guest-session::$body"
+fi
+
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
         echo "## Agent session: exit $rc"
