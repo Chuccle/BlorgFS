@@ -129,8 +129,8 @@ guestctl screenshot "$SESSION_OUT/screen.png"'
 
 ## The golden image
 
-Windows Server 2022 Standard **Server Core**, from Microsoft's public
-180-day evaluation ISO (override with `WINDOWS_ISO_URL`). Every input (the
+Windows Server 2025 Standard **Server Core** (build 26100, the oldest
+Windows the driver targets), from Microsoft's public 180-day evaluation ISO (override with `WINDOWS_ISO_URL`). Every input (the
 ISO, virtio-win, the OpenSSH zip) is pinned by SHA-256 in `build-image.sh`,
 so one recipe always builds from the same bytes. Built unattended:
 `autounattend.xml` on a generated config ISO, then `Setup-GoldenImage.ps1`

@@ -115,9 +115,11 @@ Step 'QEMU guest agent (optional)' {
         return
     }
     # vioserial carries the agent's channel; without it the service starts
-    # and never sees its port. The 2k22 build also loads on 2025.
+    # and never sees its port. The newest Server build in the ISO (2k25,
+    # else 2k22) is the one for this image.
     $inf = Get-ChildItem (Join-Path $virtio 'vioserial') -Recurse -Filter 'vioser.inf' |
-        Where-Object { $_.FullName -match '\\2k22\\amd64\\' } | Select-Object -First 1
+        Where-Object { $_.FullName -match '\\2k2[25]\\amd64\\' } |
+        Sort-Object FullName -Descending | Select-Object -First 1
     if ($inf) { Invoke-Native pnputil.exe @('/add-driver', $inf.FullName, '/install') }
     $msi = Join-Path $virtio 'guest-agent\qemu-ga-x86_64.msi'
     $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart') -Wait -PassThru

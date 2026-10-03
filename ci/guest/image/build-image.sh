@@ -9,14 +9,16 @@
 #
 #   build-image.sh [--iso PATH|URL] [--virtio-iso PATH|URL] [--image-index N]
 #
-# Defaults build Windows Server 2022 Standard (Server Core) from Microsoft's
-# public 180-day evaluation ISO. Server Core because a filesystem driver
-# test needs no desktop, and the image is a fraction of the size to build,
+# Defaults build Windows Server 2025 Standard (Server Core) from Microsoft's
+# public 180-day evaluation ISO: build 26100, the oldest Windows the driver
+# loads on (src/BlorgFS.vcxproj targets NTDDI 0x0A000010, 24H2; on 2022 it
+# fails to start with "procedure not found"). Server Core because a
+# filesystem driver test needs no desktop, and the image is a fraction of the size to build,
 # cache and boot. The evaluation clock starts when the image is built, so
 # CI keys its image cache by quarter and rebuilds well inside 180 days.
 #
 # Environment (all optional):
-#   WINDOWS_ISO_URL      install ISO (default: Server 2022 evaluation, en-US)
+#   WINDOWS_ISO_URL      install ISO (default: Server 2025 evaluation, en-US)
 #   WINDOWS_IMAGE_INDEX  index in install.wim (default 1: Standard Core)
 #   VIRTIO_ISO_URL       virtio-win ISO, for the QEMU guest agent; set to
 #                        "none" to skip the agent
@@ -36,11 +38,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=ci/guest/host/lib.sh
 source "$HERE/../host/lib.sh"
 
-WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso}"
+WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://go.microsoft.com/fwlink/?linkid=2293312&clcid=0x409&culture=en-us&country=us}"
 WINDOWS_IMAGE_INDEX="${WINDOWS_IMAGE_INDEX:-1}"
 VIRTIO_ISO_URL="${VIRTIO_ISO_URL:-https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso}"
 OPENSSH_ZIP_URL="${OPENSSH_ZIP_URL:-https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip}"
-WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256-3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325}"
+WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256-}"
 VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256-303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d}"
 # Win32-OpenSSH publishes no stable per-version URL here; the pin is what
 # keeps "latest" from changing the image underneath the recipe.
