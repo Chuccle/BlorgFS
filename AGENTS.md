@@ -518,6 +518,36 @@ NuGet's CDN drops long HTTP/2 downloads through some egress proxies, so
 policy, `cargo-xwin` cannot fetch the MSVC CRT and `server-exe` falls back
 to mingw.
 
+### Containers: what they solve and what they cannot
+
+`ci/agent/container/Containerfile` is the Linux half of this toolchain as
+one image: clang, CMake, Rust with both Windows targets, cargo-xwin,
+mingw-w64, gh, QEMU and the image-build tools. `ci/agent/container/run.sh
+<blorg args>` runs `blorg` in it against this checkout (building the image
+on first use), so a laptop, the KVM host and CI get the same Linux
+toolchain without installing anything but podman or docker.
+
+What a container cannot do is the Windows part. MSVC and the WDK run only
+on Windows, and a container shares its host's kernel, so no container on
+any host can load `BlorgFS.sys`. Windows containers do not change that:
+they could host the MSVC build, but they still share a Windows host
+kernel, so loading a test driver into one would put the host at risk, and
+they would need a Windows host the rest of this rig does not have. The
+build VM and the test guest stay; the container is what drives them.
+
+- **Podman on the KVM host.** It runs rootless and needs no daemon, and
+  `run.sh` passes `--userns=keep-id --group-add keep-groups --device
+  /dev/kvm`, so QEMU in the container gets KVM through the user's own
+  `kvm` group membership and files it writes stay owned by that user.
+- **Docker** works the same through `run.sh` (as root inside, which its
+  daemon is anyway). It is what GitHub's runners and some agent sandboxes
+  already have.
+- **Cloud agent sessions** (Claude Code on the web, Codex cloud) run in the
+  provider's own container image and cannot be pointed at this one, so
+  they use `tools/agent/session-start.sh` as their setup script instead.
+  Where a session has a working docker, `run.sh` works there too, but it
+  buys nothing over running `blorg` directly.
+
 ### The build VM
 
 The test guest (see the cloud test guest section) is deliberately

@@ -1,0 +1,47 @@
+# The Linux half of the BlorgFS agent toolchain as one image: everything
+# tools/agent/blorg runs on Linux (the driver compile check, server-rs,
+# CI dispatch) and everything the KVM host needs to drive the Windows
+# guests (QEMU, image-build tools). Builds with podman or docker:
+#
+#   podman build -t blorg-agent -f ci/agent/container/Containerfile ci/agent/container
+#
+# and is run through ci/agent/container/run.sh, which mounts the checkout
+# and passes /dev/kvm through when the host has it.
+#
+# It deliberately holds no Windows toolchain: MSVC and the WDK run only on
+# Windows, and no Linux container can load a Windows kernel driver. Those
+# stay in the build VM and the test guest; this image is what talks to them.
+
+FROM docker.io/library/ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends \
+        ca-certificates curl git unzip xz-utils jq rsync openssh-client python3 \
+        build-essential clang cmake ninja-build pkg-config \
+        gcc-mingw-w64-x86-64 \
+        qemu-system-x86 qemu-utils xorriso openssl \
+        gh \
+    && rm -rf /var/lib/apt/lists/* \
+    # The checkout is bind-mounted and may belong to another uid.
+    && git config --system --add safe.directory '*'
+
+ENV RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo PATH=/opt/rust/cargo/bin:$PATH
+# rustup-init straight from static.rust-lang.org, downloaded before it runs
+# so a failed download fails the build instead of piping an error page to sh.
+RUN curl -fsSL -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain stable \
+        --component clippy,rustfmt \
+        --target x86_64-pc-windows-msvc,x86_64-pc-windows-gnu \
+    && cargo install --locked cargo-xwin \
+    && rm -rf "$CARGO_HOME/registry" /tmp/rustup-init \
+    && chmod -R a+rwX /opt/rust
+
+# blorg's downloads and builds (WDK/SDK headers, flatc, flatcc) live here;
+# run.sh mounts a named volume over it so they survive between containers.
+ENV BLORG_CACHE=/var/cache/blorg XDG_STATE_HOME=/var/lib/blorg-state
+RUN mkdir -p /var/cache/blorg /var/lib/blorg-state && chmod 1777 /var/cache/blorg /var/lib/blorg-state
+
+WORKDIR /src
+ENTRYPOINT ["tools/agent/blorg"]
+CMD ["doctor"]
