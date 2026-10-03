@@ -1,0 +1,38 @@
+name: Agent toolchain
+
+# Runs `tools/agent/blorg check` -- the Linux tier remote agents use -- so it
+# cannot drift from the real build: it reads its defines, include paths and
+# WDK/SDK versions from src/BlorgFS.vcxproj and src/packages.config. Not a
+# substitute for build.yml; it only proves the agents' quick check still works.
+
+on:
+  pull_request:
+    branches: [ master ]
+    paths:
+      - 'tools/agent/**'
+      - 'ci/agent/**'
+      - 'src/BlorgFS.vcxproj'
+      - 'src/packages.config'
+      - '.gitmodules'
+      - '.github/workflows/agent-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  linux-tier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ github.actor == 'dependabot[bot]' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+          submodules: recursive
+
+      - uses: actions/cache@v5
+        with:
+          path: ~/.cache/blorg
+          key: blorg-${{ hashFiles('src/packages.config', '.gitmodules') }}
+
+      - name: blorg check
+        run: tools/agent/blorg check

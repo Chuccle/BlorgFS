@@ -2,21 +2,15 @@
 #
 # Runs tools/agent/blorg inside the blorg-agent image, against this
 # checkout:   ci/agent/container/run.sh check
-#             ci/agent/container/run.sh win build
 #
 # Uses podman when installed, else docker (BLORG_ENGINE overrides). Builds
 # the image on first use (BLORG_IMAGE to use a prebuilt one instead).
-#
-# With podman the container runs rootless as you; --userns=keep-id keeps
-# files written into the checkout owned by you, and keep-groups carries
-# your kvm group membership in, so /dev/kvm works without root. Docker runs
-# as root inside (its daemon is root anyway) and needs nothing extra.
+# With podman, --userns=keep-id keeps files written into the checkout
+# owned by you.
 #
 # Mounted: the checkout at /src, a sibling ../server-rs when there is one,
-# a named volume for blorg's cache, the guest images ($GUEST_HOME) when
-# set, and /dev/kvm when the host has it. GH_TOKEN/BLORG_GH_TOKEN and the
-# BLORG_*/GUEST_* settings are passed through. For BLORG_KVM_SSH, run
-# blorg on the host instead: the work happens on the remote end anyway.
+# and a named volume for blorg's cache. GH_TOKEN, the BLORG_* settings and
+# any proxy variables are passed through.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,20 +31,12 @@ fi
 
 args=(run --rm -i -v "$REPO:/src" -v blorg-cache:/var/cache/blorg -w /src)
 [[ -t 0 && -t 1 ]] && args+=(-t)
-if [[ "$engine" == podman ]]; then
-    args+=(--userns=keep-id --group-add keep-groups)
-fi
-if [[ -e /dev/kvm ]]; then
-    args+=(--device /dev/kvm)
-fi
+[[ "$engine" == podman ]] && args+=(--userns=keep-id)
 if [[ -f "$REPO/../server-rs/Cargo.toml" ]]; then
     args+=(-v "$(cd "$REPO/../server-rs" && pwd):/server-rs" -e BLORG_SERVER_RS=/server-rs)
 fi
-if [[ -n "${GUEST_HOME:-}" ]]; then
-    args+=(-v "$GUEST_HOME:$GUEST_HOME" -e "GUEST_HOME=$GUEST_HOME")
-fi
 while IFS='=' read -r name _; do
     args+=(-e "$name")
-done < <(env | grep -E '^(GH_TOKEN|BLORG_[A-Z_]+|GUEST_[A-Z_]+)=' | grep -vE '^(BLORG_CACHE|BLORG_SERVER_RS|GUEST_HOME)=')
+done < <(env | grep -E '^(GH_TOKEN|BLORG_[A-Z_]+|(HTTPS?|NO)_PROXY|(https?|no)_proxy)=' | grep -vE '^(BLORG_CACHE|BLORG_SERVER_RS)=')
 
 exec "$engine" "${args[@]}" "$IMAGE" "$@"

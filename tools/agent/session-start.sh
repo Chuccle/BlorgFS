@@ -2,8 +2,8 @@
 #
 # Warms a fresh Linux agent session for BlorgFS: runs `blorg setup` (flatcc
 # and the generated headers, the WDK/SDK headers from NuGet, and -- when a
-# server-rs checkout is present -- flatc, the Windows Rust targets and
-# mingw-w64), then prints what the session can do.
+# server-rs checkout is present -- flatc and the Windows Rust target), then
+# prints what the session can do.
 #
 # Use it as the setup script of a cloud agent environment, e.g.
 #   Claude Code on the web: environment "Setup script"

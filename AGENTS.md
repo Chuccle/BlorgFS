@@ -28,7 +28,7 @@ occasionally, not every session.
 | [Documentation discipline](#documentation-discipline) | Where findings go, and how to keep docs from going stale |
 | [Conventions](#conventions) | Naming, style, and hard rules |
 | [Build and test tiers](#build-and-test-tiers) | How to build and run the regression tiers |
-| [Remote agents: building, deploying and testing from Linux](#remote-agents-building-deploying-and-testing-from-linux) | `tools/agent/blorg`: what a Linux cloud session can check locally, and how it reaches a Windows build and a real kernel |
+| [Remote agents: building, deploying and testing from Linux](#remote-agents-building-deploying-and-testing-from-linux) | `tools/agent/blorg`: what a Linux cloud session can check locally, and how it reaches the Windows build and a real kernel |
 | [Continuous integration](#continuous-integration) | What each CI workflow gates |
 | [Sanitizers](#sanitizers) | ASan/KASAN requirements |
 | [Deploying to a VM](#deploying-to-a-vm) | The deploy pipeline and its quirks |
@@ -461,16 +461,18 @@ instead of corrupting every replay after it. `SchedulerAudit` in
 ## Remote agents: building, deploying and testing from Linux
 
 A cloud agent session (Claude Code on the web, Codex, any Linux container)
-has no MSVC, no WDK and, usually, no `/dev/kvm`. `tools/agent/blorg` is the
-one entrypoint that gets such a session as close to Windows as it can, and
-says plainly where each check really runs. `blorg doctor` reports what the
-current session can reach; `blorg help` lists every command.
+has no MSVC, no WDK and no Windows kernel. `tools/agent/blorg` is the one
+entrypoint for such a session: it checks what Linux can check, and hands
+the rest to the same CI a PR gets. `blorg doctor` reports what the current
+session can reach; `blorg help` lists every command.
 
 | Where | Command | What it proves | Needs |
 |---|---|---|---|
-| This Linux session | `tools/agent/blorg check` | The driver compiles (every `ClCompile` in `BlorgFS.vcxproj`, clang against the WDK's own kernel headers), schema pins agree, server-rs tests + clippy pass, server-rs type-checks for `x86_64-pc-windows-msvc` | clang, cmake, cargo, nuget.org |
-| GitHub Actions | `tools/agent/blorg ci test` | Exactly what a PR gets: `build.yml` (the one recipe for the shipped package: MSVC/PREfast, the usermode suites, server-rs, packaging), then `guest-runtime.yml` loads that package into a real Windows kernel | A GitHub token that can dispatch workflows |
-| The KVM host | `tools/agent/blorg win build`, `win test` | The same checks, incremental in a persistent build VM: for iterating, not for certifying — its package is not the one `build.yml` ships | `/dev/kvm` here, `BLORG_KVM_SSH=user@host`, or `ci remote` (self-hosted runner) |
+| This Linux session | `tools/agent/blorg check` | The driver compiles (every `ClCompile` in `BlorgFS.vcxproj`, clang against the WDK's own kernel headers); with a server-rs checkout, its tests and clippy pass and it type-checks for `x86_64-pc-windows-msvc` | clang, cmake, nuget.org; cargo for server-rs |
+| GitHub Actions | `tools/agent/blorg ci test` | Exactly what a PR gets: `build.yml` (the one recipe for the shipped package), then `guest-runtime.yml` loads that package into a real Windows kernel | A GitHub token that can dispatch workflows |
+
+There is no third, local Windows path on purpose: one recipe builds the
+package, so what an agent tests is what ships.
 
 **The Linux tier is not the gate.** It catches what a compile catches —
 typos, undeclared or misused kernel APIs, type errors, header breakage — in
@@ -478,35 +480,40 @@ seconds, from the WDK/SDK NuGet packages pinned in `src/packages.config`
 and with the defines and include paths read out of `BlorgFS.vcxproj`. It
 does not run PREfast, does not link, does not run the usermode sandbox
 suites, and clang's diagnostics are not cl's. Use it to iterate; before
-calling a change done, get a green `build.yml` and guest run (`ci test`, or the PR's own checks).
+calling a change done, get a green `build.yml` and guest run (`ci test`, or
+the PR's own checks). `agent-check.yml` runs `blorg check` on PRs that
+touch the toolchain or the project files it reads, so it cannot rot.
+
+**`blorg ci test`** follows the `build.yml` run a push already started for
+the commit (dispatching one only when there is none), then the guest run
+that chains on it, and prints the verdict. Push first: it tests what is on
+GitHub, not the working tree.
 
 **Getting results back without a token.** A Claude Code session on the
 web pushes through its own git credential and drives GitHub through the
 GitHub MCP tools; `gh` may or may not be authenticated. Pushing the branch
 is always enough: `build.yml` builds it and `guest-runtime.yml` tests every
-successful build. `actions_run_trigger` (workflow `build.yml`) and
-`get_job_logs` are the MCP equivalents of `blorg ci test`. Any other environment sets
+successful build. `actions_run_trigger`, `actions_list` and `get_job_logs`
+are the MCP equivalents of `blorg ci test`. Any other environment sets
 `BLORG_GH_TOKEN` to a fine-grained token on this repository with Actions
 read/write and Contents read.
 
 Run logs and artifacts are served from blob storage hosts
 (`*.blob.core.windows.net`, `results-receiver.actions.githubusercontent.com`)
 that an agent's egress proxy may block even when `api.github.com` works.
-So `agent-remote.yml` also publishes its build summary and guest verdict as
-`blorg …` annotations (`guest-runtime.yml` writes its verdict to the job
-log, which `get_job_logs` reaches), which `blorg ci results` reads through the API; the
+`blorg ci results` therefore prints any annotation titled `blorg …` (served
+by the API) before trying the artifacts; a workflow that wants agents to
+read its verdict emits one (`::notice title=blorg guest-verdict::…`). The
 GitHub MCP `get_job_logs` tool also works, because it fetches server-side.
 
 **server-rs from here.** `blorg` finds server-rs as `third_party/server-rs`
 (the package pin) or a sibling checkout `../server-rs`. It builds `flatc`
 from server-rs's own pinned flatbuffers (the generated Rust must match the
-crate) into `~/.cache/blorg`. `blorg server-exe` produces a Windows
-`server-rs.exe`: with `cargo-xwin` (the MSVC target, as shipped) when the
-session can reach Microsoft's download CDN, otherwise with mingw-w64 —
-fine for iterating, but the package always ships the MSVC build from CI.
-Cloud sessions typically run as root, which defeats permission-based tests;
-server-rs's `test_permission_denied` detects that and says so instead of
-failing.
+crate) into `~/.cache/blorg`. The Windows-target clippy covers the library
+and binaries only: the benches pull in a C build that needs MSVC's
+`lib.exe`. Cloud sessions typically run as root, which defeats
+permission-based tests; server-rs's `test_permission_denied` detects that
+and says so instead of failing.
 
 ### Setting up a session
 
@@ -515,83 +522,22 @@ failing.
 Put `bash BlorgFS/tools/agent/session-start.sh` (path relative to where the
 environment clones the repo) in the agent environment's setup script —
 Claude Code on the web and Codex cloud both have one. Nothing depends on
-it having run: each command fetches what it is missing.
+it having run: each command fetches what it is missing. NuGet's CDN drops
+long HTTP/2 downloads through some egress proxies, so `blorg` fetches
+packages over HTTP/1.1.
 
-NuGet's CDN drops long HTTP/2 downloads through some egress proxies, so
-`blorg` fetches packages over HTTP/1.1. If `aka.ms` and
-`download.visualstudio.microsoft.com` are blocked by the session's network
-policy, `cargo-xwin` cannot fetch the MSVC CRT and `server-exe` falls back
-to mingw.
+### Containers
 
-### Containers: what they solve and what they cannot
+`ci/agent/container/Containerfile` is the Linux tier as one image (clang,
+CMake, Rust with the MSVC target, gh). `ci/agent/container/run.sh <blorg
+args>` runs `blorg` in it against this checkout, with podman or docker,
+building the image on first use, so a laptop gets the same toolchain
+without installing anything else. Cloud agent sessions run in their
+provider's own image and use `session-start.sh` instead.
 
-`ci/agent/container/Containerfile` is the Linux half of this toolchain as
-one image: clang, CMake, Rust with both Windows targets, cargo-xwin,
-mingw-w64, gh, QEMU and the image-build tools. `ci/agent/container/run.sh
-<blorg args>` runs `blorg` in it against this checkout (building the image
-on first use), so a laptop, the KVM host and CI get the same Linux
-toolchain without installing anything but podman or docker.
-
-What a container cannot do is the Windows part. MSVC and the WDK run only
-on Windows, and a container shares its host's kernel, so no container on
-any host can load `BlorgFS.sys`. Windows containers do not change that:
-they could host the MSVC build, but they still share a Windows host
-kernel, so loading a test driver into one would put the host at risk, and
-they would need a Windows host the rest of this rig does not have. The
-build VM and the test guest stay; the container is what drives them.
-
-- **Podman on the KVM host.** It runs rootless and needs no daemon, and
-  `run.sh` passes `--userns=keep-id --group-add keep-groups --device
-  /dev/kvm`, so QEMU in the container gets KVM through the user's own
-  `kvm` group membership and files it writes stay owned by that user.
-- **Docker** works the same through `run.sh` (as root inside, which its
-  daemon is anyway). It is what GitHub's runners and some agent sandboxes
-  already have.
-- **Cloud agent sessions** (Claude Code on the web, Codex cloud) run in the
-  provider's own container image and cannot be pointed at this one, so
-  they use `tools/agent/session-start.sh` as their setup script instead.
-  Where a session has a working docker, `run.sh` works there too, but it
-  buys nothing over running `blorg` directly.
-
-### The build VM
-
-The test guest (see the cloud test guest section) is deliberately
-toolchain-free. The build VM is a second guest on the same KVM host, booted
-from a *layer* — a qcow2 overlay on the golden image with VS Build Tools
-(C++ x64 + Spectre libraries), CMake, nuget.exe, MinGit and rustup added by
-`ci/agent/build-vm/Install-BuildToolchain.ps1`. The golden image is never
-written, so the test guest keeps testing exactly what CI ships. The WDK is
-not installed in the layer; it comes from NuGet, as in `build.yml`.
-
-- `ci/agent/host/setup-kvm-host.sh` prepares a host once: QEMU, the golden
-  image, the layer (`ci/agent/build-vm/build-layer.sh`, rebuild it with
-  `--force` whenever the golden image is rebuilt) and, with
-  `--runner-token`, a self-hosted Actions runner labelled `blorg-kvm`.
-- `blorg win build` ships the working tree, including uncommitted and
-  untracked files and the git metadata the package script reads, into the
-  build VM's persistent checkout (`C:\src\BlorgFS`) and runs
-  `ci/agent/build-vm/Invoke-GuestBuild.ps1`: flatcc codegen, NuGet restore,
-  `Invoke-BlorgChecks.ps1 -Tier <tier>`, then — once the package tooling
-  is on the branch — the driver in solution layout, server-rs with cargo,
-  and `New-BlorgPackage.ps1`. Results land in `out/win/`
-  (`build-summary.txt`, `logs/`) and the package in `out/package/`.
-- `blorg win test` hands `out/package` to `ci/guest/run-guest-tests.sh`,
-  i.e. a fresh test guest; results in `out/guest-results/`.
-- The build VM listens on host port 2223 (test guest: 2222), keeps 8 GB by
-  default (`BLORG_BUILD_MEM_MB`), and survives between builds; `blorg win
-  up --fresh` discards it.
-- A file deleted on the host is not deleted in the build VM's checkout.
-  MSBuild compiles only what the project lists, so this is harmless unless
-  a stale header shadows a moved one.
-
-BlorgFS is public. A self-hosted runner on a public repository runs any
-workflow a branch or fork PR points at it, so register one only with
-"Require approval for all external contributors" set under
-Settings > Actions > General, and keep that host for this rig alone.
-`agent-remote.yml` only sends work to `blorg-kvm` from `workflow_dispatch`. Its
-checkout does not persist the token on the host, and it prefers a
-read-only `BLORG_KVM_READ_TOKEN` secret over `GH_PAT`; set one before
-registering the runner.
+A container cannot do the Windows part: MSVC and the WDK run only on
+Windows, and a container shares its host's kernel, so no container can
+load `BlorgFS.sys`. That half is `build.yml` and the test guest.
 
 ## Deploying to a VM
 

@@ -7,17 +7,15 @@
 # Every command says what it needs; `blorg doctor` says which of those this
 # session has. See "Remote agents" in AGENTS.md.
 #
-# Three places work happens, cheapest first:
+# Two places work happens:
 #
 #   here      (Linux, no Windows anywhere)
 #     setup                 fetch/build what the local checks need (cached)
 #     check                 the Linux tier: driver compile check against the
-#                           real WDK headers, schema pins, server-rs tests,
-#                           clippy, and a Windows-target clippy of server-rs
+#                           real WDK headers, server-rs tests, clippy, and a
+#                           Windows-target clippy of server-rs
 #     driver-check [file..] just the driver compile check
-#     server-exe [--out D]  build server-rs.exe for Windows (MSVC via
-#                           cargo-xwin when Microsoft's CDN is reachable,
-#                           else mingw -- fine for iteration, not shipped)
+#     server-test           just the server-rs part
 #
 #   ci        (GitHub Actions; needs a GitHub token, see `doctor`)
 #     ci test [--ref R] [--no-verifier]
@@ -28,24 +26,9 @@
 #     ci guest [--package-run ID] [--no-verifier]
 #                           just the guest runtime tests, on a build.yml
 #                           run's package (default: the newest)
-#     ci remote [--ref R] [--action build|build-test] [--tier T]
-#                           dispatch agent-remote.yml to the self-hosted KVM
-#                           host: incremental build in its build VM, then
-#                           (build-test) the guest tests there
 #     ci status [--ref R]   latest runs of every workflow for a ref
-#     ci results ID         download a run's artifacts and print verdicts
-#
-#   win       (a KVM host: this machine if it has /dev/kvm, else
-#              BLORG_KVM_SSH=user@host; the host is set up once with
-#              ci/agent/host/setup-kvm-host.sh)
-#     win up [--fresh] | down | status | ssh [cmd]
-#     win sync              copy this working tree into the build VM
-#     win build [--tier T] [--config C]
-#                           sync, then Invoke-BlorgChecks + package in the
-#                           build VM; the package lands in out/package
-#     win test [--package D] [--no-verifier] [--keep]
-#                           run-guest-tests.sh on a fresh test guest with
-#                           that package (default: the last win build's)
+#     ci results ID         a run's verdict annotations (and artifacts, when
+#                           blob storage is reachable)
 #
 #   doctor                  what this session can and cannot do, and why
 #
@@ -151,16 +134,10 @@ cmd_setup() {
     hdr "driver: flatcc + generated headers";   gen_driver_headers >/dev/null || { note "FAILED"; rc=2; }
     hdr "driver: WDK + SDK headers (NuGet)";    setup_wdk_headers  >/dev/null || { note "FAILED"; rc=2; }
     if srv="$(server_dir)"; then
-        hdr "server-rs ($srv): flatc + Rust targets"
+        hdr "server-rs ($srv): flatc + Windows Rust target"
         setup_flatc "$srv" || { note "flatc FAILED"; rc=2; }
         if have rustup; then
-            rustup target add x86_64-pc-windows-msvc x86_64-pc-windows-gnu >/dev/null 2>&1 || note "rustup target add failed"
-        fi
-        if ! have x86_64-w64-mingw32-gcc && [[ $EUID -eq 0 ]] && have apt-get; then
-            note "installing mingw-w64 (for server-exe without the MSVC CRT)"
-            apt-get install -y -q gcc-mingw-w64-x86-64 >/dev/null 2>&1 ||
-                { apt-get update -q >/dev/null 2>&1 && apt-get install -y -q gcc-mingw-w64-x86-64 >/dev/null 2>&1; } ||
-                note "mingw-w64 install failed; server-exe will need cargo-xwin"
+            rustup target add x86_64-pc-windows-msvc >/dev/null 2>&1 || note "rustup target add failed"
         fi
     else
         note "no server-rs checkout found (third_party/server-rs, ../server-rs or \$BLORG_SERVER_RS); skipping its setup"
@@ -232,26 +209,6 @@ cmd_driver_check() {
     return $fail
 }
 
-# ---------------------------------------------------------------- pins
-
-# The schema pin check from tools/Test-BlorgPackagePins.ps1, without pwsh.
-cmd_pins() {
-    local srv_pin drv_schemas srv_schemas srv
-    drv_schemas="$(git -C "$REPO" ls-files -s -- third_party/schemas | awk '{print $2}')"
-    if srv_pin="$(git -C "$REPO" ls-files -s -- third_party/server-rs | awk '$1=="160000"{print $2}')" && [[ -n "$srv_pin" ]]; then
-        git -C "$REPO" submodule update --init third_party/server-rs >/dev/null 2>&1
-        srv_schemas="$(git -C "$REPO/third_party/server-rs" ls-tree "$srv_pin" -- schemas | awk '{print $3}')"
-        echo "driver schemas $drv_schemas; pinned server-rs ${srv_pin:0:7} schemas $srv_schemas"
-    elif srv="$(server_dir)"; then
-        srv_schemas="$(git -C "$srv" ls-files -s -- schemas | awk '{print $2}')"
-        echo "driver schemas $drv_schemas; server-rs checkout at $srv (not pinned here) schemas $srv_schemas"
-    else
-        echo "no server-rs to compare against"; return 0
-    fi
-    [[ "$drv_schemas" == "$srv_schemas" ]] || { echo "FAIL: driver and server compile different schemas"; return 1; }
-    echo "ok   schemas match"
-}
-
 # ---------------------------------------------------------------- server
 
 server_env() {
@@ -277,31 +234,13 @@ cmd_server_test() {
     return $rc
 }
 
-cmd_server_exe() {
-    local out="$OUT/server" srv
-    [[ "${1:-}" == "--out" ]] && out="$2"
-    srv="$(server_dir)" || die "no server-rs checkout"
-    server_env "$srv"
-    mkdir -p "$out"
-    if have cargo-xwin && (cd "$srv" && cargo xwin build --locked --release --target x86_64-pc-windows-msvc); then
-        cp "$srv/target/x86_64-pc-windows-msvc/release/server-rs.exe" "$out/"
-        note "MSVC build (as shipped): $out/server-rs.exe"
-        return 0
-    fi
-    note "cargo-xwin unavailable or Microsoft's CDN unreachable; building with mingw-w64 instead"
-    (cd "$srv" && cargo build --locked --release --target x86_64-pc-windows-gnu) || return 1
-    cp "$srv/target/x86_64-pc-windows-gnu/release/server-rs.exe" "$out/"
-    note "mingw build (iteration only; the package ships the MSVC one): $out/server-rs.exe"
-}
-
 cmd_check() {
     local rc=0
-    hdr "schema pins";             cmd_pins || rc=1
     hdr "driver compile check";    cmd_driver_check || rc=1
     if server_dir >/dev/null; then cmd_server_test || rc=1; fi
     echo
     (( rc == 0 )) && echo "Linux tier: PASS" || echo "Linux tier: FAIL"
-    echo "Not covered here: MSVC/PREfast build, usermode sandbox suites, driver load. Use 'blorg ci ...' or 'blorg win ...'."
+    echo "Not covered here: MSVC/PREfast build, usermode sandbox suites, driver load. Use 'blorg ci test'."
     return $rc
 }
 
@@ -368,21 +307,11 @@ build_run_for() {
     fi
 }
 
-# Wait for a run; on failure print the tail of each failed job's log. A run
-# still queued after BLORG_QUEUE_TIMEOUT seconds (default 600) is waiting for
-# a runner that is not there -- usually the self-hosted KVM host being off --
-# so it is cancelled rather than waited on for GitHub's 24 hours.
+# Wait for a run; on failure print the tail of each failed job's log.
 watch_run() {
-    local id="$1" status concl start=$SECONDS
+    local id="$1" concl
     note "https://github.com/$GH_REPO/actions/runs/$id"
-    while :; do
-        status="$(gh run view "$id" -R "$GH_REPO" --json status --jq .status 2>/dev/null)"
-        [[ "$status" == "completed" ]] && break
-        if [[ "$status" == "queued" ]] && (( SECONDS - start > ${BLORG_QUEUE_TIMEOUT:-600} )); then
-            gh run cancel "$id" -R "$GH_REPO" >/dev/null 2>&1 || true
-            note "run $id never left the queue; cancelled. Is a runner for it online? (runner=kvm needs the blorg-kvm host up)"
-            return 2
-        fi
+    until [[ "$(gh run view "$id" -R "$GH_REPO" --json status --jq .status 2>/dev/null)" == "completed" ]]; do
         sleep 20
     done
     concl="$(gh run view "$id" -R "$GH_REPO" --json conclusion --jq .conclusion)"
@@ -475,24 +404,6 @@ cmd_ci() {
             hdr "guest runtime tests on build $bid's package"
             cmd_ci guest --ref "$ref" --package-run "$bid" "${nover[@]}"
             ;;
-        remote)
-            need_gh
-            local action=build-test tier=Fast
-            while (( $# )); do
-                case "$1" in
-                    --ref)    ref="$2"; shift 2 ;;
-                    --action) action="$2"; shift 2 ;;
-                    --tier)   tier="$2"; shift 2 ;;
-                    *) die "unknown ci remote argument '$1'" ;;
-                esac
-            done
-            local id rc
-            id="$(dispatch agent-remote.yml "$ref" -f "action=$action" -f "tier=$tier")" || exit 2
-            echo "remote_run=$id"
-            watch_run "$id"; rc=$?
-            cmd_ci results "$id"
-            return $rc
-            ;;
         status)
             need_gh
             [[ "${1:-}" == "--ref" ]] && ref="$2"
@@ -516,122 +427,7 @@ cmd_ci() {
                 note "could not download run $id's artifacts (none yet, or blob storage unreachable from here)"
             fi
             ;;
-        *) die "usage: blorg ci test|build|guest|remote|status|results" ;;
-    esac
-}
-
-# ---------------------------------------------------------------- win
-
-# The build VM is a second guest on the KVM host, from the build layer
-# (golden image + VS Build Tools), on its own port and run directory so it
-# can sit next to the test guest. Unlike the test guest it is persistent:
-# its disk keeps obj/, packages/ and cargo's target/ between builds, which
-# is what makes an incremental build quick.
-win_env() {
-    export GUEST_HOME="${GUEST_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/blorgfs-guest}"
-    export GUEST_GOLDEN="${BLORG_BUILD_IMAGE:-$GUEST_HOME/image/build.qcow2}"
-    export GUEST_RUN_DIR="$GUEST_HOME/build-run"
-    export GUEST_SSH_PORT="${BLORG_BUILD_SSH_PORT:-2223}"
-    export GUEST_MEM_MB="${BLORG_BUILD_MEM_MB:-${GUEST_MEM_MB:-8192}}"
-}
-guestctl() { "$REPO/ci/guest/host/guestctl" "$@"; }
-build_vm() { ( win_env; guestctl "$@" ); }
-
-# Not on a KVM host: run this same command there, over SSH, on a copy of
-# this working tree.
-win_remote() {
-    local host="${BLORG_KVM_SSH:-}"
-    [[ -n "$host" ]] || die "no /dev/kvm here and BLORG_KVM_SSH is unset.
-  Point BLORG_KVM_SSH at a KVM host prepared with ci/agent/host/setup-kvm-host.sh,
-  or use 'blorg ci remote' (the KVM host's runner, needs only GitHub) / 'blorg ci test' (CI's own build + guest)."
-    local rdir="${BLORG_KVM_DIR:-blorg-agent/BlorgFS}"
-    note "syncing working tree to $host:$rdir"
-    ssh "$host" "mkdir -p '$rdir'" || die "cannot ssh to $host (outbound SSH may be blocked by this environment's network policy)"
-    tree_files |
-        rsync -a --from0 --files-from=- --delete-missing-args "$REPO/" "$host:$rdir/" || die "rsync failed"
-    ssh -t "$host" "cd '$rdir' && BLORG_KVM_SSH= tools/agent/blorg win $*"
-    local rc=$?
-    mkdir -p "$OUT"
-    rsync -a "$host:$rdir/out/" "$OUT/" 2>/dev/null || true
-    return $rc
-}
-
-# The working tree as a NUL-separated list: tracked files (submodules
-# included), untracked-but-not-ignored ones so an agent's new files go along
-# too, and the git metadata -- the package script reads commits and the
-# schema pins from git, so the copy has to be a repository, not a snapshot.
-# (git refuses --others with --recurse-submodules, hence separate calls.)
-tree_files() {
-    (
-        cd "$REPO" || exit 1
-        git ls-files -z --recurse-submodules
-        git ls-files -z --others --exclude-standard
-        find .git -type f -not -name '*.lock' -print0
-        # shellcheck disable=SC2016 # expanded by git, per submodule
-        git submodule foreach --quiet --recursive 'printf "%s/.git\0" "$displaypath"'
-    )
-}
-
-on_kvm_host() { [[ -r /dev/kvm && -w /dev/kvm && -z "${BLORG_KVM_SSH:-}" ]]; }
-
-win_sync() {
-    [[ -x "$REPO/ci/guest/host/guestctl" ]] || die "ci/guest/ (the test-guest rig) is not in this checkout"
-    local tarball="$CACHE/src.tar.gz"
-    note "packing working tree (tracked + untracked, not ignored, with submodules)"
-    tree_files | (cd "$REPO" && tar --null -T - --ignore-failed-read -czf "$tarball") ||
-        die "could not pack the tree"
-    build_vm push "$tarball" C:/blorg-agent/src.tar.gz || die "could not copy into the build VM"
-    build_vm ps "$REPO/ci/agent/build-vm/Sync-Source.ps1" -Archive C:/blorg-agent/src.tar.gz -Dest C:/src/BlorgFS ||
-        die "could not unpack in the build VM"
-}
-
-cmd_win() {
-    local sub="${1:-}"
-    if ! on_kvm_host; then win_remote "$@"; return $?; fi
-    shift || true
-    case "$sub" in
-        up)     build_vm up "$@" ;;
-        down)   build_vm down --graceful ;;
-        status) build_vm status ;;
-        ssh)    build_vm ssh "$@" ;;
-        sync)   build_vm up >/dev/null && win_sync ;;
-        build)
-            local tier=Fast config=Release
-            while (( $# )); do
-                case "$1" in
-                    --tier)   tier="$2"; shift 2 ;;
-                    --config) config="$2"; shift 2 ;;
-                    *) die "unknown win build argument '$1'" ;;
-                esac
-            done
-            build_vm up || exit 2
-            win_sync
-            build_vm ps "$REPO/ci/agent/build-vm/Invoke-GuestBuild.ps1" -Source C:/src/BlorgFS \
-                -Tier "$tier" -Configuration "$config" -OutDir C:/blorg-agent/out
-            local rc=$?
-            rm -rf "$OUT/win"; mkdir -p "$OUT"
-            build_vm pull C:/blorg-agent/out "$OUT/win" || note "could not copy results out of the build VM"
-            if [[ -f "$OUT/win/package/manifest.json" ]]; then
-                rm -rf "$OUT/package"; cp -r "$OUT/win/package" "$OUT/package"
-                note "package: $OUT/package"
-            fi
-            [[ -f "$OUT/win/build-summary.txt" ]] && cat "$OUT/win/build-summary.txt"
-            return $rc
-            ;;
-        test)
-            local pkg="$OUT/package" args=()
-            while (( $# )); do
-                case "$1" in
-                    --package) pkg="$2"; shift 2 ;;
-                    *) args+=("$1"); shift ;;
-                esac
-            done
-            [[ -f "$pkg/manifest.json" ]] || die "no package at $pkg (run 'blorg win build' first, or pass --package)"
-            local suites=()
-            [[ -d "$REPO/tests/guest-suites" ]] && suites=(--suites "$REPO/tests/guest-suites")
-            "$REPO/ci/guest/run-guest-tests.sh" --package "$pkg" --out "$OUT/guest-results" "${suites[@]}" "${args[@]}"
-            ;;
-        *) die "usage: blorg win up|down|status|ssh|sync|build|test" ;;
+        *) die "usage: blorg ci test|build|guest|status|results" ;;
     esac
 }
 
@@ -645,24 +441,15 @@ cmd_doctor() {
     echo "clang               $(yes_no have clang)"
     echo "cmake               $(yes_no have cmake)"
     echo "cargo               $(yes_no have cargo)"
-    echo "cargo-xwin          $(yes_no have cargo-xwin)"
-    echo "mingw-w64           $(yes_no have x86_64-w64-mingw32-gcc)"
     echo "nuget.org           $(yes_no curl -fsS --http1.1 -m 10 -o /dev/null https://api.nuget.org/v3/index.json)"
-    echo "MS CDN (xwin)       $(yes_no curl -fsS -m 10 -o /dev/null -I https://aka.ms/vs/17/release/channel)"
     echo "GitHub API          $(yes_no gh_ok)"
-    echo "/dev/kvm            $(yes_no test -w /dev/kvm)"
-    echo "BLORG_KVM_SSH       ${BLORG_KVM_SSH:-unset}"
-    echo "ci/guest rig        $(yes_no test -x "$REPO/ci/guest/host/guestctl")"
     echo
     echo "So, from here:"
-    echo "  blorg check                Linux tier (driver compile check, pins, server-rs)"
+    echo "  blorg check                Linux tier (driver compile check, server-rs)"
     if gh_ok; then
         echo "  blorg ci test              real MSVC build (build.yml) + real-kernel guest tests, via GitHub Actions"
     else
         echo "  (no GitHub token)          push the branch and read CI on the PR; see 'blorg ci' for how to add a token"
-    fi
-    if on_kvm_host || [[ -n "${BLORG_KVM_SSH:-}" ]]; then
-        echo "  blorg win build|test       Windows build VM + test guest on the KVM host"
     fi
 }
 
@@ -672,11 +459,8 @@ case "${1:-}" in
     setup)        shift; cmd_setup "$@" ;;
     check)        shift; cmd_check "$@" ;;
     driver-check) shift; cmd_driver_check "$@" ;;
-    pins)         shift; cmd_pins ;;
     server-test)  shift; cmd_server_test ;;
-    server-exe)   shift; cmd_server_exe "$@" ;;
     ci)           shift; cmd_ci "$@" ;;
-    win)          shift; cmd_win "$@" ;;
     doctor)       shift; cmd_doctor ;;
     ""|-h|--help|help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' ;;
     *)            die "unknown command '$1' (blorg help)" ;;
