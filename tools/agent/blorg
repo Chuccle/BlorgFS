@@ -20,14 +20,18 @@
 #                           else mingw -- fine for iteration, not shipped)
 #
 #   ci        (GitHub Actions; needs a GitHub token, see `doctor`)
-#     ci build [--ref R]    dispatch "Build BlorgFS" and wait; prints failing
-#                           job logs. Its package artifact feeds `ci guest`
+#     ci test [--ref R] [--no-verifier]
+#                           the whole chain, exactly as a PR gets it: build.yml
+#                           (the one recipe for the package), then the guest
+#                           runtime tests on its package; prints the verdict
+#     ci build [--ref R]    just build.yml, waited on; prints failing jobs
 #     ci guest [--package-run ID] [--no-verifier]
-#                           dispatch the Windows guest runtime tests, wait,
-#                           download guest-results/, print the verdict
-#     ci remote [--ref R] [--action build|build-test] [--tier T] [--runner hosted|kvm]
-#                           dispatch agent-remote.yml: build (and test) on
-#                           a Windows runner, or on the KVM host's build VM
+#                           just the guest runtime tests, on a build.yml
+#                           run's package (default: the newest)
+#     ci remote [--ref R] [--action build|build-test] [--tier T]
+#                           dispatch agent-remote.yml to the self-hosted KVM
+#                           host: incremental build in its build VM, then
+#                           (build-test) the guest tests there
 #     ci status [--ref R]   latest runs of every workflow for a ref
 #     ci results ID         download a run's artifacts and print verdicts
 #
@@ -412,29 +416,59 @@ cmd_ci() {
             cmd_ci results "$id"
             return $a
             ;;
+        test)
+            need_gh
+            local nover=() bid sha gid="" since
+            while (( $# )); do
+                case "$1" in
+                    --ref)         ref="$2"; shift 2 ;;
+                    --no-verifier) nover=(--no-verifier); shift ;;
+                    *) die "unknown ci test argument '$1'" ;;
+                esac
+            done
+            bid="$(dispatch build.yml "$ref")" || exit 2
+            echo "build_run=$bid"
+            watch_run "$bid" || return 1
+            # guest-runtime.yml chains on every successful build (workflow_run).
+            # Follow that run rather than starting a second one; dispatch only
+            # when none appears (no chaining before guest-runtime.yml is on
+            # the default branch, or --no-verifier asked for a different run).
+            sha="$(gh run view "$bid" -R "$GH_REPO" --json headSha --jq .headSha)"
+            since="$(gh run view "$bid" -R "$GH_REPO" --json updatedAt --jq .updatedAt)"
+            if (( ${#nover[@]} == 0 )); then
+                for _ in $(seq 1 18); do
+                    gid="$(gh run list -R "$GH_REPO" -w guest-runtime.yml -e workflow_run -L 10 \
+                           --json databaseId,headSha,createdAt \
+                           --jq "[.[] | select(.headSha == \"$sha\" and .createdAt >= \"$since\")][0].databaseId // empty" 2>/dev/null)"
+                    [[ -n "$gid" ]] && break
+                    sleep 10
+                done
+            fi
+            if [[ -n "$gid" ]]; then
+                hdr "guest runtime tests (run $gid, chained on build $bid)"
+                watch_run "$gid"; local rc=$?
+                cmd_ci results "$gid"
+                return $rc
+            fi
+            hdr "guest runtime tests on build $bid's package"
+            cmd_ci guest --ref "$ref" --package-run "$bid" "${nover[@]}"
+            ;;
         remote)
             need_gh
-            local action=build-test tier=Fast runner=hosted
+            local action=build-test tier=Fast
             while (( $# )); do
                 case "$1" in
                     --ref)    ref="$2"; shift 2 ;;
                     --action) action="$2"; shift 2 ;;
                     --tier)   tier="$2"; shift 2 ;;
-                    --runner) runner="$2"; shift 2 ;;
                     *) die "unknown ci remote argument '$1'" ;;
                 esac
             done
             local id rc
-            id="$(dispatch agent-remote.yml "$ref" -f "action=$action" -f "tier=$tier" -f "runner=$runner")" || exit 2
+            id="$(dispatch agent-remote.yml "$ref" -f "action=$action" -f "tier=$tier")" || exit 2
             echo "remote_run=$id"
             watch_run "$id"; rc=$?
             cmd_ci results "$id"
-            # The KVM host runs the guest tests itself; a hosted build hands
-            # its package to the guest workflow.
-            if (( rc == 0 )) && [[ "$runner" == "hosted" && "$action" == "build-test" ]]; then
-                hdr "guest runtime tests on run $id's package"
-                cmd_ci guest --ref "$ref" --package-run "$id"; rc=$?
-            fi
             return $rc
             ;;
         status)
@@ -460,7 +494,7 @@ cmd_ci() {
                 note "could not download run $id's artifacts (none yet, or blob storage unreachable from here)"
             fi
             ;;
-        *) die "usage: blorg ci build|guest|remote|status|results" ;;
+        *) die "usage: blorg ci test|build|guest|remote|status|results" ;;
     esac
 }
 
@@ -487,7 +521,7 @@ win_remote() {
     local host="${BLORG_KVM_SSH:-}"
     [[ -n "$host" ]] || die "no /dev/kvm here and BLORG_KVM_SSH is unset.
   Point BLORG_KVM_SSH at a KVM host prepared with ci/agent/host/setup-kvm-host.sh,
-  or use 'blorg ci remote --runner kvm' (needs only GitHub) / 'blorg ci remote' (a hosted Windows runner)."
+  or use 'blorg ci remote' (the KVM host's runner, needs only GitHub) / 'blorg ci test' (CI's own build + guest)."
     local rdir="${BLORG_KVM_DIR:-blorg-agent/BlorgFS}"
     note "syncing working tree to $host:$rdir"
     ssh "$host" "mkdir -p '$rdir'" || die "cannot ssh to $host (outbound SSH may be blocked by this environment's network policy)"
@@ -601,7 +635,7 @@ cmd_doctor() {
     echo "So, from here:"
     echo "  blorg check                Linux tier (driver compile check, pins, server-rs)"
     if gh_ok; then
-        echo "  blorg ci build|guest|remote  real MSVC build and real-kernel tests, via GitHub Actions"
+        echo "  blorg ci test              real MSVC build (build.yml) + real-kernel guest tests, via GitHub Actions"
     else
         echo "  (no GitHub token)          push the branch and read CI on the PR; see 'blorg ci' for how to add a token"
     fi

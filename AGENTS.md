@@ -49,7 +49,7 @@ a task needs it.
 | Do this | Command | Detail |
 |---|---|---|
 | Build + test (default gate) | `powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Fast` | [Build and test tiers](#build-and-test-tiers) |
-| From a Linux session: quick compile check, then Windows build + guest tests | `tools/agent/blorg check`, then `tools/agent/blorg ci remote` | [Remote agents](#remote-agents-building-deploying-and-testing-from-linux) |
+| From a Linux session: quick compile check, then Windows build + guest tests | `tools/agent/blorg check`, then `tools/agent/blorg ci test` | [Remote agents](#remote-agents-building-deploying-and-testing-from-linux) |
 | Deploy to the dev VM | `.\deploy\Deploy-ToVM.ps1 -Configuration Release` | [Deploying to a VM](#deploying-to-a-vm) |
 | Benchmark (Release, Verifier off) | `powershell -File deploy/Deploy-ToVM.ps1 -ForBenchmark` | [Measuring performance](#measuring-performance) |
 | Accept new perf baseline | `powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Perf -PerfFile <path> -UpdateBaseline` | [Measuring performance](#measuring-performance) |
@@ -469,9 +469,8 @@ current session can reach; `blorg help` lists every command.
 | Where | Command | What it proves | Needs |
 |---|---|---|---|
 | This Linux session | `tools/agent/blorg check` | The driver compiles (every `ClCompile` in `BlorgFS.vcxproj`, clang against the WDK's own kernel headers), schema pins agree, server-rs tests + clippy pass, server-rs type-checks for `x86_64-pc-windows-msvc` | clang, cmake, cargo, nuget.org |
-| GitHub-hosted Windows | `tools/agent/blorg ci remote` | The real MSVC/PREfast build and `Invoke-BlorgChecks` tier, then the package in a real Windows kernel (guest runtime tests) | A GitHub token that can dispatch workflows |
-| GitHub, full CI | `tools/agent/blorg ci build`, then `ci guest` | Exactly what a PR gets: `build.yml`'s matrix and package, then `guest-runtime.yml` on it | as above |
-| The KVM host | `tools/agent/blorg win build`, `win test` | Same as `ci remote`, but incremental in a persistent build VM: minutes, not a clean runner each time | `/dev/kvm` here, `BLORG_KVM_SSH=user@host`, or `ci remote --runner kvm` |
+| GitHub Actions | `tools/agent/blorg ci test` | Exactly what a PR gets: `build.yml` (the one recipe for the shipped package: MSVC/PREfast, the usermode suites, server-rs, packaging), then `guest-runtime.yml` loads that package into a real Windows kernel | A GitHub token that can dispatch workflows |
+| The KVM host | `tools/agent/blorg win build`, `win test` | The same checks, incremental in a persistent build VM: for iterating, not for certifying — its package is not the one `build.yml` ships | `/dev/kvm` here, `BLORG_KVM_SSH=user@host`, or `ci remote` (self-hosted runner) |
 
 **The Linux tier is not the gate.** It catches what a compile catches —
 typos, undeclared or misused kernel APIs, type errors, header breakage — in
@@ -479,16 +478,14 @@ seconds, from the WDK/SDK NuGet packages pinned in `src/packages.config`
 and with the defines and include paths read out of `BlorgFS.vcxproj`. It
 does not run PREfast, does not link, does not run the usermode sandbox
 suites, and clang's diagnostics are not cl's. Use it to iterate; before
-calling a change done, get `-Tier Fast` from a Windows build (`ci remote`,
-`win build`, or a PR's `build.yml`).
+calling a change done, get a green `build.yml` and guest run (`ci test`, or the PR's own checks).
 
 **Getting results back without a token.** A Claude Code session on the
 web pushes through its own git credential and drives GitHub through the
 GitHub MCP tools; `gh` may or may not be authenticated. Pushing the branch
 is always enough: `build.yml` builds it and `guest-runtime.yml` tests every
-successful build. `actions_run_trigger` (workflow `agent-remote.yml`,
-inputs `action`, `tier`, `runner`) and `get_job_logs` are the MCP
-equivalents of `blorg ci remote`. Any other environment sets
+successful build. `actions_run_trigger` (workflow `build.yml`) and
+`get_job_logs` are the MCP equivalents of `blorg ci test`. Any other environment sets
 `BLORG_GH_TOKEN` to a fine-grained token on this repository with Actions
 read/write and Contents read.
 
@@ -496,7 +493,8 @@ Run logs and artifacts are served from blob storage hosts
 (`*.blob.core.windows.net`, `results-receiver.actions.githubusercontent.com`)
 that an agent's egress proxy may block even when `api.github.com` works.
 So `agent-remote.yml` also publishes its build summary and guest verdict as
-`blorg …` annotations, which `blorg ci results` reads through the API; the
+`blorg …` annotations (`guest-runtime.yml` writes its verdict to the job
+log, which `get_job_logs` reaches), which `blorg ci results` reads through the API; the
 GitHub MCP `get_job_logs` tool also works, because it fetches server-side.
 
 **server-rs from here.** `blorg` finds server-rs as `third_party/server-rs`
@@ -590,7 +588,10 @@ BlorgFS is public. A self-hosted runner on a public repository runs any
 workflow a branch or fork PR points at it, so register one only with
 "Require approval for all external contributors" set under
 Settings > Actions > General, and keep that host for this rig alone.
-`agent-remote.yml` only sends work to `blorg-kvm` from `workflow_dispatch`.
+`agent-remote.yml` only sends work to `blorg-kvm` from `workflow_dispatch`. Its
+checkout does not persist the token on the host, and it prefers a
+read-only `BLORG_KVM_READ_TOKEN` secret over `GH_PAT`; set one before
+registering the runner.
 
 ## Deploying to a VM
 

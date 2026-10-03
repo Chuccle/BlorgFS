@@ -25,7 +25,12 @@
          flatbuffers, then New-BlorgPackage.ps1.
 
     Nothing here is specific to running in a VM: on a runner it runs
-    against the checkout directly.
+    against the checkout directly (agent-remote.yml's PR check does that).
+
+    This is the iteration build, not the release recipe: the package that
+    ships, and that guest-runtime.yml certifies, comes from build.yml only.
+    The server-rs step mirrors build.yml's server job; when that job's
+    steps move into a shared script, call it here instead.
 
     Exit code: 0 when every step that ran passed, 1 otherwise.
 

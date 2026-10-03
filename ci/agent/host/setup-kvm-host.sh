@@ -73,5 +73,5 @@ fi
 echo
 echo "KVM host ready. From here:      tools/agent/blorg win build && tools/agent/blorg win test"
 echo "From an agent with SSH access:  BLORG_KVM_SSH=$USER@<this host> tools/agent/blorg win build"
-[[ -n "$runner_token" ]] && echo "From an agent with only GitHub: tools/agent/blorg ci remote --runner kvm"
+[[ -n "$runner_token" ]] && echo "From an agent with only GitHub: tools/agent/blorg ci remote"
 exit 0

@@ -1,28 +1,22 @@
 name: Agent remote build
 
-# The Windows end of tools/agent/blorg, for coding agents (and people)
-# working from a Linux session that cannot run MSVC or the WDK. An agent
-# dispatches this with `blorg ci remote` (or the GitHub API/MCP directly)
-# and reads the results back; see "Remote agents" in AGENTS.md.
+# The KVM-host end of tools/agent/blorg. build.yml stays the one recipe for
+# the package that ships (and guest-runtime.yml tests it); this workflow is
+# only for the iteration loop on the self-hosted KVM host (label blorg-kvm,
+# set up with ci/agent/host/setup-kvm-host.sh): an incremental build in the
+# persistent build VM, then, for build-test, the guest runtime tests on that
+# package, all on one machine. An agent dispatches it with
+# `blorg ci remote --runner kvm`; see "Remote agents" in AGENTS.md.
 #
-#   runner=hosted  a GitHub-hosted Windows runner: a clean build of the ref
-#                  with ci/agent/build-vm/Invoke-GuestBuild.ps1. Its package
-#                  is uploaded under the same name build.yml uses, so
-#                  `blorg ci guest --package-run <this run>` tests it.
-#   runner=kvm     the self-hosted KVM host (label blorg-kvm, set up with
-#                  ci/agent/host/setup-kvm-host.sh): an incremental build in
-#                  the persistent build VM, then, for build-test, the guest
-#                  runtime tests on that package, all on one machine.
-#
-# On pull requests it runs only the parts that need no secrets or special
-# hardware -- the Linux tier and a hosted Build-tier pass -- so a change to
-# this tooling is tested by the tooling.
+# On pull requests that touch this tooling it runs the parts that need no
+# secrets or special hardware: the Linux tier, and the build VM's script on
+# a hosted Windows runner at the cheapest tier, without packaging.
 
 on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'build, or build-test (kvm: also run the guest tests here)'
+        description: 'build, or build-test (also run the guest tests on the package)'
         type: choice
         options: [ build, build-test ]
         default: build-test
@@ -31,11 +25,6 @@ on:
         type: choice
         options: [ Build, Fast, Proof, All ]
         default: Fast
-      runner:
-        description: 'hosted (GitHub Windows runner) or kvm (self-hosted blorg-kvm host)'
-        type: choice
-        options: [ hosted, kvm ]
-        default: hosted
   # Changes to this tooling, or to what its driver check reads.
   pull_request:
     branches: [ master ]
@@ -78,10 +67,14 @@ jobs:
     - name: Run the Linux tier
       run: tools/agent/blorg check
 
-  hosted:
-    if: github.event_name == 'pull_request' || inputs.runner == 'hosted'
+  # Keeps ci/agent/build-vm/Invoke-GuestBuild.ps1 working without a KVM
+  # host: the same script the build VM runs, on a hosted runner, at the
+  # Build tier and without packaging. It uploads no package -- the package
+  # comes from build.yml only.
+  script-check:
+    if: github.event_name == 'pull_request'
     runs-on: windows-latest
-    name: Windows build (hosted)
+    name: Build VM script (hosted check)
     timeout-minutes: 120
     steps:
     - name: Detect if Dependabot
@@ -94,6 +87,7 @@ jobs:
       with:
         token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
         submodules: recursive
+        persist-credentials: false
 
     - name: Cache NuGet packages
       uses: actions/cache@v5
@@ -103,14 +97,11 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-nuget-
 
-    # A PR checks that the script works, at the cheapest tier.
-    - name: Build, check and package
+    - name: Run Invoke-GuestBuild.ps1 (Build tier, no package)
       shell: pwsh
-      env:
-        TIER: ${{ github.event_name == 'pull_request' && 'Build' || inputs.tier }}
       run: |
         powershell -NoProfile -ExecutionPolicy Bypass -File ci/agent/build-vm/Invoke-GuestBuild.ps1 `
-          -Source . -Tier $env:TIER -OutDir agent-out
+          -Source . -Tier Build -NoPackage -OutDir agent-out
         exit $LASTEXITCODE
 
     - name: Summary
@@ -119,33 +110,15 @@ jobs:
       run: |
         if (Test-Path agent-out\build-summary.txt) {
           $text = Get-Content agent-out\build-summary.txt -Raw
-          "## Agent remote build (hosted)`n`n``````n$text``````" >> $env:GITHUB_STEP_SUMMARY
+          "## Build VM script (hosted check)`n`n``````n$text``````" >> $env:GITHUB_STEP_SUMMARY
           # Also as an annotation: agents behind an egress proxy often cannot
           # reach the blob storage artifacts and logs are served from, but
           # can read annotations through api.github.com (blorg ci results).
           "::notice title=blorg build-summary::$($text.Trim() -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')"
         }
 
-    - name: Upload results
-      if: always()
-      uses: actions/upload-artifact@v7
-      with:
-        name: agent-build
-        path: |
-          agent-out/build-summary.txt
-          agent-out/logs/
-        if-no-files-found: warn
-
-    # Same name as build.yml's, so guest-runtime.yml takes it by run id.
-    - name: Upload package
-      if: success() && hashFiles('agent-out/package/manifest.json') != ''
-      uses: actions/upload-artifact@v7
-      with:
-        name: blorg-package-windows-x64
-        path: agent-out/package/
-
   kvm:
-    if: github.event_name == 'workflow_dispatch' && inputs.runner == 'kvm'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [ self-hosted, blorg-kvm ]
     name: Build VM + guest (KVM host)
     timeout-minutes: 240
@@ -154,11 +127,15 @@ jobs:
       group: blorg-kvm-host
       cancel-in-progress: false
     steps:
+    # The host is persistent, so nothing may stay on it: the token is not
+    # written into .git/config, and a read-only token scoped to these
+    # repositories (BLORG_KVM_READ_TOKEN) is preferred over GH_PAT.
     - name: Checkout repository and submodules
       uses: actions/checkout@v6
       with:
-        token: ${{ secrets.GH_PAT }}
+        token: ${{ secrets.BLORG_KVM_READ_TOKEN || secrets.GH_PAT }}
         submodules: recursive
+        persist-credentials: false
 
     - name: Build in the build VM
       run: tools/agent/blorg win build --tier "${{ inputs.tier }}"
@@ -189,9 +166,11 @@ jobs:
           out/guest-results/
         if-no-files-found: warn
 
+    # Not blorg-package-windows-x64: that name means "built by build.yml",
+    # the package that ships. This one is an iteration build.
     - name: Upload package
       if: always() && hashFiles('out/package/manifest.json') != ''
       uses: actions/upload-artifact@v7
       with:
-        name: blorg-package-windows-x64
+        name: agent-package-windows-x64
         path: out/package/
