@@ -195,9 +195,18 @@ cmd_driver_check() {
     if (( ${#files[@]} == 0 )); then
         mapfile -t files < <(grep -o 'ClCompile Include="[^"]*"' "$proj" | sed 's/.*="//;s/"$//;s#\\#/#g;s#^#src/#')
     fi
-    local f out fail=0 nerr nwarn
+    # One clang per core; results are printed in project order.
+    local tmp f out fail=0 nerr nwarn n=0 jobs
+    tmp="$(mktemp -d)"; jobs="$(nproc)"
     for f in "${files[@]}"; do
-        out="$(cd "$REPO" && clang "${flags[@]}" "$f" 2>&1)"
+        (( n >= jobs )) && wait -n
+        (cd "$REPO" && clang "${flags[@]}" "$f" >"$tmp/$n" 2>&1) &
+        n=$((n + 1))
+    done
+    wait
+    n=0
+    for f in "${files[@]}"; do
+        out="$(cat "$tmp/$n")"; n=$((n + 1))
         nerr="$(grep -c 'error:' <<<"$out")"; nwarn="$(grep -c 'warning:' <<<"$out")"
         if (( nerr )); then
             fail=1; echo "FAIL $f ($nerr errors)"; grep -A3 'error:' <<<"$out" | head -40
@@ -206,6 +215,7 @@ cmd_driver_check() {
             (( verbose )) && [[ -n "$out" ]] && echo "$out"
         fi
     done
+    rm -rf "$tmp"
     return $fail
 }
 
@@ -315,12 +325,13 @@ build_run_for() {
     fi
 }
 
-# Wait for a run; on failure print the tail of each failed job's log.
+# Wait for a run (polling every BLORG_POLL seconds, default 10); on failure
+# print the tail of each failed job's log.
 watch_run() {
     local id="$1" concl
     note "https://github.com/$GH_REPO/actions/runs/$id"
     until [[ "$(gh run view "$id" -R "$GH_REPO" --json status --jq .status 2>/dev/null)" == "completed" ]]; do
-        sleep 20
+        sleep "${BLORG_POLL:-10}"
     done
     concl="$(gh run view "$id" -R "$GH_REPO" --json conclusion --jq .conclusion)"
     echo "run $id: ${concl:-unknown}"
@@ -395,12 +406,12 @@ cmd_ci() {
             sha="$(gh run view "$bid" -R "$GH_REPO" --json headSha --jq .headSha)"
             since="$(gh run view "$bid" -R "$GH_REPO" --json updatedAt --jq .updatedAt)"
             if (( ${#nover[@]} == 0 )); then
-                for _ in $(seq 1 18); do
+                for _ in $(seq 1 36); do
                     gid="$(gh run list -R "$GH_REPO" -w guest-runtime.yml -e workflow_run -L 10 \
                            --json databaseId,headSha,createdAt \
                            --jq "[.[] | select(.headSha == \"$sha\" and .createdAt >= \"$since\")][0].databaseId // empty" 2>/dev/null)"
                     [[ -n "$gid" ]] && break
-                    sleep 10
+                    sleep 5
                 done
             fi
             if [[ -n "$gid" ]]; then
