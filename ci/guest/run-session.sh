@@ -3,7 +3,8 @@
 # Runs an agent's script against the live guest and keeps everything it
 # produced: the way a remote agent with no KVM of its own acts in the guest.
 # The agent dispatches guest-runtime.yml with a `session` script, and reads
-# the transcript and files back from the guest-results artifact.
+# the transcript and files back from the guest-results artifact, or from
+# the job log, which carries the transcript and any screenshots (base64).
 #
 #   run-session.sh --out DIR SCRIPT
 #
@@ -39,6 +40,12 @@ guestctl status >/dev/null 2>&1 || guestctl up --fresh
 bash -x "$script" 2>&1 | tee "$SESSION_OUT/transcript.txt"
 rc=${PIPESTATUS[0]}
 echo "exit=$rc" >> "$SESSION_OUT/transcript.txt"
+
+# Images into the job log too, base64: an agent that can read the log but
+# not download the artifact (an egress proxy in the way) still sees them.
+for png in "$SESSION_OUT"/*.png; do
+    [[ -f "$png" ]] && echo "SCREEN $(basename "$png") png-base64 $(base64 -w0 "$png")"
+done
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
