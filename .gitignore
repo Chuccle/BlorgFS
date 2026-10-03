@@ -389,3 +389,7 @@ FodyWeavers.xsd
 blorgfs.env
 deploy/blorgfs.env
 .env
+
+# guest test results and tools/blorg output
+guest-results/
+/out/

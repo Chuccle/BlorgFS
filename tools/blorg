@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# blorg -- build, package and test BlorgFS + server-rs from a Linux shell.
+#
+# The one entrypoint for everything that runs on Linux, in CI or by hand.
+# Windows is needed only for the driver build (build.yml's Windows job, or
+# tools\Invoke-BlorgChecks.ps1) and inside the test guest. See AGENTS.md.
+#
+#   setup                   fetch/build what the local checks need (cached);
+#                           also the setup step of any hosted environment
+#   check                   the Linux tier: driver compile check against the
+#                           real WDK headers, server-rs tests and clippy
+#   driver-check [file..]   just the driver compile check
+#   server-test             just the server-rs part
+#   doctor                  what this machine can and cannot do, and why
+#
+#   pins                    the driver and the pinned server-rs compile the
+#                           same schemas commit
+#   server [--out DIR] [linux-x64|windows-x64 ...]
+#                           cross-build the pinned server-rs
+#   package --driver DIR [--servers DIR] [--out DIR] [--release]
+#                           assemble the package and its manifest.json
+#
+#   guest <command>         the Windows test guest on a KVM host: up, down,
+#                           ssh, push, pull, snapshot, screenshot, ...,
+#                           image, test, run, selftest (blorg guest help)
+#
+#   ci test|build|guest|status|results
+#                           the Windows build and guest tests on GitHub
+#                           Actions, from any shell with a GitHub token
+#
+#   container [command]     run blorg in tools/Containerfile's image
+#
+# Exit codes: 0 pass, 1 checks/tests failed, 2 the tool or environment broke.
+
+set -uo pipefail
+
+BLORG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/blorg"
+BLORG_D="$(dirname "$BLORG")/blorg.d"
+REPO="$(cd "$(dirname "$BLORG")/.." && pwd)"
+# shellcheck disable=SC2034  # GH_REPO and OUT are used by the modules
+GH_REPO="${BLORG_GH_REPO:-Chuccle/BlorgFS}"
+CACHE="${BLORG_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/blorg}"
+# shellcheck disable=SC2034
+OUT="${BLORG_OUT:-$REPO/out}"
+export BLORG BLORG_D
+mkdir -p "$CACHE"
+
+die()  { echo "blorg: $*" >&2; exit 2; }
+note() { echo "blorg: $*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+hdr()  { echo; echo "==> $*"; }
+
+# server-rs: the pinned submodule, else a sibling checkout, else $BLORG_SERVER_RS.
+server_dir() {
+    local d
+    for d in "${BLORG_SERVER_RS:-}" "$REPO/third_party/server-rs" "$REPO/../server-rs"; do
+        [[ -n "$d" && -f "$d/Cargo.toml" ]] && { (cd "$d" && pwd); return 0; }
+    done
+    return 1
+}
+
+# shellcheck source=/dev/null
+for module in "$BLORG_D"/*.sh; do source "$module"; done
+
+# blorg container [command...]: blorg inside tools/Containerfile's image,
+# against this checkout (podman, else docker; BLORG_ENGINE to choose). The
+# image is built on first use; a sibling ../server-rs is mounted too.
+cmd_container() {
+    local engine="${BLORG_ENGINE:-}" image="${BLORG_IMAGE:-localhost/blorg-dev}" args=() v
+    if [[ -z "$engine" ]]; then
+        if have podman; then engine=podman; elif have docker; then engine=docker
+        else die "neither podman nor docker is installed"; fi
+    fi
+    if ! "$engine" image inspect "$image" >/dev/null 2>&1; then
+        note "building $image with $engine (first use)"
+        "$engine" build -t "$image" -f "$REPO/tools/Containerfile" "$REPO/tools" >&2 || die "image build failed"
+    fi
+    args=(run --rm -i -v "$REPO:/src" -v blorg-cache:/var/cache/blorg -w /src)
+    [[ -t 0 && -t 1 ]] && args+=(-t)
+    [[ "$engine" == podman ]] && args+=(--userns=keep-id)
+    [[ -f "$REPO/../server-rs/Cargo.toml" ]] &&
+        args+=(-v "$(cd "$REPO/../server-rs" && pwd):/server-rs" -e BLORG_SERVER_RS=/server-rs)
+    for v in GH_TOKEN BLORG_GH_TOKEN BLORG_GH_REPO HTTPS_PROXY HTTP_PROXY NO_PROXY https_proxy http_proxy no_proxy; do
+        [[ -n "${!v:-}" ]] && args+=(-e "$v")
+    done
+    exec "$engine" "${args[@]}" "$image" "${@:-check}"
+}
+
+case "${1:-}" in
+    setup)        shift; cmd_setup "$@" ;;
+    check)        shift; cmd_check "$@" ;;
+    driver-check) shift; cmd_driver_check "$@" ;;
+    server-test)  shift; cmd_server_test ;;
+    doctor)       shift; cmd_doctor ;;
+    pins)         shift; cmd_pins >/dev/null ;;
+    server)       shift; cmd_server "$@" ;;
+    package)      shift; cmd_package "$@" ;;
+    guest)        shift; cmd_guest "$@" ;;
+    ci)           shift; cmd_ci "$@" ;;
+    container)    shift; cmd_container "$@" ;;
+    ""|-h|--help|help) sed -n '2,/^$/p' "$BLORG" | sed 's/^# \{0,1\}//' ;;
+    *)            die "unknown command '$1' (blorg help)" ;;
+esac
