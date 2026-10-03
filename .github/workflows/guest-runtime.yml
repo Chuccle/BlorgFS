@@ -157,6 +157,10 @@ jobs:
     # unattended Windows install, roughly 30-60 minutes.
     - name: Build the golden image
       if: steps.pkg.outputs.found == 'true' && steps.image.outputs.cache-hit != 'true'
+      # An unattended install takes ~20-30 min under KVM; much longer means
+      # it is stuck on a screen, which the log shows (SCREEN lines).
+      env:
+        BUILD_TIMEOUT_MIN: 50
       run: ci/guest/image/build-image.sh
 
     - name: Save the golden image
