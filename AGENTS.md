@@ -731,7 +731,10 @@ mid-way still says how far it got. `verdict.txt` is the one-screen answer;
 Put `<name>.ps1` in `tests/guest-suites/`; CI passes that directory in.
 It exits 0 on pass and is given whichever of `-Drive`, `-BackendUrl`,
 `-CorpusDir`, `-CorpusManifest` and `-ResultsDir` its `param()` declares.
-It runs in Windows PowerShell 5.1 inside the guest, so no PowerShell 7
+Only top-level `*.ps1` files run, so helpers can sit in subdirectories
+beside the suite. The rig also copies `third_party/schemas/conformance/`
+(the wire-contract probe) to `suites\contract\`, where the contract suite
+looks for it. It runs in Windows PowerShell 5.1 inside the guest, so no PowerShell 7
 syntax, and build non-ASCII strings from code points (a BOM-less script is
 read as ANSI).
 

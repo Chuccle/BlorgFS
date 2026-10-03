@@ -60,6 +60,14 @@ jobs:
       with:
         ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
+    # Only for the contract probe (third_party/schemas/conformance), which
+    # tests/guest-suites/Contract.ps1 runs in the guest. No credentials on
+    # purpose: this job runs PR code. If the submodule cannot be fetched
+    # anonymously, the Contract suite fails saying the probe is missing.
+    - name: Check out the schemas submodule
+      continue-on-error: true
+      run: git submodule update --init third_party/schemas
+
     - name: Find the package
       id: pkg
       env:

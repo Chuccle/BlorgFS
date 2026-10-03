@@ -74,8 +74,17 @@ cp -r "$package" "$bundle/package"
 cp -r "$HERE/in-guest" "$bundle/in-guest"
 cp "$REPO/tools/Test-BlorgCorrectness.ps1" "$bundle/tools/"
 if [[ -n "$suites" ]]; then
+    # The whole directory: only its top-level *.ps1 run as suites, so a
+    # suite can keep helpers in subdirectories beside it.
     mkdir -p "$bundle/suites"
-    cp "$suites"/*.ps1 "$bundle/suites/" 2>/dev/null || echo "  (no *.ps1 in $suites)"
+    cp -r "$suites"/. "$bundle/suites/"
+    # The wire-contract probe lives in the schemas repo, next to the schema
+    # it checks; tests/guest-suites/Contract.ps1 looks for it here.
+    if [[ -d "$REPO/third_party/schemas/conformance" ]]; then
+        mkdir -p "$bundle/suites/contract"
+        cp -r "$REPO/third_party/schemas/conformance"/. "$bundle/suites/contract/"
+    fi
+    ls -R "$bundle/suites"
 fi
 python3 -c 'import json,sys; m=json.load(open(sys.argv[1], encoding="utf-8-sig")); print("  package", m.get("version"))' "$package/manifest.json"
 endstep
