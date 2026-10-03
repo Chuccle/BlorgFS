@@ -481,8 +481,9 @@ and with the defines and include paths read out of `BlorgFS.vcxproj`. It
 does not run PREfast, does not link, does not run the usermode sandbox
 suites, and clang's diagnostics are not cl's. Use it to iterate; before
 calling a change done, get a green `build.yml` and guest run (`ci test`, or
-the PR's own checks). `agent-check.yml` runs `blorg check` on PRs that
-touch the toolchain or the project files it reads, so it cannot rot.
+the PR's own checks). Nothing gates on `blorg check` and no CI job runs
+it: it is a tool a session runs, and CI stays the deterministic workflows
+below.
 
 **`blorg ci test`** follows the `build.yml` run a push already started for
 the commit (dispatching one only when there is none), then the guest run
