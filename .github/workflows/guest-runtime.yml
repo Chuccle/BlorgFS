@@ -34,6 +34,10 @@ on:
         description: 'Driver Verifier on BlorgFS.sys'
         type: boolean
         default: true
+      session:
+        description: 'Agent session: bash run against the live guest after the tests, with guestctl on PATH; output in guest-results/session/ (see ci/guest/run-session.sh)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -162,14 +166,37 @@ jobs:
         path: ${{ env.GUEST_HOME }}/image
         key: ${{ steps.image.outputs.cache-primary-key }}
 
+    # A session runs against the guest the tests leave up. PRs that change
+    # the rig run the probe session, which exercises every guestctl channel.
+    - name: Choose the agent session
+      if: steps.pkg.outputs.found == 'true'
+      env:
+        SESSION: ${{ inputs.session }}
+      run: |
+        if [[ -n "$SESSION" ]]; then
+          printf '%s\n' "$SESSION" > "$RUNNER_TEMP/session.sh"
+          echo "SESSION_SCRIPT=$RUNNER_TEMP/session.sh" >> "$GITHUB_ENV"
+        elif [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+          echo "SESSION_SCRIPT=$PWD/ci/guest/session-probe.sh" >> "$GITHUB_ENV"
+        fi
+
     - name: Run the tests in the guest
       if: steps.pkg.outputs.found == 'true'
       run: |
         args=(--package package --out guest-results)
+        [[ -n "${SESSION_SCRIPT:-}" ]] && args+=(--keep)
         [[ "${{ inputs.verifier }}" == "false" ]] && args+=(--no-verifier)
         # Contract and behavioural suites, when the repo carries them.
         [[ -d tests/guest-suites ]] && args+=(--suites tests/guest-suites)
         ci/guest/run-guest-tests.sh "${args[@]}"
+
+    - name: Agent session
+      if: always() && steps.pkg.outputs.found == 'true' && env.SESSION_SCRIPT != ''
+      run: ci/guest/run-session.sh --out guest-results "$SESSION_SCRIPT"
+
+    - name: Power off the guest
+      if: always() && steps.pkg.outputs.found == 'true'
+      run: ci/guest/host/guestctl down
 
     - name: Upload results
       if: always() && steps.pkg.outputs.found == 'true'

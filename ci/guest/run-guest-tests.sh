@@ -23,8 +23,9 @@
 #                   contract in in-guest/Invoke-GuestTests.ps1
 #   --no-verifier   run without Driver Verifier on BlorgFS.sys
 #   --kernel-dump   bring MEMORY.DMP back too after a bugcheck (large)
-#   --keep          leave the guest running afterwards, for an agent or a
-#                   person to investigate with host/guestctl
+#   --keep          leave the guest (and the host's server-rs) running
+#                   afterwards, for an agent or a person to investigate with
+#                   host/guestctl or run-session.sh
 #
 # Exit: 0 pass, 1 fail (tests failed or the guest bugchecked), 2 the rig
 # itself broke before a verdict existed.
@@ -73,12 +74,14 @@ finish() {
     # shellcheck source=ci/guest/host/lib.sh
     ( source "$HERE/host/lib.sh"; cp -f "$GUEST_SERIAL" "$GUEST_QEMU_LOG" "$out/host/" 2>/dev/null || true )
     "$GUESTCTL" screenshot "$out/host/screen.png" >/dev/null 2>&1 || true
-    [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
-    [[ -n "${work:-}" ]] && rm -rf "$work"
     if (( keep )); then
+        # The server and its corpus stay too: B: is only useful with both.
         echo "run-guest-tests: guest left running (--keep); drive it with $GUESTCTL"
+        [[ -n "$server_pid" ]] && echo "run-guest-tests: server-rs (pid $server_pid) serving $work/corpus"
     else
         "$GUESTCTL" down >/dev/null 2>&1 || true
+        [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
+        [[ -n "${work:-}" ]] && rm -rf "$work"
     fi
     exit "$code"
 }

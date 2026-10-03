@@ -690,6 +690,8 @@ ci/guest/
   in-guest/                   Prepare-Guest, Invoke-GuestTests,
                               Get-GuestDiagnostics
   run-guest-tests.sh          one full run: fresh guest -> package -> verdict
+  run-session.sh              an agent's script against the live guest
+  session-probe.sh            the example session: every channel, once
   infra/azure/main.bicep      optional long-lived KVM host on Azure
 ```
 
@@ -777,6 +779,22 @@ nothing else on the network can reach it. The SSH key lives next to the
 golden image. Inline `guestctl ssh` commands pass through Windows argv
 parsing on the way to `powershell.exe -c`, which mangles double quotes: use
 single quotes inline, or `guestctl ps` for anything longer than a line.
+
+**From an agent with no KVM of its own** (a cloud session, say), dispatch
+`guest-runtime.yml` with a `session` input: bash that runs against the live
+guest after the tests, with `guestctl` on `PATH` and `$SESSION_OUT` for
+files to bring back. The `guest-results` artifact then holds
+`session/transcript.txt` (every command echoed, with its output) and
+whatever the script wrote to `$SESSION_OUT`, alongside the test results.
+`ci/guest/session-probe.sh` is a worked example that uses every channel
+once; PRs touching the rig run it. For example:
+
+```bash
+gh workflow run guest-runtime.yml -f session='
+guestctl ssh "Get-Service BlorgFS"
+guestctl pull C:/Windows/INF/setupapi.dev.log "$SESSION_OUT/"
+guestctl screenshot "$SESSION_OUT/screen.png"'
+```
 
 The VMware rules above still hold here: deploy with `Install-BlorgFS.ps1`,
 never by copying the `.sys`; and a second deploy into the same boot needs a
