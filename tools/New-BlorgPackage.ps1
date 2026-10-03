@@ -79,10 +79,22 @@ $stagedDir = Join-Path $buildDir "BlorgFS"
 # The staged package directory is the installable unit; the .cer only ever
 # lands in the output directory itself.
 $driverFiles = [ordered]@{
-    "BlorgFS.sys" = @((Join-Path $stagedDir "BlorgFS.sys"), (Join-Path $buildDir "BlorgFS.sys"))
-    "BlorgFS.inf" = @((Join-Path $stagedDir "BlorgFS.inf"))
-    "BlorgFS.cat" = @((Join-Path $stagedDir "BlorgFS.cat"))
-    "BlorgFS.cer" = @((Join-Path $buildDir "BlorgFS.cer"))
+    "BlorgFS.sys" = @($stagedDir, $buildDir)
+    "BlorgFS.inf" = @($stagedDir)
+    "BlorgFS.cat" = @($stagedDir)
+    "BlorgFS.cer" = @($buildDir)
+}
+
+# Case-insensitive lookup: Inf2Cat writes the catalog as blorgfs.cat, which
+# Windows never noticed, but CI assembles the package on Linux. The packaged
+# copy is always written under the canonical name.
+function Find-BuildFile {
+    param([string]$Name, [string[]]$Dirs)
+    foreach ($dir in $Dirs) {
+        if (-not (Test-Path $dir)) { continue }
+        $hit = Get-ChildItem $dir -File | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
 }
 
 if (Test-Path $OutDir) {
@@ -94,8 +106,8 @@ $driverOut = New-Item -ItemType Directory -Path (Join-Path $OutDir "driver")
 $serverOut = New-Item -ItemType Directory -Path (Join-Path $OutDir "server")
 
 foreach ($name in $driverFiles.Keys) {
-    $src = $driverFiles[$name] | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $src) { throw "$name not found -- looked in: $($driverFiles[$name] -join ', '). Was the driver built ($Configuration|$Platform)?" }
+    $src = Find-BuildFile $name $driverFiles[$name]
+    if (-not $src) { throw "$name not found (any case) in: $($driverFiles[$name] -join ', '). Was the driver built ($Configuration|$Platform)?" }
     Copy-Item $src (Join-Path $driverOut $name)
 }
 foreach ($script in @("Install-BlorgFS.ps1", "Uninstall-BlorgFS.ps1")) {
