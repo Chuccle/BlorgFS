@@ -433,11 +433,11 @@ INSTANTIATE_TEST_SUITE_P(
     Contract,
     ContractStatusTest,
     ::testing::Values(
-        StatusCase{ BLORG_CONTRACT_STATUS_NOT_FOUND, STATUS_OBJECT_NAME_NOT_FOUND, "NotFound" },
-        StatusCase{ BLORG_CONTRACT_STATUS_FORBIDDEN, STATUS_ACCESS_DENIED, "Forbidden" },
-        StatusCase{ BLORG_CONTRACT_STATUS_RANGE_NOT_SATISFIABLE, STATUS_END_OF_FILE, "RangeNotSatisfiable" },
-        StatusCase{ BLORG_CONTRACT_STATUS_BAD_REQUEST, STATUS_INVALID_PARAMETER, "BadRequest" },
-        StatusCase{ BLORG_CONTRACT_STATUS_INTERNAL, STATUS_INVALID_PARAMETER, "Internal" }),
+        StatusCase{ BLORG_CONTRACT_STATUS_NOT_FOUND, (NTSTATUS)STATUS_OBJECT_NAME_NOT_FOUND, "NotFound" },
+        StatusCase{ BLORG_CONTRACT_STATUS_FORBIDDEN, (NTSTATUS)STATUS_ACCESS_DENIED, "Forbidden" },
+        StatusCase{ BLORG_CONTRACT_STATUS_RANGE_NOT_SATISFIABLE, (NTSTATUS)STATUS_END_OF_FILE, "RangeNotSatisfiable" },
+        StatusCase{ BLORG_CONTRACT_STATUS_BAD_REQUEST, (NTSTATUS)STATUS_INVALID_PARAMETER, "BadRequest" },
+        StatusCase{ BLORG_CONTRACT_STATUS_INTERNAL, (NTSTATUS)STATUS_INVALID_PARAMETER, "Internal" }),
     [](const ::testing::TestParamInfo<StatusCase>& info) { return std::string(info.param.Name); });
 
 //
