@@ -430,11 +430,15 @@ and the server bump that adopts it arrive as one PR rather than two that are
 each red alone. A schema change therefore lands as: schemas first, then
 server-rs adopting it, then one BlorgFS PR moving both pins.
 
-**What the package is.** `build.yml`'s `server` job builds server-rs for
-`x86_64-pc-windows-msvc` from the pinned commit (flatc built from
-server-rs's own `buildtools/flatbuffers`, `cargo build --release --locked`),
-and the `package` job runs `tools/New-BlorgPackage.ps1` over that and the
-Release driver build:
+**What the package is.** `build.yml`'s `server` job runs
+`tools/Build-BlorgServer.ps1`, which builds server-rs from the pinned
+commit (flatc built from server-rs's own `buildtools/flatbuffers`, then
+`cargo build --release --locked`), and the `package` job runs
+`tools/New-BlorgPackage.ps1` over that and the Release driver build. Those
+two scripts are the only recipe: anything else that needs a package should
+dispatch `build.yml` (it takes `workflow_dispatch` on any ref, with an
+optional `correlation_id` input that is echoed into the run name so the
+caller can find its run), or call the scripts, never copy their steps.
 
 ```
 manifest.json   version, and the blorgfs / server_rs / schemas commits,

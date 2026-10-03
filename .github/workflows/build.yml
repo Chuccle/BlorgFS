@@ -8,7 +8,18 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ master ]
-  workflow_dispatch: {}
+  # Dispatchable so other tooling builds the package through this workflow
+  # rather than a copy of it. Dispatch with the BlorgFS ref to build (the
+  # API's own `ref`); server-rs always comes from that ref's pin. Pass a
+  # unique `correlation_id` to find the run again: it goes in the run name.
+  workflow_dispatch:
+    inputs:
+      correlation_id:
+        description: Opaque caller id, echoed into the run name
+        required: false
+        default: ''
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Build BlorgFS {0} {1}', github.ref_name, inputs.correlation_id) || github.event.pull_request.title || github.event.head_commit.message || github.workflow }}
 
 permissions:
   contents: read
@@ -388,30 +399,6 @@ jobs:
         path: ${{ runner.temp }}\flatc
         key: ${{ runner.os }}-flatc-${{ steps.flatc_hash.outputs.flatc_hash }}
 
-    # server-rs's build.rs shells out to flatc, and the generated code must
-    # match its flatbuffers crate version -- so flatc is built from server-rs's
-    # own pinned submodule, exactly as server-rs's CI does on Linux.
-    - name: Build flatc
-      if: steps.cache_flatc.outputs.cache-hit != 'true'
-      shell: pwsh
-      run: |
-        $ErrorActionPreference = 'Stop'
-        $build = Join-Path $env:RUNNER_TEMP 'flatc-build'
-        cmake -S third_party/server-rs/buildtools/flatbuffers -B $build `
-          -DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATLIB=OFF -DFLATBUFFERS_BUILD_FLATHASH=OFF
-        if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
-        cmake --build $build --config Release --target flatc
-        if ($LASTEXITCODE -ne 0) { throw "flatc build failed with exit code $LASTEXITCODE" }
-        $dest = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'flatc')
-        Copy-Item (Join-Path $build 'Release\flatc.exe') $dest
-
-    - name: Put flatc on PATH
-      shell: pwsh
-      run: |
-        $dir = Join-Path $env:RUNNER_TEMP 'flatc'
-        if (-not (Test-Path (Join-Path $dir 'flatc.exe'))) { throw "flatc.exe missing from $dir" }
-        echo $dir >> $env:GITHUB_PATH
-
     - name: Cache cargo registry and build
       uses: actions/cache@v5
       with:
@@ -422,19 +409,18 @@ jobs:
           third_party/server-rs/target/
         key: ${{ runner.os }}-server-cargo-${{ hashFiles('third_party/server-rs/Cargo.lock') }}
 
-    # Default features, as server-rs ships them. --locked so the package is
-    # built from exactly the dependency set server-rs's own CI tested.
+    # The one recipe for the server (flatc from server-rs's own submodule,
+    # then cargo --locked). Anything else that builds a package should call
+    # this script too, so every package's server is built the same way.
     - name: Build server-rs
-      working-directory: third_party/server-rs
-      run: cargo build --release --locked
+      shell: pwsh
+      run: ./tools/Build-BlorgServer.ps1 -FlatcDir "$env:RUNNER_TEMP\flatc" -OutDir "$env:RUNNER_TEMP\server-bin"
 
     - name: Upload server binary
       uses: actions/upload-artifact@v7
       with:
         name: server-rs-windows-x64
-        path: |
-          third_party/server-rs/target/release/server-rs.exe
-          third_party/server-rs/target/release/server_rs.pdb
+        path: ${{ runner.temp }}/server-bin/
         if-no-files-found: error
 
   package:
