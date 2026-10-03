@@ -25,9 +25,9 @@
 #                           ssh, push, pull, snapshot, screenshot, ...,
 #                           image, test, run, selftest (blorg guest help)
 #
-#   ci test|build|guest|status|results
-#                           the Windows build and guest tests on GitHub
-#                           Actions, from any shell with a GitHub token
+#   ci test|guest|status|results
+#                           the Windows build, package and guest tests on
+#                           GitHub Actions, from any shell with a GitHub token
 #
 #   container [command]     run blorg in tools/Containerfile's image
 #

@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # blorg guest ... -- the BlorgFS Windows test guest on a KVM/QEMU host.
 # Sourced by tools/blorg. The one interface to the guest, for CI and for a
-# person at a shell on the host alike; see AGENTS.md, "Cloud test guest".
+# person at a shell on the host alike; see AGENTS.md, "Package and test guest".
 #
 # Commands:
 #   up [--fresh]              boot the guest (a fresh disk from the golden

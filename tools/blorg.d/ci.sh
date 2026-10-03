@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# blorg ci test | build | guest | status | results
+# blorg ci test | guest | status | results
 # Runs the real Windows build and guest tests on GitHub Actions from any
 # shell with a GitHub token. Sourced by tools/blorg.
 
@@ -104,13 +104,6 @@ cmd_ci() {
     local sub="${1:-}"; shift || true
     local ref; ref="$(cur_ref)"
     case "$sub" in
-        build)
-            need_gh
-            [[ "${1:-}" == "--ref" ]] && ref="$2"
-            local id; id="$(build_run_for "$ref")" || exit 2
-            echo "build_run=$id"
-            watch_run "$id"
-            ;;
         guest)
             need_gh
             local args=() a
@@ -175,7 +168,7 @@ cmd_ci() {
                 note "could not download run $id's artifacts (none yet, or blob storage unreachable from here)"
             fi
             ;;
-        *) die "usage: blorg ci test|build|guest|status|results" ;;
+        *) die "usage: blorg ci test|guest|status|results" ;;
     esac
 }
 

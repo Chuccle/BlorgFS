@@ -5,7 +5,7 @@ name: Guest
 # Linux runner, driven by tools/blorg -- the same commands run on any Linux
 # host with KVM, so a red run here reproduces with
 #   tools/blorg guest test --package <unpacked artifact>
-# See "Cloud test guest" in AGENTS.md.
+# See "Package and test guest" in AGENTS.md.
 #
 # build.yml calls this as its last job, on the package it just built, so
 # every push and PR is tested in the guest. Dispatch it directly to test an

@@ -18,9 +18,13 @@ tests/         everything that verifies it
   PerfHarness/   workload driver and counter reader
   VolumeTester/  volume-level behaviour against a mounted drive
 tools/         tiered check runner, metric comparison, crash triage,
-               differential correctness harness
+               differential correctness harness; blorg, the Linux
+               entrypoint for packaging and the test guest
+  guest/         what runs inside the Windows test guest
 deploy/        VM deploy pipeline (see AGENTS.md)
-third_party/   submodules: flatcc, picohttpparser, schemas, googletest
+third_party/   submodules: flatcc, picohttpparser, schemas, googletest,
+               and server-rs (the backend this driver ships with)
+VERSION        the package version
 ```
 
 ## Building and testing
@@ -42,11 +46,34 @@ Exit code is 0 only if everything in the tier passed. Run `-Tier Fast` before
 calling any change done — cheaper tiers don't run the crypto tests that catch
 a `Tls.c` regression.
 
-Three GitHub Actions workflows cover the rest: `build.yml` gates every push
-and PR to `master` at the Fast tier, `verify.yml` runs CBMC proofs and
+GitHub Actions covers the rest: `build.yml` gates every push and PR to
+`master` at the Fast tier, builds the package and tests it in a Windows
+guest (`guest.yml`), `verify.yml` runs CBMC proofs and
 extended fuzz/interleaving coverage nightly, and `codeql.yml` runs weekly
 (and on PRs touching its own config) with the pinned Microsoft driver query
 packs.
+
+## Package and test guest
+
+BlorgFS ships with its backend, [server-rs](https://github.com/Chuccle/server-rs),
+pinned as `third_party/server-rs`. Every build produces one package,
+`blorg-package-windows-x64`: the test-signed driver, server-rs for Linux
+and Windows, and a `manifest.json` naming every commit. A Windows Server
+guest under KVM then installs that driver and tests it against that server,
+so a driver/server mismatch fails the build. A `v*` tag matching `VERSION`
+publishes the package as a release.
+
+The Linux side has one entrypoint, the same in CI and by hand:
+
+```bash
+tools/blorg check                   # compile-check the driver, test server-rs
+tools/blorg package --driver x64/Release
+tools/blorg guest test --package <dir>   # on any Linux host with KVM
+tools/blorg ci test                 # the full pipeline for the pushed commit
+```
+
+`tools/blorg help` lists everything; [AGENTS.md](AGENTS.md#package-and-test-guest)
+has the detail.
 
 ## Deploying to a VM
 
