@@ -143,6 +143,13 @@ jobs:
     - name: Build driver
       run: msbuild ${{ env.SOLUTION_NAME }} /p:Configuration=${{ matrix.config }} /p:Platform=${{ matrix.platform }} /bl # /bl creates msbuild.binlog
 
+    # The only packaging step that needs Windows: Authenticode can only be
+    # read here. Everything else about the package is assembled on Linux.
+    - name: Check driver signature
+      if: matrix.config == 'Release'
+      shell: pwsh
+      run: ./tools/Test-BlorgDriverSignature.ps1 -BuildDir "${{ matrix.platform }}\${{ matrix.config }}"
+
     # The sandbox suites compile the real driver sources against a kernel
     # model and are where most of this project's coverage actually lives --
     # IRQL and lock-order rules, the node-table pin protocol and its
@@ -368,21 +375,13 @@ jobs:
       run: ./tools/Test-BlorgPackagePins.ps1 | Out-Null
 
   # The server, for both platforms the package ships: Linux is where the
-  # backend actually runs (static musl, so any distribution), Windows is the
-  # single-machine fallback beside the driver. Both are built by the same
-  # script from the same pin.
+  # backend actually runs, Windows is the single-machine fallback beside the
+  # driver. Both are cross-built here on Linux by the same script from the
+  # same pin: static musl for Linux, mingw for Windows (it links only system
+  # DLLs, so it needs nothing installed beside it).
   server:
-    strategy:
-      matrix:
-        include:
-          - platform: linux-x64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - platform: windows-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    name: Build server-rs (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    name: Build server-rs
 
     steps:
     - name: Detect if Dependabot
@@ -402,8 +401,7 @@ jobs:
 
     - name: Get flatbuffers commit hash
       id: flatc_hash
-      shell: pwsh
-      run: echo "flatc_hash=$(git -C third_party/server-rs/buildtools/flatbuffers rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+      run: echo "flatc_hash=$(git -C third_party/server-rs/buildtools/flatbuffers rev-parse HEAD)" >> $GITHUB_OUTPUT
 
     - name: Cache flatc build
       uses: actions/cache@v5
@@ -419,11 +417,10 @@ jobs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           third_party/server-rs/target/
-        key: ${{ runner.os }}-${{ matrix.target }}-server-cargo-${{ hashFiles('third_party/server-rs/Cargo.lock') }}
+        key: ${{ runner.os }}-server-cargo-${{ hashFiles('third_party/server-rs/Cargo.lock') }}
 
-    - name: Install musl tools
-      if: matrix.platform == 'linux-x64'
-      run: sudo apt-get update && sudo apt-get install -y musl-tools
+    - name: Install cross linkers
+      run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-mingw-w64-x86-64
 
     # The one recipe for the server (flatc from server-rs's own submodule,
     # then cargo --locked). Anything else that builds a package should call
@@ -431,20 +428,21 @@ jobs:
     - name: Build server-rs
       shell: pwsh
       run: |
-        ./tools/Build-BlorgServer.ps1 -Target ${{ matrix.target }} `
-          -FlatcDir (Join-Path $env:RUNNER_TEMP 'flatc') `
-          -OutDir (Join-Path $env:RUNNER_TEMP 'server-bin')
+        $flatc = Join-Path $env:RUNNER_TEMP 'flatc'
+        $out = Join-Path $env:RUNNER_TEMP 'server-bin'
+        ./tools/Build-BlorgServer.ps1 -Target x86_64-unknown-linux-musl -FlatcDir $flatc -OutDir (Join-Path $out 'linux-x64')
+        ./tools/Build-BlorgServer.ps1 -Target x86_64-pc-windows-gnu -FlatcDir $flatc -OutDir (Join-Path $out 'windows-x64')
 
-    - name: Upload server binary
+    - name: Upload server binaries
       uses: actions/upload-artifact@v7
       with:
-        name: server-rs-${{ matrix.platform }}
+        name: server-rs
         path: ${{ runner.temp }}/server-bin/
         if-no-files-found: error
 
   package:
     needs: [build, server, pins]
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     name: Package
     # contents: write is only exercised on a v* tag, to publish the release.
     permissions:
@@ -465,25 +463,18 @@ jobs:
     - name: Check out the pinned server-rs
       run: git submodule update --init third_party/server-rs
 
-    # Restores x64\Release\... exactly as the build job left it.
+    # Restores x64/Release/... exactly as the build job left it.
     - name: Download driver build
       uses: actions/download-artifact@v5
       with:
         name: BlorgFS-Release-x64
         path: ${{ github.workspace }}
 
-    # One directory per platform, the layout New-BlorgPackage.ps1 expects.
-    - name: Download Linux server build
+    - name: Download server builds
       uses: actions/download-artifact@v5
       with:
-        name: server-rs-linux-x64
-        path: ${{ runner.temp }}/server-bin/linux-x64
-
-    - name: Download Windows server build
-      uses: actions/download-artifact@v5
-      with:
-        name: server-rs-windows-x64
-        path: ${{ runner.temp }}/server-bin/windows-x64
+        name: server-rs
+        path: ${{ runner.temp }}/server-bin
 
     - name: Assemble package
       id: package
@@ -500,7 +491,7 @@ jobs:
           -ServerDir (Join-Path $env:RUNNER_TEMP 'server-bin') `
           -OutDir package -Release:$release
         echo "version=$version" >> $env:GITHUB_OUTPUT
-        Get-Content package\manifest.json
+        Get-Content package/manifest.json
 
     # Stable name on purpose: the Windows test guest pulls this artifact by
     # name. The version lives in manifest.json, not in the artifact name.
@@ -511,14 +502,16 @@ jobs:
         path: package/
         if-no-files-found: error
 
+    # zip from Linux, unlike the artifact, keeps the Linux server executable.
     - name: Publish release
       if: startsWith(github.ref, 'refs/tags/v')
-      shell: pwsh
       env:
         GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ steps.package.outputs.version }}
       run: |
-        $ErrorActionPreference = 'Stop'
-        $zip = "blorg-${{ steps.package.outputs.version }}-windows-x64.zip"
-        Compress-Archive -Path package\* -DestinationPath $zip
-        gh release create $env:GITHUB_REF_NAME $zip package\manifest.json --title "blorg $env:GITHUB_REF_NAME" --notes "Test-signed driver, and server-rs for Linux and Windows, built together. See manifest.json for the exact commits. Run chmod +x on server/linux-x64/server-rs after unpacking."
-        if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
+        zip_name="blorg-${VERSION}-windows-x64.zip"
+        chmod +x package/server/linux-x64/server-rs
+        (cd package && zip -r "../${zip_name}" .)
+        gh release create "$GITHUB_REF_NAME" "$zip_name" package/manifest.json \
+          --title "blorg $GITHUB_REF_NAME" \
+          --notes "Test-signed driver, and server-rs for Linux and Windows, built together. See manifest.json for the exact commits."

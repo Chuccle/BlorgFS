@@ -430,17 +430,21 @@ and the server bump that adopts it arrive as one PR rather than two that are
 each red alone. A schema change therefore lands as: schemas first, then
 server-rs adopting it, then one BlorgFS PR moving both pins.
 
-**What the package is.** `build.yml`'s `server` job runs
-`tools/Build-BlorgServer.ps1` once per platform, building server-rs from
-the pinned commit (flatc built from server-rs's own
-`buildtools/flatbuffers`, then `cargo build --release --locked`) as a static
-`x86_64-unknown-linux-musl` binary and an `x86_64-pc-windows-msvc` one, and
-the `package` job runs
-`tools/New-BlorgPackage.ps1` over that and the Release driver build. Those
-two scripts are the only recipe: anything else that needs a package should
-dispatch `build.yml` (it takes `workflow_dispatch` on any ref, with an
-optional `correlation_id` input that is echoed into the run name so the
-caller can find its run), or call the scripts, never copy their steps.
+**What the package is.** Only the driver build needs Windows: MSVC,
+PREfast, the WDK, signing, the usermode sandbox suites, and the
+Authenticode check (`tools/Test-BlorgDriverSignature.ps1`, which confirms
+the `.sys` and `.cat` are signed by the build's `.cer`). Everything else in
+`build.yml` runs on Linux. The `server` job runs `tools/Build-BlorgServer.ps1`
+twice from the pinned commit (flatc built from server-rs's own
+`buildtools/flatbuffers`, then `cargo build --release --locked`): a static
+`x86_64-unknown-linux-musl` binary, and an `x86_64-pc-windows-gnu` one
+cross-linked with mingw that imports only system DLLs. The `package` job then
+runs `tools/New-BlorgPackage.ps1` over those and the Release driver build.
+These scripts are the only recipe. Anything else that needs a package
+should either dispatch `build.yml` or call the scripts, never copy their
+steps. `build.yml` takes `workflow_dispatch` on any ref, with an optional
+`correlation_id` input that is echoed into the run name so the caller can
+find its run.
 
 ```
 manifest.json   version, and the blorgfs / server_rs / schemas commits,
@@ -451,16 +455,16 @@ server/         linux-x64/server-rs        where the backend really runs
                 windows-x64/server-rs.exe  single-machine fallback
 ```
 
-It is uploaded as **`blorg-package-windows-x64`** -- a fixed name, so test
+It is uploaded as **`blorg-package-windows-x64`**, a fixed name, so test
 infrastructure can fetch the latest package without knowing the version.
-`driver\Install-BlorgFS.ps1` runs as is from the unpacked artifact.
-Artifact and release zips drop the Unix executable bit, so `chmod +x
-server/linux-x64/server-rs` after unpacking. The Linux build is the one to
-test against: the Windows one runs on loopback beside the driver, on a
-case-insensitive filesystem, which hides real-deployment behaviour. The INF
-is the staged one from `x64\Release\BlorgFS\` (see "Deploying to a VM" for
-why the root INF does not match the catalog), and on Windows the script
-checks that the `.sys` and `.cat` are signed by the packaged `.cer`.
+`driver\Install-BlorgFS.ps1` runs as is from the unpacked artifact. Actions
+artifacts drop the Unix executable bit, so run `chmod +x
+server/linux-x64/server-rs` after unpacking one. The release zip is built on
+Linux and keeps the bit. Test against the Linux build: the Windows one runs on
+loopback beside the driver, on a case-insensitive filesystem, which hides
+how a real deployment behaves. The INF is the staged one from
+`x64\Release\BlorgFS\`; see "Deploying to a VM" for why the root INF does
+not match the catalog.
 
 **Versioning.** `VERSION` holds `MAJOR.MINOR.PATCH` for the package as a
 whole. CI packages carry both commits as build metadata

@@ -28,10 +28,8 @@
     deploy\Deploy-ToVM.ps1).
 
     Runs tools\Test-BlorgPackagePins.ps1 first, so a package is never built
-    from a driver and server that disagree on the schema. On Windows it also
-    checks that BlorgFS.sys and BlorgFS.cat are signed by BlorgFS.cer, since
-    an install against a mismatched cert fails in the guest with a far less
-    useful error.
+    from a driver and server that disagree on the schema. Runs anywhere
+    PowerShell does; CI runs it on Linux.
 
 .PARAMETER ServerDir
     Built servers, one subdirectory per platform (linux-x64, windows-x64),
@@ -107,7 +105,7 @@ foreach ($script in @("Install-BlorgFS.ps1", "Uninstall-BlorgFS.ps1")) {
 # Platform directory -> the Rust target and binary name build.yml builds.
 $serverPlatforms = [ordered]@{
     "linux-x64"   = @{ target = "x86_64-unknown-linux-musl"; binary = "server-rs" }
-    "windows-x64" = @{ target = "x86_64-pc-windows-msvc"; binary = "server-rs.exe" }
+    "windows-x64" = @{ target = "x86_64-pc-windows-gnu"; binary = "server-rs.exe" }
 }
 $serverTargets = [ordered]@{}
 foreach ($serverPlatform in $serverPlatforms.Keys) {
@@ -118,22 +116,11 @@ foreach ($serverPlatform in $serverPlatforms.Keys) {
     $serverTargets[$serverPlatform] = $serverPlatforms[$serverPlatform].target
 }
 
-$signer = $null
-if ($IsWindows -or $env:OS -eq "Windows_NT") {
-    $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new((Join-Path $driverOut "BlorgFS.cer"))
-    foreach ($signed in @("BlorgFS.sys", "BlorgFS.cat")) {
-        $sig = Get-AuthenticodeSignature (Join-Path $driverOut $signed)
-        # Status is expected to be UnknownError/NotTrusted on a machine that
-        # does not trust the test cert; what matters is who signed it.
-        if (-not $sig.SignerCertificate) { throw "$signed is not signed (status: $($sig.Status))" }
-        if ($sig.SignerCertificate.Thumbprint -ne $cert.Thumbprint) {
-            throw "$signed is signed by $($sig.SignerCertificate.Thumbprint), not by the packaged BlorgFS.cer ($($cert.Thumbprint))"
-        }
-    }
-    $signer = [ordered]@{ subject = $cert.Subject; thumbprint = $cert.Thumbprint }
-} else {
-    Write-Warning "Not on Windows: skipping the driver signature check."
-}
+# Who signed it is checked on the Windows build machine, where Authenticode
+# can be read (tools\Test-BlorgDriverSignature.ps1); here it is only
+# recorded, which works anywhere.
+$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new((Join-Path $driverOut "BlorgFS.cer"))
+$signer = [ordered]@{ subject = $cert.Subject; thumbprint = $cert.Thumbprint }
 
 $files = [ordered]@{}
 Get-ChildItem $OutDir -Recurse -File | Sort-Object FullName | ForEach-Object {
