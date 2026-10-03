@@ -25,8 +25,8 @@
 #
 # Every input is pinned by SHA-256, so the same recipe always builds from
 # the same bytes and a moved download fails the build instead of silently
-# changing the guest. An input with an empty pin is used and its hash
-# printed ("input ... sha256=..."), ready to be pinned here.
+# changing the guest. Overriding a URL means overriding its pin too; an
+# empty pin (VAR=) uses the input unchecked and prints its hash.
 #   BUILD_TIMEOUT_MIN    give up on Windows Setup after this (default 120)
 # plus the GUEST_* settings in host/lib.sh. Output: $GUEST_IMAGE_DIR/golden.qcow2
 # and the SSH key it trusts, $GUEST_IMAGE_DIR/id_ed25519.
@@ -36,13 +36,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=ci/guest/host/lib.sh
 source "$HERE/../host/lib.sh"
 
-WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US}"
+WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso}"
 WINDOWS_IMAGE_INDEX="${WINDOWS_IMAGE_INDEX:-1}"
-VIRTIO_ISO_URL="${VIRTIO_ISO_URL:-https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso}"
+VIRTIO_ISO_URL="${VIRTIO_ISO_URL:-https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso}"
 OPENSSH_ZIP_URL="${OPENSSH_ZIP_URL:-https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip}"
-WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256:-}"
-VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256:-}"
-OPENSSH_ZIP_SHA256="${OPENSSH_ZIP_SHA256:-}"
+WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256-3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325}"
+VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256-303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d}"
+# Win32-OpenSSH publishes no stable per-version URL here; the pin is what
+# keeps "latest" from changing the image underneath the recipe.
+OPENSSH_ZIP_SHA256="${OPENSSH_ZIP_SHA256-23f50f3458c4c5d0b12217c6a5ddfde0137210a30fa870e98b29827f7b43aba5}"
 BUILD_TIMEOUT_MIN="${BUILD_TIMEOUT_MIN:-120}"
 
 iso_src="$WINDOWS_ISO_URL"
