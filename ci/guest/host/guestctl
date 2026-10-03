@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+#
+# guestctl -- drive the BlorgFS Windows test guest on a KVM/QEMU host.
+#
+# This is the one interface to the guest, for CI and for agents alike: an
+# agent with a shell on the host can boot the guest, act inside it over
+# SSH, snapshot and revert it, and look at its screen, without a human.
+# It is the cloud/Linux counterpart of deploy/Deploy-ToVM.ps1's vmrun
+# workflow; see "Cloud test guest" in AGENTS.md.
+#
+# Commands:
+#   up [--fresh]              boot the guest (a fresh disk from the golden
+#                             image with --fresh or when none exists), wait
+#                             for SSH
+#   down [--graceful]         power off (hard by default: the disk is
+#                             disposable; --graceful asks Windows first)
+#   status                    is it running, and is SSH answering
+#   wait [timeout-s]          block until SSH answers (default 600)
+#   ssh [command...]          PowerShell in the guest; no command = interactive
+#   ps <file.ps1> [args...]   copy a local script in and run it; exits with
+#                             the script's exit code
+#   push <local> <guest-path> copy into the guest   (guest paths: C:/x/y)
+#   pull <guest-path> <local> copy out of the guest
+#   reboot [timeout-s]        restart Windows and wait until it is back
+#   boot-id                   the guest's last boot time (changes on any
+#                             reboot, including a bugcheck's)
+#   snapshot <name>           save a live snapshot (RAM + disk)
+#   revert <name>             return to it
+#   snapshots                 list them
+#   screenshot <out.png>      what the guest's screen shows right now -- the
+#                             way to see a bugcheck or a stuck boot
+#   qga-exec <powershell>     run PowerShell through the QEMU guest agent,
+#                             for when SSH is down but Windows is not
+#   qmp <command> [json]      raw QMP, for anything else
+#
+# Settings come from the environment; see lib.sh.
+
+set -euo pipefail
+# shellcheck source=ci/guest/host/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+GUEST_STAGE='C:/blorgfs-ci/stage'
+
+ssh_guest() {
+    local -a opts
+    mapfile -t opts < <(guest_ssh_opts)
+    ssh "${opts[@]}" -p "$GUEST_SSH_PORT" Administrator@127.0.0.1 "$@"
+}
+
+scp_guest() {
+    local -a opts
+    mapfile -t opts < <(guest_ssh_opts)
+    scp -q -r "${opts[@]}" -P "$GUEST_SSH_PORT" "$@"
+}
+
+cmd_wait() {
+    local timeout="${1:-600}" start=$SECONDS
+    while (( SECONDS - start < timeout )); do
+        guest_running || die "QEMU is not running (see $GUEST_QEMU_LOG)"
+        if ssh_guest 'exit 0' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 5
+    done
+    die "SSH did not answer within ${timeout}s; try: guestctl screenshot /tmp/screen.png"
+}
+
+cmd_up() {
+    local fresh=0
+    [[ "${1:-}" == "--fresh" ]] && fresh=1
+    guest_running && { note "already running"; cmd_wait; return; }
+    [[ -f "$GUEST_GOLDEN" ]] || die "no golden image at $GUEST_GOLDEN; build one with image/build-image.sh"
+    mkdir -p "$GUEST_RUN_DIR"
+    if (( fresh )) || [[ ! -f "$GUEST_DISK" ]]; then
+        rm -f "$GUEST_DISK"
+        # A thin overlay: the golden image is never written, so every fresh
+        # run starts from exactly the same disk.
+        qemu-img create -q -f qcow2 -F qcow2 -b "$GUEST_GOLDEN" "$GUEST_DISK"
+    fi
+    rm -f "$GUEST_QMP" "$GUEST_QGA" "$GUEST_PIDFILE"
+    : > "$GUEST_SERIAL"
+    local -a args
+    mapfile -t args < <(guest_qemu_args "$GUEST_DISK")
+    qemu-system-x86_64 "${args[@]}" -daemonize -pidfile "$GUEST_PIDFILE" >"$GUEST_QEMU_LOG" 2>&1 \
+        || die "QEMU failed to start: $(cat "$GUEST_QEMU_LOG")"
+    note "booting (cpus=$GUEST_CPUS mem=${GUEST_MEM_MB}MiB ssh=127.0.0.1:$GUEST_SSH_PORT)"
+    cmd_wait 900
+    note "up"
+}
+
+cmd_down() {
+    guest_running || { note "not running"; return 0; }
+    if [[ "${1:-}" == "--graceful" ]]; then
+        guest_qmp system_powerdown >/dev/null || true
+        local start=$SECONDS
+        while guest_running && (( SECONDS - start < 180 )); do sleep 2; done
+    fi
+    if guest_running; then
+        guest_qmp quit >/dev/null 2>&1 || kill "$(cat "$GUEST_PIDFILE")" 2>/dev/null || true
+        local start=$SECONDS
+        while guest_running && (( SECONDS - start < 30 )); do sleep 1; done
+    fi
+    rm -f "$GUEST_PIDFILE"
+    note "down"
+}
+
+cmd_status() {
+    if ! guest_running; then echo "stopped"; return 1; fi
+    if ssh_guest 'exit 0' >/dev/null 2>&1; then echo "running, ssh up"; else echo "running, ssh not answering"; fi
+}
+
+cmd_boot_id() {
+    ssh_guest "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')" | tr -d '\r'
+}
+
+cmd_reboot() {
+    local timeout="${1:-900}" before after start=$SECONDS
+    before="$(cmd_boot_id)"
+    ssh_guest 'Restart-Computer -Force' >/dev/null 2>&1 || true
+    # Wait for the boot id to change, not merely for SSH to answer: sshd
+    # can still accept a connection in the seconds before shutdown begins.
+    while (( SECONDS - start < timeout )); do
+        sleep 10
+        after="$(cmd_boot_id 2>/dev/null || true)"
+        if [[ -n "$after" && "$after" != "$before" ]]; then
+            note "rebooted"
+            return 0
+        fi
+    done
+    die "guest did not come back within ${timeout}s"
+}
+
+cmd_ps() {
+    local script="${1:?usage: guestctl ps <file.ps1> [args...]}"; shift
+    [[ -f "$script" ]] || die "no such script: $script"
+    ssh_guest "New-Item -ItemType Directory -Force -Path '$GUEST_STAGE' | Out-Null"
+    local name
+    name="$(basename "$script")"
+    scp_guest "$script" "Administrator@127.0.0.1:$GUEST_STAGE/$name"
+    local quoted=() a
+    for a in "$@"; do quoted+=("'${a//\'/\'\'}'"); done
+    # A child powershell so the script's own `exit N` becomes ssh's exit code.
+    ssh_guest "powershell -NoProfile -ExecutionPolicy Bypass -File '$GUEST_STAGE/$name' ${quoted[*]:-}; exit \$LASTEXITCODE"
+}
+
+cmd_snapshot() {
+    local name="${1:?usage: guestctl snapshot <name>}"
+    guest_qmp hmp "savevm $name"
+    note "saved snapshot '$name'"
+}
+
+cmd_revert() {
+    local name="${1:?usage: guestctl revert <name>}"
+    guest_qmp hmp "loadvm $name"
+    note "reverted to '$name'"
+}
+
+case "${1:-}" in
+    up)         shift; cmd_up "$@" ;;
+    down)       shift; cmd_down "$@" ;;
+    status)     shift; cmd_status ;;
+    wait)       shift; cmd_wait "$@" ;;
+    ssh)        shift; ssh_guest "$@" ;;
+    ps)         shift; cmd_ps "$@" ;;
+    push)       shift; ssh_guest "New-Item -ItemType Directory -Force -Path (Split-Path '${2:?}') | Out-Null"
+                       scp_guest "${1:?}" "Administrator@127.0.0.1:$2" ;;
+    pull)       shift; scp_guest "Administrator@127.0.0.1:${1:?}" "${2:?}" ;;
+    reboot)     shift; cmd_reboot "$@" ;;
+    boot-id)    shift; cmd_boot_id ;;
+    snapshot)   shift; cmd_snapshot "$@" ;;
+    revert)     shift; cmd_revert "$@" ;;
+    snapshots)  shift; guest_qmp hmp "info snapshots" ;;
+    screenshot) shift; guest_qmp screendump "{\"filename\": \"$(realpath -m "${1:?}")\", \"format\": \"png\"}" >/dev/null
+                       note "wrote $1" ;;
+    qga-exec)   shift; guest_qga exec 600 "$@" ;;
+    qmp)        shift; guest_qmp "$@" ;;
+    ""|-h|--help|help)
+                sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)          die "unknown command '$1' (guestctl help)" ;;
+esac

@@ -31,6 +31,7 @@ occasionally, not every session.
 | [Continuous integration](#continuous-integration) | What each CI workflow gates |
 | [Sanitizers](#sanitizers) | ASan/KASAN requirements |
 | [Deploying to a VM](#deploying-to-a-vm) | The deploy pipeline and its quirks |
+| [Cloud test guest](#cloud-test-guest) | The scripted KVM/QEMU Windows guest: CI runtime tests, and how agents act in it |
 | [Debugging the VM: what's real and what's noise](#debugging-the-vm-whats-real-and-whats-noise) | Decision tree for VM/debugger flakiness |
 | [Measuring performance](#measuring-performance) | How to benchmark correctly |
 | [Read-ahead policy: current state](#read-ahead-policy-current-state) | What the driver does today, and why, in one place |
@@ -49,6 +50,7 @@ a task needs it.
 |---|---|---|
 | Build + test (default gate) | `powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Fast` | [Build and test tiers](#build-and-test-tiers) |
 | Deploy to the dev VM | `.\deploy\Deploy-ToVM.ps1 -Configuration Release` | [Deploying to a VM](#deploying-to-a-vm) |
+| Runtime-test a package in a KVM guest | `ci/guest/run-guest-tests.sh --package <dir>` | [Cloud test guest](#cloud-test-guest) |
 | Benchmark (Release, Verifier off) | `powershell -File deploy/Deploy-ToVM.ps1 -ForBenchmark` | [Measuring performance](#measuring-performance) |
 | Accept new perf baseline | `powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Perf -PerfFile <path> -UpdateBaseline` | [Measuring performance](#measuring-performance) |
 | KASAN driver build | `msbuild src\BlorgFS.vcxproj -p:Configuration=Debug -p:Platform=x64 -p:EnableKASAN=true` | [Sanitizers](#sanitizers) |
@@ -383,13 +385,14 @@ test directory.
 
 ## Continuous integration
 
-Three workflows, split by what a failure should cost you.
+Four workflows, split by what a failure should cost you.
 
 | Workflow | Runs on | What it does |
 |---|---|---|
 | `build.yml` | push and PR to master | Both configurations, Fast tier. The merge gate. |
 | `verify.yml` | 03:00 UTC daily, or on demand | CBMC proofs and extended fuzz/interleaving runs. |
 | `codeql.yml` | Saturdays 23:41 UTC, on demand, and on any PR touching its own config | CodeQL with the pinned Microsoft driver query packs. |
+| `guest-runtime.yml` | after every successful build, on PRs touching `ci/guest/`, on demand | Loads the built package into a Windows guest under KVM and runs the runtime tests. See [Cloud test guest](#cloud-test-guest). |
 
 The daily and weekly ones are deliberately not gates: a CBMC regression or
 a new CodeQL finding is worth waking up to, not worth blocking a merge that
@@ -665,6 +668,139 @@ The `Perf` tier of `tools\Invoke-BlorgChecks.ps1` must run **inside the
 guest**, where `B:` is mounted and the HTTP backend is reachable. See
 "Measuring performance" below for what the counters mean and how baselines
 are updated.
+
+## Cloud test guest
+
+The VMware workflow above needs a person's workstation. The **cloud test
+guest** is the same idea with nothing on anyone's desk: a Windows guest under
+KVM/QEMU on any Linux host with `/dev/kvm` (a GitHub ubuntu runner, an Azure
+VM with nested virtualization, a developer's Linux box), driven entirely by
+scripts in `ci/guest/`. CI uses it to load every built package into a real
+kernel, and an agent with a shell on the host can use it to act inside the
+guest without a human.
+
+```
+ci/guest/
+  image/build-image.sh        golden Windows image, unattended, once per host
+  image/Setup-GoldenImage.ps1   (runs in the guest during that build)
+  host/guestctl               the control CLI: boot, ssh, push/pull, reboot,
+                              snapshot/revert, screenshot, guest-agent exec
+  host/install-host-deps.sh   QEMU + /dev/kvm access on Debian/Ubuntu
+  in-guest/                   Prepare-Guest, Invoke-GuestTests,
+                              New-TestCorpus, Get-GuestDiagnostics
+  run-guest-tests.sh          one full run: fresh guest -> package -> verdict
+  infra/azure/main.bicep      optional long-lived KVM host on Azure
+```
+
+### Running it
+
+```bash
+ci/guest/host/install-host-deps.sh        # once per host
+ci/guest/image/build-image.sh             # once per host (30-60 min)
+ci/guest/run-guest-tests.sh --package <unpacked blorg-package-windows-x64>
+```
+
+The package is the `blorg-package-windows-x64` artifact (see "Packaging");
+the rig never builds anything itself, so what it tests is what ships.
+`run-guest-tests.sh` boots a fresh guest, pushes the package plus
+`in-guest/` and `tools/Test-BlorgCorrectness.ps1`, prepares the guest
+(test signing, Driver Verifier on `BlorgFS.sys` unless `--no-verifier`,
+old dumps cleared; reboots if any of that needs it), runs
+`Invoke-GuestTests.ps1`, collects diagnostics, pulls everything back to
+`--out`, and powers the guest off (`--keep` leaves it up). Exit 0 is pass,
+1 fail, 2 the rig broke before there was a verdict.
+
+What a run checks, in order: the package's files match `manifest.json`; a
+deterministic corpus (sizes either side of page, 64 KiB, read-ahead granule
+and ceiling; 300-entry directory; awkward and non-ASCII names; deep and
+empty directories) is served by `server-rs.exe` on loopback;
+`driver\Install-BlorgFS.ps1` installs against it and `B:` mounts; the
+service is RUNNING; the tree on `B:` matches the corpus path for path and
+size for size; `Test-BlorgCorrectness.ps1` passes against the same server;
+any `tests/guest-suites/*.ps1` pass; the service is still RUNNING. A
+bugcheck or unexplained reboot anywhere fails the run even if every step
+before it passed, and the minidumps come back in `results/diag/dumps` for
+`tools\Get-CrashVerdict.ps1` on a Windows machine.
+
+`results/results.json` is rewritten after every step, so a run that died
+mid-way still says how far it got. `verdict.txt` is the one-screen answer;
+`host/screen.png` is what the guest's screen showed at the end.
+
+### Adding a suite
+
+Put `<name>.ps1` in `tests/guest-suites/`; CI passes that directory in.
+It exits 0 on pass and is given whichever of `-Drive`, `-BackendUrl`,
+`-CorpusDir`, `-CorpusManifest` and `-ResultsDir` its `param()` declares.
+It runs in Windows PowerShell 5.1 inside the guest, so no PowerShell 7
+syntax, and build non-ASCII strings from code points (a BOM-less script is
+read as ANSI).
+
+### Acting in the guest (agents)
+
+Everything goes through `ci/guest/host/guestctl` on the host:
+
+| Do this | Command |
+|---|---|
+| Boot a fresh guest | `guestctl up --fresh` |
+| Run PowerShell in it | `guestctl ssh 'Get-Service BlorgFS'` |
+| Run a local script in it | `guestctl ps ./thing.ps1 -Arg value` |
+| Copy in / out | `guestctl push ./dir C:/x/dir`, `guestctl pull C:/x/file .` |
+| Reboot and wait | `guestctl reboot` |
+| Checkpoint / go back | `guestctl snapshot clean`, `guestctl revert clean` |
+| See the screen (bugcheck?) | `guestctl screenshot screen.png` |
+| SSH is down, Windows is not | `guestctl qga-exec 'Get-NetAdapter'` |
+| Power off | `guestctl down` |
+
+The guest is reachable only from the host's loopback (SSH on
+127.0.0.1:2222, key-only, as Administrator with PowerShell as the shell);
+nothing else on the network can reach it. The SSH key lives next to the
+golden image. Inline `guestctl ssh` commands pass through Windows argv
+parsing on the way to `powershell.exe -c`, which mangles double quotes: use
+single quotes inline, or `guestctl ps` for anything longer than a line.
+
+The VMware rules above still hold here: deploy with `Install-BlorgFS.ps1`,
+never by copying the `.sys`; and a second deploy into the same boot needs a
+reboot or a revert, because `sc stop BlorgFS` wedges in `STOP_PENDING`.
+`guestctl revert` to a snapshot taken before the install is the fast way.
+
+### The golden image
+
+Windows Server 2022 Standard **Server Core**, from Microsoft's public
+180-day evaluation ISO (override with `WINDOWS_ISO_URL`; pin with
+`WINDOWS_ISO_SHA256`). Built unattended: `autounattend.xml` on a generated
+config ISO, then `Setup-GoldenImage.ps1` on first logon installs OpenSSH
+(from the Win32-OpenSSH release zip, since Server Core's own capability
+needs Windows Update), the QEMU guest agent (from the virtio-win ISO), turns
+test signing on and boot-failure recovery off (a crash reboots straight
+back into Windows instead of waiting at a recovery menu), keeps kernel
+dumps, and turns Windows Update off. The build then boots the result once
+and checks it over SSH before publishing it.
+
+Device choices that matter, all in `host/lib.sh`: SeaBIOS, because Secure
+Boot blocks `bcdedit /set testsigning on`; AHCI disk and e1000e NIC,
+because both have inbox Windows drivers so setup needs no injected virtio
+storage driver.
+
+CI caches the image (`actions/cache`, keyed by the image recipe's hash and
+the calendar quarter, so the evaluation never runs out under a cached
+image). A cache miss costs one unattended install in that run.
+
+### CI
+
+`guest-runtime.yml` runs after every successful `Build BlorgFS` run, on the
+package that run produced; on PRs touching the rig, against the newest
+package available; and on demand (`package_run_id`, `verifier`). The guest
+runs on the stock `ubuntu-latest` runner, which exposes KVM. It uploads
+`guest-results` (results, logs, diagnostics, screenshot, and the image
+build's screenshots if the image was built). It needs no secrets.
+
+### A host that outlives a CI job
+
+`ci/guest/infra/azure/main.bicep` provisions an Ubuntu VM (`Standard_D4s_v5`
+by default; Dsv5 supports nested virtualization) with QEMU installed and SSH
+open only to `allowedSshSource`. Clone the repo there, build the image once,
+and use `guestctl` as above; deallocate it when idle. This is the place for
+an agent session that needs the guest for longer than a CI job lasts.
 
 ## Debugging the VM: what's real and what's noise
 

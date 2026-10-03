@@ -1,0 +1,165 @@
+name: Guest runtime tests
+
+# Loads the packaged driver into a real Windows kernel and tests it against
+# the packaged server. The Windows guest runs under KVM/QEMU on a Linux
+# runner, driven by ci/guest/ -- the same scripts run on any KVM host, so a
+# red run here reproduces on a developer's or agent's machine with
+#   ci/guest/run-guest-tests.sh --package <unpacked artifact>
+# See "Cloud test guest" in AGENTS.md.
+#
+# Input is the blorg-package-windows-x64 artifact from build.yml, never a
+# build of its own: what is tested is exactly what ships.
+
+on:
+  # Every successful build, on any branch or PR, gets a guest run against
+  # the package it just produced.
+  workflow_run:
+    workflows: [ "Build BlorgFS" ]
+    types: [ completed ]
+  # Changes to the rig itself are tested by the rig, against the newest
+  # package available.
+  pull_request:
+    branches: [ master ]
+    paths:
+      - 'ci/guest/**'
+      - 'tools/Test-BlorgCorrectness.ps1'
+      - '.github/workflows/guest-runtime.yml'
+  workflow_dispatch:
+    inputs:
+      package_run_id:
+        description: 'Build BlorgFS run to take the package from (default: newest with one)'
+        required: false
+        default: ''
+      verifier:
+        description: 'Driver Verifier on BlorgFS.sys'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: guest-runtime-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guest:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    name: Windows guest (KVM)
+    env:
+      GUEST_HOME: /mnt/blorgfs-guest
+      PACKAGE_ARTIFACT: blorg-package-windows-x64
+
+    steps:
+    # The rig's scripts from the same commit as the package under test.
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+    - name: Find the package
+      id: pkg
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        EXPLICIT_RUN: ${{ github.event.workflow_run.id || inputs.package_run_id }}
+        PREFER_BRANCH: ${{ github.head_ref || github.ref_name }}
+      run: |
+        set -euo pipefail
+        has_package() {
+          gh api "repos/$REPO/actions/runs/$1/artifacts" \
+            --jq ".artifacts[] | select(.name == \"$PACKAGE_ARTIFACT\" and .expired == false) | .id" | grep -q .
+        }
+        run_id=""
+        if [[ -n "$EXPLICIT_RUN" ]]; then
+          has_package "$EXPLICIT_RUN" && run_id="$EXPLICIT_RUN"
+        else
+          # Newest successful build that produced a package: this branch's
+          # first, then anyone's -- until the package job is on master, a
+          # rig change can still be tested against a PR's package.
+          for scope in "--branch $PREFER_BRANCH" ""; do
+            # shellcheck disable=SC2086
+            for id in $(gh run list -R "$REPO" -w build.yml --status success -L 30 $scope --json databaseId --jq '.[].databaseId'); do
+              if has_package "$id"; then run_id="$id"; break 2; fi
+            done
+          done
+        fi
+        if [[ -z "$run_id" ]]; then
+          echo "::notice title=No package::No Build BlorgFS run with a $PACKAGE_ARTIFACT artifact was found; nothing to test."
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "Testing the package from https://github.com/$REPO/actions/runs/$run_id"
+        echo "found=true" >> "$GITHUB_OUTPUT"
+        echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+    - name: Download the package
+      if: steps.pkg.outputs.found == 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh run download "${{ steps.pkg.outputs.run_id }}" -R "${{ github.repository }}" -n "$PACKAGE_ARTIFACT" -D package
+        cat package/manifest.json
+
+    - name: Prepare the KVM host
+      if: steps.pkg.outputs.found == 'true'
+      run: |
+        ci/guest/host/install-host-deps.sh
+        sudo mkdir -p "$GUEST_HOME"
+        sudo chown "$(id -u):$(id -g)" "$GUEST_HOME"
+        # Leave the runner ~2.5 GB; the guest gets the rest, 2-6 GB.
+        mem=$(( $(free -m | awk '/^Mem:/ {print $2}') - 2560 ))
+        (( mem > 6144 )) && mem=6144
+        (( mem < 2048 )) && mem=2048
+        # The evaluation image expires 180 days after it is built; keying
+        # the cache by quarter rebuilds it long before that.
+        {
+          echo "GUEST_MEM_MB=$mem"
+          echo "GUEST_CPUS=$(nproc)"
+          echo "IMAGE_QUARTER=$(date -u +%Y)-q$(( ($(date -u +%-m) - 1) / 3 + 1 ))"
+        } >> "$GITHUB_ENV"
+        df -h "$GUEST_HOME"; free -m; nproc
+
+    - name: Restore the golden image
+      if: steps.pkg.outputs.found == 'true'
+      id: image
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ env.GUEST_HOME }}/image
+        key: blorgfs-guest-image-${{ hashFiles('ci/guest/image/**', 'ci/guest/host/lib.sh') }}-${{ env.IMAGE_QUARTER }}
+
+    # First run of a quarter, or after the image recipe changed: a full
+    # unattended Windows install, roughly 30-60 minutes.
+    - name: Build the golden image
+      if: steps.pkg.outputs.found == 'true' && steps.image.outputs.cache-hit != 'true'
+      run: ci/guest/image/build-image.sh
+
+    - name: Save the golden image
+      if: steps.pkg.outputs.found == 'true' && steps.image.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ env.GUEST_HOME }}/image
+        key: ${{ steps.image.outputs.cache-primary-key }}
+
+    - name: Run the tests in the guest
+      if: steps.pkg.outputs.found == 'true'
+      run: |
+        args=(--package package --out guest-results)
+        [[ "${{ inputs.verifier }}" == "false" ]] && args+=(--no-verifier)
+        # Contract and behavioural suites, when the repo carries them.
+        [[ -d tests/guest-suites ]] && args+=(--suites tests/guest-suites)
+        ci/guest/run-guest-tests.sh "${args[@]}"
+
+    - name: Upload results
+      if: always() && steps.pkg.outputs.found == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: guest-results
+        path: |
+          guest-results/
+          ${{ env.GUEST_HOME }}/image/build/install/screens/
+          ${{ env.GUEST_HOME }}/image/build/install/qemu.log
+        if-no-files-found: warn
