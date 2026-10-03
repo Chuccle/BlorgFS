@@ -686,8 +686,9 @@ ci/guest/
   host/guestctl               the control CLI: boot, ssh, push/pull, reboot,
                               snapshot/revert, screenshot, guest-agent exec
   host/install-host-deps.sh   QEMU + /dev/kvm access on Debian/Ubuntu
+  host/make-corpus.py         the deterministic tree server-rs serves
   in-guest/                   Prepare-Guest, Invoke-GuestTests,
-                              New-TestCorpus, Get-GuestDiagnostics
+                              Get-GuestDiagnostics
   run-guest-tests.sh          one full run: fresh guest -> package -> verdict
   infra/azure/main.bicep      optional long-lived KVM host on Azure
 ```
@@ -710,10 +711,22 @@ old dumps cleared; reboots if any of that needs it), runs
 `--out`, and powers the guest off (`--keep` leaves it up). Exit 0 is pass,
 1 fail, 2 the rig broke before there was a verdict.
 
+**Topology.** server-rs runs on the KVM host as the Linux build, the way
+the product is deployed, and the guest reaches it at `10.0.2.2` (QEMU user
+networking's address for the host). The driver's WSK traffic therefore
+crosses a real (emulated e1000e) NIC, and the backend's filesystem is
+case-sensitive. The Linux binary comes from the package
+(`server/linux-x64/server-rs`) or `--server-bin`. Without one the run falls
+back to the package's `server-rs.exe` inside the guest on loopback
+(`--server-in-guest`), says so in the summary, and cannot exercise the NIC
+path or a case-sensitive backend. The driver's TLS path is not exercised
+by either yet.
+
 What a run checks, in order: the package's files match `manifest.json`; a
-deterministic corpus (sizes either side of page, 64 KiB, read-ahead granule
-and ceiling; 300-entry directory; awkward and non-ASCII names; deep and
-empty directories) is served by `server-rs.exe` on loopback;
+deterministic corpus from `host/make-corpus.py` (sizes either side of page,
+64 KiB, read-ahead granule and ceiling; 300-entry directory; awkward and
+non-ASCII names; deep and empty directories) is served and answers
+`/healthcheck` from inside the guest;
 `driver\Install-BlorgFS.ps1` installs against it and `B:` mounts; the
 service is RUNNING; the tree on `B:` matches the corpus path for path and
 size for size; `Test-BlorgCorrectness.ps1` passes against the same server;
@@ -730,7 +743,11 @@ mid-way still says how far it got. `verdict.txt` is the one-screen answer;
 
 Put `<name>.ps1` in `tests/guest-suites/`; CI passes that directory in.
 It exits 0 on pass and is given whichever of `-Drive`, `-BackendUrl`,
-`-CorpusDir`, `-CorpusManifest` and `-ResultsDir` its `param()` declares.
+`-CorpusManifest` and `-ResultsDir` its `param()` declares (`-CorpusDir`
+too, but only with `--server-in-guest`: normally the served tree is on the
+host). Fixtures a suite needs on the volume go in
+`tests/guest-suites/<name>.corpus/`; the host serves them as `<name>\` and
+they are in the corpus manifest like everything else.
 Only top-level `*.ps1` files run, so helpers can sit in subdirectories
 beside the suite. The rig also copies `third_party/schemas/conformance/`
 (the wire-contract probe) to `suites\contract\`, where the contract suite
@@ -786,7 +803,12 @@ storage driver.
 
 CI caches the image (`actions/cache`, keyed by the image recipe's hash and
 the calendar quarter, so the evaluation never runs out under a cached
-image). A cache miss costs one unattended install in that run.
+image). A cache miss costs one unattended install in that run. A
+`workflow_run` triggered by a pull request runs in master's cache scope, so
+it uses the default branch's rig scripts and never saves the image: a PR
+(possibly from a fork) must not be able to plant a golden image that master
+later boots. The image directory also holds the guest's SSH key; that key
+only opens a guest bound to the runner's loopback.
 
 ### CI
 

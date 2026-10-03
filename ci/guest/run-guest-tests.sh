@@ -5,10 +5,19 @@
 # tests, collect results and diagnostics, and exit with the verdict.
 #
 #   run-guest-tests.sh --package DIR [--out DIR] [--suites DIR]
+#                      [--server-bin PATH | --server-in-guest]
 #                      [--no-verifier] [--kernel-dump] [--keep]
 #
 #   --package DIR   the unpacked blorg-package-windows-x64 artifact
 #                   (manifest.json, driver/, server/)
+#   --server-bin PATH
+#                   the Linux server-rs to run on this host (default: the
+#                   package's server/linux-x64/server-rs)
+#   --server-in-guest
+#                   run the package's server-rs.exe inside the guest on
+#                   loopback instead; the fallback when there is no Linux
+#                   server, and it cannot exercise the NIC, TLS, or a
+#                   case-sensitive backend
 #   --out DIR       where results land (default ./guest-results)
 #   --suites DIR    extra suites (*.ps1) to run in the guest; see the suite
 #                   contract in in-guest/Invoke-GuestTests.ps1
@@ -21,6 +30,11 @@
 # itself broke before a verdict existed.
 #
 # The same script runs in CI and by hand; nothing in it knows which.
+#
+# Topology: by default server-rs runs here on the host, as Linux, the way
+# the product is deployed, and the guest reaches it at 10.0.2.2 (QEMU user
+# networking's address for the host). So the driver's WSK traffic crosses
+# a real NIC, and the backend's filesystem is case-sensitive.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +42,8 @@ REPO="$(cd "$HERE/../.." && pwd)"
 GUESTCTL="$HERE/host/guestctl"
 
 package="" out="$PWD/guest-results" suites="" verifier=1 kernel_dump=0 keep=0
+server_bin="" server_in_guest=0 server_pid=""
+SERVER_PORT="${SERVER_PORT:-18080}"
 while (( $# )); do
     case "$1" in
         --package)     package="$2"; shift 2 ;;
@@ -35,6 +51,8 @@ while (( $# )); do
         --suites)      suites="$2"; shift 2 ;;
         --no-verifier) verifier=0; shift ;;
         --kernel-dump) kernel_dump=1; shift ;;
+        --server-bin)  server_bin="$2"; shift 2 ;;
+        --server-in-guest) server_in_guest=1; shift ;;
         --keep)        keep=1; shift ;;
         *) echo "run-guest-tests: unknown argument '$1'" >&2; exit 2 ;;
     esac
@@ -55,6 +73,8 @@ finish() {
     # shellcheck source=ci/guest/host/lib.sh
     ( source "$HERE/host/lib.sh"; cp -f "$GUEST_SERIAL" "$GUEST_QEMU_LOG" "$out/host/" 2>/dev/null || true )
     "$GUESTCTL" screenshot "$out/host/screen.png" >/dev/null 2>&1 || true
+    [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
+    [[ -n "${work:-}" ]] && rm -rf "$work"
     if (( keep )); then
         echo "run-guest-tests: guest left running (--keep); drive it with $GUESTCTL"
     else
@@ -67,8 +87,20 @@ finish() {
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 
+if (( ! server_in_guest )) && [[ -z "$server_bin" ]]; then
+    if [[ -x "$package/server/linux-x64/server-rs" ]]; then
+        server_bin="$package/server/linux-x64/server-rs"
+    else
+        echo "run-guest-tests: no Linux server-rs (package has no server/linux-x64/server-rs, no --server-bin);" >&2
+        echo "run-guest-tests: falling back to server-rs.exe inside the guest, which cannot test the NIC path" >&2
+        [[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::warning title=Guest topology::No Linux server-rs in the package; ran the Windows server inside the guest on loopback instead."
+        server_in_guest=1
+    fi
+fi
+
 step "Assembling the bundle"
-bundle="$(mktemp -d)/bundle"
+work="$(mktemp -d)"
+bundle="$work/bundle"
 mkdir -p "$bundle/tools"
 cp -r "$package" "$bundle/package"
 cp -r "$HERE/in-guest" "$bundle/in-guest"
@@ -86,8 +118,32 @@ if [[ -n "$suites" ]]; then
     fi
     ls -R "$bundle/suites"
 fi
+
+# The corpus is generated here for both topologies; suites' fixture
+# directories (suites/<name>.corpus/) are served as <name>/.
+extras=()
+if [[ -d "$bundle/suites" ]]; then
+    for d in "$bundle/suites"/*.corpus; do
+        [[ -d "$d" ]] && extras+=(--extra "$(basename "$d" .corpus)=$d")
+    done
+fi
+python3 "$HERE/host/make-corpus.py" "$work" "${extras[@]}" || rig_fail "could not generate the corpus"
 python3 -c 'import json,sys; m=json.load(open(sys.argv[1], encoding="utf-8-sig")); print("  package", m.get("version"))' "$package/manifest.json"
 endstep
+
+if (( ! server_in_guest )); then
+    step "Starting server-rs on the host (port $SERVER_PORT)"
+    mkdir -p "$out/host"
+    PORT="$SERVER_PORT" RUST_LOG=info "$server_bin" "$work/corpus" >"$out/host/server.log" 2>&1 &
+    server_pid=$!
+    for _ in $(seq 60); do
+        curl -fsS "http://127.0.0.1:$SERVER_PORT/healthcheck" >/dev/null 2>&1 && break
+        kill -0 "$server_pid" 2>/dev/null || rig_fail "server-rs exited at startup: $(tail -n 20 "$out/host/server.log")"
+        sleep 0.5
+    done
+    curl -fsS "http://127.0.0.1:$SERVER_PORT/healthcheck" >/dev/null || rig_fail "server-rs did not answer /healthcheck"
+    endstep
+fi
 
 step "Booting a fresh guest"
 "$GUESTCTL" up --fresh || rig_fail "guest did not boot"
@@ -97,6 +153,11 @@ step "Deploying the bundle"
 "$GUESTCTL" ssh "Remove-Item -Recurse -Force C:/blorgfs-ci/bundle, C:/blorgfs-ci/results -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force C:/blorgfs-ci | Out-Null" \
     || rig_fail "could not prepare the guest's staging directory"
 "$GUESTCTL" push "$bundle" C:/blorgfs-ci/bundle || rig_fail "could not copy the bundle into the guest"
+"$GUESTCTL" push "$work/corpus-manifest.json" C:/blorgfs-ci/corpus-manifest.json || rig_fail "could not copy the corpus manifest into the guest"
+if (( server_in_guest )); then
+    "$GUESTCTL" ssh "Remove-Item -Recurse -Force C:/blorgfs-ci/corpus -ErrorAction SilentlyContinue" || true
+    "$GUESTCTL" push "$work/corpus" C:/blorgfs-ci/corpus || rig_fail "could not copy the corpus into the guest"
+fi
 endstep
 
 step "Preparing the guest"
@@ -113,7 +174,9 @@ endstep
 
 step "Running the tests in the guest"
 boot_before="$("$GUESTCTL" boot-id)"
-"$GUESTCTL" ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/in-guest/Invoke-GuestTests.ps1; exit \$LASTEXITCODE"
+test_args="-Port $SERVER_PORT"
+(( server_in_guest )) && test_args+=" -ServerInGuest"
+"$GUESTCTL" ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/in-guest/Invoke-GuestTests.ps1 $test_args; exit \$LASTEXITCODE"
 test_rc=$?
 endstep
 
@@ -136,7 +199,8 @@ endstep
 
 # The verdict: the runner's own, overridden by a bugcheck or an unexplained
 # reboot -- a crash after the last step still counts.
-python3 - "$out" "$test_rc" "$boot_before" "$boot_after" <<'PY'
+if (( server_in_guest )); then topology="guest loopback (Windows server-rs.exe)"; else topology="host over NIC (Linux server-rs)"; fi
+SERVER_TOPOLOGY="$topology" python3 - "$out" "$test_rc" "$boot_before" "$boot_after" <<'PY'
 import json, os, sys
 out, rc, before, after = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 def load(p):
@@ -157,7 +221,7 @@ if before and after and before != after:
 if rc == 255:
     reasons.append("lost contact with the guest mid-run")
 verdict = "fail" if reasons else "pass"
-lines = [f"verdict={verdict}", f"package={res.get('package')}"]
+lines = [f"verdict={verdict}", f"package={res.get('package')}", f"server={os.environ.get('SERVER_TOPOLOGY', '')}"]
 lines += [f"reason={r}" for r in reasons]
 for s in res.get("steps", []):
     lines.append(f"step.{s['name']}={s['status']}" + (f" ({s['detail']})" if s.get("detail") else ""))
@@ -170,7 +234,7 @@ if summary:
     icon = {"pass": "✅", "fail": "❌", "skip": "⏭️"}
     with open(summary, "a", encoding="utf-8") as f:
         f.write(f"## Windows guest runtime tests: {verdict.upper()}\n\n")
-        f.write(f"Package `{res.get('package')}`\n\n")
+        f.write(f"Package `{res.get('package')}`, server: {os.environ.get('SERVER_TOPOLOGY', '')}\n\n")
         for r in reasons:
             f.write(f"- **{r}**\n")
         f.write("\n| Step | Result | Time | Detail |\n|---|---|---|---|\n")

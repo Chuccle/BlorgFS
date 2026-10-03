@@ -16,8 +16,14 @@
     mid-run still leaves everything up to that point:
 
       package      every file matches the SHA-256 in manifest.json
-      corpus       New-TestCorpus.ps1 writes the served tree
-      server       server-rs.exe serves it on loopback; /healthcheck answers
+      corpus       the corpus manifest (host/make-corpus.py) was pushed in
+      server       the backend answers /healthcheck from inside the guest.
+                   Normally that is the Linux server-rs on the KVM host,
+                   reached through the guest's NIC at 10.0.2.2 -- the
+                   topology the product actually runs in. With
+                   -ServerInGuest, the package's server-rs.exe is started
+                   here on loopback instead (a fallback for a package with
+                   no Linux server).
       install      driver\Install-BlorgFS.ps1 against that server; B: mounts
       service      BlorgFS is RUNNING
       volume       VolumeTester.exe, when the package carries it
@@ -31,7 +37,10 @@
     suites\<name>.ps1 that exits 0 on pass. It is offered -Drive (the
     mounted letter), -BackendUrl, -CorpusDir, -CorpusManifest and
     -ResultsDir (a directory of its own for logs), and given whichever of
-    those its param() block declares.
+    those its param() block declares. -CorpusDir is only offered with
+    -ServerInGuest, since otherwise the served tree is on the host; a suite
+    that needs fixtures on the volume ships them as suites\<name>.corpus\,
+    which the host serves as <name>\ (run-guest-tests.sh).
 
     The driver is not stopped at the end: there is no dismount handler, so
     `sc stop` wedges in STOP_PENDING (AGENTS.md). Runs end by discarding the
@@ -45,14 +54,24 @@
 .PARAMETER ResultsDir
     Where results.json and the logs go. Prepare-Guest.ps1 creates it.
 
+.PARAMETER BackendHost
+    Where the driver and the checks reach server-rs. 10.0.2.2 is the KVM
+    host as seen through QEMU user networking.
+
 .PARAMETER Port
-    Loopback port for server-rs.
+    server-rs's port.
+
+.PARAMETER ServerInGuest
+    Start the package's server-rs.exe in the guest on loopback, serving the
+    pushed corpus, instead of using the host's server.
 #>
 [CmdletBinding()]
 param(
     [string]$BundleDir = 'C:\blorgfs-ci\bundle',
     [string]$ResultsDir = 'C:\blorgfs-ci\results',
-    [int]$Port = 8080,
+    [string]$BackendHost = '10.0.2.2',
+    [int]$Port = 18080,
+    [switch]$ServerInGuest,
     [char]$Drive = 'B'
 )
 
@@ -62,7 +81,8 @@ $ProgressPreference = 'SilentlyContinue'
 $package = Join-Path $BundleDir 'package'
 $corpus = 'C:\blorgfs-ci\corpus'
 $corpusManifest = 'C:\blorgfs-ci\corpus-manifest.json'
-$backendUrl = "http://127.0.0.1:$Port"
+if ($ServerInGuest) { $BackendHost = '127.0.0.1' }
+$backendUrl = "http://${BackendHost}:$Port"
 $logs = Join-Path $ResultsDir 'logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 
@@ -167,12 +187,24 @@ try {
 
     Invoke-Step 'corpus' {
         param($log)
-        & (Join-Path $PSScriptRoot 'New-TestCorpus.ps1') -Path $corpus *>&1 | Write-StepLog -Log $log
-        Test-Path $corpusManifest
+        if (-not (Test-Path $corpusManifest)) { return 'corpus-manifest.json was not pushed into the guest' }
+        if ($ServerInGuest -and -not (Test-Path $corpus)) { return 'corpus was not pushed into the guest (needed for -ServerInGuest)' }
+        $m = Get-Content $corpusManifest -Raw | ConvertFrom-Json
+        "corpus: $($m.files.Count) files, $($m.directories.Count) directories" | Write-StepLog -Log $log
+        $true
     } | Out-Null
 
     Invoke-Step 'server' {
         param($log)
+        if (-not $ServerInGuest) {
+            # Across the NIC, before the driver tries the same path: a
+            # failure here is the network, not the filesystem.
+            try {
+                $r = Invoke-WebRequest -UseBasicParsing -Uri "$backendUrl/healthcheck" -TimeoutSec 15
+                "host server at $backendUrl answered $($r.StatusCode)" | Write-StepLog -Log $log
+                return ($r.StatusCode -eq 200)
+            } catch { return "host server at $backendUrl unreachable from the guest: $($_.Exception.Message)" }
+        }
         $exe = Join-Path $package 'server\server-rs.exe'
         $env:PORT = "$Port"
         $env:RUST_LOG = 'info'
@@ -194,7 +226,7 @@ try {
     Invoke-Step 'install' {
         param($log)
         $code = Invoke-ChildScript $log (Join-Path $package 'driver\Install-BlorgFS.ps1') @{
-            RemoteHost = '127.0.0.1'; RemotePort = "$Port"; DriveLetter = $Drive
+            RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive
         }
         if ($code -eq 2) { return 'test signing is off (Install-BlorgFS.ps1 exit 2) -- Prepare-Guest.ps1 and a reboot should have handled this' }
         if ($code -ne 0) { return "Install-BlorgFS.ps1 exited $code" }
@@ -266,9 +298,10 @@ try {
                 param($log)
                 $out = New-Item -ItemType Directory -Force -Path (Join-Path $ResultsDir "suites\$name")
                 $offered = @{
-                    Drive = $Drive; BackendUrl = $backendUrl; CorpusDir = $corpus
+                    Drive = $Drive; BackendUrl = $backendUrl
                     CorpusManifest = $corpusManifest; ResultsDir = $out.FullName
                 }
+                if ($ServerInGuest) { $offered.CorpusDir = $corpus }
                 $declared = (Get-Command $suite.FullName).Parameters.Keys
                 $pass = @{}
                 foreach ($k in $offered.Keys) { if ($declared -contains $k) { $pass[$k] = $offered[$k] } }
