@@ -348,6 +348,26 @@ dispatch() {
     note "dispatched $wf but could not find its run"; return 1
 }
 
+# The build.yml run for what is pushed at ref: a push or PR has usually
+# started one already, and following it beats building the same commit
+# twice. Dispatch only when there is none -- which also covers a build.yml
+# without workflow_dispatch (before #63), since push/PR runs exist anyway.
+build_run_for() {
+    local ref="$1" sha id
+    sha="$(gh api "repos/$GH_REPO/commits/$ref" --jq .sha 2>/dev/null)" ||
+        { note "ref '$ref' is not on GitHub; push it first"; return 1; }
+    [[ "$sha" == "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" ]] ||
+        note "local HEAD differs from $ref on GitHub ($(cut -c1-7 <<<"$sha")); testing what is pushed"
+    id="$(gh run list -R "$GH_REPO" -w build.yml -c "$sha" -L 10 --json databaseId,status,conclusion \
+          --jq '[.[] | select(.status != "completed" or .conclusion == "success" or .conclusion == "failure")][0].databaseId // empty')"
+    if [[ -n "$id" ]]; then
+        note "following the existing build.yml run for ${sha:0:7}"
+        echo "$id"
+    else
+        dispatch build.yml "$ref"
+    fi
+}
+
 # Wait for a run; on failure print the tail of each failed job's log. A run
 # still queued after BLORG_QUEUE_TIMEOUT seconds (default 600) is waiting for
 # a runner that is not there -- usually the self-hosted KVM host being off --
@@ -396,7 +416,7 @@ cmd_ci() {
         build)
             need_gh
             [[ "${1:-}" == "--ref" ]] && ref="$2"
-            local id; id="$(dispatch build.yml "$ref")" || exit 2
+            local id; id="$(build_run_for "$ref")" || exit 2
             echo "build_run=$id"
             watch_run "$id"
             ;;
@@ -411,6 +431,8 @@ cmd_ci() {
                     *) die "unknown ci guest argument '$1'" ;;
                 esac
             done
+            gh api "repos/$GH_REPO/contents/.github/workflows/guest-runtime.yml?ref=$ref" --jq .sha >/dev/null 2>&1 ||
+                die "guest-runtime.yml is not on '$ref' (it arrives with the Windows guest rig, BlorgFS #64); merge or rebase onto it first"
             local id; id="$(dispatch guest-runtime.yml "$ref" "${args[@]}")" || exit 2
             watch_run "$id"; a=$?
             cmd_ci results "$id"
@@ -426,7 +448,7 @@ cmd_ci() {
                     *) die "unknown ci test argument '$1'" ;;
                 esac
             done
-            bid="$(dispatch build.yml "$ref")" || exit 2
+            bid="$(build_run_for "$ref")" || exit 2
             echo "build_run=$bid"
             watch_run "$bid" || return 1
             # guest-runtime.yml chains on every successful build (workflow_run).
