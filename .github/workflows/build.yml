@@ -485,3 +485,8 @@ jobs:
           --title "blorg $GITHUB_REF_NAME" \
           --notes "Test-signed driver, and server-rs for Linux and Windows, built together. See manifest.json for the exact commits."
 
+  # The packaged driver in a real Windows kernel, against the packaged Linux
+  # server. Part of every build so a broken driver/server pairing fails here.
+  guest:
+    needs: package
+    uses: ./.github/workflows/guest.yml

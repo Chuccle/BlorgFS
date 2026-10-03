@@ -1,0 +1,672 @@
+<#
+.SYNOPSIS
+    Everything that runs inside the BlorgFS Windows test guest, one step
+    per call. The host side is tools/blorg (blorg guest image | test).
+
+.DESCRIPTION
+    -Step Image
+        Turns a freshly installed Windows into the BlorgFS test guest's golden
+        image. Runs once, inside the guest, from the autounattend first logon.
+
+        Everything a test run would otherwise have to do (and reboot for) is
+        done here once, so a run starts from a guest that can load a test-signed
+        driver straight away:
+
+          - OpenSSH server, key-only, PowerShell as the default shell. This is
+            the channel blorg guest uses to act in the guest.
+          - QEMU guest agent (when the virtio-win ISO is attached), the fallback
+            channel for when the guest network is what broke.
+          - Driver Verifier's standard checks on BlorgFS.sys, the default for
+            a test run, so the run does not have to reboot to apply them.
+          - Test signing on, and boot-failure recovery off, so a bugcheck
+            reboots straight back into Windows instead of parking at a recovery
+            menu nobody can see.
+          - Kernel crash dumps kept on C:, where -Step Diagnostics finds
+            them.
+          - Windows Update off, high-performance power plan: a run should not
+            compete with a servicing stack or fall asleep.
+
+        It powers the machine off when done, success or not. blorg guest image
+        waits for that power-off and then boots the image once more to check
+        the result over SSH, so a failure here surfaces there rather than as a
+        hung build.
+
+    -Step Prepare
+        Puts the guest into the state a test run needs, and says whether that
+        takes a reboot.
+
+        Runs inside the guest before -Step Test. Idempotent, and
+        deliberately independent of how the guest was built or which hypervisor
+        hosts it: the golden image already has test signing on, but a guest
+        from anywhere else (the VMware dev VM, a cloud VM) gets the same
+        treatment.
+
+          - Test signing on (a reboot to apply, if it was off).
+          - Driver Verifier's standard checks on BlorgFS.sys, or off with
+            -NoVerifier. Correctness runs want it on; benchmark runs must not
+            have it (Verifier skews timings). Either change
+            needs a reboot.
+          - Old crash dumps cleared, and the time recorded, so the diagnostics
+            afterwards only ever report crashes from this run.
+
+        Exit codes: 0 ready now; 3010 ready after a reboot; 1 failed.
+
+    -Step Test
+        The runtime test run: real driver, real server, real kernel. Runs inside
+        the guest and leaves a machine-readable verdict.
+
+        Expects the bundle blorg guest test pushes:
+
+            <BundleDir>\package\    the blorg-package-windows-x64 artifact
+                                    (manifest.json, driver\, server\)
+            <BundleDir>\Invoke-BlorgGuest.ps1   this script
+            <BundleDir>\tools\      Test-BlorgCorrectness.ps1
+            <BundleDir>\suites\     optional extra suites (see below)
+
+        Steps, each recorded in results.json as it finishes so a bugcheck
+        mid-run still leaves everything up to that point:
+
+          package      every file matches the SHA-256 in manifest.json
+          corpus       the corpus manifest (tools/blorg.d/corpus.py) was pushed in
+          server       the Linux server-rs on the KVM host answers /healthcheck
+                       through the guest's NIC at 10.0.2.2 -- the topology the
+                       product actually runs in
+          install      driver\Install-BlorgFS.ps1 against that server; B: mounts
+          service      BlorgFS is RUNNING
+          volume       VolumeTester.exe, when the package carries it
+          listing      the tree on B: matches the corpus: every path, every size
+          correctness  tools\Test-BlorgCorrectness.ps1 (size, hash, range,
+                       reread, tail) against the same server
+          suite:<name> each suites\*.ps1
+          survived     BlorgFS still RUNNING afterwards
+
+        Suite contract, for contract and behavioural tests from elsewhere: a
+        suites\<name>.ps1 that exits 0 on pass. It is offered -Drive (the
+        mounted letter), -BackendUrl, -CorpusManifest and
+        -ResultsDir (a directory of its own for logs), and given whichever of
+        those its param() block declares. The served tree lives on the host,
+        so a suite that needs fixtures on the volume ships them as
+        suites\<name>.corpus\, which the host serves as <name>\
+        (blorg guest test).
+
+        The driver is not stopped at the end: there is no dismount handler, so
+        `sc stop` wedges in STOP_PENDING. Runs end by discarding the
+        guest's disk instead.
+
+        Exit code 0 only when the verdict is "pass".
+
+    -Step Diagnostics
+        Collects what explains a failed or crashed run, and says whether the
+        guest bugchecked during it.
+
+        Runs inside the guest after -Step Test, or after the guest
+        came back from a crash mid-run, and writes into <ResultsDir>\diag:
+
+          crash.json        bugchecked yes/no since -Step Prepare ran, the
+                            bugcheck events, and the dumps found
+          dumps\            minidumps, and the kernel MEMORY.DMP (zipped) when
+                            -IncludeKernelDump is given
+          setupapi.*.log    the driver install's own log
+          system.evtx       the System event log, plus system-errors.txt
+          state.txt         sc query, bcdedit, verifier settings, driver store
+
+        A dump is evidence for tools\Get-CrashVerdict.ps1, which needs cdb and
+        symbols and so runs on a Windows host, not here.
+
+    Windows PowerShell 5.1: no PowerShell 7 syntax.
+
+.PARAMETER Step
+    Image, Prepare, Test or Diagnostics.
+
+.PARAMETER ConfigDrive
+    Image: the config ISO's drive, e.g. "E:". Holds this script, the
+    OpenSSH zip and authorized_keys.
+
+.PARAMETER BundleDir
+    Test: where the bundle was pushed.
+
+.PARAMETER ResultsDir
+    Prepare recreates it empty; Test writes results.json and logs into it;
+    Diagnostics adds diag\ (and reads prepared-at.txt from Prepare).
+
+.PARAMETER BackendHost
+    Test: where the driver and the checks reach server-rs. 10.0.2.2 is the
+    KVM host as seen through QEMU user networking.
+
+.PARAMETER Port
+    Test: server-rs's port.
+
+.PARAMETER Drive
+    Test: the drive letter BlorgFS mounts.
+
+.PARAMETER NoVerifier
+    Prepare: leave Driver Verifier off for BlorgFS.sys (and turn it off if
+    set). Benchmark runs must not have it; it skews timings.
+
+.PARAMETER IncludeKernelDump
+    Diagnostics: also zip C:\Windows\MEMORY.DMP into the results. Large.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][ValidateSet('Image', 'Prepare', 'Test', 'Diagnostics')][string]$Step,
+    [string]$ConfigDrive,
+    [string]$BundleDir = 'C:\blorgfs-ci\bundle',
+    [string]$ResultsDir = 'C:\blorgfs-ci\results',
+    [string]$BackendHost = '10.0.2.2',
+    [int]$Port = 18080,
+    [char]$Drive = 'B',
+    [switch]$NoVerifier,
+    [switch]$IncludeKernelDump
+)
+
+# Each step is a function, so its helpers and preferences stay its own;
+# `exit` in a step ends the script with that step's exit code.
+
+function Invoke-ImageStep {
+    $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
+    Start-Transcript -Path 'C:\blorgfs-image.log' -Append | Out-Null
+
+    $script:Failed = @()
+
+    function Step {
+        param([string]$Name, [scriptblock]$Body)
+        Write-Host "==> $Name" -ForegroundColor Cyan
+        try {
+            & $Body
+        } catch {
+            Write-Host "FAILED: $Name -- $($_.Exception.Message)" -ForegroundColor Red
+            $script:Failed += $Name
+        }
+    }
+
+    function Invoke-Native {
+        param([string]$File, [string[]]$Arguments)
+        & $File @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "$File $($Arguments -join ' ') exited $LASTEXITCODE" }
+    }
+
+    New-Item -ItemType Directory -Force -Path 'C:\blorgfs-ci' | Out-Null
+
+    Step 'Execution policy' {
+        Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope LocalMachine -Force
+    }
+
+    Step 'OpenSSH server' {
+        $zip = Join-Path $ConfigDrive 'OpenSSH-Win64.zip'
+        $dest = 'C:\Program Files\OpenSSH'
+        Expand-Archive -Path $zip -DestinationPath 'C:\Program Files' -Force
+        if (Test-Path 'C:\Program Files\OpenSSH-Win64') {
+            if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+            Rename-Item 'C:\Program Files\OpenSSH-Win64' 'OpenSSH'
+        }
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $dest 'install-sshd.ps1')
+        if ($LASTEXITCODE -ne 0) { throw "install-sshd.ps1 exited $LASTEXITCODE" }
+
+        # First start writes %ProgramData%\ssh\sshd_config and the host keys.
+        Set-Service -Name sshd -StartupType Automatic
+        Start-Service sshd
+        Stop-Service sshd
+
+        # Administrators read their keys from one machine-wide file (the
+        # stock sshd_config's "Match Group administrators" block), and sshd
+        # ignores that file unless only Administrators and SYSTEM can touch it.
+        $keys = 'C:\ProgramData\ssh\administrators_authorized_keys'
+        Copy-Item (Join-Path $ConfigDrive 'authorized_keys') $keys -Force
+        Invoke-Native icacls.exe @($keys, '/inheritance:r', '/grant', 'Administrators:F', '/grant', 'SYSTEM:F')
+
+        $cfg = 'C:\ProgramData\ssh\sshd_config'
+        $text = Get-Content $cfg -Raw
+        $text = $text -replace '(?m)^#?\s*PasswordAuthentication\s+\S+', 'PasswordAuthentication no'
+        $text = $text -replace '(?m)^#?\s*PubkeyAuthentication\s+\S+', 'PubkeyAuthentication yes'
+        Set-Content -Path $cfg -Value $text -Encoding ascii
+
+        New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' -Force | Out-Null
+        New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -PropertyType String -Force `
+            -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' | Out-Null
+
+        if (-not (Get-NetFirewallRule -Name 'BlorgFS-SSH' -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -Name 'BlorgFS-SSH' -DisplayName 'OpenSSH (BlorgFS test guest)' `
+                -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -Profile Any | Out-Null
+        }
+        Start-Service sshd
+    }
+
+    Step 'QEMU guest agent (optional)' {
+        $virtio = Get-PSDrive -PSProvider FileSystem |
+            ForEach-Object { $_.Root } |
+            Where-Object { Test-Path (Join-Path $_ 'guest-agent\qemu-ga-x86_64.msi') } |
+            Select-Object -First 1
+        if (-not $virtio) {
+            Write-Host '    virtio-win ISO not attached; skipping (SSH is the primary channel)'
+            return
+        }
+        # vioserial carries the agent's channel; without it the service starts
+        # and never sees its port. The 2k22 build also loads on 2025.
+        $inf = Get-ChildItem (Join-Path $virtio 'vioserial') -Recurse -Filter 'vioser.inf' |
+            Where-Object { $_.FullName -match '\\2k22\\amd64\\' } | Select-Object -First 1
+        if ($inf) { Invoke-Native pnputil.exe @('/add-driver', $inf.FullName, '/install') }
+        $msi = Join-Path $virtio 'guest-agent\qemu-ga-x86_64.msi'
+        $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart') -Wait -PassThru
+        if ($p.ExitCode -notin 0, 3010) { throw "qemu-ga install exited $($p.ExitCode)" }
+    }
+
+    Step 'Test signing, and no recovery menu after a crash' {
+        Invoke-Native bcdedit.exe @('/set', '{current}', 'testsigning', 'on')
+        Invoke-Native bcdedit.exe @('/set', '{current}', 'bootstatuspolicy', 'ignoreallfailures')
+        Invoke-Native bcdedit.exe @('/set', '{current}', 'recoveryenabled', 'no')
+        Invoke-Native bcdedit.exe @('/timeout', '0')
+    }
+
+    # Keyed by image name, so it can be set before the driver exists. Done
+    # here so a default (verifier-on) run needs no reboot before its tests:
+    # -Step Prepare only reboots when a run asks for something else.
+    Step 'Driver Verifier on BlorgFS.sys' {
+        verifier.exe /standard /driver BlorgFS.sys | Out-Null
+    }
+
+    Step 'Kernel crash dumps' {
+        $k = 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl'
+        Set-ItemProperty $k CrashDumpEnabled 2      # kernel memory dump
+        Set-ItemProperty $k AutoReboot 1
+        Set-ItemProperty $k Overwrite 1
+        Set-ItemProperty $k AlwaysKeepMemoryDump 1  # disk-space pressure must not eat the evidence
+        Set-ItemProperty $k MinidumpsCount 50
+    }
+
+    Step 'Windows Update off' {
+        foreach ($svc in 'wuauserv', 'UsoSvc', 'WaaSMedicSvc') {
+            try { Stop-Service $svc -Force -ErrorAction SilentlyContinue } catch { Write-Verbose "stop $svc failed" }
+            # WaaSMedicSvc refuses Set-Service; the registry is the only lever.
+            Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$svc" Start 4 -ErrorAction SilentlyContinue
+        }
+        $au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+        New-Item -Path $au -Force | Out-Null
+        Set-ItemProperty $au NoAutoUpdate 1
+    }
+
+    Step 'Power and shutdown prompts' {
+        Invoke-Native powercfg.exe @('/setactive', 'SCHEME_MIN')
+        Invoke-Native powercfg.exe @('/hibernate', 'off')
+        $r = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Reliability'
+        New-Item -Path $r -Force | Out-Null
+        Set-ItemProperty $r ShutdownReasonOn 0
+    }
+
+    Step 'Record image info' {
+        $os = Get-CimInstance Win32_OperatingSystem
+        [ordered]@{
+            built      = (Get-Date).ToUniversalTime().ToString('o')
+            caption    = $os.Caption
+            version    = $os.Version
+            build      = $os.BuildNumber
+            failedSteps = $script:Failed
+        } | ConvertTo-Json | Set-Content -Path 'C:\blorgfs-ci\image-info.json' -Encoding ascii
+    }
+
+    Step 'Trim free space so the image compresses' {
+        Remove-Item -Recurse -Force "$env:TEMP\*" -ErrorAction SilentlyContinue
+        Optimize-Volume -DriveLetter C -ReTrim
+    }
+
+    if ($script:Failed.Count) {
+        Write-Host "Golden image setup finished with failures: $($script:Failed -join ', ')" -ForegroundColor Red
+    } else {
+        Write-Host 'Golden image setup finished.' -ForegroundColor Green
+    }
+    Stop-Transcript | Out-Null
+    Stop-Computer -Force
+}
+
+function Invoke-PrepareStep {
+    $ErrorActionPreference = 'Stop'
+    $reboot = $false
+
+    try {
+        if (Test-Path $ResultsDir) { Remove-Item -Recurse -Force $ResultsDir }
+        New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
+
+        $bcd = bcdedit /enum '{current}' | Out-String
+        if ($bcd -notmatch 'testsigning\s+Yes') {
+            Write-Host '==> Enabling test signing'
+            bcdedit /set '{current}' testsigning on | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "bcdedit testsigning failed ($LASTEXITCODE) -- is Secure Boot on? It must be off for a test-signed driver." }
+            $reboot = $true
+        }
+
+        $verifierOn = (verifier /querysettings | Out-String) -match '(?im)^\s*BlorgFS\.sys\s*$'
+        if (-not $NoVerifier -and -not $verifierOn) {
+            Write-Host '==> Enabling Driver Verifier (standard) for BlorgFS.sys'
+            verifier /standard /driver BlorgFS.sys | Out-Null
+            $reboot = $true
+        } elseif ($NoVerifier -and $verifierOn) {
+            Write-Host '==> Clearing Driver Verifier'
+            verifier /reset | Out-Null
+            $reboot = $true
+        }
+
+        Write-Host '==> Clearing old crash dumps'
+        Remove-Item -Force 'C:\Windows\MEMORY.DMP' -ErrorAction SilentlyContinue
+        Remove-Item -Force 'C:\Windows\Minidump\*' -ErrorAction SilentlyContinue
+
+        (Get-Date).ToUniversalTime().ToString('o') | Set-Content -Encoding ascii (Join-Path $ResultsDir 'prepared-at.txt')
+        [ordered]@{ verifier = (-not $NoVerifier); rebootRequired = $reboot } |
+            ConvertTo-Json | Set-Content -Encoding ascii (Join-Path $ResultsDir 'prepare.json')
+    } catch {
+        Write-Host "PREPARE FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+
+    if ($reboot) {
+        Write-Host 'REBOOT REQUIRED'
+        exit 3010
+    }
+    Write-Host 'Guest ready.'
+    exit 0
+}
+
+function Invoke-TestStep {
+    $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
+
+    $package = Join-Path $BundleDir 'package'
+    $corpusManifest = 'C:\blorgfs-ci\corpus-manifest.json'
+    $backendUrl = "http://${BackendHost}:$Port"
+    $logs = Join-Path $ResultsDir 'logs'
+    New-Item -ItemType Directory -Force -Path $logs | Out-Null
+
+    $script:Steps = [System.Collections.Generic.List[object]]::new()
+    $script:Started = (Get-Date).ToUniversalTime()
+    $script:Mounted = $false
+
+    # Logs and results as BOM-less UTF-8: Windows PowerShell 5.1's own
+    # Tee-Object and Set-Content -Encoding utf8 write UTF-16 or a BOM, which
+    # the host side (and anything reading results.json) then trips over.
+    $script:Utf8 = New-Object System.Text.UTF8Encoding $false
+    filter Write-StepLog {
+        param([string]$Log)
+        $line = "$_"
+        [System.IO.File]::AppendAllText($Log, $line + "`r`n", $script:Utf8)
+        Write-Host $line
+    }
+
+    function Save-Results {
+        param([string]$Verdict = 'running')
+        $manifest = $null
+        $mf = Join-Path $package 'manifest.json'
+        if (Test-Path $mf) { $manifest = Get-Content $mf -Raw | ConvertFrom-Json }
+        [ordered]@{
+            verdict  = $Verdict
+            started  = $script:Started.ToString('o')
+            updated  = (Get-Date).ToUniversalTime().ToString('o')
+            package  = if ($manifest) { $manifest.version } else { $null }
+            commits  = if ($manifest) { $manifest.components } else { $null }
+            os       = (Get-CimInstance Win32_OperatingSystem).Version
+            steps    = $script:Steps
+        } | ConvertTo-Json -Depth 6 | ForEach-Object {
+            [System.IO.File]::WriteAllText((Join-Path $ResultsDir 'results.json'), $_, $script:Utf8)
+        }
+    }
+
+    # Runs one step. The body returns $true/$false (or throws); 'skip' and a
+    # reason string are for steps whose precondition is missing.
+    function Invoke-Step {
+        param([string]$Name, [scriptblock]$Body, [switch]$NeedsMount)
+        $log = Join-Path $logs (($Name -replace '[^\w.-]', '_') + '.log')
+        Write-Host ""
+        Write-Host "===== $Name =====" -ForegroundColor Cyan
+        $t0 = Get-Date
+        $status = 'fail'; $detail = $null
+        if ($NeedsMount -and -not $script:Mounted) {
+            $status = 'skip'; $detail = "${Drive}: is not mounted"
+        } else {
+            try {
+                $r = & $Body $log
+                if ($r -is [array]) { $r = $r[-1] }
+                if ($r -eq 'skip') { $status = 'skip'; $detail = 'not applicable' }
+                elseif ($r -is [string]) { $status = 'fail'; $detail = $r }
+                elseif ($r) { $status = 'pass' }
+            } catch {
+                $detail = $_.Exception.Message
+            }
+        }
+        $secs = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+        $color = @{ pass = 'Green'; fail = 'Red'; skip = 'Yellow' }[$status]
+        Write-Host ("----- {0}: {1} ({2}s){3}" -f $Name, $status.ToUpper(), $secs, $(if ($detail) { " -- $detail" } else { '' })) -ForegroundColor $color
+        $script:Steps.Add([ordered]@{
+            name = $Name; status = $status; seconds = $secs; detail = $detail
+            log = if (Test-Path $log) { "logs/" + (Split-Path $log -Leaf) } else { $null }
+        })
+        Save-Results
+        return ($status -ne 'fail')
+    }
+
+    # Runs a PowerShell script in a child process (so its `exit N` is just an
+    # exit code), streaming output to the console and the step log.
+    function Invoke-ChildScript {
+        param([string]$Log, [string]$File, [hashtable]$Arguments = @{})
+        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $File)
+        foreach ($k in $Arguments.Keys) {
+            $v = $Arguments[$k]
+            if ($v -is [switch] -or $v -is [bool]) { if ($v) { $argList += "-$k" } }
+            else { $argList += "-$k"; $argList += "$v" }
+        }
+        & powershell.exe @argList 2>&1 | Write-StepLog -Log $Log
+        return $LASTEXITCODE
+    }
+
+    try {
+        Save-Results
+
+        Invoke-Step 'package' {
+            param($log)
+            $m = Get-Content (Join-Path $package 'manifest.json') -Raw | ConvertFrom-Json
+            "package $($m.version)" | Write-StepLog -Log $log
+            $bad = @()
+            foreach ($p in $m.files.PSObject.Properties) {
+                $f = Join-Path $package ($p.Name -replace '/', '\')
+                if (-not (Test-Path -LiteralPath $f)) { $bad += "missing $($p.Name)"; continue }
+                $h = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($h -ne $p.Value) { $bad += "hash mismatch $($p.Name)" }
+            }
+            if ($bad) { $bad | Add-Content $log; return ($bad -join '; ') }
+            $true
+        } | Out-Null
+
+        Invoke-Step 'corpus' {
+            param($log)
+            if (-not (Test-Path $corpusManifest)) { return 'corpus-manifest.json was not pushed into the guest' }
+            $m = Get-Content $corpusManifest -Raw | ConvertFrom-Json
+            "corpus: $($m.files.Count) files, $($m.directories.Count) directories" | Write-StepLog -Log $log
+            $true
+        } | Out-Null
+
+        # Across the NIC, before the driver tries the same path: a failure
+        # here is the network or the host, not the filesystem.
+        Invoke-Step 'server' {
+            param($log)
+            try {
+                $r = Invoke-WebRequest -UseBasicParsing -Uri "$backendUrl/healthcheck" -TimeoutSec 15
+                "server at $backendUrl answered $($r.StatusCode)" | Write-StepLog -Log $log
+                $r.StatusCode -eq 200
+            } catch { "server at $backendUrl unreachable from the guest: $($_.Exception.Message)" }
+        } | Out-Null
+
+        Invoke-Step 'install' {
+            param($log)
+            $code = Invoke-ChildScript $log (Join-Path $package 'driver\Install-BlorgFS.ps1') @{
+                RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive
+            }
+            if ($code -eq 2) { return 'test signing is off (Install-BlorgFS.ps1 exit 2) -- -Step Prepare and a reboot should have handled this' }
+            if ($code -ne 0) { return "Install-BlorgFS.ps1 exited $code" }
+            $script:Mounted = Test-Path "${Drive}:\"
+            $script:Mounted
+        } | Out-Null
+
+        $serviceRunning = {
+            param($log)
+            $q = sc.exe query BlorgFS | Out-String
+            $q | Set-Content $log
+            if ($q -match 'STATE\s+:\s+4\s+RUNNING') { return $true }
+            'BlorgFS is not RUNNING: ' + (($q -split "`n" | Where-Object { $_ -match 'STATE' }) -join ' ').Trim()
+        }
+        Invoke-Step 'service' $serviceRunning | Out-Null
+
+        Invoke-Step 'volume' -NeedsMount {
+            param($log)
+            $exe = @((Join-Path $package 'tests\VolumeTester.exe'), (Join-Path $BundleDir 'tests\VolumeTester.exe')) |
+                Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $exe) { 'VolumeTester.exe not in the package' | Set-Content $log; return 'skip' }
+            & $exe 2>&1 | Write-StepLog -Log $log
+            if ($LASTEXITCODE -ne 0) { return "VolumeTester exited $LASTEXITCODE" }
+            $true
+        } | Out-Null
+
+        Invoke-Step 'listing' -NeedsMount {
+            param($log)
+            $want = Get-Content $corpusManifest -Raw | ConvertFrom-Json
+            $root = "${Drive}:\"
+            $haveFiles = @{}
+            foreach ($p in [System.IO.Directory]::EnumerateFiles($root, '*', [System.IO.SearchOption]::AllDirectories)) {
+                $haveFiles[$p.Substring($root.Length)] = ([System.IO.FileInfo]::new($p)).Length
+            }
+            $haveDirs = @{}
+            foreach ($p in [System.IO.Directory]::EnumerateDirectories($root, '*', [System.IO.SearchOption]::AllDirectories)) {
+                $haveDirs[$p.Substring($root.Length)] = $true
+            }
+            $bad = @()
+            foreach ($f in $want.files) {
+                if (-not $haveFiles.ContainsKey($f.path)) { $bad += "missing file $($f.path)" }
+                elseif ($haveFiles[$f.path] -ne [long]$f.size) { $bad += "size $($f.path): volume $($haveFiles[$f.path]) != $($f.size)" }
+                $haveFiles.Remove($f.path)
+            }
+            foreach ($extra in $haveFiles.Keys) { $bad += "unexpected file $extra" }
+            foreach ($d in $want.directories) {
+                if (-not $haveDirs.ContainsKey($d)) { $bad += "missing directory $d" }
+            }
+            "checked $($want.files.Count) files, $($want.directories.Count) directories" | Set-Content $log
+            if ($bad) { $bad | Add-Content $log; $bad | Select-Object -First 20 | Write-Host; return "$($bad.Count) listing mismatches (first: $($bad[0]))" }
+            $true
+        } | Out-Null
+
+        Invoke-Step 'correctness' -NeedsMount {
+            param($log)
+            $code = Invoke-ChildScript $log (Join-Path $BundleDir 'tools\Test-BlorgCorrectness.ps1') @{
+                Drive = $Drive; BackendUrl = $backendUrl; MaxFiles = 1000
+                Report = (Join-Path $ResultsDir 'correctness.txt')
+            }
+            if ($code -ne 0) { return "Test-BlorgCorrectness.ps1 exited $code (see correctness.txt)" }
+            $true
+        } | Out-Null
+
+        $suiteDir = Join-Path $BundleDir 'suites'
+        if (Test-Path $suiteDir) {
+            foreach ($suite in Get-ChildItem $suiteDir -Filter '*.ps1' | Sort-Object Name) {
+                $name = $suite.BaseName
+                Invoke-Step "suite:$name" -NeedsMount {
+                    param($log)
+                    $out = New-Item -ItemType Directory -Force -Path (Join-Path $ResultsDir "suites\$name")
+                    $offered = @{
+                        Drive = $Drive; BackendUrl = $backendUrl
+                        CorpusManifest = $corpusManifest; ResultsDir = $out.FullName
+                    }
+                    $declared = (Get-Command $suite.FullName).Parameters.Keys
+                    $pass = @{}
+                    foreach ($k in $offered.Keys) { if ($declared -contains $k) { $pass[$k] = $offered[$k] } }
+                    $code = Invoke-ChildScript $log $suite.FullName $pass
+                    if ($code -ne 0) { return "exited $code" }
+                    $true
+                } | Out-Null
+            }
+        }
+
+        Invoke-Step 'survived' $serviceRunning | Out-Null
+    } catch {
+        Write-Host "RUNNER ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        $script:Steps.Add([ordered]@{ name = 'runner'; status = 'fail'; seconds = 0; detail = $_.Exception.Message; log = $null })
+    }
+
+    $failed = @($script:Steps | Where-Object { $_.status -eq 'fail' })
+    $verdict = if ($failed.Count) { 'fail' } else { 'pass' }
+    Save-Results $verdict
+
+    Write-Host ""
+    foreach ($s in $script:Steps) { Write-Host ("  {0,-5} {1}" -f $s.status.ToUpper(), $s.name) }
+    Write-Host "VERDICT: $verdict"
+    if ($verdict -eq 'pass') { exit 0 } else { exit 1 }
+}
+
+function Invoke-DiagnosticsStep {
+    $ErrorActionPreference = 'Continue'
+    $ProgressPreference = 'SilentlyContinue'
+    $diag = Join-Path $ResultsDir 'diag'
+    New-Item -ItemType Directory -Force -Path (Join-Path $diag 'dumps') | Out-Null
+
+    $since = (Get-Date).AddHours(-6)
+    $preparedAt = Join-Path $ResultsDir 'prepared-at.txt'
+    if (Test-Path $preparedAt) { $since = [datetime]::Parse((Get-Content $preparedAt -Raw).Trim()).ToLocalTime() }
+
+    foreach ($log in 'setupapi.dev.log', 'setupapi.app.log') {
+        Copy-Item (Join-Path 'C:\Windows\INF' $log) $diag -ErrorAction SilentlyContinue
+    }
+
+    wevtutil.exe epl System (Join-Path $diag 'system.evtx') /ow:true
+    Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2; StartTime = $since } -ErrorAction SilentlyContinue |
+        Select-Object -First 200 TimeCreated, Id, ProviderName, Message |
+        Format-List | Out-File -Encoding ascii -Width 200 (Join-Path $diag 'system-errors.txt')
+
+    # 1001 from WER-SystemErrorReporting is "the computer has rebooted from a
+    # bugcheck", with the code and parameters; 41 from Kernel-Power is the
+    # unclean-restart marker that accompanies it.
+    $bugEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $since } -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($_.ProviderName -eq 'Microsoft-Windows-WER-SystemErrorReporting' -and $_.Id -eq 1001) -or
+            ($_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 41)
+        } |
+        ForEach-Object { [ordered]@{ time = $_.TimeCreated.ToUniversalTime().ToString('o'); provider = $_.ProviderName; id = $_.Id; message = $_.Message } })
+
+    $dumps = @()
+    foreach ($d in Get-ChildItem 'C:\Windows\Minidump' -Filter '*.dmp' -ErrorAction SilentlyContinue) {
+        Copy-Item $d.FullName (Join-Path $diag 'dumps')
+        $dumps += [ordered]@{ name = $d.Name; size = $d.Length; kind = 'mini' }
+    }
+    $kernel = Get-Item 'C:\Windows\MEMORY.DMP' -ErrorAction SilentlyContinue
+    if ($kernel) {
+        $entry = [ordered]@{ name = 'MEMORY.DMP'; size = $kernel.Length; kind = 'kernel'; collected = $false }
+        if ($IncludeKernelDump) {
+            Compress-Archive -Path $kernel.FullName -DestinationPath (Join-Path $diag 'dumps\MEMORY.zip') -Force
+            $entry.collected = $true
+        }
+        $dumps += $entry
+    }
+
+    & {
+        '### sc query BlorgFS'; sc.exe query BlorgFS
+        '### sc qc BlorgFS'; sc.exe qc BlorgFS
+        '### Parameters'; Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\BlorgFS\Parameters' -ErrorAction SilentlyContinue | Format-List
+        '### bcdedit'; bcdedit /enum '{current}'
+        '### verifier /querysettings'; verifier /querysettings
+        '### pnputil /enum-drivers (BlorgFS)'; pnputil /enum-drivers | Select-String -Context 0, 7 'blorgfs'
+        '### volumes'; Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+        '### server-rs processes'; Get-Process server-rs -ErrorAction SilentlyContinue | Format-Table -AutoSize
+    } 2>&1 | Out-File -Encoding ascii -Width 200 (Join-Path $diag 'state.txt')
+
+    $crash = [ordered]@{
+        since      = $since.ToUniversalTime().ToString('o')
+        bugchecked = ($dumps.Count -gt 0) -or [bool]($bugEvents | Where-Object { $_.id -eq 1001 })
+        events     = $bugEvents
+        dumps      = $dumps
+    }
+    $json = $crash | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText((Join-Path $diag 'crash.json'), $json, (New-Object System.Text.UTF8Encoding $false))
+    Write-Host $json
+    if ($crash.bugchecked) { Write-Host 'BUGCHECK DETECTED during this run' -ForegroundColor Red }
+    exit 0
+}
+
+switch ($Step) {
+    'Image'       { if (-not $ConfigDrive) { throw '-Step Image needs -ConfigDrive' }; Invoke-ImageStep }
+    'Prepare'     { Invoke-PrepareStep }
+    'Test'        { Invoke-TestStep }
+    'Diagnostics' { Invoke-DiagnosticsStep }
+}

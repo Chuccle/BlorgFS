@@ -1,0 +1,165 @@
+name: Guest
+
+# Loads the packaged driver into a real Windows kernel and tests it against
+# the packaged Linux server. The Windows guest runs under KVM/QEMU on a
+# Linux runner, driven by tools/blorg -- the same commands run on any Linux
+# host with KVM, so a red run here reproduces with
+#   tools/blorg guest test --package <unpacked artifact>
+# See "Cloud test guest" in AGENTS.md.
+#
+# build.yml calls this as its last job, on the package it just built, so
+# every push and PR is tested in the guest. Dispatch it directly to test an
+# existing build's package again, optionally running a `script` against
+# the guest afterwards; the script never changes the verdict above it.
+
+on:
+  workflow_call:
+    inputs:
+      package_run_id:
+        description: Build BlorgFS run to take the package from (empty = this run)
+        type: string
+        default: ''
+      verifier:
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      package_run_id:
+        description: 'Build BlorgFS run to take the package from (default: the newest successful one on this branch)'
+        required: false
+        default: ''
+      verifier:
+        description: 'Driver Verifier on BlorgFS.sys'
+        type: boolean
+        default: true
+      script:
+        description: 'Optional bash to run against the live guest afterwards (blorg on PATH, $SESSION_OUT for files to keep)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  guest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    name: Windows guest (KVM)
+    env:
+      GUEST_HOME: /mnt/blorgfs-guest
+      PACKAGE_ARTIFACT: blorg-package-windows-x64
+      SCRIPT: ${{ inputs.script || '' }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    # Called from build.yml: the package this run just built.
+    - name: Download this run's package
+      if: github.event_name != 'workflow_dispatch' && inputs.package_run_id == ''
+      uses: actions/download-artifact@v5
+      with:
+        name: ${{ env.PACKAGE_ARTIFACT }}
+        path: package
+
+    - name: Download an earlier build's package
+      if: github.event_name == 'workflow_dispatch' || inputs.package_run_id != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        RUN_ID: ${{ inputs.package_run_id }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$RUN_ID" ]]; then
+          RUN_ID="$(gh run list -R "$REPO" -w build.yml --status success --branch "$GITHUB_REF_NAME" -L 1 --json databaseId --jq '.[0].databaseId')"
+          [[ -n "$RUN_ID" ]] || { echo "::error::no successful Build BlorgFS run on $GITHUB_REF_NAME"; exit 1; }
+        fi
+        echo "Testing the package from https://github.com/$REPO/actions/runs/$RUN_ID"
+        gh run download "$RUN_ID" -R "$REPO" -n "$PACKAGE_ARTIFACT" -D package
+
+    - name: Prepare the KVM host
+      run: |
+        tools/blorg guest host-setup
+        sudo mkdir -p "$GUEST_HOME"
+        sudo chown "$(id -u):$(id -g)" "$GUEST_HOME"
+        # Leave the runner ~2.5 GB; the guest gets the rest, 2-6 GB.
+        mem=$(( $(free -m | awk '/^Mem:/ {print $2}') - 2560 ))
+        (( mem > 6144 )) && mem=6144
+        (( mem < 2048 )) && mem=2048
+        # The evaluation image expires 180 days after it is built; keying
+        # the cache by quarter rebuilds it long before that.
+        {
+          echo "GUEST_MEM_MB=$mem"
+          echo "GUEST_CPUS=$(nproc)"
+          echo "IMAGE_KEY=$(tools/blorg guest image-key)-$(date -u +%Y)-q$(( ($(date -u +%-m) - 1) / 3 + 1 ))"
+        } >> "$GITHUB_ENV"
+
+    # The key is the image's inputs (blorg guest image-key) and the quarter:
+    # the same key always means the same image, and test-only changes reuse it.
+    - name: Restore the golden image
+      id: image
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ env.GUEST_HOME }}/image
+        key: blorgfs-guest-image-${{ env.IMAGE_KEY }}
+
+    # First run of a quarter, or after the recipe changed: a full unattended
+    # Windows install, ~20-30 min under KVM. Much longer means it is stuck
+    # on a screen, which the log shows (SCREEN lines).
+    - name: Build the golden image
+      if: steps.image.outputs.cache-hit != 'true'
+      env:
+        BUILD_TIMEOUT_MIN: '50'
+      run: tools/blorg guest image
+
+    - name: Save the golden image
+      if: steps.image.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ env.GUEST_HOME }}/image
+        key: ${{ steps.image.outputs.cache-primary-key }}
+
+    - name: Run the tests in the guest
+      env:
+        VERIFIER: ${{ inputs.verifier }}
+      run: |
+        # --keep: the self-test and any script below act on this guest.
+        args=(--package package --out guest-results --suites tests/guest-suites --keep)
+        [[ "$VERIFIER" == "false" ]] && args+=(--no-verifier)
+        tools/blorg guest test "${args[@]}"
+
+    # Every way of acting in the guest, once, so a broken channel is found
+    # by CI rather than by whoever next needs it.
+    - name: Self-test the guest channels
+      run: tools/blorg guest selftest --out guest-results
+
+    - name: Run the dispatched script
+      if: always() && env.SCRIPT != ''
+      run: |
+        printf '%s\n' "$SCRIPT" > "$RUNNER_TEMP/script.sh"
+        tools/blorg guest run --out guest-results "$RUNNER_TEMP/script.sh"
+
+    - name: Power off the guest
+      if: always()
+      run: tools/blorg guest down || true
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: guest-results
+        path: guest-results/
+        if-no-files-found: warn
+
+    - name: Upload the image build's screens
+      if: failure()
+      uses: actions/upload-artifact@v7
+      with:
+        name: guest-image-build
+        path: |
+          ${{ env.GUEST_HOME }}/image/build/install/screens/
+          ${{ env.GUEST_HOME }}/image/build/install/qemu.log
+        if-no-files-found: ignore
