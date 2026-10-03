@@ -118,7 +118,12 @@ jobs:
       shell: pwsh
       run: |
         if (Test-Path agent-out\build-summary.txt) {
-          "## Agent remote build (hosted)`n`n``````n$(Get-Content agent-out\build-summary.txt -Raw)``````" >> $env:GITHUB_STEP_SUMMARY
+          $text = Get-Content agent-out\build-summary.txt -Raw
+          "## Agent remote build (hosted)`n`n``````n$text``````" >> $env:GITHUB_STEP_SUMMARY
+          # Also as an annotation: agents behind an egress proxy often cannot
+          # reach the blob storage artifacts and logs are served from, but
+          # can read annotations through api.github.com (blorg ci results).
+          "::notice title=blorg build-summary::$($text.Trim() -replace '%','%25' -replace "`r",'' -replace "`n",'%0A')"
         }
 
     - name: Upload results
@@ -161,6 +166,17 @@ jobs:
     - name: Test in a fresh guest
       if: inputs.action == 'build-test'
       run: tools/agent/blorg win test
+
+    - name: Summary
+      if: always()
+      run: |
+        for f in out/win/build-summary.txt out/guest-results/verdict.txt; do
+          [[ -f "$f" ]] || continue
+          { echo "## $f"; echo; echo '```'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          # Readable through api.github.com, unlike artifacts and logs.
+          text="$(sed 's/%/%25/g' "$f" | sed ':a;N;$!ba;s/\n/%0A/g')"
+          echo "::notice title=blorg $(basename "$f" .txt)::$text"
+        done
 
     - name: Upload results
       if: always()

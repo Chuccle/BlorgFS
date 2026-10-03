@@ -364,9 +364,20 @@ watch_run() {
     concl="$(gh run view "$id" -R "$GH_REPO" --json conclusion --jq .conclusion)"
     echo "run $id: ${concl:-unknown}"
     if [[ "$concl" != "success" ]]; then
-        gh run view "$id" -R "$GH_REPO" --log-failed 2>/dev/null | tail -n "${BLORG_LOG_LINES:-150}"
+        gh run view "$id" -R "$GH_REPO" --log-failed 2>/dev/null | tail -n "${BLORG_LOG_LINES:-150}" ||
+            note "logs unreachable from here; failing jobs' annotations:"
+        gh run view "$id" -R "$GH_REPO" --json jobs \
+            --jq '.jobs[] | select(.conclusion == "failure") | "  failed: \(.name) -- \(.url)"'
         return 1
     fi
+}
+
+print_annotations() {
+    local id="$1" job
+    for job in $(gh run view "$id" -R "$GH_REPO" --json jobs --jq '.jobs[].databaseId' 2>/dev/null); do
+        gh api "repos/$GH_REPO/check-runs/$job/annotations" \
+            --jq '.[] | select(.title // "" | startswith("blorg ")) | "--- \(.title)\n\(.message)"' 2>/dev/null
+    done
 }
 
 print_verdicts() {
@@ -437,10 +448,17 @@ cmd_ci() {
             need_gh
             local id="${1:?usage: blorg ci results RUN_ID}" dest="$OUT/runs/${1}"
             rm -rf "$dest"; mkdir -p "$dest"
-            gh run download "$id" -R "$GH_REPO" -D "$dest" >/dev/null 2>&1 || note "run $id has no downloadable artifacts (yet)"
-            echo "artifacts: $dest"
-            ls "$dest" 2>/dev/null | sed 's/^/  /'
-            print_verdicts "$dest"
+            # Annotations come from api.github.com; artifacts and logs are
+            # served from blob storage that an agent's egress proxy may block,
+            # so the workflows put their verdicts in annotations too.
+            print_annotations "$id"
+            if gh run download "$id" -R "$GH_REPO" -D "$dest" >/dev/null 2>&1; then
+                echo "artifacts: $dest"
+                ls "$dest" 2>/dev/null | sed 's/^/  /'
+                print_verdicts "$dest"
+            else
+                note "could not download run $id's artifacts (none yet, or blob storage unreachable from here)"
+            fi
             ;;
         *) die "usage: blorg ci build|guest|remote|status|results" ;;
     esac

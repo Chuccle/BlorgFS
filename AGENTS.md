@@ -492,6 +492,13 @@ equivalents of `blorg ci remote`. Any other environment sets
 `BLORG_GH_TOKEN` to a fine-grained token on this repository with Actions
 read/write and Contents read.
 
+Run logs and artifacts are served from blob storage hosts
+(`*.blob.core.windows.net`, `results-receiver.actions.githubusercontent.com`)
+that an agent's egress proxy may block even when `api.github.com` works.
+So `agent-remote.yml` also publishes its build summary and guest verdict as
+`blorg …` annotations, which `blorg ci results` reads through the API; the
+GitHub MCP `get_job_logs` tool also works, because it fetches server-side.
+
 **server-rs from here.** `blorg` finds server-rs as `third_party/server-rs`
 (the package pin) or a sibling checkout `../server-rs`. It builds `flatc`
 from server-rs's own pinned flatbuffers (the generated Rust must match the
