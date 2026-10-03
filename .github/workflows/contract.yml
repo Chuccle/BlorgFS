@@ -3,7 +3,8 @@ name: Contract
 # The driver's half of the wire contract it shares with server-rs
 # (third_party/schemas/contract.json). The checks themselves are sandbox
 # tests (tests/sandbox/ContractTest.cpp), which build.yml already runs as
-# part of ClientSandbox, and a guest suite (tests/guest-suites/Contract.ps1).
+# part of ClientSandbox, and a guest suite (tests/guest-suites/Contract.ps1)
+# with its corpus (tests/guest-suites/Contract.corpus).
 # This workflow makes sure they keep up with the contract: every behaviour
 # the driver is responsible for needs a tagged sandbox test, and the guest
 # suite has to parse under the Windows PowerShell 5.1 the guest runs.
@@ -42,6 +43,16 @@ jobs:
 
     - name: Check the guest suite covers the guest's behaviours
       run: python3 third_party/schemas/tools/check_traceability.py --checker guest --root tests/guest-suites --root third_party/schemas/conformance
+
+    # The host serves Contract.corpus as-is, so it has to stay exactly what
+    # the pinned probe seeds; a probe change that reshapes its tree fails here.
+    - name: Check the contract corpus is what the probe seeds
+      shell: pwsh
+      run: |
+        $seed = Join-Path $env:RUNNER_TEMP 'seed'
+        ./third_party/schemas/conformance/Test-BlorgContract.ps1 -Server unused:0 -SeedRoot $seed -ProbeDir Contract.corpus -SeedOnly
+        git diff --no-index --stat -- (Join-Path $seed 'Contract.corpus') tests/guest-suites/Contract.corpus
+        if ($LASTEXITCODE -ne 0) { Write-Host '::error::tests/guest-suites/Contract.corpus differs from what the probe seeds; regenerate it with -SeedOnly'; exit 1 }
 
   guest-suite-syntax:
     name: Guest suite parses on Windows PowerShell 5.1

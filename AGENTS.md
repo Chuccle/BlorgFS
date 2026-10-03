@@ -364,10 +364,17 @@ assumes of the other (B01-B11: Content-Length framing, keep-alive, exact
   receive path, and checks the status table. Every test is tagged
   `contract: Bnn`. `contract.yml` fails if a behaviour the driver is
   responsible for has no tagged sandbox test.
-- `tests/guest-suites/Contract.ps1` runs the live wire probe against the
-  guest's server and reads the same tree back through `B:`. The two known
-  gaps (B09 case sensitivity against a Linux host, B11 a read across a file
-  that shrank under a cached size) are reported there as INFO.
+- `tests/guest-suites/Contract.ps1` reads the contract corpus back through
+  `B:` and runs the live wire probe against the guest's server. The corpus,
+  `tests/guest-suites/Contract.corpus/`, is exactly the tree the probe
+  seeds; the host serves it as `Contract\` and lists it in
+  `-CorpusManifest`, and `contract.yml` fails if it drifts from the pinned
+  probe (regenerate with `Test-BlorgContract.ps1 -SeedRoot <dir> -ProbeDir
+  Contract.corpus -SeedOnly`). The guest can't change a file on the host,
+  so the checks that need one (B08 after a change, B11) run in server-rs
+  CI, where the probe gets `-SeedRoot`. The two known gaps (B09 case
+  sensitivity against a Linux host, B11 a read across a file that shrank
+  under a cached size) are reported as INFO.
 - Changing what the driver sends or expects is a contract change: edit
   `contract.json` in Chuccle/schemas first, then server-rs, then move this
   repo's pin.
