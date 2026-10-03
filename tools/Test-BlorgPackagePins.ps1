@@ -3,7 +3,7 @@
     Fails if the driver and the pinned server-rs disagree on the wire contract.
 
 .DESCRIPTION
-    BlorgFS and server-rs ship as one package (see "Packaging" in AGENTS.md),
+    BlorgFS and server-rs ship as one package (see "Packaging" in README.md),
     and the thing that ties them together is the FlatBuffers schema: the
     driver compiles third_party/schemas with flatcc, the server compiles its
     own schemas submodule with flatc, and both are the same Chuccle/schemas

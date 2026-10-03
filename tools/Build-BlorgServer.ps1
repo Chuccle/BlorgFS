@@ -5,7 +5,7 @@
 .DESCRIPTION
     The single recipe for the server half of the package: build.yml's server
     job runs this, and so should anything else that builds a package (a
-    local build, an agent, a build VM). A second copy of these steps is how
+    local build, another workflow, a build VM). A second copy of these steps is how
     two "identical" packages end up built differently.
 
     Two steps:

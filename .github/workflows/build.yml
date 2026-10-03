@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       correlation_id:
-        description: Opaque caller id, echoed into the run name
+        description: Any id, echoed into the run name so you can find the run
         required: false
         default: ''
 
@@ -346,7 +346,7 @@ jobs:
           ${{ github.workspace }}/msbuild.binlog
         if-no-files-found: warn
   # The combined package: this driver plus the server-rs commit pinned at
-  # third_party/server-rs, versioned together. See "Packaging" in AGENTS.md.
+  # third_party/server-rs, versioned together. See "Packaging" in README.md.
   #
   # pins is cheap and runs on Linux so a schema skew between the two fails in
   # seconds, before either Windows build has finished.
