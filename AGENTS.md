@@ -717,12 +717,9 @@ old dumps cleared; reboots if any of that needs it), runs
 the product is deployed, and the guest reaches it at `10.0.2.2` (QEMU user
 networking's address for the host). The driver's WSK traffic therefore
 crosses a real (emulated e1000e) NIC, and the backend's filesystem is
-case-sensitive. The Linux binary comes from the package
-(`server/linux-x64/server-rs`) or `--server-bin`. Without one the run falls
-back to the package's `server-rs.exe` inside the guest on loopback
-(`--server-in-guest`), says so in the summary, and cannot exercise the NIC
-path or a case-sensitive backend. The driver's TLS path is not exercised
-by either yet.
+case-sensitive. The binary is the package's static
+`server/linux-x64/server-rs` (or `--server-bin`). The driver's TLS path is
+not exercised yet.
 
 What a run checks, in order: the package's files match `manifest.json`; a
 deterministic corpus from `host/make-corpus.py` (sizes either side of page,
@@ -745,9 +742,8 @@ mid-way still says how far it got. `verdict.txt` is the one-screen answer;
 
 Put `<name>.ps1` in `tests/guest-suites/`; CI passes that directory in.
 It exits 0 on pass and is given whichever of `-Drive`, `-BackendUrl`,
-`-CorpusManifest` and `-ResultsDir` its `param()` declares (`-CorpusDir`
-too, but only with `--server-in-guest`: normally the served tree is on the
-host). Fixtures a suite needs on the volume go in
+`-CorpusManifest` and `-ResultsDir` its `param()` declares. The served tree
+is on the host, so fixtures a suite needs on the volume go in
 `tests/guest-suites/<name>.corpus/`; the host serves them as `<name>\` and
 they are in the corpus manifest like everything else.
 Only top-level `*.ps1` files run, so helpers can sit in subdirectories

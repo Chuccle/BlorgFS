@@ -12,6 +12,8 @@
         the channel guestctl and agents use to act in the guest.
       - QEMU guest agent (when the virtio-win ISO is attached), the fallback
         channel for when the guest network is what broke.
+      - Driver Verifier's standard checks on BlorgFS.sys, the default for
+        a test run, so the run does not have to reboot to apply them.
       - Test signing on, and boot-failure recovery off, so a bugcheck
         reboots straight back into Windows instead of parking at a recovery
         menu nobody can see.
@@ -127,6 +129,13 @@ Step 'Test signing, and no recovery menu after a crash' {
     Invoke-Native bcdedit.exe @('/set', '{current}', 'bootstatuspolicy', 'ignoreallfailures')
     Invoke-Native bcdedit.exe @('/set', '{current}', 'recoveryenabled', 'no')
     Invoke-Native bcdedit.exe @('/timeout', '0')
+}
+
+# Keyed by image name, so it can be set before the driver exists. Done
+# here so a default (verifier-on) run needs no reboot before its tests:
+# Prepare-Guest.ps1 only reboots when a run asks for something else.
+Step 'Driver Verifier on BlorgFS.sys' {
+    verifier.exe /standard /driver BlorgFS.sys | Out-Null
 }
 
 Step 'Kernel crash dumps' {

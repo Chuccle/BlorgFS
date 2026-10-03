@@ -172,7 +172,9 @@ echo "$info"
 # Publish: verification booted an overlay, so $disk itself is untouched.
 # Compressed, because CI caches it.
 note "compressing"
-qemu-img convert -c -O qcow2 "$disk" "$GUEST_GOLDEN.tmp"
+# zstd rather than zlib: several times faster to decompress, which is
+# paid on every warm run's first reads; -m/-W parallelise the compression.
+qemu-img convert -c -O qcow2 -o compression_type=zstd -m 8 -W "$disk" "$GUEST_GOLDEN.tmp"
 mv "$GUEST_GOLDEN.tmp" "$GUEST_GOLDEN"
 mv "$WORK/id_ed25519" "$GUEST_KEY"
 mv "$WORK/id_ed25519.pub" "$GUEST_KEY.pub"

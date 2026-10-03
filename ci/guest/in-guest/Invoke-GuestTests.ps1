@@ -17,13 +17,9 @@
 
       package      every file matches the SHA-256 in manifest.json
       corpus       the corpus manifest (host/make-corpus.py) was pushed in
-      server       the backend answers /healthcheck from inside the guest.
-                   Normally that is the Linux server-rs on the KVM host,
-                   reached through the guest's NIC at 10.0.2.2 -- the
-                   topology the product actually runs in. With
-                   -ServerInGuest, the package's server-rs.exe is started
-                   here on loopback instead (a fallback for a package with
-                   no Linux server).
+      server       the Linux server-rs on the KVM host answers /healthcheck
+                   through the guest's NIC at 10.0.2.2 -- the topology the
+                   product actually runs in
       install      driver\Install-BlorgFS.ps1 against that server; B: mounts
       service      BlorgFS is RUNNING
       volume       VolumeTester.exe, when the package carries it
@@ -35,12 +31,12 @@
 
     Suite contract, for contract and behavioural tests from elsewhere: a
     suites\<name>.ps1 that exits 0 on pass. It is offered -Drive (the
-    mounted letter), -BackendUrl, -CorpusDir, -CorpusManifest and
+    mounted letter), -BackendUrl, -CorpusManifest and
     -ResultsDir (a directory of its own for logs), and given whichever of
-    those its param() block declares. -CorpusDir is only offered with
-    -ServerInGuest, since otherwise the served tree is on the host; a suite
-    that needs fixtures on the volume ships them as suites\<name>.corpus\,
-    which the host serves as <name>\ (run-guest-tests.sh).
+    those its param() block declares. The served tree lives on the host,
+    so a suite that needs fixtures on the volume ships them as
+    suites\<name>.corpus\, which the host serves as <name>\
+    (run-guest-tests.sh).
 
     The driver is not stopped at the end: there is no dismount handler, so
     `sc stop` wedges in STOP_PENDING (AGENTS.md). Runs end by discarding the
@@ -60,10 +56,6 @@
 
 .PARAMETER Port
     server-rs's port.
-
-.PARAMETER ServerInGuest
-    Start the package's server-rs.exe in the guest on loopback, serving the
-    pushed corpus, instead of using the host's server.
 #>
 [CmdletBinding()]
 param(
@@ -71,7 +63,6 @@ param(
     [string]$ResultsDir = 'C:\blorgfs-ci\results',
     [string]$BackendHost = '10.0.2.2',
     [int]$Port = 18080,
-    [switch]$ServerInGuest,
     [char]$Drive = 'B'
 )
 
@@ -79,9 +70,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $package = Join-Path $BundleDir 'package'
-$corpus = 'C:\blorgfs-ci\corpus'
 $corpusManifest = 'C:\blorgfs-ci\corpus-manifest.json'
-if ($ServerInGuest) { $BackendHost = '127.0.0.1' }
 $backendUrl = "http://${BackendHost}:$Port"
 $logs = Join-Path $ResultsDir 'logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
@@ -89,7 +78,6 @@ New-Item -ItemType Directory -Force -Path $logs | Out-Null
 $script:Steps = [System.Collections.Generic.List[object]]::new()
 $script:Started = (Get-Date).ToUniversalTime()
 $script:Mounted = $false
-$server = $null
 
 # Logs and results as BOM-less UTF-8: Windows PowerShell 5.1's own
 # Tee-Object and Set-Content -Encoding utf8 write UTF-16 or a BOM, which
@@ -188,40 +176,21 @@ try {
     Invoke-Step 'corpus' {
         param($log)
         if (-not (Test-Path $corpusManifest)) { return 'corpus-manifest.json was not pushed into the guest' }
-        if ($ServerInGuest -and -not (Test-Path $corpus)) { return 'corpus was not pushed into the guest (needed for -ServerInGuest)' }
         $m = Get-Content $corpusManifest -Raw | ConvertFrom-Json
         "corpus: $($m.files.Count) files, $($m.directories.Count) directories" | Write-StepLog -Log $log
         $true
     } | Out-Null
 
+    # Across the NIC, before the driver tries the same path: a failure
+    # here is the network or the host, not the filesystem.
     Invoke-Step 'server' {
         param($log)
-        if (-not $ServerInGuest) {
-            # Across the NIC, before the driver tries the same path: a
-            # failure here is the network, not the filesystem.
-            try {
-                $r = Invoke-WebRequest -UseBasicParsing -Uri "$backendUrl/healthcheck" -TimeoutSec 15
-                "host server at $backendUrl answered $($r.StatusCode)" | Write-StepLog -Log $log
-                return ($r.StatusCode -eq 200)
-            } catch { return "host server at $backendUrl unreachable from the guest: $($_.Exception.Message)" }
-        }
-        $exe = Join-Path $package 'server\server-rs.exe'
-        $env:PORT = "$Port"
-        $env:RUST_LOG = 'info'
-        $script:serverProc = Start-Process -FilePath $exe -ArgumentList "`"$corpus`"" -PassThru -WindowStyle Hidden `
-            -RedirectStandardOutput (Join-Path $logs 'server.stdout.log') `
-            -RedirectStandardError (Join-Path $logs 'server.stderr.log')
-        $deadline = (Get-Date).AddSeconds(30)
-        while ((Get-Date) -lt $deadline) {
-            if ($script:serverProc.HasExited) { return "server-rs exited with $($script:serverProc.ExitCode) (see server.stderr.log)" }
-            try {
-                $r = Invoke-WebRequest -UseBasicParsing -Uri "$backendUrl/healthcheck" -TimeoutSec 5
-                if ($r.StatusCode -eq 200) { "healthcheck 200 after $([int]((Get-Date) - $deadline.AddSeconds(-30)).TotalSeconds)s" | Set-Content $log; return $true }
-            } catch { Start-Sleep -Milliseconds 500 }
-        }
-        'server-rs did not answer /healthcheck within 30s'
+        try {
+            $r = Invoke-WebRequest -UseBasicParsing -Uri "$backendUrl/healthcheck" -TimeoutSec 15
+            "server at $backendUrl answered $($r.StatusCode)" | Write-StepLog -Log $log
+            $r.StatusCode -eq 200
+        } catch { "server at $backendUrl unreachable from the guest: $($_.Exception.Message)" }
     } | Out-Null
-    $server = $script:serverProc
 
     Invoke-Step 'install' {
         param($log)
@@ -301,7 +270,6 @@ try {
                     Drive = $Drive; BackendUrl = $backendUrl
                     CorpusManifest = $corpusManifest; ResultsDir = $out.FullName
                 }
-                if ($ServerInGuest) { $offered.CorpusDir = $corpus }
                 $declared = (Get-Command $suite.FullName).Parameters.Keys
                 $pass = @{}
                 foreach ($k in $offered.Keys) { if ($declared -contains $k) { $pass[$k] = $offered[$k] } }
@@ -316,8 +284,6 @@ try {
 } catch {
     Write-Host "RUNNER ERROR: $($_.Exception.Message)" -ForegroundColor Red
     $script:Steps.Add([ordered]@{ name = 'runner'; status = 'fail'; seconds = 0; detail = $_.Exception.Message; log = $null })
-} finally {
-    if ($server -and -not $server.HasExited) { Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue }
 }
 
 $failed = @($script:Steps | Where-Object { $_.status -eq 'fail' })
