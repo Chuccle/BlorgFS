@@ -272,16 +272,25 @@ EOF
 
 cur_ref() { git -C "$REPO" rev-parse --abbrev-ref HEAD; }
 
-# Dispatch a workflow and print the id of the run it created.
+# Dispatch a workflow and print the id of the run it created. build.yml
+# takes a correlation_id and puts it in its run name, so its run is matched
+# exactly; other workflows are matched by ref and start time.
 dispatch() {
     local wf="$1" ref="$2"; shift 2
-    local since id
+    local since id cid="" filter
     since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$wf" == build.yml ]]; then
+        cid="blorg-$(date +%s)-$$"
+        set -- "$@" -f "correlation_id=$cid"
+        filter="[.[] | select(.displayTitle | endswith(\" $cid\"))][0].databaseId // empty"
+    else
+        filter="[.[] | select(.createdAt >= \"$since\")][0].databaseId // empty"
+    fi
     gh workflow run "$wf" -R "$GH_REPO" --ref "$ref" "$@" >&2 || return 1
     for _ in $(seq 1 30); do
         sleep 4
-        id="$(gh run list -R "$GH_REPO" -w "$wf" -b "$ref" -e workflow_dispatch -L 5 \
-              --json databaseId,createdAt --jq "[.[] | select(.createdAt >= \"$since\")][0].databaseId // empty")"
+        id="$(gh run list -R "$GH_REPO" -w "$wf" -b "$ref" -e workflow_dispatch -L 20 \
+              --json databaseId,createdAt,displayTitle --jq "$filter")"
         [[ -n "$id" ]] && { echo "$id"; return 0; }
     done
     note "dispatched $wf but could not find its run"; return 1
@@ -289,8 +298,7 @@ dispatch() {
 
 # The build.yml run for what is pushed at ref: a push or PR has usually
 # started one already, and following it beats building the same commit
-# twice. Dispatch only when there is none -- which also covers a build.yml
-# without workflow_dispatch (before #63), since push/PR runs exist anyway.
+# twice. Dispatch only when there is none.
 build_run_for() {
     local ref="$1" sha id
     sha="$(gh api "repos/$GH_REPO/commits/$ref" --jq .sha 2>/dev/null)" ||
