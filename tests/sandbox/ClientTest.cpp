@@ -534,6 +534,8 @@ TEST_F(HttpClientTest, DribbledResponseReassembles)
 }
 
 //
+// contract: B03
+//
 // The keep-alive idle-close race: a pooled connection the peer already
 // dropped. A close before any response byte is retryable exactly once on
 // a fresh connection -- without that, every keep-alive race would surface

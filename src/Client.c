@@ -23,6 +23,15 @@
 
 #include "picohttpparser.h"
 
+//
+// The wire contract shared with server-rs (third_party/schemas/contract.json):
+// route paths, the path query key and the status codes come from here, so a
+// route renamed on one side and not the other fails to build rather than
+// failing on a mounted volume. Generated, macros only -- see
+// third_party/schemas/README.md.
+//
+#include "third_party/schemas/generated/blorg_contract.h"
+
 #define HTTP_TAG 'PTTH'
 //
 // How many response headers picohttpparser is given room to report. This is
@@ -80,6 +89,7 @@
 // listing and sizeable ranged file reads.
 //
 #define HTTP_MAX_CONTENT_LENGTH C_CAST(SIZE_T, (64 * 1024 * 1024))
+C_ASSERT(HTTP_MAX_CONTENT_LENGTH == BLORG_CONTRACT_MAX_BODY_BYTES);
 
 //
 // Hard ceiling on the status line plus headers of a single response, and
@@ -101,6 +111,7 @@
 // headers to grow, so the ceiling is unreachable by accident.
 //
 #define HTTP_MAX_HEADER_BYTES C_CAST(ULONG, (64 * 1024))
+C_ASSERT(HTTP_MAX_HEADER_BYTES == BLORG_CONTRACT_MAX_HEADER_BYTES);
 
 //
 // Checked SIZE_T addition. Returns FALSE (and leaves *Result unspecified)
@@ -826,7 +837,7 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
 
     size_t headerSize = sizeof(DIRECTORY_INFO);
 
-    BlorgMetaFlat_FileEntryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(directory);
+    BlorgMetaFlat_SubdirectoryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(directory);
     SIZE_T subdirCount = (flatSubdirEntries) ? BlorgMetaFlat_SubdirectoryMetadata_vec_len(flatSubdirEntries) : 0;
 
     BlorgMetaFlat_FileEntryMetadata_vec_t flatFileEntries = BlorgMetaFlat_Directory_files(directory);
@@ -2136,6 +2147,31 @@ static VOID HttpOnTlsReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID 
 }
 
 //
+// Maps a status the request did not expect to what the caller sees, per the
+// contract's error table (behaviour B04 in third_party/schemas/contract.json).
+// 403 used to fall through to STATUS_INVALID_PARAMETER, so a permission
+// problem on the host -- or a path the server refused as escaping its root --
+// surfaced as "The parameter is incorrect" instead of "Access is denied". A
+// 416 means the read started at or past the file's current end on the
+// server, i.e. the file shrank under a cached size: end of file, not a
+// malformed request.
+//
+static NTSTATUS HttpStatusToNtStatus(int StatusCode)
+{
+    switch (StatusCode)
+    {
+    case BLORG_CONTRACT_STATUS_NOT_FOUND:
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    case BLORG_CONTRACT_STATUS_FORBIDDEN:
+        return STATUS_ACCESS_DENIED;
+    case BLORG_CONTRACT_STATUS_RANGE_NOT_SATISFIABLE:
+        return STATUS_END_OF_FILE;
+    default:
+        return STATUS_INVALID_PARAMETER;
+    }
+}
+
+//
 // Runs inline at <= DISPATCH_LEVEL on the WSK completion chain for every
 // operation -- deliberately no PASSIVE bounce here. Everything this
 // function touches directly is DISPATCH-safe by construction:
@@ -2211,7 +2247,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
 
         if (Ctx->StatusCode != Ctx->ExpectedStatusCode)
         {
-            HttpFail(Ctx, (404 == Ctx->StatusCode) ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_INVALID_PARAMETER);
+            HttpFail(Ctx, HttpStatusToNtStatus(Ctx->StatusCode));
             return;
         }
 
@@ -2915,7 +2951,7 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
         return STATUS_INVALID_PARAMETER;
     }
 
-    HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpDirInfo, 200, HTTP_INITIAL_RECV_CAPACITY);
+    HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpDirInfo, BLORG_CONTRACT_STATUS_DIR_INFO_OK, HTTP_INITIAL_RECV_CAPACITY);
 
     if (!ctx)
     {
@@ -2929,7 +2965,7 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
     BLORGFS_STAT_INC(MetaDataDiskReads);
 
     static const char requestFormat[] =
-        "GET /get_dir_info?path=%hs HTTP/1.1\r\n"
+        "GET " BLORG_CONTRACT_ROUTE_DIR_INFO "?" BLORG_CONTRACT_QUERY_PATH "=%hs HTTP/1.1\r\n"
         "Host: %hs\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
@@ -2964,7 +3000,7 @@ NTSTATUS BlorgHttpGetFileInformation(
         return STATUS_INVALID_PARAMETER;
     }
 
-    HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpFileInfo, 200, PAGE_SIZE);
+    HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpFileInfo, BLORG_CONTRACT_STATUS_DIR_ENTRY_INFO_OK, PAGE_SIZE);
 
     if (!ctx)
     {
@@ -2978,7 +3014,7 @@ NTSTATUS BlorgHttpGetFileInformation(
     BLORGFS_STAT_INC(MetaDataDiskReads);
 
     static const char requestFormat[] =
-        "GET /get_dir_entry_info?path=%hs HTTP/1.1\r\n"
+        "GET " BLORG_CONTRACT_ROUTE_DIR_ENTRY_INFO "?" BLORG_CONTRACT_QUERY_PATH "=%hs HTTP/1.1\r\n"
         "Host: %hs\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
@@ -3034,7 +3070,7 @@ static NTSTATUS HttpGetFileCommon(
 
     HTTP_CONTEXT* ctx = HttpAllocateContext(
         HttpOpFileRead,
-        206,
+        BLORG_CONTRACT_STATUS_FILE_OK,
         TargetMdl ? HTTP_MDL_INITIAL_RECV_CAPACITY : HTTP_FILE_INITIAL_RECV_CAPACITY);
 
     if (!ctx)
@@ -3048,7 +3084,7 @@ static NTSTATUS HttpGetFileCommon(
     ctx->ExpectedContentLength = Length;
 
     static const char requestFormat[] =
-        "GET /get_file?path=%hs HTTP/1.1\r\n"
+        "GET " BLORG_CONTRACT_ROUTE_FILE "?" BLORG_CONTRACT_QUERY_PATH "=%hs HTTP/1.1\r\n"
         "Host: %hs\r\n"
         "Connection: keep-alive\r\n"
         "Range: bytes=%zu-%zu\r\n"

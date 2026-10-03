@@ -1,0 +1,61 @@
+name: Contract
+
+# The driver's half of the wire contract it shares with server-rs
+# (third_party/schemas/contract.json). The checks themselves are sandbox
+# tests (tests/sandbox/ContractTest.cpp), which build.yml already runs as
+# part of ClientSandbox, and a guest suite (tests/guest-suites/Contract.ps1).
+# This workflow makes sure they keep up with the contract: every behaviour
+# the driver is responsible for needs a tagged sandbox test, and the guest
+# suite has to parse under the Windows PowerShell 5.1 the guest runs.
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  traceability:
+    name: Every driver behaviour has a sandbox test
+    runs-on: ubuntu-latest
+    steps:
+    - name: Detect if Dependabot
+      id: is_dependabot
+      run: echo "is_dependabot=${{ github.actor == 'dependabot[bot]' }}" >> $GITHUB_OUTPUT
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        token: ${{ steps.is_dependabot.outputs.is_dependabot == 'true' && secrets.GH_DEPENDABOT_PAT || secrets.GH_PAT }}
+
+    - name: Check out the pinned contract
+      run: git submodule update --init third_party/schemas
+
+    # Against the contract this commit pins, so a schemas bump that adds a
+    # behaviour fails here until the driver has a test for it.
+    - name: Check sandbox tests cover the driver's behaviours
+      run: python3 third_party/schemas/tools/check_traceability.py --checker BlorgFS --root tests/sandbox
+
+    - name: Check the guest suite covers the guest's behaviours
+      run: python3 third_party/schemas/tools/check_traceability.py --checker guest --root tests/guest-suites --root third_party/schemas/conformance
+
+  guest-suite-syntax:
+    name: Guest suite parses on Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Parse with Windows PowerShell 5.1
+      shell: powershell
+      run: |
+        $failed = $false
+        foreach ($script in Get-ChildItem tests\guest-suites -Filter *.ps1) {
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$null, [ref]$errors)
+          foreach ($e in @($errors)) { if ($e) { Write-Host "::error file=$($script.Name)::$e"; $failed = $true } }
+        }
+        if ($failed) { exit 1 }
+        Write-Host "Parsed under PowerShell $($PSVersionTable.PSVersion)"

@@ -109,6 +109,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="ClientTest.cpp" />
+    <ClCompile Include="ContractTest.cpp" />
     <ClCompile Include="KernelModel.c" />
     <ClCompile Include="NtShim.c" />
     <ClCompile Include="NtShimSync.c" />
