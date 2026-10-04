@@ -470,8 +470,9 @@ typedef struct _HTTP_CONTEXT
     // second is a like-for-like comparison.
     //
     //
-    // QPC stamp taken the moment WskSend has accepted the buffer and
-    // returned STATUS_PENDING, splitting the send span once more.
+    // QPC stamp taken just before the send is issued, splitting the send
+    // span once more. It cannot be taken after: the send may complete, and
+    // the request with it, before the issue returns.
     //
     // Real playback put the send at 5.1 ms mean and 164.7 ms max for a
     // request of about two hundred bytes, and made the worst
@@ -505,6 +506,7 @@ static BOOLEAN HttpTryRetryReusedConnection(HTTP_CONTEXT* Ctx);
 static VOID HttpOnSocket(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext);
 static VOID HttpOnTlsHandshakeComplete(NTSTATUS Status, PVOID CallerContext);
 static VOID HttpTlsHandshakeWorker(PDEVICE_OBJECT DeviceObject, PVOID Context);
+static VOID HttpAcquireSocketWorker(PDEVICE_OBJECT DeviceObject, PVOID Context);
 static VOID HttpOnSend(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID CompletionContext);
 static VOID HttpOnReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID CompletionContext);
 static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx);
@@ -826,7 +828,7 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
 
     size_t headerSize = sizeof(DIRECTORY_INFO);
 
-    BlorgMetaFlat_FileEntryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(directory);
+    BlorgMetaFlat_SubdirectoryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(directory);
     SIZE_T subdirCount = (flatSubdirEntries) ? BlorgMetaFlat_SubdirectoryMetadata_vec_len(flatSubdirEntries) : 0;
 
     BlorgMetaFlat_FileEntryMetadata_vec_t flatFileEntries = BlorgMetaFlat_Directory_files(directory);
@@ -1228,12 +1230,13 @@ static BOOLEAN HttpMustBounceToPassive(const HTTP_CONTEXT* Ctx)
 }
 
 //
-// Whether this operation can ever queue Ctx->WorkItem. Only two things
-// do: the HttpDispatch/HttpComplete bounces (HttpMustBounceToPassive,
-// never true for a file read) and HttpKick's TLS handshake stage. So a
-// file read on a plaintext connection needs no work item at all, and
-// skipping it takes one pool allocation and one free off every chunk on
-// the read hot path. global.TlsEnabled is sampled here, at the one point
+// Whether this operation can ever queue Ctx->WorkItem on its normal path.
+// Only two things do: the HttpDispatch/HttpComplete bounces
+// (HttpMustBounceToPassive, never true for a file read) and HttpKick's TLS
+// handshake stage. So a file read on a plaintext connection needs no work
+// item up front, and skipping it takes one pool allocation and one free off
+// every chunk on the read hot path. The idle-close retry, which is rare,
+// allocates one itself when it has to (see HttpKick). global.TlsEnabled is sampled here, at the one point
 // where an allocation failure can still be reported to the caller, rather
 // than at handshake time; HttpKick re-checks for NULL so that flipping
 // the flag live (the debugger poke documented in Driver.h) degrades to a
@@ -1250,7 +1253,11 @@ static BOOLEAN HttpNeedsWorkItem(HTTP_OPERATION Operation)
 // Central re-entry point for every stage transition in this file.
 // HttpStageAcquireSocket bypasses the pool only on the post-retry attempt
 // (the retry path forced ConnectionSource to Fresh); the initial attempt
-// is free to reuse a pooled connection. HttpStageTlsHandshake bounces to
+// is free to reuse a pooled connection. That fresh attempt is a
+// WskSocketConnect, which reaches pageable code in tcpip and so is issued
+// below DISPATCH_LEVEL; the retry runs from a receive completion, so at
+// DISPATCH_LEVEL it bounces to PASSIVE first, allocating the work item a
+// plaintext file read does not carry. HttpStageTlsHandshake bounces to
 // PASSIVE unconditionally (unlike HttpMustBounceToPassive, independent of
 // Ctx->Operation) because BlorgTlsStartHandshakeAsync's ECDH key-pair
 // generation is documented PASSIVE_LEVEL-only CNG, while this stage can be
@@ -1267,6 +1274,23 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
         case HttpStageAcquireSocket:
         {
             BOOLEAN forceFresh = C_CAST(BOOLEAN, Ctx->ConnectionSource == HttpConnectionFresh);
+
+            if (forceFresh && (DISPATCH_LEVEL <= KeGetCurrentIrql()))
+            {
+                if (!Ctx->WorkItem)
+                {
+                    Ctx->WorkItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
+                }
+
+                if (!Ctx->WorkItem)
+                {
+                    HttpComplete(Ctx, STATUS_INSUFFICIENT_RESOURCES);
+                    break;
+                }
+
+                IoQueueWorkItem(Ctx->WorkItem, HttpAcquireSocketWorker, DelayedWorkQueue, Ctx);
+                break;
+            }
 
             NTSTATUS result = BlorgAcquireReusableWskSocketAsync(
                 C_CAST(PSOCKADDR, &Ctx->RemoteAddress),
@@ -1322,6 +1346,8 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
                 }
             }
 
+            Ctx->SendIssuedQpc = BlorgStatisticsNow();
+
             result = BlorgSendWskAsync(
                 Ctx->Socket,
                 sendBuffer,
@@ -1329,8 +1355,6 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
                 WSK_FLAG_NODELAY,
                 HttpOnSend,
                 Ctx);
-
-            Ctx->SendIssuedQpc = BlorgStatisticsNow();
 
             if (STATUS_PENDING != result)
             {
@@ -1514,6 +1538,17 @@ static VOID HttpTlsHandshakeWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 }
 
 //
+// Re-entry at PASSIVE_LEVEL for a fresh connect that HttpKick reached above
+// it.
+//
+static VOID HttpAcquireSocketWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    HttpKick(C_CAST(HTTP_CONTEXT*, Context));
+}
+
+//
 // Completion for BlorgTlsStartHandshakeAsync: advances to sending the request
 // on success, otherwise fails the request (never the idle-close retry
 // case -- see the comment in HttpOnSocket).
@@ -1664,10 +1699,10 @@ static VOID HttpIssueReceiveDispatch(HTTP_CONTEXT* Ctx)
 // until the receive watchdog kills it. A short or failed WAITALL
 // completion (peer close, cancellation) flows through HttpOnReceive ->
 // HttpReadResponse, which re-issues or fails via the same length checks.
-// After issuing the receive, STATUS_PENDING means HttpOnReceive runs later
-// on a fresh dispatch; any other status means HttpOnReceive already ran
-// synchronously inside the call (IoSetCompletionRoutine with
-// InvokeOnSuccess/InvokeOnError both TRUE), so Ctx may already be freed.
+// The receive returns STATUS_PENDING once issued, even when HttpOnReceive
+// has already run inside the call, so Ctx is not touched after a pending
+// issue. Any other status is a failure before issue: HttpOnReceive never
+// runs, and the request is completed here.
 //
 static VOID HttpIssueReceive(HTTP_CONTEXT* Ctx)
 {
@@ -2136,6 +2171,28 @@ static VOID HttpOnTlsReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID 
 }
 
 //
+// Maps a status the request did not expect to what the caller sees. 403 is
+// the server refusing the path (host permissions, or a path that escapes its
+// root): access denied. 416 means the read started at or past the file's
+// current end on the server -- the file shrank under a cached size -- which
+// is end of file, not a malformed request.
+//
+static NTSTATUS HttpStatusToNtStatus(int StatusCode)
+{
+    switch (StatusCode)
+    {
+    case 404:
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    case 403:
+        return STATUS_ACCESS_DENIED;
+    case 416:
+        return STATUS_END_OF_FILE;
+    default:
+        return STATUS_INVALID_PARAMETER;
+    }
+}
+
+//
 // Runs inline at <= DISPATCH_LEVEL on the WSK completion chain for every
 // operation -- deliberately no PASSIVE bounce here. Everything this
 // function touches directly is DISPATCH-safe by construction:
@@ -2211,7 +2268,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
 
         if (Ctx->StatusCode != Ctx->ExpectedStatusCode)
         {
-            HttpFail(Ctx, (404 == Ctx->StatusCode) ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_INVALID_PARAMETER);
+            HttpFail(Ctx, HttpStatusToNtStatus(Ctx->StatusCode));
             return;
         }
 

@@ -170,7 +170,7 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket);
 // puts a 1438 ms worst case on a volume whose median read is 0.005 ms.
 //
 // Idempotent: a call made while a fill is already running is ignored, and
-// a call made after teardown has latched the pump (BlorgCleanupWskSocketPool)
+// a call made after teardown has latched the pump (BlorgDrainWskSocketPrewarm)
 // is dropped whole -- teardown waits out any step already in flight, so no
 // connect can complete into a torn-down client.
 //
@@ -193,6 +193,8 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket);
 #define BLORGFS_SOCKET_PREWARM_COUNT 32
 
 VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count);
+
+VOID BlorgDrainWskSocketPrewarm(VOID);
 
 VOID BlorgCleanupWskSocketPool(VOID);
 

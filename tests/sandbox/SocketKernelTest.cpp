@@ -737,13 +737,21 @@ TEST_F(SocketKernelTest, PrewarmChainIssuesExactlyItsBudgetAndTerminates)
         << "the pump keeps exactly one step outstanding";
 
     //
-    // One release cascades: completing step N issues step N+1 inline
-    // (deferred again), which this same drain then delivers, until the
-    // budget is spent.
+    // Each release completes step N at DISPATCH_LEVEL, which bounces its
+    // accounting to the work item; draining that issues step N+1 at
+    // PASSIVE_LEVEL (deferred again), until the budget is spent.
     //
-    EXPECT_GT(WskModelReleaseDeferred(), 0);
+    int rounds = 0;
 
+    while (WskModelReleaseDeferred() + ShimDrainWorkItems() > 0 && rounds < 16)
+    {
+        ++rounds;
+    }
+
+    EXPECT_GT(rounds, 0) << "nothing was released";
+    EXPECT_LT(rounds, 16) << "the chain did not terminate";
     EXPECT_EQ(0, WskModelDeferredCount()) << "the chain did not terminate";
+    EXPECT_EQ(0u, ShimPendingWorkItems());
     EXPECT_EQ(3u, WskModelConnects());
 
     BlorgCleanupWskSocketPool();
@@ -765,6 +773,9 @@ TEST_F(SocketKernelTest, PrewarmChainIssuesExactlyItsBudgetAndTerminates)
 // when the drain loop starts. What no ordering may produce is a live socket
 // once both sides are done, which is exactly what the pre-fix code produced
 // whenever the transport answered second.
+//
+// The completion leaves its step in flight until the work item it queued
+// has run, so the cleaner also waits for the work-item drain.
 //
 //
 // Same fixture, different name, because these two are sampling runs rather
@@ -798,6 +809,7 @@ TEST_F(SocketStressTest, TeardownDrainsAPrewarmConnectThatOutlivesIt)
     Sleep(100);
 
     WskModelReleaseDeferred();
+    ShimDrainWorkItems();
 
     cleaner.join();
 
@@ -831,6 +843,10 @@ TEST_F(SocketStressTest, TeardownDrainsAPrewarmConnectThatOutlivesIt)
 // preemption -- including the weak-memory ordering the SC explorer cannot
 // model at all -- without that artifact.
 //
+// Teardown waits for a step whose work item has not run, so each iteration
+// ends by draining connects and work items together until neither has
+// anything left, yielding between rounds like the settle loop.
+//
 struct PumpRaceProof
 {
     SOCKADDR_IN Address;
@@ -863,13 +879,14 @@ void PumpRaceCompleter(PumpRaceProof* proof)
 
     while (!ReadNoFence(&proof->Stop))
     {
-        if (WskModelReleaseDeferred() == 0)
+        if (WskModelReleaseDeferred() + ShimDrainWorkItems() == 0)
         {
             SwitchToThread();
         }
     }
 
     WskModelReleaseDeferred();
+    ShimDrainWorkItems();
 }
 
 TEST_F(SocketStressTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
@@ -912,6 +929,7 @@ TEST_F(SocketStressTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
         while (BlorgPrewarmRemainingForDiagnostics() > 0 && settle < 2000)
         {
             WskModelReleaseDeferred();
+            ShimDrainWorkItems();
             SwitchToThread();
             ++settle;
         }
@@ -922,7 +940,10 @@ TEST_F(SocketStressTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
         completer.join();
         InterlockedExchange(&proof.Stop, 0);
 
-        WskModelReleaseDeferred();
+        while (WskModelReleaseDeferred() + ShimDrainWorkItems() > 0)
+        {
+            SwitchToThread();
+        }
 
         if (remaining == 0)
         {

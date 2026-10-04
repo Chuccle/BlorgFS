@@ -100,10 +100,16 @@ protected:
         EXPECT_EQ(0u, ShimPoolOutstanding()) << "pool allocation(s) leaked";
     }
 
+    //
+    // A work item can issue more I/O (a retry's fresh connect does), so
+    // this runs until neither side has anything left.
+    //
     void Drain()
     {
-        SandboxDrainCompletions();
-        ShimDrainWorkItems();
+        do
+        {
+            SandboxDrainCompletions();
+        } while (ShimDrainWorkItems() > 0);
     }
 
     // Issues a ranged read against the current script.
@@ -451,6 +457,55 @@ TEST_F(HttpClientTest, NotFoundMapsToObjectNameNotFound)
     Drain();
 
     EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, LastRead.Status);
+    EXPECT_EQ(1, LastRead.Calls);
+
+    FreeMdl();
+}
+
+//
+// 403 is the server refusing the path (host permissions, or a path that
+// escapes its root): the caller should see "access denied", not "the
+// parameter is incorrect".
+//
+TEST_F(HttpClientTest, ForbiddenMapsToAccessDenied)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char target[8] = {};
+
+    Read(target, sizeof(target));
+    Drain();
+
+    EXPECT_EQ(static_cast<NTSTATUS>(STATUS_ACCESS_DENIED), LastRead.Status);
+    EXPECT_EQ(1, LastRead.Calls);
+
+    FreeMdl();
+}
+
+//
+// 416 means the read started at or past the file's current end on the
+// server -- the file shrank under a cached size. That is end of file.
+//
+TEST_F(HttpClientTest, RangeNotSatisfiableMapsToEndOfFile)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char target[8] = {};
+
+    Read(target, sizeof(target));
+    Drain();
+
+    EXPECT_EQ(static_cast<NTSTATUS>(STATUS_END_OF_FILE), LastRead.Status);
     EXPECT_EQ(1, LastRead.Calls);
 
     FreeMdl();
