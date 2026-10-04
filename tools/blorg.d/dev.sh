@@ -1,6 +1,9 @@
 # shellcheck shell=bash
 # blorg setup | check | driver-check | server-test | doctor
 # The Linux tier: what can be checked without Windows. Sourced by tools/blorg.
+#
+#   BLORG_CMAKE_GENERATOR  CMake generator for the flatcc build (default:
+#                          CMake's own choice)
 
 # Version of a package in src/packages.config.
 pkg_version() {
@@ -26,7 +29,6 @@ nuget_fetch() {
 }
 
 flatcc_bin() { echo "$REPO/third_party/flatcc/bin/flatcc"; }
-flatc_bin()  { echo "$CACHE/flatc/flatc"; }
 
 # ---------------------------------------------------------------- setup
 
@@ -73,7 +75,6 @@ cmd_setup() {
     return $rc
 }
 
-
 # Compiles every driver translation unit with clang against the WDK's own
 # kernel headers: catches what a compile catches (typos, undeclared or
 # misused APIs, type errors, header breakage) in seconds, with no Windows.
@@ -110,7 +111,7 @@ cmd_driver_check() {
         # Noise from WDK idioms that MSVC never warns about.
         -Wno-microsoft-anon-tag -Wno-multichar -Wno-microsoft-static-assert
     )
-    local d i
+    local d i parts
     IFS=';' read -ra parts <<<"$defs"
     for d in "${parts[@]}"; do [[ -n "$d" && "$d" != %* ]] && flags+=("-D$d"); done
     IFS=';' read -ra parts <<<"$incs"
@@ -181,8 +182,9 @@ cmd_check() {
     return $rc
 }
 
+yes_no() { if "$@" >/dev/null 2>&1; then echo yes; else echo no; fi; }
+
 cmd_doctor() {
-    yes_no() { if "$@" >/dev/null 2>&1; then echo yes; else echo no; fi; }
     local srv; srv="$(server_dir 2>/dev/null || echo none)"
     echo "repo                $REPO"
     echo "server-rs           $srv"
@@ -197,7 +199,7 @@ cmd_doctor() {
     if gh_ok; then
         echo "  blorg ci test              real MSVC build (build.yml) + real-kernel guest tests, via GitHub Actions"
     else
-        echo "  (no GitHub token)          push the branch and read CI on the PR; see 'blorg ci' for how to add a token"
+        echo "  (no GitHub token)          push the branch and read CI on the PR; AGENTS.md, \"The guest in CI\", says how to add a token"
     fi
 }
 

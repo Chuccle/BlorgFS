@@ -68,7 +68,8 @@ cmd_server() {
             *) want+=("$1"); shift ;;
         esac
     done
-    srv="$(server_dir)" || die "no server-rs checkout (git submodule update --init --recursive third_party/server-rs)"
+    srv="$REPO/third_party/server-rs"
+    [[ -f "$srv/Cargo.toml" ]] || die "third_party/server-rs is not checked out (git submodule update --init --recursive third_party/server-rs)"
     [[ -z "$(git -C "$srv" status --porcelain --untracked-files=no 2>/dev/null)" ]] &&
         rev="$(git -C "$srv" rev-parse HEAD 2>/dev/null)"
     for t in "${SERVER_TARGETS[@]}"; do
@@ -76,7 +77,7 @@ cmd_server() {
         (( ${#want[@]} == 0 )) || [[ " ${want[*]} " == *" $plat "* ]] || continue
         mkdir -p "$out/$plat"
         key=""
-        [[ -n "$rev" ]] && key="$CACHE/server-rs/${rev:0:12}-$triple-$(rustc -V | sha256sum | cut -c1-8)"
+        [[ -n "$rev" ]] && key="$CACHE/server-rs/${rev:0:12}-$triple-$(cd "$srv" && rustc -V | sha256sum | cut -c1-8)"
         if [[ -n "$key" && -f "$key/$bin" ]]; then
             note "server-rs for $plat: cached build of ${rev:0:12}"
             cp "$key/$bin" "$out/$plat/"
@@ -84,7 +85,7 @@ cmd_server() {
         fi
         hdr "server-rs for $plat ($triple)"
         [[ -n "$flatc" ]] || flatc="$(server_flatc "$srv")"
-        rustup target add "$triple" >/dev/null 2>&1 || true
+        (cd "$srv" && rustup target add "$triple" >/dev/null 2>&1) || true
         (cd "$srv" && PATH="$flatc:$PATH" cargo build --release --locked --target "$triple") || return 1
         cp "$srv/target/$triple/release/$bin" "$out/$plat/"
         [[ -n "$key" ]] && mkdir -p "$key" && cp "$srv/target/$triple/release/$bin" "$key/"
@@ -134,7 +135,7 @@ cmd_package() {
 
     [[ -e "$out" && -n "$(ls -A "$out" 2>/dev/null)" ]] && die "$out is not empty"
     mkdir -p "$out/driver" "$out/server"
-    local name src
+    local name src d1 d2
     for name in BlorgFS.sys:BlorgFS:. BlorgFS.inf:BlorgFS BlorgFS.cat:BlorgFS BlorgFS.cer:.; do
         IFS=: read -r name d1 d2 <<<"$name"
         src="$(find_build_file "$name" "$driver/$d1" ${d2:+"$driver/$d2"})" ||

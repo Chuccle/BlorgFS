@@ -25,6 +25,7 @@ deploy/        VM deploy pipeline (see AGENTS.md)
 third_party/   submodules: flatcc, picohttpparser, schemas, googletest,
                and server-rs (the backend this driver ships with)
 VERSION        the package version
+rust-toolchain.toml  the Rust toolchain that builds server-rs
 ```
 
 ## Building and testing
@@ -66,10 +67,18 @@ publishes the package as a release.
 The Linux side has one entrypoint, the same in CI and by hand:
 
 ```bash
-tools/blorg check                   # compile-check the driver, test server-rs
+git submodule update --init --recursive third_party/server-rs
+tools/blorg check            # compile-check the driver, test server-rs
+tools/blorg ci test          # the full pipeline for the pushed commit
+
+# A package from a driver build (x64/Release, from msbuild or a build's
+# BlorgFS-Release-x64 artifact), then a test of it in a local guest
+# (any Linux host with KVM; the first two guest commands once per host):
+tools/blorg server           # the pinned server-rs, into out/server
 tools/blorg package --driver x64/Release
-tools/blorg guest test --package <dir>   # on any Linux host with KVM
-tools/blorg ci test                 # the full pipeline for the pushed commit
+tools/blorg guest host-setup
+tools/blorg guest image
+tools/blorg guest test --package out/package --suites tests/guest-suites
 ```
 
 `tools/blorg help` lists everything; [AGENTS.md](AGENTS.md#package-and-test-guest)

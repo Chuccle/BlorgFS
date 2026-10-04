@@ -32,7 +32,7 @@
 #   image [--iso ...]         build the golden image (guest-image.sh)
 #   image-key                 hash of the image's inputs, for caching it
 #   test --package DIR ...    one end-to-end runtime test run (guest-test.sh)
-#   run SCRIPT [--out DIR]    run a bash script against the live guest,
+#   run [--out DIR] SCRIPT    run a bash script against the live guest,
 #                             with `blorg` on PATH; transcript kept
 #   selftest [--out DIR]      every channel above, once (CI runs it after
 #                             every guest test run)
@@ -42,6 +42,8 @@
 #
 #   GUEST_HOME      state root (image + current run)
 #   GUEST_IMAGE_DIR golden image and its key (default: $GUEST_HOME/image)
+#   GUEST_RUN_DIR   the running guest's disk, sockets and logs
+#                   (default: $GUEST_HOME/run)
 #   GUEST_GOLDEN    base image every run starts from
 #                   (default: $GUEST_IMAGE_DIR/golden.qcow2)
 #   GUEST_KEY       SSH key the image trusts (default: next to the image)
@@ -185,7 +187,7 @@ guest_wait() {
 guest_report() {
     local png="$GUEST_RUN_DIR/screen-unanswered.png"
     echo "blorg: VM state: $(guest_qmp query-status 2>&1 | tr -d '\n')"
-    echo "blorg: guest agent: $(timeout 10 python3 "$BLORG_D/qmp.py" qga "$GUEST_QGA" guest-ping 2>&1 | tr -d '\n' || echo 'no answer')"
+    echo "blorg: guest agent: $(guest_qga guest-ping 2>&1 | tr -d '\n' || echo 'no answer')"
     [[ -s "$GUEST_SERIAL" ]] && { echo "blorg: serial tail:"; tail -n 20 "$GUEST_SERIAL"; }
     if guest_qmp screendump "{\"filename\": \"$png\", \"format\": \"png\"}" >/dev/null 2>&1 && [[ -s "$png" ]]; then
         echo "SCREEN unanswered png-base64 $(base64 -w0 "$png")"
@@ -282,7 +284,6 @@ guest_revert() {
     note "reverted to '$name'"
 }
 
-
 # Prepares a Debian/Ubuntu machine to host the guest: QEMU, the image-build
 # tools, and /dev/kvm for the current user. GitHub's ubuntu runners expose
 # KVM; on a cloud VM pick a size with nested virtualization.
@@ -312,20 +313,25 @@ guest_host_setup() {
 # PATH and $SESSION_OUT for files to keep) against the live guest -- the one
 # a `blorg guest test --keep` left up, or a fresh one. Commands are echoed
 # (bash -x) into DIR/session/transcript.txt. Exits with the script's code.
-guest_run() (
+guest_run() { guest_session session "$@"; }
+
+# guest_session NAME [--out DIR] SCRIPT: guest run, into DIR/NAME.
+guest_session() (
     set +e -uo pipefail
-    local out="$PWD/guest-results" script rc bindir
+    local name="$1" out="$PWD/guest-results" script rc bindir
+    shift
     while (( $# > 1 )); do
         case "$1" in
             --out) out="$2"; shift 2 ;;
             *) die "unknown guest run argument '$1'" ;;
         esac
     done
-    script="${1:?usage: blorg guest run [--out DIR] SCRIPT}"
+    (( $# == 1 )) || die "usage: blorg guest run [--out DIR] SCRIPT"
+    script="$1"
     [[ -f "$script" ]] || die "no such script '$script'"
     bindir="$(dirname "$BLORG")"
     export PATH="$bindir:$PATH"
-    export SESSION_OUT="$out/session"
+    export SESSION_OUT="$out/$name"
     mkdir -p "$SESSION_OUT"
     cp "$script" "$SESSION_OUT/script.sh"
 
@@ -337,7 +343,7 @@ guest_run() (
 
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         {
-            echo "## Guest session: exit $rc"
+            echo "## Guest $name: exit $rc"
             echo
             echo '```'
             tail -n 200 "$SESSION_OUT/transcript.txt"
@@ -349,6 +355,7 @@ guest_run() (
 
 # blorg guest selftest [--out DIR]: every way of acting in the guest, once,
 # against a guest a test run left up (package installed, B: mounted).
+# Transcript and files in DIR/selftest/.
 guest_selftest() {
     local script
     script="$(mktemp)"
@@ -383,7 +390,7 @@ blorg guest wait 300
 
 echo "selftest: every channel works"
 SH
-    guest_run "$@" "$script"
+    guest_session selftest "$@" "$script"
 }
 
 cmd_guest() {
@@ -414,6 +421,8 @@ cmd_guest() {
         test)       guest_test "$@" ;;
         run)        guest_run "$@" ;;
         selftest)   guest_selftest "$@" ;;
-        *)          sed -n '2,/^$/p' "$BLORG_D/guest.sh" | sed 's/^# \{0,1\}//'; [[ -z "$sub" ]] ;;
+        ""|-h|--help|help)
+                    sed -n '2,/^$/p' "$BLORG_D/guest.sh" | sed 's/^# \{0,1\}//' ;;
+        *)          die "unknown guest command '$sub' (blorg guest help)" ;;
     esac
 }

@@ -17,16 +17,16 @@ on:
   workflow_call:
     inputs:
       package_run_id:
-        description: Build BlorgFS run to take the package from (empty = this run)
+        description: Build BlorgFS run to take the package from; the calling run's own id waits for its Package job
         type: string
-        default: ''
+        required: true
       verifier:
         type: boolean
         default: true
   workflow_dispatch:
     inputs:
       package_run_id:
-        description: 'Build BlorgFS run to take the package from (default: the newest successful one on this branch)'
+        description: 'Build BlorgFS run to take the package from (default: the newest on this branch whose Package job succeeded)'
         required: false
         default: ''
       verifier:
@@ -110,10 +110,10 @@ jobs:
       timeout-minutes: 20
       run: tools/blorg guest up --fresh
 
-    # Called from build.yml, the package is this run's: wait for its Package
-    # job, then take the artifact.
+    # Given this run's own id (build.yml calling), the package is this
+    # run's: wait for its Package job, then take the artifact.
     - name: Wait for this run's package
-      if: github.event_name != 'workflow_dispatch' && inputs.package_run_id == ''
+      if: inputs.package_run_id == github.run_id
       env:
         GH_TOKEN: ${{ github.token }}
         REPO: ${{ github.repository }}
@@ -131,7 +131,7 @@ jobs:
         echo "::error::no package after an hour"; exit 1
 
     - name: Download this run's package
-      if: github.event_name != 'workflow_dispatch' && inputs.package_run_id == ''
+      if: inputs.package_run_id == github.run_id
       uses: actions/download-artifact@v5
       with:
         name: ${{ env.PACKAGE_ARTIFACT }}
@@ -139,16 +139,22 @@ jobs:
 
     - name: Download an earlier build's package
       id: earlier
-      if: github.event_name == 'workflow_dispatch' || inputs.package_run_id != ''
+      if: inputs.package_run_id != github.run_id
       env:
         GH_TOKEN: ${{ github.token }}
         REPO: ${{ github.repository }}
         RUN_ID: ${{ inputs.package_run_id }}
       run: |
         set -euo pipefail
+        # The newest run whose Package job succeeded, whatever its guest
+        # tests said: re-testing a package that failed them is the point.
         if [[ -z "$RUN_ID" ]]; then
-          RUN_ID="$(gh run list -R "$REPO" -w build.yml --status success --branch "$GITHUB_REF_NAME" -L 1 --json databaseId --jq '.[0].databaseId')"
-          [[ -n "$RUN_ID" ]] || { echo "::error::no successful Build BlorgFS run on $GITHUB_REF_NAME"; exit 1; }
+          for id in $(gh run list -R "$REPO" -w build.yml --branch "$GITHUB_REF_NAME" -L 20 --json databaseId --jq '.[].databaseId'); do
+            package="$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+                       --jq '[.jobs[] | select(.name == "Package")][0].conclusion // ""')"
+            [[ "$package" == success ]] && { RUN_ID="$id"; break; }
+          done
+          [[ -n "$RUN_ID" ]] || { echo "::error::no Build BlorgFS run among the last 20 on $GITHUB_REF_NAME has a successful Package job"; exit 1; }
         fi
         echo "Testing the package from https://github.com/$REPO/actions/runs/$RUN_ID"
         gh run download "$RUN_ID" -R "$REPO" -n "$PACKAGE_ARTIFACT" -D package

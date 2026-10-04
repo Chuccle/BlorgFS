@@ -2,6 +2,9 @@
 # blorg ci test | guest | status | results
 # Runs the real Windows build and guest tests on GitHub Actions from any
 # shell with a GitHub token. Sourced by tools/blorg.
+#
+#   BLORG_POLL       seconds between polls of a running run (default 10)
+#   BLORG_LOG_LINES  lines of a failed run's log to print (default 150)
 
 gh_ok() {
     have gh || return 1

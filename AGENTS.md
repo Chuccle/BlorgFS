@@ -425,8 +425,9 @@ one is the package root: a BlorgFS commit names the exact server it ships
 with. Everything on the Linux side, in CI or by hand, goes through one
 entrypoint, `tools/blorg` (`tools/blorg help` lists every command; its
 modules are in `tools/blorg.d/`). Windows is needed only for the driver
-build (`build.yml`'s Windows job, or `Invoke-BlorgChecks.ps1`) and inside
-the test guest. Everything that runs inside the guest is one script,
+build (`build.yml`'s Windows job, or `Invoke-BlorgChecks.ps1`), for
+analysing a guest's crash dumps (`guest.yml`'s crash job) and inside the
+test guest. Everything that runs inside the guest is one script,
 `tools/guest/Invoke-BlorgGuest.ps1 -Step Image|Prepare|Test|Diagnostics`.
 
 ### The package
@@ -444,14 +445,18 @@ server/         linux-x64/server-rs        static (musl); where the backend runs
 `blorg-package-windows-x64`. Only the driver job runs on Windows; the pins
 check, both server builds and the packaging run on Linux. `blorg server`
 keeps the binaries of a clean server-rs checkout in its cache, keyed by
-commit, target and compiler, and CI caches that by the pin, so an unchanged
-pin costs a copy rather than a build:
+commit, target and compiler, and CI caches that by the pin and the
+toolchain, so an unchanged pin costs a copy rather than a build:
 
 | Command | Does |
 |---|---|
 | `tools/blorg pins` | Fails unless the driver and the pinned server-rs compile the same `schemas` commit |
 | `tools/blorg server [--out DIR]` | Cross-builds the pinned server-rs for both platforms, with `flatc` built from server-rs's own pinned flatbuffers (the generated Rust must match the crate) |
 | `tools/blorg package --driver x64/Release [--servers DIR]` | Assembles the package and its `manifest.json` into `out/package` |
+
+The Rust toolchain that builds server-rs is pinned once, in
+`rust-toolchain.toml`: rustup uses it anywhere under this checkout, CI
+installs it, and `tools/Containerfile` is built with it.
 
 The driver and server agree on the wire only because both compile the same
 FlatBuffers schema, so Dependabot bumps the two submodules together
@@ -467,8 +472,9 @@ Artifact zips drop the executable bit: `chmod +x server/linux-x64/server-rs`.
 
 ### Linux-side checks
 
-`tools/blorg setup` fetches what the local checks need into
-`~/.cache/blorg` (about 270 MB: WDK/SDK headers from NuGet, flatcc, flatc);
+`tools/blorg setup` fetches and builds what the local checks need: WDK/SDK
+headers from NuGet and flatc into `~/.cache/blorg` (about 270 MB, with
+flatcc's build tree), flatcc itself into `third_party/flatcc/bin`;
 `tools/blorg doctor` says what the machine can and cannot do.
 `tools/blorg check` compile-checks every driver source with clang against
 the real WDK headers (defines and include paths read from
@@ -560,15 +566,15 @@ generated config ISO, then `Invoke-BlorgGuest.ps1 -Step Image` installs
 OpenSSH and the QEMU guest agent, turns test signing on and boot recovery
 off, sets Driver Verifier, keeps kernel dumps and turns Windows Update off.
 The build then boots the result once and checks it over SSH. Every download
-is pinned by SHA-256 in `tools/blorg.d/guest-image.sh` (versioned URLs,
-except OpenSSH's "latest", which the pin holds still), so the same recipe
-always builds from the same bytes; a moved download fails the build with its
-new hash. The answer file is checked to be well-formed first: Setup silently
-ignores a broken one and waits at its language screen. The install gives up
-after 45 min, or after 20 min on one unchanged screen (it is stuck), with a
-`blorg image-build` annotation holding the tail of the setup transcript.
-SeaBIOS, because Secure Boot blocks `bcdedit /set testsigning on`; AHCI disk
-and e1000e NIC, because Windows has inbox drivers for both.
+is a versioned URL pinned by SHA-256 in `tools/blorg.d/guest-image.sh`, so
+the same recipe always builds from the same bytes; a moved download fails
+the build with its new hash. The answer file is checked to be well-formed
+first: Setup silently ignores a broken one and waits at its language screen.
+The install gives up after 45 min, or after 20 min on one unchanged screen
+(it is stuck), with a `blorg image-build` annotation holding the tail of the
+setup transcript. SeaBIOS, because Secure Boot blocks
+`bcdedit /set testsigning on`; AHCI disk and e1000e NIC, because Windows has
+inbox drivers for both.
 
 ### The guest in CI
 
@@ -580,15 +586,17 @@ golden image keyed by `tools/blorg guest image-key` (a hash of the image's
 own inputs, so a change to the tests reuses it) and the calendar quarter (so
 the evaluation never expires under a cached image); a miss costs one
 unattended install in that run. Each run also exercises every guest channel
-once (`blorg guest selftest`). It uploads `guest-results` and, when it
-fails, the image build's screens.
+once (`blorg guest selftest`, into `guest-results/selftest/`). It uploads
+`guest-results` and, when it fails, the image build's screens.
 
 Dispatch `guest.yml` to test an earlier build's package again
-(`package_run_id`, default the newest successful build on the branch),
-without Driver Verifier (`verifier`), or with a `script`: bash run against
-the live guest afterwards, with `blorg` on `PATH` and `$SESSION_OUT` for
-files to bring back. This is how to work in a guest without a KVM host of
-your own. The script never changes the verdict above it.
+(`package_run_id`, default the newest build on the branch whose `Package`
+job succeeded, whatever its guest tests said), without Driver Verifier
+(`verifier`), or with a `script`: bash run against the live guest
+afterwards, with `blorg` on `PATH` and `$SESSION_OUT`
+(`guest-results/session/`) for files to bring back. This is how to work in
+a guest without a KVM host of your own. The script never changes the
+verdict above it.
 
 From any shell with `gh` and a token (a fine-grained PAT with Actions
 read/write and Contents read, as `BLORG_GH_TOKEN` or `GH_TOKEN`):

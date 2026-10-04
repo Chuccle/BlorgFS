@@ -400,16 +400,20 @@ jobs:
       id: pins
       run: echo "server_rs=$(git rev-parse HEAD:third_party/server-rs)" >> "$GITHUB_OUTPUT" && tools/blorg pins
 
-    # Keyed by the server-rs pin. An unchanged pin restores the built
-    # binaries (blorg keeps them in its cache) and the build below is a
-    # copy; only a new pin needs cargo, restored from the previous pin so
-    # just what changed recompiles.
+    # The toolchain rust-toolchain.toml pins, not the runner's.
+    - name: Install the pinned Rust toolchain
+      run: rustup toolchain install --no-self-update
+
+    # Keyed by the server-rs pin and the toolchain. An unchanged pair
+    # restores the built binaries (blorg keeps them in its cache) and the
+    # build below is a copy; anything else needs cargo, restored from the
+    # previous key so just what changed recompiles.
     - name: Cache server-rs binaries
       id: server_cache
       uses: actions/cache@v5
       with:
         path: .blorg-cache/
-        key: ${{ runner.os }}-server-bin-${{ steps.pins.outputs.server_rs }}
+        key: ${{ runner.os }}-server-bin-${{ steps.pins.outputs.server_rs }}-${{ hashFiles('rust-toolchain.toml') }}
         restore-keys: ${{ runner.os }}-server-bin-
 
     - name: Cache cargo
@@ -421,7 +425,7 @@ jobs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           third_party/server-rs/target/
-        key: ${{ runner.os }}-server-cargo-${{ steps.pins.outputs.server_rs }}
+        key: ${{ runner.os }}-server-cargo-${{ steps.pins.outputs.server_rs }}-${{ hashFiles('rust-toolchain.toml') }}
         restore-keys: ${{ runner.os }}-server-cargo-
 
     - name: Install cross linkers
@@ -506,7 +510,6 @@ jobs:
         VERSION: ${{ steps.package.outputs.version }}
       run: |
         zip_name="blorg-${VERSION}-windows-x64.zip"
-        chmod +x package/server/linux-x64/server-rs
         (cd package && zip -r "../${zip_name}" .)
         gh release create "$GITHUB_REF_NAME" "$zip_name" package/manifest.json \
           --title "blorg $GITHUB_REF_NAME" \
@@ -518,3 +521,5 @@ jobs:
   # waits for the package job.
   guest:
     uses: ./.github/workflows/guest.yml
+    with:
+      package_run_id: ${{ github.run_id }}

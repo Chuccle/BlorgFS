@@ -4,7 +4,8 @@
 #
 # The one entrypoint for everything that runs on Linux, in CI or by hand.
 # Windows is needed only for the driver build (build.yml's Windows job, or
-# tools\Invoke-BlorgChecks.ps1) and inside the test guest. See AGENTS.md.
+# tools\Invoke-BlorgChecks.ps1), for analysing a guest's crash dumps
+# (guest.yml's crash job) and inside the test guest. See AGENTS.md.
 #
 #   setup                   fetch/build what the local checks need (cached)
 #   check                   the Linux tier: driver compile check against the
@@ -50,8 +51,9 @@ note() { echo "blorg: $*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 hdr()  { echo; echo "==> $*"; }
 
-# server-rs: $BLORG_SERVER_RS, else the pinned submodule, else a sibling
-# ../server-rs checkout.
+# The server-rs the checks run against (setup, check, server-test, doctor):
+# $BLORG_SERVER_RS, else the pinned submodule, else a sibling ../server-rs
+# checkout. blorg server and package build only the pinned submodule.
 server_dir() {
     local d
     for d in "${BLORG_SERVER_RS:-}" "$REPO/third_party/server-rs" "$REPO/../server-rs"; do
@@ -65,16 +67,19 @@ for module in "$BLORG_D"/*.sh; do source "$module"; done
 
 # blorg container [command...]: blorg inside tools/Containerfile's image,
 # against this checkout (podman, else docker; BLORG_ENGINE to choose). The
-# image is built on first use; a sibling ../server-rs is mounted too.
+# image is built on first use, one per rust-toolchain.toml toolchain; a
+# sibling ../server-rs is mounted too.
 cmd_container() {
-    local engine="${BLORG_ENGINE:-}" image="${BLORG_IMAGE:-localhost/blorg-dev}" args=() v
+    local engine="${BLORG_ENGINE:-}" rust image args=() v
+    rust="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")"
+    image="${BLORG_IMAGE:-localhost/blorg-dev:rust-$rust}"
     if [[ -z "$engine" ]]; then
         if have podman; then engine=podman; elif have docker; then engine=docker
         else die "neither podman nor docker is installed"; fi
     fi
     if ! "$engine" image inspect "$image" >/dev/null 2>&1; then
         note "building $image with $engine (first use)"
-        "$engine" build -t "$image" -f "$REPO/tools/Containerfile" "$REPO/tools" >&2 || die "image build failed"
+        "$engine" build -t "$image" --build-arg RUST_TOOLCHAIN="$rust" -f "$REPO/tools/Containerfile" "$REPO/tools" >&2 || die "image build failed"
     fi
     args=(run --rm -i -v "$REPO:/src" -v blorg-cache:/var/cache/blorg -w /src)
     [[ -t 0 && -t 1 ]] && args+=(-t)

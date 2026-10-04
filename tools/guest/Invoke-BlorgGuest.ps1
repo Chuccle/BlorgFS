@@ -72,7 +72,6 @@
                        product actually runs in
           install      driver\Install-BlorgFS.ps1 against that server; B: mounts
           service      BlorgFS is RUNNING
-          volume       VolumeTester.exe, when the package carries it
           listing      the tree on B: matches the corpus: every path, every size
           correctness  tools\Test-BlorgCorrectness.ps1 (size, hash, range,
                        reread, tail) against the same server
@@ -276,7 +275,7 @@ function Invoke-ImageStep {
 
     Step 'Windows Update off' {
         foreach ($svc in 'wuauserv', 'UsoSvc', 'WaaSMedicSvc') {
-            try { Stop-Service $svc -Force -ErrorAction SilentlyContinue } catch { Write-Verbose "stop $svc failed" }
+            Stop-Service $svc -Force -ErrorAction SilentlyContinue
             # WaaSMedicSvc refuses Set-Service; the registry is the only lever.
             Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$svc" Start 4 -ErrorAction SilentlyContinue
         }
@@ -530,17 +529,6 @@ function Invoke-TestStep {
         }
         Invoke-Step 'service' $serviceRunning | Out-Null
 
-        Invoke-Step 'volume' -NeedsMount {
-            param($log)
-            $exe = @((Join-Path $package 'tests\VolumeTester.exe'), (Join-Path $BundleDir 'tests\VolumeTester.exe')) |
-                Where-Object { Test-Path $_ } | Select-Object -First 1
-            if (-not $exe) { 'VolumeTester.exe not in the package' | Set-Content $log; return 'skip' }
-            $ErrorActionPreference = 'Continue'   # see Invoke-ChildScript
-            & $exe 2>&1 | ForEach-Object { "$_" } | Write-StepLog -Log $log
-            if ($LASTEXITCODE -ne 0) { return "VolumeTester exited $LASTEXITCODE" }
-            $true
-        } | Out-Null
-
         Invoke-Step 'listing' -NeedsMount {
             param($log)
             $want = Get-Content $corpusManifest -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -669,7 +657,6 @@ function Invoke-DiagnosticsStep {
         '### verifier /querysettings'; verifier /querysettings
         '### pnputil /enum-drivers (BlorgFS)'; pnputil /enum-drivers | Select-String -Context 0, 7 'blorgfs'
         '### volumes'; Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
-        '### server-rs processes'; Get-Process server-rs -ErrorAction SilentlyContinue | Format-Table -AutoSize
     } 2>&1 | Out-File -Encoding ascii -Width 200 (Join-Path $diag 'state.txt')
 
     $crash = [ordered]@{

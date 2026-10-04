@@ -8,11 +8,11 @@
 # no Linux container can load a Windows kernel driver. That half is
 # build.yml and the guest runtime tests, which `blorg ci` drives.
 
-FROM docker.io/library/ubuntu:24.04
+FROM docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -q && apt-get install -y -q --no-install-recommends \
-        ca-certificates curl git unzip jq \
+        ca-certificates curl git unzip \
         build-essential clang cmake openssl python3 \
         musl-tools gcc-mingw-w64-x86-64 \
         gh \
@@ -21,12 +21,18 @@ RUN apt-get update -q && apt-get install -y -q --no-install-recommends \
     && git config --system --add safe.directory '*'
 
 ENV RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo PATH=/opt/rust/cargo/bin:$PATH
-# rustup-init straight from static.rust-lang.org, downloaded before it runs
-# so a failed download fails the build instead of piping an error page to sh.
-RUN curl -fsSL -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init \
+# The toolchain rust-toolchain.toml pins; blorg container passes it in.
+ARG RUST_TOOLCHAIN
+ARG RUSTUP_VERSION=1.29.1
+ARG RUSTUP_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+# rustup-init straight from static.rust-lang.org, checked against its pin
+# before it runs.
+RUN test -n "$RUST_TOOLCHAIN" \
+    && curl -fsSL -o /tmp/rustup-init https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/x86_64-unknown-linux-gnu/rustup-init \
+    && echo "$RUSTUP_SHA256  /tmp/rustup-init" | sha256sum -c - \
     && chmod +x /tmp/rustup-init \
-    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain stable \
-        --component clippy,rustfmt --target x86_64-pc-windows-gnu,x86_64-unknown-linux-musl \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN" \
+        --component clippy --target x86_64-pc-windows-gnu,x86_64-unknown-linux-musl \
     && rm -rf /tmp/rustup-init \
     && chmod -R a+rwX /opt/rust
 
@@ -38,4 +44,3 @@ RUN mkdir -p /var/cache/blorg && chmod 1777 /var/cache/blorg
 
 WORKDIR /src
 ENTRYPOINT ["tools/blorg"]
-CMD ["doctor"]

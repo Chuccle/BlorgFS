@@ -10,7 +10,8 @@
     server-rs changes what it answers, this is where it shows.
 
     Runs against the generated corpus (tools/blorg.d/corpus.py), so it needs
-    no fixtures of its own. Exits with the number of failed checks.
+    no fixtures of its own. Exits with the number of failed checks; INFO
+    lines report behaviour that is not settled yet and never fail.
     Windows PowerShell 5.1.
 
 .PARAMETER Drive
@@ -34,14 +35,20 @@ function Report([string]$Outcome, [string]$Check, [string]$Detail = '') {
     if ($Outcome -eq 'FAIL') { $script:failures++ }
 }
 
+# The exception a .NET method threw, without PowerShell's wrapper.
+function Get-ThrownException([System.Management.Automation.ErrorRecord]$Record) {
+    $e = $Record.Exception
+    while ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+    $e
+}
+
 # Runs $Action and passes if it throws $Expected (or a subclass).
 function Expect-Error([string]$Check, [type]$Expected, [scriptblock]$Action) {
     try {
         & $Action
         Report 'FAIL' $Check 'it succeeded'
     } catch {
-        $e = $_.Exception
-        while ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+        $e = Get-ThrownException $_
         if ($Expected.IsInstanceOfType($e)) { Report 'PASS' $Check }
         else { Report 'FAIL' $Check "$($e.GetType().FullName): $($e.Message)" }
     }
@@ -59,9 +66,7 @@ try {
     [System.IO.File]::OpenRead((Join-Path $root 'no-such-dir\file.bin')).Dispose()
     Report 'FAIL' 'opening under a missing directory' 'it succeeded'
 } catch {
-    $e = $_.Exception
-    while ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
-    Report 'INFO' 'opening under a missing directory' $e.GetType().Name
+    Report 'INFO' 'opening under a missing directory' (Get-ThrownException $_).GetType().Name
 }
 
 Expect-Error 'listing a missing directory fails with DirectoryNotFound' ([System.IO.DirectoryNotFoundException]) {
