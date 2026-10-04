@@ -501,7 +501,10 @@ static VOID DirCtrlComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Call
 // Issuing a second fetch here in that race is redundant but not unsafe:
 // DirCtrlComplete already discards whichever of two racing fetches
 // loses the publish (see its own comment), the same protection this
-// leans on for two different handles racing the same DCB.
+// leans on for two different handles racing the same DCB. That second
+// query also skips the posts in the pattern branches, so the fetch posts
+// to the FSP itself when not already there: it can complete the IRP
+// before it returns, so it is only issued once the IRP is pending.
 //
 // NOTIFY_CHANGE_DIRECTORY registers the watch with the FsRtl notify
 // package, which captures its own copy of the directory name and holds
@@ -661,6 +664,13 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             if (!netDone && !dcb->CachedListing)
             {
                 ExReleaseResourceLite(dcb->Header.Resource);
+
+                if (!BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_IN_FSP))
+                {
+                    BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
+                    return BlorgFsdPostRequest(Irp, IrpSp);
+                }
+
                 return BlorgHttpGetDirectoryInfo(&dcb->FullPath, DirCtrlComplete, Irp);
             }
 
