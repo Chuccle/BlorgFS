@@ -38,11 +38,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=ci/guest/host/lib.sh
 source "$HERE/../host/lib.sh"
 
-WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://go.microsoft.com/fwlink/?linkid=2293312&clcid=0x409&culture=en-us&country=us}"
+WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso}"
 WINDOWS_IMAGE_INDEX="${WINDOWS_IMAGE_INDEX:-1}"
 VIRTIO_ISO_URL="${VIRTIO_ISO_URL:-https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso}"
 OPENSSH_ZIP_URL="${OPENSSH_ZIP_URL:-https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip}"
-WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256-}"
+WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256-d0ef4502e350e3c6c53c15b1b3020d38a5ded011bf04998e950720ac8579b23d}"
 VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256-303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d}"
 # Win32-OpenSSH publishes no stable per-version URL here; the pin is what
 # keeps "latest" from changing the image underneath the recipe.
