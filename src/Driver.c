@@ -423,8 +423,8 @@ static VOID DriverDeleteFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceOb
 //
 // The drain runs before anything is torn down. It refuses new work and
 // waits for what is already outstanding, and must complete while the
-// filesystem device object still exists, because an in-flight request holds
-// an IO work item queued against it.
+// filesystem device object still exists, because an in-flight request or
+// pre-warm connect may queue an IO work item against it.
 //
 // This used to be two drains in a fixed order, rings before requests, since
 // a live prefetch ring would otherwise keep issuing into a drained client.
