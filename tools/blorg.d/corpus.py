@@ -8,10 +8,9 @@ OUT_DIR/corpus is the served root; OUT_DIR/corpus-manifest.json lists every
 file (Windows-style relative path, size, SHA-256) and every directory, which
 the in-guest listing check compares the mounted volume against.
 
-Generated on the host, so the same tree serves the Linux server on the host
-and, pushed into the guest, the Windows server's fallback mode -- one
-generator, so the two can't drift. The same seed always produces the same
-bytes, so a failure on one run replays byte for byte on the next.
+Generated on the host and served by the Linux server-rs there. The same
+seed always produces the same bytes, so a failure on one run replays byte
+for byte on the next.
 
 The shape is chosen for what tends to break a network filesystem:
   boundaries/  sizes either side of sector, page, 64 KiB, the read-ahead
@@ -22,9 +21,10 @@ The shape is chosen for what tends to break a network filesystem:
   nested/      a deep path
   empty/       an empty directory and a zero-byte file
 
---extra NAME=DIR copies a suite's fixture directory in as NAME/ (see the suite
-contract in tools/guest/Invoke-BlorgGuest.ps1, -Step Test), so fixtures are served by the
-same server and appear in the manifest like everything else.
+--extra NAME=DIR copies a suite's fixture directory in as NAME/ (see the
+suite contract in tools/guest/Invoke-BlorgGuest.ps1, -Step Test), so
+fixtures are served by the same server and appear in the manifest like
+everything else.
 """
 
 import argparse

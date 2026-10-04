@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# blorg setup | check | driver-check | server-test | doctor | container
+# blorg setup | check | driver-check | server-test | doctor
 # The Linux tier: what can be checked without Windows. Sourced by tools/blorg.
 
 # Version of a package in src/packages.config.

@@ -35,17 +35,15 @@
         Puts the guest into the state a test run needs, and says whether that
         takes a reboot.
 
-        Runs inside the guest before -Step Test. Idempotent, and
-        deliberately independent of how the guest was built or which hypervisor
-        hosts it: the golden image already has test signing on, but a guest
-        from anywhere else (the VMware dev VM, a cloud VM) gets the same
-        treatment.
+        Runs inside the guest before -Step Test. Idempotent, and deliberately
+        independent of how the guest was built or which hypervisor hosts it:
+        the golden image already has test signing on, but a guest from
+        anywhere else (the VMware dev VM, a cloud VM) gets the same treatment.
 
           - Test signing on (a reboot to apply, if it was off).
           - Driver Verifier's standard checks on BlorgFS.sys, or off with
             -NoVerifier. Correctness runs want it on; benchmark runs must not
-            have it (Verifier skews timings). Either change
-            needs a reboot.
+            have it (Verifier skews timings). Either change needs a reboot.
           - Old crash dumps cleared, and the time recorded, so the diagnostics
             afterwards only ever report crashes from this run.
 
@@ -67,7 +65,8 @@
         mid-run still leaves everything up to that point:
 
           package      every file matches the SHA-256 in manifest.json
-          corpus       the corpus manifest (tools/blorg.d/corpus.py) was pushed in
+          corpus       the corpus manifest (tools/blorg.d/corpus.py) was
+                       pushed in
           server       the Linux server-rs on the KVM host answers /healthcheck
                        through the guest's NIC at 10.0.2.2 -- the topology the
                        product actually runs in
@@ -82,15 +81,14 @@
 
         Suite contract, for contract and behavioural tests from elsewhere: a
         suites\<name>.ps1 that exits 0 on pass. It is offered -Drive (the
-        mounted letter), -BackendUrl, -CorpusManifest and
-        -ResultsDir (a directory of its own for logs), and given whichever of
-        those its param() block declares. The served tree lives on the host,
-        so a suite that needs fixtures on the volume ships them as
-        suites\<name>.corpus\, which the host serves as <name>\
-        (blorg guest test).
+        mounted letter), -BackendUrl, -CorpusManifest and -ResultsDir (a
+        directory of its own for logs), and given whichever of those its
+        param() block declares. The served tree lives on the host, so a suite
+        that needs fixtures on the volume ships them as suites\<name>.corpus\,
+        which the host serves as <name>\ (blorg guest test).
 
-        The driver is not stopped at the end: there is no dismount handler, so
-        `sc stop` wedges in STOP_PENDING. Runs end by discarding the
+        The driver is not stopped at the end: there is no dismount handler,
+        so `sc stop` wedges in STOP_PENDING. Runs end by discarding the
         guest's disk instead.
 
         Exit code 0 only when the verdict is "pass".
@@ -99,8 +97,8 @@
         Collects what explains a failed or crashed run, and says whether the
         guest bugchecked during it.
 
-        Runs inside the guest after -Step Test, or after the guest
-        came back from a crash mid-run, and writes into <ResultsDir>\diag:
+        Runs inside the guest after -Step Test, or after the guest came back
+        from a crash mid-run, and writes into <ResultsDir>\diag:
 
           crash.json        bugchecked yes/no since -Step Prepare ran, the
                             bugcheck events, and the dumps found
@@ -418,8 +416,9 @@ function Invoke-TestStep {
         }
     }
 
-    # Runs one step. The body returns $true/$false (or throws); 'skip' and a
-    # reason string are for steps whose precondition is missing.
+    # Runs one step. The body returns $true/$false (or throws); any other
+    # string fails the step with that string as the reason, and 'skip' is
+    # for a step whose precondition is missing.
     function Invoke-Step {
         param([string]$Name, [scriptblock]$Body, [switch]$NeedsMount)
         $log = Join-Path $logs (($Name -replace '[^\w.-]', '_') + '.log')

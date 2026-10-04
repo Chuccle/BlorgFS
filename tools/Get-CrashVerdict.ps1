@@ -50,7 +50,6 @@
 
 .EXAMPLE
     .\Get-CrashVerdict.ps1 -DumpPath guest-results\results\diag\dumps\x.dmp -SymbolServer -SymbolDir BlorgFS-Release-x64
-
     A dump a guest run brought back, with the PDB from the same build.
     Besides the verdict it prints the bugcheck arguments, faulting line and
     stack; under GitHub Actions that summary is also a "blorg guest-crash"
@@ -126,7 +125,10 @@ $env:_NT_SYMBOL_PATH = if ($SymbolServer) {
     "cache*$symbolCache"
 }
 if ($SymbolDir) {
-    # Build artifacts keep their x64\Release\ layout: use wherever the PDB is.
+    #
+    # Build artifacts keep their x64\Release\ layout: use wherever the PDB
+    # is.
+    #
     $pdb = Get-ChildItem $SymbolDir -Recurse -Filter "$DriverName.pdb" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($pdb) { $env:_NT_SYMBOL_PATH = "$($pdb.DirectoryName);$env:_NT_SYMBOL_PATH" }
     else { Write-Warning "no $DriverName.pdb under $SymbolDir" }
@@ -176,7 +178,11 @@ function Find-First {
 }
 
 $bugcheck = Find-First 'BugCheck\s+([0-9A-Fa-f]+)'
-# A minidump's !analyze names it BUGCHECK_CODE; only a full dump's banner says "BugCheck".
+
+#
+# A minidump's !analyze names it BUGCHECK_CODE; only a full dump's banner
+# says "BugCheck".
+#
 if (-not $bugcheck) { $bugcheck = Find-First '^BUGCHECK_CODE:\s*([0-9A-Fa-f]+)' }
 $analysisName = Find-First 'MODULE_NAME:\s*(\S+)'
 $faultModule = Find-First 'FAULTING_MODULE:\s*\S+\s+(\S+)'

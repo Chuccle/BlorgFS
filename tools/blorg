@@ -6,8 +6,7 @@
 # Windows is needed only for the driver build (build.yml's Windows job, or
 # tools\Invoke-BlorgChecks.ps1) and inside the test guest. See AGENTS.md.
 #
-#   setup                   fetch/build what the local checks need (cached);
-#                           also the setup step of any hosted environment
+#   setup                   fetch/build what the local checks need (cached)
 #   check                   the Linux tier: driver compile check against the
 #                           real WDK headers, server-rs tests and clippy
 #   driver-check [file..]   just the driver compile check
@@ -51,7 +50,8 @@ note() { echo "blorg: $*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 hdr()  { echo; echo "==> $*"; }
 
-# server-rs: the pinned submodule, else a sibling checkout, else $BLORG_SERVER_RS.
+# server-rs: $BLORG_SERVER_RS, else the pinned submodule, else a sibling
+# ../server-rs checkout.
 server_dir() {
     local d
     for d in "${BLORG_SERVER_RS:-}" "$REPO/third_party/server-rs" "$REPO/../server-rs"; do

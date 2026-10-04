@@ -105,12 +105,13 @@ jobs:
         key: ${{ steps.image.outputs.cache-primary-key }}
 
     # The guest boots while build.yml is still building, so the boot costs
-    # nothing on the critical path. Called from build.yml, the package is
-    # this run's: wait for its Package job, then take the artifact.
+    # nothing on the critical path.
     - name: Boot the guest
       timeout-minutes: 20
       run: tools/blorg guest up --fresh
 
+    # Called from build.yml, the package is this run's: wait for its Package
+    # job, then take the artifact.
     - name: Wait for this run's package
       if: github.event_name != 'workflow_dispatch' && inputs.package_run_id == ''
       env:
@@ -165,9 +166,9 @@ jobs:
         tools/blorg guest test "${args[@]}"
 
     # Every way of acting in the guest, once, so a broken channel is found
-    # by CI rather than by whoever next needs it.
-    # Even when the tests fail: whether every way into the guest works is a
-    # separate question from whether the driver does.
+    # by CI rather than by whoever next needs it. Runs even when the tests
+    # fail: whether every way into the guest works is a separate question
+    # from whether the driver does.
     - name: Self-test the guest channels
       if: ${{ !cancelled() && steps.test.outcome != 'skipped' }}
       run: tools/blorg guest selftest --out guest-results

@@ -68,7 +68,7 @@ def open_qmp(path):
 def open_qga(path):
     ch = Channel(path, timeout=30)
     # The agent channel is a byte stream with no framing guarantee across
-    # reconnects; guest-sync with a random id discards stale output.
+    # reconnects; guest-sync with a fresh id discards stale output.
     token = int(time.time() * 1000) % 2**31
     ch.send({"execute": "guest-sync", "arguments": {"id": token}})
     while ch.reply() != token:

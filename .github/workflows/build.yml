@@ -357,8 +357,6 @@ jobs:
 
     # BlorgFS/ is the staged driver package (stamped INF + catalog); the
     # package job below needs it, since only that INF matches the catalog.
-    # The binlog's comment used to sit on its path line, inside the block
-    # scalar, so the pattern never matched and the log was never uploaded.
     - name: Upload build artifacts
       uses: actions/upload-artifact@v7
       with:
@@ -370,6 +368,7 @@ jobs:
           ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/BlorgFS/
           ${{ github.workspace }}/msbuild.binlog
         if-no-files-found: warn
+
   # The combined package: this driver plus the server-rs commit pinned at
   # third_party/server-rs, versioned together. Everything but the driver
   # build runs on Linux through tools/blorg, so a package built by hand

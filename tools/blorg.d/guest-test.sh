@@ -1,9 +1,9 @@
 # shellcheck shell=bash
-# blorg guest test -- sourced by tools/blorg.
-#
+# blorg guest test
 # One runtime test run, end to end, on a KVM host: boot a fresh guest from
 # the golden image, deploy the blorg package into it, run the in-guest
 # tests, collect results and diagnostics, and exit with the verdict.
+# Sourced by tools/blorg.
 #
 #   blorg guest test --package DIR [--out DIR] [--suites DIR]
 #                    [--server-bin PATH]
@@ -28,12 +28,13 @@
 # Exit: 0 pass, 1 fail (tests failed or the guest bugchecked), 2 the rig
 # itself broke before a verdict existed.
 #
-# The same script runs in CI and by hand; nothing in it knows which.
+# The same script runs in CI and by hand; under GitHub Actions it only
+# adds log groups, annotations and a step summary.
 #
-# Topology: server-rs runs here on the host, as Linux, the way
-# the product is deployed, and the guest reaches it at 10.0.2.2 (QEMU user
-# networking's address for the host). So the driver's WSK traffic crosses
-# a real NIC, and the backend's filesystem is case-sensitive.
+# Topology: server-rs runs here on the host, as Linux, the way the product
+# is deployed, and the guest reaches it at 10.0.2.2 (QEMU user networking's
+# address for the host). So the driver's WSK traffic crosses a real NIC,
+# and the backend's filesystem is case-sensitive.
 
 guest_test() (
     set +e -uo pipefail
@@ -104,8 +105,9 @@ if [[ -n "$suites" ]]; then
     ls -R "$bundle/suites"
 fi
 
-# The corpus is generated here for both topologies; suites' fixture
-# directories (suites/<name>.corpus/) are served as <name>/.
+# The corpus is generated here and served by server-rs on this host; only
+# its manifest goes into the guest. Suites' fixture directories
+# (suites/<name>.corpus/) are served as <name>/.
 extras=()
 if [[ -d "$bundle/suites" ]]; then
     for d in "$bundle/suites"/*.corpus; do

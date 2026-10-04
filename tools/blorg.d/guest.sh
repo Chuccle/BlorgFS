@@ -34,14 +34,16 @@
 #   test --package DIR ...    one end-to-end runtime test run (guest-test.sh)
 #   run SCRIPT [--out DIR]    run a bash script against the live guest,
 #                             with `blorg` on PATH; transcript kept
-#   selftest [--out DIR]      every channel above, once (CI runs it on
-#                             changes to the rig)
+#   selftest [--out DIR]      every channel above, once (CI runs it after
+#                             every guest test run)
 #
-# Settings. Everything is overridable from the environment, so CI, a cloud host and
-# a developer's Linux box all drive the same guest the same way:
+# Settings. Everything is overridable from the environment, so CI, a cloud
+# host and a developer's Linux box all drive the same guest the same way:
 #
 #   GUEST_HOME      state root (image + current run)
-#   GUEST_GOLDEN    base image every run starts from (default: $GUEST_HOME/image/golden.qcow2)
+#   GUEST_IMAGE_DIR golden image and its key (default: $GUEST_HOME/image)
+#   GUEST_GOLDEN    base image every run starts from
+#                   (default: $GUEST_IMAGE_DIR/golden.qcow2)
 #   GUEST_KEY       SSH key the image trusts (default: next to the image)
 #   GUEST_CPUS      vCPUs              (default: min(nproc, 4))
 #   GUEST_MEM_MB    RAM in MiB         (default: 4096)

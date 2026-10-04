@@ -555,33 +555,33 @@ the same boot needs a reboot or a `revert`, because `sc stop` wedges in
 **The golden image** is Windows Server 2025 (build 26100), the oldest
 Windows the driver loads on: `BlorgFS.vcxproj` targets NTDDI 0x0A000010, so
 on Server 2022 it fails to start with "procedure not found". It is built
-unattended from Microsoft's 180-day evaluation ISO: `autounattend.xml` on a generated config ISO, then
-`Invoke-BlorgGuest.ps1 -Step Image` installs OpenSSH and the QEMU guest
-agent, turns test signing on and boot recovery off, sets Driver Verifier,
-keeps kernel dumps and turns Windows Update off. The build then boots the
-result once and checks it over SSH. Every download is pinned by SHA-256 in
-`tools/blorg.d/guest-image.sh` (versioned URLs, except OpenSSH's "latest",
-which the pin holds still), so the same recipe always builds from the same
-bytes; a moved download fails the build with its new hash. The answer
-file is checked to be well-formed first: Setup silently ignores a broken
-one and waits at its language screen. The install gives up after 45 min,
-or after 20 min on one unchanged screen (it is stuck), with a
-`blorg image-build` annotation holding the tail of the setup transcript. SeaBIOS, because Secure Boot blocks
-`bcdedit /set testsigning on`; AHCI disk and e1000e NIC, because Windows
-has inbox drivers for both.
+unattended from Microsoft's 180-day evaluation ISO: `autounattend.xml` on a
+generated config ISO, then `Invoke-BlorgGuest.ps1 -Step Image` installs
+OpenSSH and the QEMU guest agent, turns test signing on and boot recovery
+off, sets Driver Verifier, keeps kernel dumps and turns Windows Update off.
+The build then boots the result once and checks it over SSH. Every download
+is pinned by SHA-256 in `tools/blorg.d/guest-image.sh` (versioned URLs,
+except OpenSSH's "latest", which the pin holds still), so the same recipe
+always builds from the same bytes; a moved download fails the build with its
+new hash. The answer file is checked to be well-formed first: Setup silently
+ignores a broken one and waits at its language screen. The install gives up
+after 45 min, or after 20 min on one unchanged screen (it is stuck), with a
+`blorg image-build` annotation holding the tail of the setup transcript.
+SeaBIOS, because Secure Boot blocks `bcdedit /set testsigning on`; AHCI disk
+and e1000e NIC, because Windows has inbox drivers for both.
 
 ### The guest in CI
 
 `guest.yml` runs the same commands on a GitHub Linux runner. `build.yml`
 calls it alongside its build jobs, so every push and PR is tested in the
-guest: the guest boots while the driver builds, then waits for the
-`Package` job and tests that package (`blorg guest test --booted`). It caches the golden image keyed by
-`tools/blorg guest image-key` (a hash of the image's own inputs, so a
-change to the tests reuses it) and the calendar quarter (so the evaluation
-never expires under a cached image); a miss costs one unattended install in
-that run. Each run also exercises every guest channel once
-(`blorg guest selftest`). It uploads `guest-results` and, when it fails,
-the image build's screens.
+guest: the guest boots while the driver builds, then waits for the `Package`
+job and tests that package (`blorg guest test --booted`). It caches the
+golden image keyed by `tools/blorg guest image-key` (a hash of the image's
+own inputs, so a change to the tests reuses it) and the calendar quarter (so
+the evaluation never expires under a cached image); a miss costs one
+unattended install in that run. Each run also exercises every guest channel
+once (`blorg guest selftest`). It uploads `guest-results` and, when it
+fails, the image build's screens.
 
 Dispatch `guest.yml` to test an earlier build's package again
 (`package_run_id`, default the newest successful build on the branch),

@@ -1,22 +1,25 @@
 # shellcheck shell=bash
-# blorg guest image -- sourced by tools/blorg.
-#
+# blorg guest image | image-key
 # Builds the golden Windows image the BlorgFS test guest boots from.
+# Sourced by tools/blorg.
 #
 # Unattended end to end: Windows Setup runs from the install ISO with
-# autounattend.xml from a generated config ISO, Invoke-BlorgGuest.ps1 -Step Image does
-# the guest-side configuration and powers off, then this script boots the
-# result once to prove SSH and test signing work before publishing it.
+# autounattend.xml from a generated config ISO, Invoke-BlorgGuest.ps1
+# -Step Image does the guest-side configuration and powers off, then this
+# script boots the result once to prove SSH and test signing work before
+# publishing it.
 #
-#   blorg guest image [--iso PATH|URL] [--virtio-iso PATH|URL] [--image-index N]
+#   blorg guest image [--iso PATH|URL] [--virtio-iso PATH|URL]
+#                     [--image-index N]
 #
 # Defaults build Windows Server 2025 Standard (Server Core) from Microsoft's
 # public 180-day evaluation ISO: build 26100, the oldest Windows the driver
 # loads on (src/BlorgFS.vcxproj targets NTDDI 0x0A000010, 24H2; on 2022 it
 # fails to start with "procedure not found"). Server Core because a
 # filesystem driver test needs no desktop, and the image is a fraction of
-# the size to build, cache and boot. The evaluation clock starts when the image is built, so
-# CI keys its image cache by quarter and rebuilds well inside 180 days.
+# the size to build, cache and boot. The evaluation clock starts when the
+# image is built, so CI keys its image cache by quarter and rebuilds well
+# inside 180 days.
 #
 # Environment (all optional):
 #   WINDOWS_ISO_URL      install ISO (default: Server 2025 evaluation, en-US)
@@ -25,16 +28,18 @@
 #                        "none" to skip the agent
 #   OPENSSH_ZIP_URL      Win32-OpenSSH release zip
 #   *_SHA256             the pin for each of the three (below)
+#   BUILD_TIMEOUT_MIN    give up on Windows Setup after this (default 45)
+#   STALL_MIN            give up sooner if the guest's screen has not
+#                        changed for this long (default 20): it is stuck
+# plus the GUEST_* settings in guest.sh.
 #
 # Every input is pinned by SHA-256, so the same recipe always builds from
 # the same bytes and a moved download fails the build instead of silently
 # changing the guest. Overriding a URL means overriding its pin too; an
 # empty pin (VAR=) uses the input unchecked and prints its hash.
-#   BUILD_TIMEOUT_MIN    give up on Windows Setup after this (default 45)
-#   STALL_MIN            give up sooner if the guest's screen has not
-#                        changed for this long (default 20): it is stuck
-# plus the GUEST_* settings in guest.sh. Output: $GUEST_IMAGE_DIR/golden.qcow2
-# and the SSH key it trusts, $GUEST_IMAGE_DIR/id_ed25519.
+#
+# Output: $GUEST_IMAGE_DIR/golden.qcow2 and the SSH key it trusts,
+# $GUEST_IMAGE_DIR/id_ed25519.
 
 # blorg guest image-key: a hash of everything the image is built from (this
 # recipe, the answer file and Invoke-BlorgGuest.ps1's Image step), and
@@ -140,7 +145,8 @@ disk="$WORK/disk.qcow2"
 rm -f "$disk"
 qemu-img create -q -f qcow2 "$disk" 64G
 
-# Install pass. Same machine as a test run, plus the three CDs.
+# Install pass. Same machine as a test run, plus the install and config
+# CDs and, when there is one, the virtio-win CD.
 GUEST_RUN_DIR="$WORK/install"
 guest_paths
 mkdir -p "$GUEST_RUN_DIR/screens"
@@ -160,9 +166,9 @@ qemu-system-x86_64 "${args[@]}" -daemonize -pidfile "$GUEST_PIDFILE" >"$GUEST_QE
     || die "QEMU failed to start: $(cat "$GUEST_QEMU_LOG")"
 
 # Windows Setup reboots several times on its own; the run is over when
-# Invoke-BlorgGuest.ps1 -Step Image powers off and QEMU exits. A screenshot every two
-# minutes is the only window into a build that hangs (a setup dialog, a
-# missing driver), so keep them -- CI uploads the directory on failure.
+# Invoke-BlorgGuest.ps1 -Step Image powers off and QEMU exits. A screenshot
+# every two minutes shows where a build that hangs stopped (a setup dialog,
+# a missing driver), so keep them -- CI uploads the directory on failure.
 note "installing Windows (timeout ${BUILD_TIMEOUT_MIN} min, or ${STALL_MIN} min on one screen); screenshots in $GUEST_RUN_DIR/screens"
 # Why an install was abandoned, as a check annotation: readable through the
 # API from places where the log and the screenshots are not.

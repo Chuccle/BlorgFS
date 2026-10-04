@@ -31,7 +31,8 @@ RUN curl -fsSL -o /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_
     && chmod -R a+rwX /opt/rust
 
 # blorg's downloads and builds (WDK/SDK headers, flatc, flatcc) live here;
-# blorg container mounts a named volume over it so they survive between containers.
+# blorg container mounts a named volume over it so they survive between
+# containers.
 ENV BLORG_CACHE=/var/cache/blorg
 RUN mkdir -p /var/cache/blorg && chmod 1777 /var/cache/blorg
 

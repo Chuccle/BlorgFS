@@ -12,6 +12,9 @@
     Runs against the generated corpus (tools/blorg.d/corpus.py), so it needs
     no fixtures of its own. Exits with the number of failed checks.
     Windows PowerShell 5.1.
+
+.PARAMETER Drive
+    Mounted BlorgFS drive letter. Defaults to B.
 #>
 [CmdletBinding()]
 param(
@@ -49,12 +52,10 @@ Expect-Error 'opening a missing file fails with FileNotFound' ([System.IO.FileNo
     [System.IO.File]::OpenRead((Join-Path $root 'names\does-not-exist.bin')).Dispose()
 }
 
-# A missing parent directory -> DirectoryNotFoundException
 Expect-Error 'opening under a missing directory fails with DirectoryNotFound' ([System.IO.DirectoryNotFoundException]) {
     [System.IO.File]::OpenRead((Join-Path $root 'no-such-dir\file.bin')).Dispose()
 }
 
-# Listing a missing directory -> DirectoryNotFoundException
 Expect-Error 'listing a missing directory fails with DirectoryNotFound' ([System.IO.DirectoryNotFoundException]) {
     [System.IO.Directory]::GetFiles((Join-Path $root 'no-such-dir')) | Out-Null
 }
