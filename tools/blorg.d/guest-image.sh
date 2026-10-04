@@ -28,7 +28,9 @@
 # the same bytes and a moved download fails the build instead of silently
 # changing the guest. An input with an empty pin is used and its hash
 # printed ("input ... sha256=..."), ready to be pinned here.
-#   BUILD_TIMEOUT_MIN    give up on Windows Setup after this (default 120)
+#   BUILD_TIMEOUT_MIN    give up on Windows Setup after this (default 45)
+#   STALL_MIN            give up sooner if the guest's screen has not
+#                        changed for this long (default 20): it is stuck
 # plus the GUEST_* settings in guest.sh. Output: $GUEST_IMAGE_DIR/golden.qcow2
 # and the SSH key it trusts, $GUEST_IMAGE_DIR/id_ed25519.
 
@@ -48,10 +50,11 @@ WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://go.microsoft.com/fwlink/p/?LinkID=21
 WINDOWS_IMAGE_INDEX="${WINDOWS_IMAGE_INDEX:-1}"
 VIRTIO_ISO_URL="${VIRTIO_ISO_URL:-https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso}"
 OPENSSH_ZIP_URL="${OPENSSH_ZIP_URL:-https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip}"
-WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256:-}"
-VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256:-}"
-OPENSSH_ZIP_SHA256="${OPENSSH_ZIP_SHA256:-}"
-BUILD_TIMEOUT_MIN="${BUILD_TIMEOUT_MIN:-120}"
+WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256:-3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325}"
+VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256:-303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d}"
+OPENSSH_ZIP_SHA256="${OPENSSH_ZIP_SHA256:-23f50f3458c4c5d0b12217c6a5ddfde0137210a30fa870e98b29827f7b43aba5}"
+BUILD_TIMEOUT_MIN="${BUILD_TIMEOUT_MIN:-45}"
+STALL_MIN="${STALL_MIN:-20}"
 
 iso_src="$WINDOWS_ISO_URL"
 virtio_src="$VIRTIO_ISO_URL"
@@ -152,14 +155,32 @@ qemu-system-x86_64 "${args[@]}" -daemonize -pidfile "$GUEST_PIDFILE" >"$GUEST_QE
 # Invoke-BlorgGuest.ps1 -Step Image powers off and QEMU exits. A screenshot every two
 # minutes is the only window into a build that hangs (a setup dialog, a
 # missing driver), so keep them -- CI uploads the directory on failure.
-note "installing Windows (timeout ${BUILD_TIMEOUT_MIN} min); screenshots in $GUEST_RUN_DIR/screens"
+note "installing Windows (timeout ${BUILD_TIMEOUT_MIN} min, or ${STALL_MIN} min on one screen); screenshots in $GUEST_RUN_DIR/screens"
+# Why an install was abandoned, as a check annotation: readable through the
+# API from places where the log and the screenshots are not.
+install_failed() {
+    local why="$1" tail_serial agent_log
+    guest_qmp screendump "{\"filename\": \"$GUEST_RUN_DIR/screens/failed.png\", \"format\": \"png\"}" >/dev/null 2>&1 || true
+    tail_serial="$(tail -c 600 "$GUEST_SERIAL" 2>/dev/null | tr -cd '[:print:]\n')"
+    agent_log="$(timeout 60 python3 "$BLORG_D/qmp.py" qga "$GUEST_QGA" exec 45 \
+        "Get-Content C:\\blorgfs-image.log -Tail 15 -ErrorAction SilentlyContinue" 2>/dev/null | tail -c 1500)"
+    guest_qmp quit >/dev/null 2>&1 || true
+    local body="$why
+setup transcript (C:\\blorgfs-image.log, via the guest agent): ${agent_log:-unreachable (not installed yet, or Windows is not up)}
+serial: ${tail_serial:-empty}"
+    [[ -n "${GITHUB_ACTIONS:-}" ]] &&
+        echo "::error title=blorg image-build::$(printf '%s' "$body" | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}')"
+    die "$why; screens in $GUEST_RUN_DIR/screens"
+}
 start=$SECONDS
+last_change=$SECONDS
 shot=0
 while guest_running; do
     if (( SECONDS - start > BUILD_TIMEOUT_MIN * 60 )); then
-        guest_qmp screendump "{\"filename\": \"$GUEST_RUN_DIR/screens/timeout.png\", \"format\": \"png\"}" >/dev/null 2>&1 || true
-        guest_qmp quit >/dev/null 2>&1 || true
-        die "Windows Setup did not finish within ${BUILD_TIMEOUT_MIN} min; see $GUEST_RUN_DIR/screens/timeout.png"
+        install_failed "Windows Setup did not finish within ${BUILD_TIMEOUT_MIN} min"
+    fi
+    if (( SECONDS - last_change > STALL_MIN * 60 )); then
+        install_failed "the guest's screen has not changed for ${STALL_MIN} min ($(( (SECONDS - start) / 60 )) min into the install): stuck"
     fi
     if (( (SECONDS - start) / 120 >= shot )); then
         png="$GUEST_RUN_DIR/screens/$(printf %03d "$shot").png"
@@ -177,7 +198,7 @@ while guest_running; do
         fi
         # A heartbeat every two minutes, so a slow install and a stuck one
         # read differently in the log.
-        note "installing: $(( (SECONDS - start) / 60 )) min, screen unchanged for $(( (SECONDS - ${last_change:-$start}) / 60 )) min"
+        note "installing: $(( (SECONDS - start) / 60 )) min, screen unchanged for $(( (SECONDS - last_change) / 60 )) min"
         shot=$(( shot + 1 ))
     fi
     sleep 10

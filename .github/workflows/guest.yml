@@ -85,12 +85,13 @@ jobs:
         key: blorgfs-guest-image-${{ env.IMAGE_KEY }}
 
     # First run of a quarter, or after the recipe changed: a full unattended
-    # Windows install, ~20-30 min under KVM. Much longer means it is stuck
-    # on a screen, which the log shows (SCREEN lines).
+    # Windows install, ~20-30 min under KVM. The install gives up after 45
+    # min, or 20 min on one unchanged screen, with a `blorg image-build`
+    # annotation saying where it stopped; the step limit covers downloads,
+    # verification and compression too.
     - name: Build the golden image
       if: steps.image.outputs.cache-hit != 'true'
-      env:
-        BUILD_TIMEOUT_MIN: '50'
+      timeout-minutes: 75
       run: tools/blorg guest image
 
     - name: Save the golden image
@@ -104,6 +105,7 @@ jobs:
     # nothing on the critical path. Called from build.yml, the package is
     # this run's: wait for its Package job, then take the artifact.
     - name: Boot the guest
+      timeout-minutes: 20
       run: tools/blorg guest up --fresh
 
     - name: Wait for this run's package
@@ -147,6 +149,7 @@ jobs:
         gh run download "$RUN_ID" -R "$REPO" -n "$PACKAGE_ARTIFACT" -D package
 
     - name: Run the tests in the guest
+      timeout-minutes: 45
       env:
         VERIFIER: ${{ inputs.verifier }}
       run: |
@@ -179,7 +182,7 @@ jobs:
         if-no-files-found: warn
 
     - name: Upload the image build's screens
-      if: failure()
+      if: failure() || cancelled()
       uses: actions/upload-artifact@v7
       with:
         name: guest-image-build

@@ -554,9 +554,12 @@ evaluation ISO: `autounattend.xml` on a generated config ISO, then
 `Invoke-BlorgGuest.ps1 -Step Image` installs OpenSSH and the QEMU guest
 agent, turns test signing on and boot recovery off, sets Driver Verifier,
 keeps kernel dumps and turns Windows Update off. The build then boots the
-result once and checks it over SSH. Each download is checked against a
-SHA-256 pin in `tools/blorg.d/guest-image.sh` when one is set; an unpinned
-input prints its hash ready to pin. SeaBIOS, because Secure Boot blocks
+result once and checks it over SSH. Every download is pinned by SHA-256 in
+`tools/blorg.d/guest-image.sh`, so the same recipe always builds from the
+same bytes; when an upstream URL moves to a new file, the build fails with
+the new hash, ready to review and pin. The install gives up after 45 min,
+or after 20 min on one unchanged screen (it is stuck), with a
+`blorg image-build` annotation holding the tail of the setup transcript. SeaBIOS, because Secure Boot blocks
 `bcdedit /set testsigning on`; AHCI disk and e1000e NIC, because Windows
 has inbox drivers for both.
 
