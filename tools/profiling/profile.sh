@@ -72,11 +72,11 @@ run_profile() {
 
 run_profile loopback none
 run_profile lan  shaped 1ms 1gbit
-run_profile wan  shaped 15ms 200mbit
+[[ -n "${WITH_WAN:-}" ]] && run_profile wan shaped 15ms 200mbit
 
 echo
 echo "===== PROFILE RESULTS ====="
-for name in loopback lan wan; do
+for name in loopback lan ${WITH_WAN:+wan}; do
     echo "### $name"
     cat "$out/$name-host.txt" 2>/dev/null
     t="$(find "$out/raw-$name" -name timings.txt 2>/dev/null | head -1)"

@@ -49,7 +49,9 @@ public static class Prof {
   // connection: what the link and server cost with no filesystem in the way.
   class Raw {
     TcpClient c; NetworkStream s; byte[] hdr = new byte[8192]; byte[] body = new byte[4 << 20]; string host, path;
-    public Raw(string h, int port, string p) { c = new TcpClient(); c.NoDelay = true; c.Connect(h, port); s = c.GetStream(); host = h; path = p; }
+    public Raw(string h, int port, string p) {
+      for (int a = 0; ; a++) { try { c = new TcpClient(); c.NoDelay = true; c.Connect(h, port); break; } catch (SocketException) { if (a >= 5) { throw; } Thread.Sleep(2000); } }
+      s = c.GetStream(); host = h; path = p; }
     public void Get(long off, int len) {
       var req = Encoding.ASCII.GetBytes(String.Format("GET /get_file?path={0} HTTP/1.1\r\nHost: {1}\r\nConnection: keep-alive\r\nRange: bytes={2}-{3}\r\n\r\n", path, host, off, off + len - 1));
       s.Write(req, 0, req.Length);
@@ -163,7 +165,7 @@ public static class Prof {
 }
 '@
 $log = Join-Path $Out 'timings.txt'
-"profile $Link; guest RAM {0:N1} GB, {1} CPUs" -f ((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB), [Environment]::ProcessorCount | Set-Content $log
+"profile $Link; guest RAM {0:N1} GB, {1} CPUs" -f ((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB), [Environment]::ProcessorCount | Set-Content -Encoding ascii $log
 $deadline = (Get-Date).AddMinutes(3)
 while (-not (Test-Path "B:\prof\$Link\big.bin")) { if ((Get-Date) -gt $deadline) { throw "B:\prof\$Link\big.bin never appeared" }; Start-Sleep 2 }
 $enc = "%5Cprof%5C$Link%5Craw.bin"
@@ -173,20 +175,16 @@ function Step([string]$Name, [scriptblock]$Body) {
   [Prof]::Lat.Clear(); [Prof]::Late = 0
   [Prof]::Reset(); [Prof]::CpuStart()
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  $bytes = & $Body
+  try { $bytes = & $Body } catch { "{0}: FAILED {1}" -f $Name, $_.Exception.Message | Add-Content -Encoding ascii $log; return }
   $sw.Stop()
   $cpu = [Prof]::CpuEnd()
   $tag = '{0:D2}-{1}' -f $script:step, $Name
   [Prof]::Query((Join-Path $Out "$tag.bin"), $ResponseSize, $Version)
   $mib = ($bytes | Measure-Object -Sum).Sum / 1MB
-  "{0,-26} {1,8:N1} MiB {2,7:N2} s {3,8:N1} MiB/s | {4} | {5}" -f $tag, $mib, $sw.Elapsed.TotalSeconds, ($mib / [Math]::Max($sw.Elapsed.TotalSeconds, 0.001)), [Prof]::Summary(), $cpu | Tee-Object -FilePath $log -Append
+  "{0,-26} {1,8:N1} MiB {2,7:N2} s {3,8:N1} MiB/s | {4} | {5}" -f $tag, $mib, $sw.Elapsed.TotalSeconds, ($mib / [Math]::Max($sw.Elapsed.TotalSeconds, 0.001)), [Prof]::Summary(), $cpu | Add-Content -Encoding ascii -PassThru $log
 }
 $d = "B:\prof\$Link"
 $small = 0..299 | ForEach-Object { "$d\small\f$_.bin" }
-Step 'raw-random-64k'     { [Prof]::RawRandom($BackendHost, $Port, $enc, 256MB, 300, 65536, 1) }
-Step 'raw-serial-128k'    { [Prof]::RawSerial($BackendHost, $Port, $enc, 0, 256MB, 131072) }
-Step 'raw-serial-1m'      { [Prof]::RawSerial($BackendHost, $Port, $enc, 0, 256MB, 1048576) }
-Step 'raw-4conn-1m'       { [Prof]::RawParallel($BackendHost, $Port, $enc, 4, 64MB, 1048576) }
 Step 'fs-unbuf-64k'       { [Prof]::SeqUnbuffered("$d\unb.bin", 65536, 64MB) }
 Step 'fs-unbuf-128k'      { [Prof]::SeqUnbuffered("$d\unb.bin", 131072, 256MB) }
 Step 'fs-seq-buffered'    { [Prof]::SeqBuffered("$d\big.bin", 1MB) }
@@ -201,3 +199,7 @@ Step 'fs-open-small-cold' { [Prof]::SmallFiles($small) }
 Step 'fs-open-small-warm' { [Prof]::SmallFiles($small) }
 Start-Sleep -Seconds 5
 Step 'fs-stat-after-5s'   { [Prof]::Stat($small) }
+Step 'raw-random-64k'     { [Prof]::RawRandom($BackendHost, $Port, $enc, 256MB, 300, 65536, 1) }
+Step 'raw-serial-128k'    { [Prof]::RawSerial($BackendHost, $Port, $enc, 0, 256MB, 131072) }
+Step 'raw-serial-1m'      { [Prof]::RawSerial($BackendHost, $Port, $enc, 0, 256MB, 1048576) }
+Step 'raw-4conn-1m'       { [Prof]::RawParallel($BackendHost, $Port, $enc, 4, 64MB, 1048576) }
