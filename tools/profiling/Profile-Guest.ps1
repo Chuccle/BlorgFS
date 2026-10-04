@@ -143,6 +143,28 @@ public static class Prof {
     for (int i = 0; i < times; i++) { var t = Stopwatch.GetTimestamp(); n += Directory.GetFileSystemEntries(dir).Length; Add(Ms(Stopwatch.GetTimestamp() - t)); }
     return 0;
   }
+  // Opens after a listing of the same directory: only the opens are timed.
+  public static long ListThenOpen(string dir, string[] paths) {
+    Directory.GetFileSystemEntries(dir);
+    return SmallFiles(paths);
+  }
+  // One paced player while greedy copies saturate the link; only the
+  // player's reads are timed.
+  static volatile bool stopGreedy;
+  static void Greedy(string path) {
+    var b = new byte[1 << 20];
+    using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan)) {
+      while (!stopGreedy && f.Read(b, 0, b.Length) > 0) { }
+    }
+  }
+  public static long Mixed(string paced, string[] greedy, int seconds) {
+    stopGreedy = false; var ts = new List<Thread>();
+    foreach (var g in greedy) { var gg = g; var t = new Thread(() => Greedy(gg)); t.Start(); ts.Add(t); }
+    Thread.Sleep(2000);
+    long n = Paced(paced, 262144, 40, seconds);
+    stopGreedy = true; foreach (var t in ts) { t.Join(); }
+    return n;
+  }
   public static long Concurrent(string[] paths, int buf) {
     var ts = new List<Thread>(); long total = 0;
     foreach (var p in paths) { var pp = p; var t = new Thread(() => { long d = SeqBuffered(pp, buf); Interlocked.Add(ref total, d); }); t.Start(); ts.Add(t); }
@@ -193,6 +215,8 @@ Step 'fs-random-4k'       { [Prof]::RandomBuffered("$d\rand.bin", 400, 4096, 3) 
 Step 'fs-random-256k'     { [Prof]::RandomBuffered("$d\rand.bin", 200, 262144, 5) }
 Step 'fs-paced-6mbs'      { [Prof]::Paced("$d\paced.bin", 262144, 40, 20) }
 Step 'fs-4-streams'       { [Prof]::Concurrent(@("$d\c0.bin", "$d\c1.bin", "$d\c2.bin", "$d\c3.bin"), 1MB) }
+Step 'fs-mixed-paced'     { [Prof]::Mixed("$d\paced2.bin", @("$d\m1.bin", "$d\m2.bin", "$d\m3.bin"), 20) }
+Step 'fs-open-after-list' { [Prof]::ListThenOpen("$d\small2", (0..99 | ForEach-Object { "$d\small2\f$_.bin" })) }
 Step 'fs-list-300-cold'   { [Prof]::ListDir("$d\small", 1) }
 Step 'fs-list-300-x20'    { [Prof]::ListDir("$d\small", 20) }
 Step 'fs-open-small-cold' { [Prof]::SmallFiles($small) }

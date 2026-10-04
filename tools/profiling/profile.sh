@@ -21,11 +21,12 @@ blorg guest ps "$here/Hygiene.ps1"
 
 mkcorpus() {
     local d="$root/prof/$1"
-    mkdir -p "$d/small"
-    truncate -s 512M "$d/big.bin"
+    mkdir -p "$d/small" "$d/small2"
+    truncate -s 512M "$d/big.bin" "$d/m1.bin" "$d/m2.bin" "$d/m3.bin" "$d/paced2.bin"
     truncate -s 256M "$d/unb.bin" "$d/raw.bin" "$d/paced.bin" "$d/c0.bin" "$d/c1.bin" "$d/c2.bin" "$d/c3.bin"
     truncate -s 1G "$d/rand.bin"
     for i in $(seq 0 299); do head -c 16384 /dev/urandom > "$d/small/f$i.bin"; done
+    for i in $(seq 0 99); do head -c 16384 /dev/urandom > "$d/small2/f$i.bin"; done
 }
 
 shape() {
