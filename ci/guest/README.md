@@ -60,7 +60,11 @@ matches the corpus path for path and size for size;
 `tests/guest-suites/*.ps1` pass; the service is still RUNNING. A bugcheck
 or unexplained reboot anywhere fails the run even if every step before it
 passed, and the minidumps come back in `results/diag/dumps` for
-`tools\Get-CrashVerdict.ps1` on a Windows machine.
+`Show-CrashAnalysis.ps1` (which runs `tools\Get-CrashVerdict.ps1`) on a
+Windows machine with the debugging tools. CI does that itself: when a run
+brings dumps back, a `windows-latest` job analyses them with the driver's
+PDB from the same build and reports the bugcheck, faulting line and stack
+in its log and as a `blorg guest-crash` check annotation.
 
 `results/results.json` is rewritten after every step, so a run that died
 mid-way still says how far it got. `verdict.txt` is the one-screen answer;

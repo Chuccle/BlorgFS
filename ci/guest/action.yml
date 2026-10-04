@@ -16,6 +16,9 @@ outputs:
   found:
     description: "'true' when a package was found and unpacked into ./package"
     value: ${{ steps.pkg.outputs.found }}
+  run-id:
+    description: The Build BlorgFS run the package came from
+    value: ${{ steps.pkg.outputs.run_id }}
 
 runs:
   using: composite
@@ -53,6 +56,7 @@ runs:
       gh run download "$run_id" -R "$REPO" -n "$PACKAGE_ARTIFACT" -D package
       cat package/manifest.json
       echo "found=true" >> "$GITHUB_OUTPUT"
+      echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
 
   - name: Prepare the KVM host
     shell: bash

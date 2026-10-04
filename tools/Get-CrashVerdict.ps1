@@ -31,6 +31,11 @@
     Also consult the Microsoft public symbol server. Slower, but resolves
     OS frames the local cache has never seen.
 
+.PARAMETER SymbolDir
+    A directory holding the driver's own .pdb (the build artifact next to
+    BlorgFS.sys), searched before anything else. Without it the driver's
+    frames are module+offset only.
+
 .PARAMETER DriverName
     Module name to look for on the faulting stack, without extension.
     A bugcheck whose stack names this is ours; one that does not may still
@@ -47,6 +52,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$DumpPath,
     [switch]$SymbolServer,
+    [string]$SymbolDir,
     [string]$DriverName = 'BlorgFS',
     [string]$ReportPath
 )
@@ -111,6 +117,7 @@ $env:_NT_SYMBOL_PATH = if ($SymbolServer) {
 } else {
     "cache*$symbolCache"
 }
+if ($SymbolDir) { $env:_NT_SYMBOL_PATH = "$SymbolDir;$env:_NT_SYMBOL_PATH" }
 
 #
 # !analyze -v is the workhorse; .lastevent and k give the fault and the

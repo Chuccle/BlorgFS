@@ -53,6 +53,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     name: Windows guest (KVM)
+    outputs:
+      package-run: ${{ steps.host.outputs.run-id }}
+      dumps: ${{ steps.dumps.outputs.found }}
     env:
       GUEST_HOME: /mnt/blorgfs-guest
       PACKAGE_ARTIFACT: blorg-package-windows-x64
@@ -111,6 +114,14 @@ jobs:
       if: always() && github.event_name == 'pull_request' && steps.host.outputs.found == 'true'
       run: ci/guest/host/guestctl down || true
 
+    - name: Look for crash dumps
+      id: dumps
+      if: always() && steps.host.outputs.found == 'true'
+      run: |
+        if compgen -G 'guest-results/results/diag/dumps/*.dmp' >/dev/null; then
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Upload results
       if: always() && steps.host.outputs.found == 'true'
       uses: actions/upload-artifact@v7
@@ -128,3 +139,34 @@ jobs:
           ${{ env.GUEST_HOME }}/image/build/install/screens/
           ${{ env.GUEST_HOME }}/image/build/install/qemu.log
         if-no-files-found: ignore
+
+  # A bugcheck's dumps are analysed on Windows, where the debugger is: the
+  # verdict, faulting module and stack go to the log and to a
+  # "blorg guest-crash" annotation. The driver's PDB comes from the same
+  # Build BlorgFS run as the package.
+  crash:
+    needs: guest
+    if: always() && needs.guest.outputs.dumps == 'true'
+    runs-on: windows-latest
+    name: Analyse the guest's crash dumps
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request') && github.event.repository.default_branch || github.event.workflow_run.head_sha || github.sha }}
+        persist-credentials: false
+
+    - name: Download the guest results
+      uses: actions/download-artifact@v5
+      with:
+        name: guest-results
+        path: guest-results
+
+    - name: Download the driver's symbols
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh run download "${{ needs.guest.outputs.package-run }}" -R "${{ github.repository }}" -n BlorgFS-Release-x64 -D symbols
+
+    - name: Analyse
+      shell: pwsh
+      run: ci/guest/Show-CrashAnalysis.ps1 -ResultsDir guest-results -SymbolDir symbols
