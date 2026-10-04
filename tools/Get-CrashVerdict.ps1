@@ -176,6 +176,8 @@ function Find-First {
 }
 
 $bugcheck = Find-First 'BugCheck\s+([0-9A-Fa-f]+)'
+# A minidump's !analyze names it BUGCHECK_CODE; only a full dump's banner says "BugCheck".
+if (-not $bugcheck) { $bugcheck = Find-First '^BUGCHECK_CODE:\s*([0-9A-Fa-f]+)' }
 $analysisName = Find-First 'MODULE_NAME:\s*(\S+)'
 $faultModule = Find-First 'FAULTING_MODULE:\s*\S+\s+(\S+)'
 $failureBucket = Find-First 'FAILURE_BUCKET_ID:\s*(\S+)'
