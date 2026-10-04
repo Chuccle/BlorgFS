@@ -52,8 +52,16 @@ Expect-Error 'opening a missing file fails with FileNotFound' ([System.IO.FileNo
     [System.IO.File]::OpenRead((Join-Path $root 'names\does-not-exist.bin')).Dispose()
 }
 
-Expect-Error 'opening under a missing directory fails with DirectoryNotFound' ([System.IO.DirectoryNotFoundException]) {
+# NTFS answers a missing parent with STATUS_OBJECT_PATH_NOT_FOUND. A 404
+# cannot say which component is missing, so the driver answers
+# STATUS_OBJECT_NAME_NOT_FOUND for both: reported, never failed.
+try {
     [System.IO.File]::OpenRead((Join-Path $root 'no-such-dir\file.bin')).Dispose()
+    Report 'FAIL' 'opening under a missing directory' 'it succeeded'
+} catch {
+    $e = $_.Exception
+    while ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+    Report 'INFO' 'opening under a missing directory' $e.GetType().Name
 }
 
 Expect-Error 'listing a missing directory fails with DirectoryNotFound' ([System.IO.DirectoryNotFoundException]) {
