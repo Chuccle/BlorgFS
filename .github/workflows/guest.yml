@@ -154,6 +154,7 @@ jobs:
         echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
     - name: Run the tests in the guest
+      id: test
       timeout-minutes: 45
       env:
         VERIFIER: ${{ inputs.verifier }}
@@ -165,7 +166,10 @@ jobs:
 
     # Every way of acting in the guest, once, so a broken channel is found
     # by CI rather than by whoever next needs it.
+    # Even when the tests fail: whether every way into the guest works is a
+    # separate question from whether the driver does.
     - name: Self-test the guest channels
+      if: ${{ !cancelled() && steps.test.outcome != 'skipped' }}
       run: tools/blorg guest selftest --out guest-results
 
     - name: Run the dispatched script
