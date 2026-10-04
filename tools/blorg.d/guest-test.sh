@@ -38,7 +38,7 @@
 guest_test() (
     set +e -uo pipefail
 package="" out="$PWD/guest-results" suites="" verifier=1 kernel_dump=0 keep=0 booted=0
-server_bin="" server_pid=""
+server_bin="" server_pid="" gone=0
 SERVER_PORT="${SERVER_PORT:-18080}"
 while (( $# )); do
     case "$1" in
@@ -175,7 +175,8 @@ if (( test_rc == 255 )); then
         echo "blorg guest test: not back after ${LOST_WAIT_S:-300}s; resetting it"
         "$BLORG" guest screenshot "$out/screen-before-reset.png" >/dev/null 2>&1 || true
         "$BLORG" guest qmp system_reset >/dev/null 2>&1 || true
-        "$BLORG" guest wait 600 || rig_fail "guest did not come back after a reset (see $out/screen-before-reset.png)"
+        # Still a verdict, not a rig failure: the driver took the guest down.
+        "$BLORG" guest wait 600 || { echo "blorg guest test: the guest did not come back even after a reset"; gone=1; }
     fi
     endstep
 fi
@@ -186,14 +187,18 @@ diag_args=()
 (( kernel_dump )) && diag_args+=(-IncludeKernelDump)
 "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Diagnostics ${diag_args[*]:-}" || true
 rm -rf "$out/results"
-"$BLORG" guest pull C:/blorgfs-ci/results "$out/" || rig_fail "could not copy results out of the guest"
+if (( gone )); then
+    echo "blorg guest test: no results to collect from a guest that never came back"
+else
+    "$BLORG" guest pull C:/blorgfs-ci/results "$out/" || rig_fail "could not copy results out of the guest"
+fi
 endstep
 
 # The verdict: the runner's own, overridden by a bugcheck or an unexplained
 # reboot -- a crash after the last step still counts.
-python3 - "$out" "$test_rc" "$boot_before" "$boot_after" <<'PY'
+python3 - "$out" "$test_rc" "$boot_before" "$boot_after" "$gone" <<'PY'
 import json, os, sys
-out, rc, before, after = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+out, rc, before, after, gone = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1"
 def load(p):
     try:
         with open(os.path.join(out, p), encoding="utf-8-sig") as f:
@@ -211,6 +216,8 @@ if before and after and before != after:
     reasons.append("guest rebooted during the run")
 if rc == 255:
     reasons.append("lost contact with the guest mid-run")
+if gone:
+    reasons.append("the guest never came back, even after a reset (screen-at-loss.png shows why)")
 verdict = "fail" if reasons else "pass"
 lines = [f"verdict={verdict}", f"package={res.get('package')}"]
 lines += [f"reason={r}" for r in reasons]
