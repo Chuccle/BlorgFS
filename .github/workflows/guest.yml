@@ -1,0 +1,263 @@
+name: Guest
+
+# Loads the packaged driver into a real Windows kernel and tests it against
+# the packaged Linux server. The Windows guest runs under KVM/QEMU on a
+# Linux runner, driven by tools/blorg -- the same commands run on any Linux
+# host with KVM, so a red run here reproduces with
+#   tools/blorg guest test --package <unpacked artifact>
+# See "Package and test guest" in AGENTS.md.
+#
+# build.yml calls this alongside its build jobs: the guest boots while the
+# driver builds, then tests the package that run produces, so every push
+# and PR is tested in the guest. Dispatch it directly to test an
+# existing build's package again, optionally running a `script` against
+# the guest afterwards; the script never changes the verdict above it.
+
+on:
+  workflow_call:
+    inputs:
+      package_run_id:
+        description: Build BlorgFS run to take the package from; the calling run's own id waits for its Package job
+        type: string
+        required: true
+      verifier:
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      package_run_id:
+        description: 'Build BlorgFS run to take the package from (default: the newest on this branch whose Package job succeeded)'
+        required: false
+        default: ''
+      verifier:
+        description: 'Driver Verifier on BlorgFS.sys'
+        type: boolean
+        default: true
+      script:
+        description: 'Optional bash to run against the live guest afterwards (blorg on PATH, $SESSION_OUT for files to keep)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  guest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    name: Windows guest (KVM)
+    outputs:
+      package_run: ${{ steps.earlier.outputs.run_id || github.run_id }}
+      dumps: ${{ steps.dumps.outputs.found }}
+    env:
+      GUEST_HOME: /mnt/blorgfs-guest
+      PACKAGE_ARTIFACT: blorg-package-windows-x64
+      SCRIPT: ${{ inputs.script || '' }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Prepare the KVM host
+      run: |
+        tools/blorg guest host-setup
+        sudo mkdir -p "$GUEST_HOME"
+        sudo chown "$(id -u):$(id -g)" "$GUEST_HOME"
+        # Leave the runner ~2.5 GB; the guest gets the rest, 2-6 GB.
+        mem=$(( $(free -m | awk '/^Mem:/ {print $2}') - 2560 ))
+        (( mem > 6144 )) && mem=6144
+        (( mem < 2048 )) && mem=2048
+        # The evaluation image expires 180 days after it is built; keying
+        # the cache by quarter rebuilds it long before that.
+        {
+          echo "GUEST_MEM_MB=$mem"
+          echo "GUEST_CPUS=$(nproc)"
+          echo "IMAGE_KEY=$(tools/blorg guest image-key)-$(date -u +%Y)-q$(( ($(date -u +%-m) - 1) / 3 + 1 ))"
+        } >> "$GITHUB_ENV"
+
+    # The key is the image's inputs (blorg guest image-key) and the quarter:
+    # the same key always means the same image, and test-only changes reuse it.
+    - name: Restore the golden image
+      id: image
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ env.GUEST_HOME }}/image
+        key: blorgfs-guest-image-${{ env.IMAGE_KEY }}
+
+    # First run of a quarter, or after the recipe changed: a full unattended
+    # Windows install, ~20-30 min under KVM. The install gives up after 45
+    # min, or 20 min on one unchanged screen, with a `blorg image-build`
+    # annotation saying where it stopped; the step limit covers downloads,
+    # verification and compression too.
+    - name: Build the golden image
+      if: steps.image.outputs.cache-hit != 'true'
+      timeout-minutes: 75
+      run: tools/blorg guest image
+
+    - name: Save the golden image
+      if: steps.image.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ env.GUEST_HOME }}/image
+        key: ${{ steps.image.outputs.cache-primary-key }}
+
+    # The guest boots while build.yml is still building, so the boot costs
+    # nothing on the critical path.
+    - name: Boot the guest
+      timeout-minutes: 20
+      run: tools/blorg guest up --fresh
+
+    # Given this run's own id (build.yml calling), the package is this
+    # run's: wait for its Package job, then take the artifact.
+    - name: Wait for this run's package
+      if: inputs.package_run_id == github.run_id
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        for _ in $(seq 1 360); do
+          state="$(gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+                   --jq '[.jobs[] | select(.name == "Package")][0] | "\(.status) \(.conclusion // "")"' || true)"
+          case "$state" in
+            "completed success") exit 0 ;;
+            completed*) echo "::error::the Package job finished '${state#completed }'; nothing to test"; exit 1 ;;
+          esac
+          sleep 10
+        done
+        echo "::error::no package after an hour"; exit 1
+
+    - name: Download this run's package
+      if: inputs.package_run_id == github.run_id
+      uses: actions/download-artifact@v5
+      with:
+        name: ${{ env.PACKAGE_ARTIFACT }}
+        path: package
+
+    - name: Download an earlier build's package
+      id: earlier
+      if: inputs.package_run_id != github.run_id
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        RUN_ID: ${{ inputs.package_run_id }}
+      run: |
+        set -euo pipefail
+        # The newest run whose Package job succeeded, whatever its guest
+        # tests said: re-testing a package that failed them is the point.
+        if [[ -z "$RUN_ID" ]]; then
+          for id in $(gh run list -R "$REPO" -w build.yml --branch "$GITHUB_REF_NAME" -L 20 --json databaseId --jq '.[].databaseId'); do
+            package="$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+                       --jq '[.jobs[] | select(.name == "Package")][0].conclusion // ""')"
+            [[ "$package" == success ]] && { RUN_ID="$id"; break; }
+          done
+          [[ -n "$RUN_ID" ]] || { echo "::error::no Build BlorgFS run among the last 20 on $GITHUB_REF_NAME has a successful Package job"; exit 1; }
+        fi
+        echo "Testing the package from https://github.com/$REPO/actions/runs/$RUN_ID"
+        gh run download "$RUN_ID" -R "$REPO" -n "$PACKAGE_ARTIFACT" -D package
+        echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+    - name: Run the tests in the guest
+      id: test
+      timeout-minutes: 45
+      env:
+        VERIFIER: ${{ inputs.verifier }}
+      run: |
+        # --keep: the self-test and any script below act on this guest.
+        args=(--package package --out guest-results --booted --keep)
+        [[ "$VERIFIER" == "false" ]] && args+=(--no-verifier)
+        tools/blorg guest test "${args[@]}"
+
+    # Every way of acting in the guest, once, so a broken channel is found
+    # by CI rather than by whoever next needs it. Runs even when the tests
+    # fail: whether every way into the guest works is a separate question
+    # from whether the driver does.
+    - name: Self-test the guest channels
+      if: ${{ !cancelled() && steps.test.outcome != 'skipped' }}
+      run: tools/blorg guest selftest --out guest-results
+
+    - name: Run the dispatched script
+      if: always() && env.SCRIPT != ''
+      run: |
+        printf '%s\n' "$SCRIPT" > "$RUNNER_TEMP/script.sh"
+        tools/blorg guest run --out guest-results "$RUNNER_TEMP/script.sh"
+
+    - name: Power off the guest
+      if: always()
+      run: tools/blorg guest down || true
+
+    - name: Look for crash dumps
+      id: dumps
+      if: always()
+      run: |
+        if compgen -G 'guest-results/results/diag/dumps/*.dmp' >/dev/null; then
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: guest-results
+        path: guest-results/
+        if-no-files-found: warn
+
+    - name: Upload the image build's screens
+      if: failure() || cancelled()
+      uses: actions/upload-artifact@v7
+      with:
+        name: guest-image-build
+        path: |
+          ${{ env.GUEST_HOME }}/image/build/install/screens/
+          ${{ env.GUEST_HOME }}/image/build/install/qemu.log
+        if-no-files-found: ignore
+
+  # A bugcheck's dumps are analysed on Windows, where the debugger is, with
+  # the driver's PDB from the build that made the package. The bugcheck,
+  # faulting line and stack go to the log and to a "blorg guest-crash"
+  # annotation. The guest job has already failed the run; this fails only
+  # if the analysis itself does not work.
+  crash:
+    needs: guest
+    if: always() && needs.guest.outputs.dumps == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    name: Analyse the guest's crash dumps
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Download the guest results
+      uses: actions/download-artifact@v5
+      with:
+        name: guest-results
+        path: guest-results
+
+    - name: Download the driver's symbols (this run)
+      if: needs.guest.outputs.package_run == github.run_id
+      uses: actions/download-artifact@v5
+      with:
+        name: BlorgFS-Release-x64
+        path: symbols
+
+    - name: Download the driver's symbols (earlier build)
+      if: needs.guest.outputs.package_run != github.run_id
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh run download "${{ needs.guest.outputs.package_run }}" -R "${{ github.repository }}" -n BlorgFS-Release-x64 -D symbols
+
+    - name: Analyse
+      shell: pwsh
+      run: |
+        $triageFailed = $false
+        foreach ($dump in Get-ChildItem guest-results/results/diag/dumps -Filter '*.dmp') {
+          & tools/Get-CrashVerdict.ps1 -DumpPath $dump.FullName -SymbolServer -SymbolDir symbols
+          if ($LASTEXITCODE -eq 3) { $triageFailed = $true }
+        }
+        if ($triageFailed) { exit 3 }
+        exit 0
