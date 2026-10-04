@@ -1664,10 +1664,10 @@ static VOID HttpIssueReceiveDispatch(HTTP_CONTEXT* Ctx)
 // until the receive watchdog kills it. A short or failed WAITALL
 // completion (peer close, cancellation) flows through HttpOnReceive ->
 // HttpReadResponse, which re-issues or fails via the same length checks.
-// After issuing the receive, STATUS_PENDING means HttpOnReceive runs later
-// on a fresh dispatch; any other status means HttpOnReceive already ran
-// synchronously inside the call (IoSetCompletionRoutine with
-// InvokeOnSuccess/InvokeOnError both TRUE), so Ctx may already be freed.
+// The receive returns STATUS_PENDING once issued, even when HttpOnReceive
+// has already run inside the call, so Ctx is not touched after a pending
+// issue. Any other status is a failure before issue: HttpOnReceive never
+// runs, and the request is completed here.
 //
 static VOID HttpIssueReceive(HTTP_CONTEXT* Ctx)
 {
