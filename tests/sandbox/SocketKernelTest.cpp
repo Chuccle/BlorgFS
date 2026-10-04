@@ -937,10 +937,12 @@ TEST_F(SocketStressTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
 
         //
         // Teardown waits for a step whose work item has not run, so drain
-        // both until neither has anything left.
+        // both until neither has anything left, yielding between rounds
+        // like the settle loop above.
         //
         while (WskModelReleaseDeferred() + ShimDrainWorkItems() > 0)
         {
+            SwitchToThread();
         }
 
         if (remaining == 0)
