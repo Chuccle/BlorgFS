@@ -826,7 +826,7 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
 
     size_t headerSize = sizeof(DIRECTORY_INFO);
 
-    BlorgMetaFlat_FileEntryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(directory);
+    BlorgMetaFlat_SubdirectoryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(directory);
     SIZE_T subdirCount = (flatSubdirEntries) ? BlorgMetaFlat_SubdirectoryMetadata_vec_len(flatSubdirEntries) : 0;
 
     BlorgMetaFlat_FileEntryMetadata_vec_t flatFileEntries = BlorgMetaFlat_Directory_files(directory);
@@ -2136,6 +2136,28 @@ static VOID HttpOnTlsReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID 
 }
 
 //
+// Maps a status the request did not expect to what the caller sees. 403 is
+// the server refusing the path (host permissions, or a path that escapes its
+// root): access denied. 416 means the read started at or past the file's
+// current end on the server -- the file shrank under a cached size -- which
+// is end of file, not a malformed request.
+//
+static NTSTATUS HttpStatusToNtStatus(int StatusCode)
+{
+    switch (StatusCode)
+    {
+    case 404:
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    case 403:
+        return STATUS_ACCESS_DENIED;
+    case 416:
+        return STATUS_END_OF_FILE;
+    default:
+        return STATUS_INVALID_PARAMETER;
+    }
+}
+
+//
 // Runs inline at <= DISPATCH_LEVEL on the WSK completion chain for every
 // operation -- deliberately no PASSIVE bounce here. Everything this
 // function touches directly is DISPATCH-safe by construction:
@@ -2211,7 +2233,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
 
         if (Ctx->StatusCode != Ctx->ExpectedStatusCode)
         {
-            HttpFail(Ctx, (404 == Ctx->StatusCode) ? STATUS_OBJECT_NAME_NOT_FOUND : STATUS_INVALID_PARAMETER);
+            HttpFail(Ctx, HttpStatusToNtStatus(Ctx->StatusCode));
             return;
         }
 
