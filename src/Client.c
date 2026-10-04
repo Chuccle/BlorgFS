@@ -470,8 +470,9 @@ typedef struct _HTTP_CONTEXT
     // second is a like-for-like comparison.
     //
     //
-    // QPC stamp taken the moment WskSend has accepted the buffer and
-    // returned STATUS_PENDING, splitting the send span once more.
+    // QPC stamp taken just before the send is issued, splitting the send
+    // span once more. It cannot be taken after: the send may complete, and
+    // the request with it, before the issue returns.
     //
     // Real playback put the send at 5.1 ms mean and 164.7 ms max for a
     // request of about two hundred bytes, and made the worst
@@ -505,6 +506,7 @@ static BOOLEAN HttpTryRetryReusedConnection(HTTP_CONTEXT* Ctx);
 static VOID HttpOnSocket(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext);
 static VOID HttpOnTlsHandshakeComplete(NTSTATUS Status, PVOID CallerContext);
 static VOID HttpTlsHandshakeWorker(PDEVICE_OBJECT DeviceObject, PVOID Context);
+static VOID HttpAcquireSocketWorker(PDEVICE_OBJECT DeviceObject, PVOID Context);
 static VOID HttpOnSend(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID CompletionContext);
 static VOID HttpOnReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID CompletionContext);
 static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx);
@@ -1228,12 +1230,13 @@ static BOOLEAN HttpMustBounceToPassive(const HTTP_CONTEXT* Ctx)
 }
 
 //
-// Whether this operation can ever queue Ctx->WorkItem. Only two things
-// do: the HttpDispatch/HttpComplete bounces (HttpMustBounceToPassive,
-// never true for a file read) and HttpKick's TLS handshake stage. So a
-// file read on a plaintext connection needs no work item at all, and
-// skipping it takes one pool allocation and one free off every chunk on
-// the read hot path. global.TlsEnabled is sampled here, at the one point
+// Whether this operation can ever queue Ctx->WorkItem on its normal path.
+// Only two things do: the HttpDispatch/HttpComplete bounces
+// (HttpMustBounceToPassive, never true for a file read) and HttpKick's TLS
+// handshake stage. So a file read on a plaintext connection needs no work
+// item up front, and skipping it takes one pool allocation and one free off
+// every chunk on the read hot path. The idle-close retry, which is rare,
+// allocates one itself when it has to (see HttpKick). global.TlsEnabled is sampled here, at the one point
 // where an allocation failure can still be reported to the caller, rather
 // than at handshake time; HttpKick re-checks for NULL so that flipping
 // the flag live (the debugger poke documented in Driver.h) degrades to a
@@ -1250,7 +1253,11 @@ static BOOLEAN HttpNeedsWorkItem(HTTP_OPERATION Operation)
 // Central re-entry point for every stage transition in this file.
 // HttpStageAcquireSocket bypasses the pool only on the post-retry attempt
 // (the retry path forced ConnectionSource to Fresh); the initial attempt
-// is free to reuse a pooled connection. HttpStageTlsHandshake bounces to
+// is free to reuse a pooled connection. That fresh attempt is a
+// WskSocketConnect, which reaches pageable code in tcpip and so is issued
+// below DISPATCH_LEVEL; the retry runs from a receive completion, so at
+// DISPATCH_LEVEL it bounces to PASSIVE first, allocating the work item a
+// plaintext file read does not carry. HttpStageTlsHandshake bounces to
 // PASSIVE unconditionally (unlike HttpMustBounceToPassive, independent of
 // Ctx->Operation) because BlorgTlsStartHandshakeAsync's ECDH key-pair
 // generation is documented PASSIVE_LEVEL-only CNG, while this stage can be
@@ -1267,6 +1274,23 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
         case HttpStageAcquireSocket:
         {
             BOOLEAN forceFresh = C_CAST(BOOLEAN, Ctx->ConnectionSource == HttpConnectionFresh);
+
+            if (forceFresh && (DISPATCH_LEVEL <= KeGetCurrentIrql()))
+            {
+                if (!Ctx->WorkItem)
+                {
+                    Ctx->WorkItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
+                }
+
+                if (!Ctx->WorkItem)
+                {
+                    HttpComplete(Ctx, STATUS_INSUFFICIENT_RESOURCES);
+                    break;
+                }
+
+                IoQueueWorkItem(Ctx->WorkItem, HttpAcquireSocketWorker, DelayedWorkQueue, Ctx);
+                break;
+            }
 
             NTSTATUS result = BlorgAcquireReusableWskSocketAsync(
                 C_CAST(PSOCKADDR, &Ctx->RemoteAddress),
@@ -1511,6 +1535,17 @@ static VOID HttpTlsHandshakeWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 
     HTTP_CONTEXT* ctx = C_CAST(HTTP_CONTEXT*, Context);
     BlorgTlsStartHandshakeAsync(ctx->Socket, HttpOnTlsHandshakeComplete, ctx);
+}
+
+//
+// Re-entry at PASSIVE_LEVEL for a fresh connect that HttpKick reached above
+// it.
+//
+static VOID HttpAcquireSocketWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    HttpKick(C_CAST(HTTP_CONTEXT*, Context));
 }
 
 //
@@ -3186,13 +3221,16 @@ NTSTATUS BlorgInitialiseHttpClient(VOID)
 //
 // Must run before the device objects are torn down: an outstanding
 // request may still queue an IO work item against
-// global.FileSystemDeviceObject.
+// global.FileSystemDeviceObject, and so may a pre-warm connect, which is
+// drained here for that reason.
 //
 VOID BlorgDrainHttpClient(VOID)
 {
     HttpReleaseActive();
 
     KeWaitForSingleObject(&HttpDrainEvent, Executive, KernelMode, FALSE, NULL);
+
+    BlorgDrainWskSocketPrewarm();
 }
 
 //

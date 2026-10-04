@@ -100,10 +100,16 @@ protected:
         EXPECT_EQ(0u, ShimPoolOutstanding()) << "pool allocation(s) leaked";
     }
 
+    //
+    // A work item can issue more I/O (a retry's fresh connect does), so
+    // this runs until neither side has anything left.
+    //
     void Drain()
     {
-        SandboxDrainCompletions();
-        ShimDrainWorkItems();
+        do
+        {
+            SandboxDrainCompletions();
+        } while (ShimDrainWorkItems() > 0);
     }
 
     // Issues a ranged read against the current script.

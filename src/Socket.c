@@ -606,19 +606,19 @@ VOID BlorgCleanupWskClient(VOID)
 }
 
 //
-// Drains and synchronously closes every pooled socket. Releases the pool
-// lock around each CloseWskSocket call since that call waits on an IRP
-// and must not hold a spinlock across a blocking wait.
+// Stops the pre-warm and waits out the step in flight. Called from
+// BlorgDrainHttpClient, before the device objects are torn down, because
+// that step may still queue SocketPrewarmWorkItem against
+// global.FileSystemDeviceObject; and again from BlorgCleanupWskSocketPool,
+// where it finds nothing left to do.
 //
-// The pre-warm latch goes first, for the same reason the HTTP client is
-// drained before anything else at unload: a pre-warm connect still in
-// flight owns nothing this function can see (it is not in the pool yet),
-// and its completion would otherwise run after WskDeregister -- handing a
-// socket to a pool nobody will drain again, against a provider that has
-// been released. Latching first stops the chain; the poll waits out any
-// step already counted as in flight, whose completion may still release a
-// socket into this pool -- which is exactly why the poll precedes the drain
-// loop rather than following it.
+// A pre-warm connect still in flight owns nothing teardown can see (it is
+// not in the pool yet), and its completion would otherwise run after
+// WskDeregister -- handing a socket to a pool nobody will drain again,
+// against a provider that has been released. Latching stops the chain; the
+// poll waits out any step already counted as in flight, whose completion
+// may still release a socket into the pool -- which is why this precedes
+// the pool drain rather than following it.
 //
 // Latch-and-zero run under SocketPool.Lock so they linearize against every
 // raise (see the state-block comment); the poll that follows is a bare read
@@ -632,7 +632,7 @@ VOID BlorgCleanupWskClient(VOID)
 // primitive -- the completing side is an interlocked decrement, not a
 // signal.
 //
-VOID BlorgCleanupWskSocketPool(VOID)
+VOID BlorgDrainWskSocketPrewarm(VOID)
 {
     KIRQL oldIrql;
 
@@ -653,6 +653,19 @@ VOID BlorgCleanupWskSocketPool(VOID)
         IoFreeWorkItem(SocketPrewarmWorkItem);
         SocketPrewarmWorkItem = NULL;
     }
+}
+
+//
+// Drains and synchronously closes every pooled socket. Releases the pool
+// lock around each CloseWskSocket call since that call waits on an IRP
+// and must not hold a spinlock across a blocking wait. The pre-warm is
+// drained first (BlorgDrainWskSocketPrewarm).
+//
+VOID BlorgCleanupWskSocketPool(VOID)
+{
+    KIRQL oldIrql;
+
+    BlorgDrainWskSocketPrewarm();
 
     KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
 
@@ -969,12 +982,8 @@ ULONG BlorgPrewarmRemainingForDiagnostics(VOID)
 // completion routine inline on every path that finishes synchronously (see
 // SocketPrewarmPump).
 //
-// Order here is load-bearing twice over. The socket handoff
-// (SocketPrewarmComplete -> BlorgReleaseReusableWskSocket) precedes the
-// in-flight drop so that a teardown which observes InFlight == 0 knows the
-// step's socket is already in the pool its drain loop is about to walk --
-// drop first and the poll could exit in the gap, resurrecting exactly the
-// post-teardown release this whole protocol exists to prevent. And the
+// The in-flight drop comes after the socket handoff, which
+// SocketPrewarmStepComplete makes before calling or queueing this. The
 // accounting runs under the pool lock (see the state-block comment for why
 // the consume is a plain locked read-and-write rather than a CAS loop),
 // with the pump re-entry -- which takes that same lock again inside the
@@ -1015,12 +1024,18 @@ static VOID SocketPrewarmStepWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 }
 
 //
-// The accounting, and with it the next connect, runs at PASSIVE_LEVEL. A
-// connect completion arrives at DISPATCH_LEVEL, and WskSocketConnect with
-// no owning process captures the caller's security context in pageable
-// code: issued from here it bugchecks 0xA in SeCaptureSubjectContextEx,
-// every time under Driver Verifier. So a completion above PASSIVE hands the
-// step to the work item, and the step stays in flight until it has run.
+// The accounting, and with it the next connect, runs at PASSIVE_LEVEL.
+// WskSocketConnect reaches pageable code in tcpip (it captures the caller's
+// security context), and a connect completion can arrive at
+// DISPATCH_LEVEL, so a completion above PASSIVE hands the step to the work
+// item, and the step stays in flight until it has run.
+//
+// The socket handoff (SocketPrewarmComplete ->
+// BlorgReleaseReusableWskSocket) precedes the in-flight drop so that a
+// teardown which observes InFlight == 0 knows the step's socket is already
+// in the pool its drain loop is about to walk -- drop first and the poll
+// could exit in the gap, resurrecting exactly the post-teardown release
+// this whole protocol exists to prevent.
 //
 static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
 {
@@ -1186,10 +1201,9 @@ static VOID SocketPrewarmPump(VOID)
 // WskSocketConnect, the per-socket RemoteAddress copy) honours the family
 // size too.
 //
-// The copy is taken before the lock, onto the stack. ai_addr comes back from
-// WskGetAddressInfo in paged pool, and reading it at DISPATCH_LEVEL under the
-// spinlock bugchecks 0xD1 whenever the page is out -- every time under Driver
-// Verifier's IRQL checking.
+// The copy is taken before the lock, onto the stack: ai_addr comes back from
+// WskGetAddressInfo in paged pool, so it cannot be read at DISPATCH_LEVEL
+// under the spinlock.
 //
 VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 {

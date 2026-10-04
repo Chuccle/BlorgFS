@@ -748,6 +748,8 @@ TEST_F(SocketKernelTest, PrewarmChainIssuesExactlyItsBudgetAndTerminates)
         ++rounds;
     }
 
+    EXPECT_GT(rounds, 0) << "nothing was released";
+    EXPECT_LT(rounds, 16) << "the chain did not terminate";
     EXPECT_EQ(0, WskModelDeferredCount()) << "the chain did not terminate";
     EXPECT_EQ(0u, ShimPendingWorkItems());
     EXPECT_EQ(3u, WskModelConnects());

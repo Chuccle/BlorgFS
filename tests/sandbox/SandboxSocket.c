@@ -565,6 +565,12 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
         return STATUS_PENDING;
     }
 
+    //
+    // A fresh socket is a WskSocketConnect, which the transport runs partly
+    // in pageable code: see WskModel.c.
+    //
+    KmRequireIrqlAtMost(APC_LEVEL, "WskSocketConnect");
+
     PKSOCKET fresh = SandboxCreateSocket();
 
     if (!fresh)
@@ -623,6 +629,13 @@ NTSTATUS BlorgCloseWskSocketAsync(PKSOCKET Socket)
 NTSTATUS BlorgInitialiseWskClient(void)
 {
     return STATUS_SUCCESS;
+}
+
+//
+// The sandbox client never pre-warms.
+//
+void BlorgDrainWskSocketPrewarm(void)
+{
 }
 
 void BlorgCleanupWskClient(void)

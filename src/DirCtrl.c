@@ -502,8 +502,8 @@ static VOID DirCtrlComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Call
 // DirCtrlComplete already discards whichever of two racing fetches
 // loses the publish (see its own comment), the same protection this
 // leans on for two different handles racing the same DCB. That second
-// query also skips the posts in the pattern branches, so the fetch posts
-// to the FSP itself when not already there: it can complete the IRP
+// query also skips the posts in the pattern branches, so it is posted to
+// the FSP here when not already there: the fetch can complete the IRP
 // before it returns, so it is only issued once the IRP is pending.
 //
 // NOTIFY_CHANGE_DIRECTORY registers the watch with the FsRtl notify
