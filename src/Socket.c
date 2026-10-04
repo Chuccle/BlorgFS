@@ -1136,12 +1136,24 @@ static VOID SocketPrewarmPump(VOID)
 // WskSocketConnect, the per-socket RemoteAddress copy) honours the family
 // size too.
 //
+// The copy is taken before the lock, onto the stack. ai_addr comes back from
+// WskGetAddressInfo in paged pool, and reading it at DISPATCH_LEVEL under the
+// spinlock bugchecks 0xD1 whenever the page is out -- every time under Driver
+// Verifier's IRQL checking.
+//
 VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 {
     if (!RemoteAddress || 0 == Count)
     {
         return;
     }
+
+    ULONG addressLength = (AF_INET6 == RemoteAddress->sa_family)
+        ? C_CAST(ULONG, sizeof(SOCKADDR_IN6))
+        : C_CAST(ULONG, sizeof(SOCKADDR_IN));
+
+    SOCKADDR_STORAGE address;
+    RtlCopyMemory(&address, RemoteAddress, addressLength);
 
     KIRQL oldIrql;
 
@@ -1157,11 +1169,7 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 
     SocketPrewarmRemaining = C_CAST(LONG, Count);
 
-    ULONG addressLength = (AF_INET6 == RemoteAddress->sa_family)
-        ? C_CAST(ULONG, sizeof(SOCKADDR_IN6))
-        : C_CAST(ULONG, sizeof(SOCKADDR_IN));
-
-    RtlCopyMemory(&SocketPrewarmAddress, RemoteAddress, addressLength);
+    RtlCopyMemory(&SocketPrewarmAddress, &address, addressLength);
 
     KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
 
