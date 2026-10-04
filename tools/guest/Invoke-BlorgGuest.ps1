@@ -335,6 +335,14 @@ function Invoke-PrepareStep {
             if ($LASTEXITCODE -ne 0) { throw "bcdedit testsigning failed ($LASTEXITCODE) -- is Secure Boot on? It must be off for a test-signed driver." }
             $reboot = $true
         }
+        # With kernel debugging on and no debugger attached, a breakpoint
+        # freezes the guest instead of bugchecking, so a run would only time
+        # out. Off, it bugchecks, reboots and leaves a dump.
+        if ($bcd -match '(?m)^debug\s+Yes') {
+            Write-Host '==> Turning kernel debugging off'
+            bcdedit /debug '{current}' off | Out-Null
+            $reboot = $true
+        }
 
         $verifierOn = (verifier /querysettings | Out-String) -match '(?im)^\s*BlorgFS\.sys\s*$'
         if (-not $NoVerifier -and -not $verifierOn) {
