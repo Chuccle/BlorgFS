@@ -631,6 +631,13 @@ NTSTATUS BlorgInitialiseWskClient(void)
     return STATUS_SUCCESS;
 }
 
+//
+// The sandbox client never pre-warms.
+//
+void BlorgDrainWskSocketPrewarm(void)
+{
+}
+
 void BlorgCleanupWskClient(void)
 {
     if (PooledSocket)
