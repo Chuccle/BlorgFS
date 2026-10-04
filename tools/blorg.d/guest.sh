@@ -172,7 +172,22 @@ guest_wait() {
         fi
         sleep 5
     done
-    die "SSH did not answer within ${timeout}s; try: blorg guest screenshot /tmp/screen.png"
+    guest_report
+    die "SSH did not answer within ${timeout}s"
+}
+
+# What a guest that stopped answering is doing, written to the log so it can
+# be read wherever the log can (CI artifacts may not be): the VM's run state,
+# whether Windows' guest agent still answers, the serial tail, and the screen
+# as a base64 PNG (a bugcheck screen names its stop code).
+guest_report() {
+    local png="$GUEST_RUN_DIR/screen-unanswered.png"
+    echo "blorg: VM state: $(guest_qmp query-status 2>&1 | tr -d '\n')"
+    echo "blorg: guest agent: $(timeout 10 python3 "$BLORG_D/qmp.py" qga "$GUEST_QGA" guest-ping 2>&1 | tr -d '\n' || echo 'no answer')"
+    [[ -s "$GUEST_SERIAL" ]] && { echo "blorg: serial tail:"; tail -n 20 "$GUEST_SERIAL"; }
+    if guest_qmp screendump "{\"filename\": \"$png\", \"format\": \"png\"}" >/dev/null 2>&1 && [[ -s "$png" ]]; then
+        echo "SCREEN unanswered png-base64 $(base64 -w0 "$png")"
+    fi
 }
 
 guest_up() {
