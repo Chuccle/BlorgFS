@@ -103,6 +103,7 @@ static NPAGED_LOOKASIDE_LIST AsyncContextLookaside;
 static IO_COMPLETION_ROUTINE SocketContextCompletionRoutine;
 static IO_COMPLETION_ROUTINE SocketAsyncCompletionRoutine;
 static KDEFERRED_ROUTINE SocketAsyncTimeoutDpc;
+static IO_WORKITEM_ROUTINE SocketPrewarmStepWorker;
 
 //
 // Pre-warm pump and teardown state, declared here because
@@ -110,8 +111,11 @@ static KDEFERRED_ROUTINE SocketAsyncTimeoutDpc;
 // waits on it.
 //
 // Remaining is the steps still owed by a fill. InFlight counts connects
-// issued but not yet completed -- 0 or 1, since the pump keeps exactly one
-// step outstanding (see SocketPrewarmPump) -- and is what teardown polls.
+// issued but not yet accounted for by SocketPrewarmStepAccount -- 0 or 1,
+// since the pump keeps exactly one step outstanding (see SocketPrewarmPump)
+// -- and is what teardown polls. A step whose completion bounced to the work
+// item stays in flight until the work item has run, so teardown waits for
+// that too.
 // ShuttingDown latches teardown. Running/Pending carry the pump's liveness
 // hand-off (see their comment at the pump).
 //
@@ -134,14 +138,23 @@ static KDEFERRED_ROUTINE SocketAsyncTimeoutDpc;
 // shorten one.
 //
 // IRQL is why the lock is the pool spinlock rather than anything APC-ish:
-// StepComplete and the pump's issue path run on WSK completion chains at
-// <= DISPATCH_LEVEL, where a push lock or ERESOURCE would be illegal. The
-// sections are a handful of instructions with no blocking inside, so
-// raising to DISPATCH for them costs nothing.
+// StepComplete runs on WSK completion chains at <= DISPATCH_LEVEL, where a
+// push lock or ERESOURCE would be illegal. The sections are a handful of
+// instructions with no blocking inside, so raising to DISPATCH for them
+// costs nothing. The pump itself runs only at PASSIVE_LEVEL, because the
+// WskSocketConnect it issues must (see SocketPrewarmStepComplete).
 //
 static LONG SocketPrewarmRemaining;
 static LONG SocketPrewarmInFlight;
 static LONG SocketPrewarmShuttingDown;
+
+//
+// Carries a step completed above PASSIVE_LEVEL to SocketPrewarmStepAccount.
+// One is enough: only one step is ever in flight, and its completion is the
+// only thing that queues it. Allocated by the first fill, freed by teardown
+// once nothing is in flight.
+//
+static PIO_WORKITEM SocketPrewarmWorkItem;
 
 //
 // Pump-loop liveness flags -- declared with the rest of the pump's state
@@ -548,6 +561,7 @@ NTSTATUS BlorgInitialiseWskClient(VOID)
     SocketPrewarmRemaining = 0;
     SocketPrewarmInFlight = 0;
     SocketPrewarmShuttingDown = 0;
+    SocketPrewarmWorkItem = NULL;
     SocketPrewarmPumpRunning = FALSE;
     SocketPrewarmPumpPending = FALSE;
 
@@ -632,6 +646,12 @@ VOID BlorgCleanupWskSocketPool(VOID)
     while (ReadNoFence(&SocketPrewarmInFlight))
     {
         KeDelayExecutionThread(KernelMode, FALSE, &prewarmInterval);
+    }
+
+    if (SocketPrewarmWorkItem)
+    {
+        IoFreeWorkItem(SocketPrewarmWorkItem);
+        SocketPrewarmWorkItem = NULL;
     }
 
     KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
@@ -960,10 +980,8 @@ ULONG BlorgPrewarmRemainingForDiagnostics(VOID)
 // with the pump re-entry -- which takes that same lock again inside the
 // acquire -- deferred until after it is dropped.
 //
-static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
+static VOID SocketPrewarmStepAccount(VOID)
 {
-    SocketPrewarmComplete(Status, Socket, Reused, CompletionContext);
-
     KIRQL oldIrql;
     BOOLEAN chain = FALSE;
 
@@ -983,6 +1001,38 @@ static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN 
     {
         SocketPrewarmPump();
     }
+}
+
+//
+// PASSIVE-level target for SocketPrewarmStepComplete's bounce.
+//
+static VOID SocketPrewarmStepWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Context);
+
+    SocketPrewarmStepAccount();
+}
+
+//
+// The accounting, and with it the next connect, runs at PASSIVE_LEVEL. A
+// connect completion arrives at DISPATCH_LEVEL, and WskSocketConnect with
+// no owning process captures the caller's security context in pageable
+// code: issued from here it bugchecks 0xA in SeCaptureSubjectContextEx,
+// every time under Driver Verifier. So a completion above PASSIVE hands the
+// step to the work item, and the step stays in flight until it has run.
+//
+static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
+{
+    SocketPrewarmComplete(Status, Socket, Reused, CompletionContext);
+
+    if (PASSIVE_LEVEL < KeGetCurrentIrql())
+    {
+        IoQueueWorkItem(SocketPrewarmWorkItem, SocketPrewarmStepWorker, DelayedWorkQueue, NULL);
+        return;
+    }
+
+    SocketPrewarmStepAccount();
 }
 
 //
@@ -1154,6 +1204,16 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 
     SOCKADDR_STORAGE address;
     RtlCopyMemory(&address, RemoteAddress, addressLength);
+
+    if (!SocketPrewarmWorkItem)
+    {
+        SocketPrewarmWorkItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
+
+        if (!SocketPrewarmWorkItem)
+        {
+            return;
+        }
+    }
 
     KIRQL oldIrql;
 
