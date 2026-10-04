@@ -737,13 +737,19 @@ TEST_F(SocketKernelTest, PrewarmChainIssuesExactlyItsBudgetAndTerminates)
         << "the pump keeps exactly one step outstanding";
 
     //
-    // One release cascades: completing step N issues step N+1 inline
-    // (deferred again), which this same drain then delivers, until the
-    // budget is spent.
+    // Each release completes step N at DISPATCH_LEVEL, which bounces its
+    // accounting to the work item; draining that issues step N+1 at
+    // PASSIVE_LEVEL (deferred again), until the budget is spent.
     //
-    EXPECT_GT(WskModelReleaseDeferred(), 0);
+    int rounds = 0;
+
+    while (WskModelReleaseDeferred() + ShimDrainWorkItems() > 0 && rounds < 16)
+    {
+        ++rounds;
+    }
 
     EXPECT_EQ(0, WskModelDeferredCount()) << "the chain did not terminate";
+    EXPECT_EQ(0u, ShimPendingWorkItems());
     EXPECT_EQ(3u, WskModelConnects());
 
     BlorgCleanupWskSocketPool();
@@ -797,7 +803,12 @@ TEST_F(SocketStressTest, TeardownDrainsAPrewarmConnectThatOutlivesIt)
     //
     Sleep(100);
 
+    //
+    // The completion leaves the step in flight until its work item runs,
+    // so the cleaner waits for this drain too.
+    //
     WskModelReleaseDeferred();
+    ShimDrainWorkItems();
 
     cleaner.join();
 
@@ -863,13 +874,14 @@ void PumpRaceCompleter(PumpRaceProof* proof)
 
     while (!ReadNoFence(&proof->Stop))
     {
-        if (WskModelReleaseDeferred() == 0)
+        if (WskModelReleaseDeferred() + ShimDrainWorkItems() == 0)
         {
             SwitchToThread();
         }
     }
 
     WskModelReleaseDeferred();
+    ShimDrainWorkItems();
 }
 
 TEST_F(SocketStressTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
@@ -912,6 +924,7 @@ TEST_F(SocketStressTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
         while (BlorgPrewarmRemainingForDiagnostics() > 0 && settle < 2000)
         {
             WskModelReleaseDeferred();
+            ShimDrainWorkItems();
             SwitchToThread();
             ++settle;
         }
@@ -922,7 +935,13 @@ TEST_F(SocketStressTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
         completer.join();
         InterlockedExchange(&proof.Stop, 0);
 
-        WskModelReleaseDeferred();
+        //
+        // Teardown waits for a step whose work item has not run, so drain
+        // both until neither has anything left.
+        //
+        while (WskModelReleaseDeferred() + ShimDrainWorkItems() > 0)
+        {
+        }
 
         if (remaining == 0)
         {

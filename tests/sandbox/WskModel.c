@@ -385,6 +385,14 @@ static NTSTATUS WskModelSocketConnect(
     (void)SocketContext; (void)Dispatch;
     (void)OwningProcess; (void)OwningThread; (void)SecurityDescriptor;
 
+    //
+    // Documented as callable at DISPATCH_LEVEL, but with no owning process
+    // the transport captures the caller's security context in pageable
+    // code, so on a real kernel a connect issued above PASSIVE bugchecks
+    // 0xA under Driver Verifier.
+    //
+    KmRequireIrqlAtMost(PASSIVE_LEVEL, "WskSocketConnect");
+
     LastLocalFamily = LocalAddress ? LocalAddress->sa_family : 0;
     LastRemoteFamily = RemoteAddress ? RemoteAddress->sa_family : 0;
 
