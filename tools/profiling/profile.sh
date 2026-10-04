@@ -15,6 +15,8 @@ echo "response size $size version $ver; host $(nproc) cpus; $(uname -r)"
 echo "== Benchmark hygiene: Driver Verifier off, reboot"
 blorg guest ssh 'verifier /reset | Out-Null; exit 0'
 blorg guest reboot
+# The service is demand-start: Install-BlorgFS.ps1 starts it, a reboot does not.
+blorg guest ssh 'sc.exe start BlorgFS | Out-Null; for ($i = 0; $i -lt 60 -and -not (Test-Path B:/); $i++) { Start-Sleep 1 }; exit 0'
 blorg guest ps "$here/Hygiene.ps1"
 
 mkcorpus() {
