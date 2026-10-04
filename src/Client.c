@@ -1322,6 +1322,8 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
                 }
             }
 
+            Ctx->SendIssuedQpc = BlorgStatisticsNow();
+
             result = BlorgSendWskAsync(
                 Ctx->Socket,
                 sendBuffer,
@@ -1329,8 +1331,6 @@ static VOID HttpKick(HTTP_CONTEXT* Ctx)
                 WSK_FLAG_NODELAY,
                 HttpOnSend,
                 Ctx);
-
-            Ctx->SendIssuedQpc = BlorgStatisticsNow();
 
             if (STATUS_PENDING != result)
             {
