@@ -420,6 +420,67 @@ static void PrintLatencyHistogram(const ULONG64* buckets)
 // than a raw counter dump: each block pairs a raw count with the ratio
 // that makes it actionable, so the output says which stage to look at.
 //
+//
+// Capacity bounds of the ghost cache's distance buckets, in GB, and the
+// running sum that turns per-bucket hits into "hits a cache this big
+// would have had". Bucket i holds hits whose distance fell between bound
+// i-1 and bound i, so a cache of bound i serves buckets 0..i. The last
+// bucket has no bound: those hits need more than the largest capacity
+// reported, and are left out of every row.
+//
+static const unsigned GhostCapacityGb[BLORGFS_GHOST_DISTANCE_BUCKETS - 1] = { 1, 4, 16, 64, 256 };
+
+static unsigned long long GhostCumulative(const ULONG64* Buckets, int Through)
+{
+    unsigned long long sum = 0;
+
+    for (int i = 0; i <= Through; ++i)
+    {
+        sum += Buckets[i];
+    }
+
+    return sum;
+}
+
+//
+// What an on-disk block cache would have done over this window, from the
+// driver's ghost cache. Demand hits come first because they are the
+// stalls a user would stop feeling; byte hits are the bandwidth handed
+// back to everything else; written bytes are the wear. Silent when the
+// model is off, which GhostFetches == 0 says.
+//
+static void PrintGhostCache(const BLORGFS_STATISTICS& t)
+{
+    if (0 == t.GhostFetches)
+    {
+        return;
+    }
+
+    static const char* const policyNames[BLORGFS_GHOST_POLICIES] = { "admit on 1st miss", "admit on 2nd miss" };
+
+    printf("\n  ghost cache (what an on-disk cache would have served; a floor, see GhostCache.c)\n");
+    printf("    fetches seen          %12llu  (%llu demand, %llu bytes)\n",
+        t.GhostFetches, t.GhostDemandFetches, t.GhostFetchBytes);
+    printf("    table evictions       %12llu  (history lost; raise GhostCacheMb if large)\n", t.GhostEvictions);
+
+    for (int p = 0; p < BLORGFS_GHOST_POLICIES; ++p)
+    {
+        printf("    %s: would write %llu bytes, %llu partial fetches\n",
+            policyNames[p], t.GhostAdmitBytes[p], t.GhostPartialFetches[p]);
+
+        for (int b = 0; b < BLORGFS_GHOST_DISTANCE_BUCKETS - 1; ++b)
+        {
+            const unsigned long long demand = GhostCumulative(t.GhostHitDemandFetches[p], b);
+            const unsigned long long bytes = GhostCumulative(t.GhostHitBytes[p], b);
+
+            printf("      %4u GB cache        demand hits %6.2f%%   bytes served %6.2f%%\n",
+                GhostCapacityGb[b],
+                SafeRatio(demand, t.GhostDemandFetches),
+                SafeRatio(bytes, t.GhostFetchBytes));
+        }
+    }
+}
+
 static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
 {
     const BLORGFS_STATISTICS& t = stats.Totals;
@@ -555,6 +616,8 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
         printf("\n  consumer idle distribution\n");
         PrintLatencyHistogram(t.ReadIdleBuckets);
     }
+
+    PrintGhostCache(t);
 
     printf("\n  chunk fetches\n");
     printf("    direct issued         %12llu\n", t.FetchesIssued);
@@ -2702,6 +2765,37 @@ static bool WriteReport(
     for (int i = 0; i < BLORGFS_STATISTICS_LATENCY_BUCKETS; ++i)
     {
         fprintf(f, "UserReadLatencyBucket%02d=%llu\n", i, t.UserReadLatencyBuckets[i]);
+    }
+
+    //
+    // The ghost cache, raw per bucket and as the cumulative shares the
+    // table prints, keyed by policy (0 = admit on first miss, 1 = second)
+    // and capacity in GB. All zero when GhostCacheMb is unset.
+    //
+    fprintf(f, "GhostFetches=%llu\n", t.GhostFetches);
+    fprintf(f, "GhostFetchBytes=%llu\n", t.GhostFetchBytes);
+    fprintf(f, "GhostDemandFetches=%llu\n", t.GhostDemandFetches);
+    fprintf(f, "GhostEvictions=%llu\n", t.GhostEvictions);
+
+    for (int p = 0; p < BLORGFS_GHOST_POLICIES; ++p)
+    {
+        fprintf(f, "GhostAdmitBytesP%d=%llu\n", p, t.GhostAdmitBytes[p]);
+        fprintf(f, "GhostPartialFetchesP%d=%llu\n", p, t.GhostPartialFetches[p]);
+
+        for (int b = 0; b < BLORGFS_GHOST_DISTANCE_BUCKETS; ++b)
+        {
+            fprintf(f, "GhostHitFetchesP%dB%d=%llu\n", p, b, t.GhostHitFetches[p][b]);
+            fprintf(f, "GhostHitBytesP%dB%d=%llu\n", p, b, t.GhostHitBytes[p][b]);
+            fprintf(f, "GhostHitDemandFetchesP%dB%d=%llu\n", p, b, t.GhostHitDemandFetches[p][b]);
+        }
+
+        for (int b = 0; b < BLORGFS_GHOST_DISTANCE_BUCKETS - 1; ++b)
+        {
+            fprintf(f, "GhostDemandHitShareP%d_%uGb=%.4f\n", p, GhostCapacityGb[b],
+                SafeRatio(GhostCumulative(t.GhostHitDemandFetches[p], b), t.GhostDemandFetches));
+            fprintf(f, "GhostByteHitShareP%d_%uGb=%.4f\n", p, GhostCapacityGb[b],
+                SafeRatio(GhostCumulative(t.GhostHitBytes[p], b), t.GhostFetchBytes));
+        }
     }
 
     fprintf(f, "NonCachedReads=%llu\n", t.NonCachedReads);

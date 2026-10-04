@@ -143,6 +143,7 @@
 #include "Util.h"
 #include "Client.h"
 #include "Statistics.h"
+#include "GhostCache.h"
 #include "CacheManager.h"
 #include "FspWorkQueue.h"
 
@@ -334,6 +335,12 @@ extern struct GLOBAL
     // not of this driver.
     //
     ULONG ReadAheadMaxGranularity;
+
+    //
+    // Ghost cache table size in MB, from the GhostCacheMb registry value;
+    // zero (the default) leaves the model off. See GhostCache.h.
+    //
+    ULONG GhostCacheMb;
 
     //
     //  A single self-relative security descriptor handed out (in the

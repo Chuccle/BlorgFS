@@ -118,6 +118,7 @@
     <ClCompile Include="DispatchSchedTest.cpp" />
     <ClCompile Include="DispatchStressTest.cpp" />
     <ClCompile Include="StatisticsTest.cpp" />
+    <ClCompile Include="GhostCacheTest.cpp" />
     <ClCompile Include="PathCacheTest.cpp" />
     <ClCompile Include="PathCacheSchedTest.cpp" />
     <ClCompile Include="KernelModel.c" />
@@ -143,6 +144,7 @@
     <ClCompile Include="DispatchModel.c" />
     <ClCompile Include="SandboxSocket.c" />
     <ClCompile Include="..\..\src\Statistics.c" />
+    <ClCompile Include="..\..\src\GhostCache.c" />
     <ClCompile Include="..\..\src\PathCache.c" />
     <ClCompile Include="..\..\src\FspWorkQueue.c" />
     <ClCompile Include="..\..\src\CacheManager.c" />

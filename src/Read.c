@@ -866,6 +866,11 @@ static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG B
 // command on NTFS; reporting zero made the standard surface useless and
 // sent the only comparison that needed it through the vendor IOCTL.
 //
+// Every fetch is also replayed against the ghost cache (GhostCache.c)
+// just before it is issued, which is the one place that sees all of them
+// at PASSIVE: inline paging reads and FSP-posted reads alike. It is a
+// no-op unless GhostCacheMb is set.
+//
 // The read-ahead granularity override is applied at cache-map time, where
 // zero means leave Cc's own default in place -- the one setting no override
 // value can express.
@@ -1032,6 +1037,14 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         {
             BLORGFS_STAT_INC(NonCachedDiskReads);
         }
+
+        BlorgGhostCacheObserve(
+            &fcb->FullPath,
+            C_CAST(ULONG64, fcb->Header.FileSize.QuadPart),
+            fcb->LastModifiedTime,
+            C_CAST(ULONG64, startingByte.QuadPart),
+            realLength,
+            !BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_SPECULATIVE_READ));
 
         IoMarkIrpPending(Irp);
 

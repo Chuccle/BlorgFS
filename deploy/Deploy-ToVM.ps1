@@ -49,6 +49,11 @@
     connects to. Passed straight through to Install-BlorgFS.ps1; leave unset to keep the
     INF-seeded default (blorgfs.blorg.lan).
 
+.PARAMETER GhostCacheMb
+    Turns on the ghost cache (src/GhostCache.c) with a table of this many MB, passed
+    straight through to Install-BlorgFS.ps1. Falls back to GhostCacheMb in blorgfs.env.
+    Off when unset.
+
 .EXAMPLE
     .\Deploy-ToVM.ps1 -VmxPath "D:\VMs\Win11\Win11.vmx" -GuestUser dev -GuestPassword "hunter2" -SnapshotName clean
     vmrun itself only accepts the guest password as plaintext on the command line -- there's
@@ -88,6 +93,7 @@ param(
     [switch]$TlsEnabled,
     [string]$RemotePort,
     [string]$TlsPinHex,
+    [int]$GhostCacheMb = 0,
     [int]$ToolsWaitTimeoutSeconds = 180
 )
 
@@ -116,6 +122,7 @@ $SnapshotName  = Get-Setting $SnapshotName  "SnapshotName"
 
 $RemoteHost    = Get-Setting $RemoteHost    "RemoteHost"
 $RemotePort    = Get-Setting $RemotePort    "RemotePort"
+$GhostCacheMb  = [int](Get-Setting $GhostCacheMb "GhostCacheMb")
 
 #
 # Benchmark mode forces Release unless the caller named a configuration
@@ -306,6 +313,7 @@ function Invoke-InstallInGuest {
     if ($TlsEnabled) { $extraArgs += "-TlsEnabled" }
     if ($RemotePort) { $extraArgs += "-RemotePort", $RemotePort }
     if ($TlsPinHex) { $extraArgs += "-TlsPinHex", $TlsPinHex }
+    if ($GhostCacheMb) { $extraArgs += "-GhostCacheMb", $GhostCacheMb }
 
     # runProgramInGuest doesn't surface the guest process's exit code, so have the
     # guest script write it to a status file we copy back and inspect ourselves.

@@ -463,6 +463,8 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 
     BlorgPathCacheCleanup();
 
+    BlorgGhostCacheCleanup();
+
     BlorgTlsGlobalCleanup();
 
     BlorgStatisticsCleanup();
@@ -692,6 +694,14 @@ static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICO
     {
         global.ReadAheadSlackGrowth = (0 != slackGrowthValue);
         BLORGFS_LOG("DriverReadRegistryConfig() - slack-driven growth: %lu\n", slackGrowthValue);
+    }
+
+    ULONG ghostCacheMb = 0;
+
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"GhostCacheMb", REG_DWORD, &ghostCacheMb, sizeof(ghostCacheMb), &actualSize)))
+    {
+        global.GhostCacheMb = ghostCacheMb;
+        BLORGFS_LOG("DriverReadRegistryConfig() - ghost cache table: %lu MB\n", ghostCacheMb);
     }
 
     UCHAR pinValue[TLS_HASH_LEN];
@@ -1109,6 +1119,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         {
             BLORGFS_LOG("DriverEntry() - SNI host string allocation failed; ClientHello will omit SNI\n");
         }
+    }
+
+    NTSTATUS ghostCacheStatus = BlorgGhostCacheInitialize(global.GhostCacheMb);
+
+    if (!NT_SUCCESS(ghostCacheStatus))
+    {
+        BLORGFS_LOG("DriverEntry() - BlorgGhostCacheInitialize failed: 0x%X (ghost cache off)\n", ghostCacheStatus);
     }
 
     BlorgPrewarmSocketPool(

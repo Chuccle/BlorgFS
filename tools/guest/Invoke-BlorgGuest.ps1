@@ -503,10 +503,13 @@ function Invoke-TestStep {
             param($log)
             # Paths passed explicitly: under `powershell -File`, Windows
             # PowerShell 5.1 leaves $PSScriptRoot empty in param() defaults.
+            # The ghost cache is on so every read the tests make also runs
+            # through GhostCache.c under Driver Verifier; nothing else turns
+            # it on, and it is off in a default install.
             $driver = Join-Path $package 'driver'
             $code = Invoke-ChildScript $log (Join-Path $driver 'Install-BlorgFS.ps1') @{
                 InfPath = (Join-Path $driver 'BlorgFS.inf'); CertPath = (Join-Path $driver 'BlorgFS.cer')
-                RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive
+                RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive; GhostCacheMb = 16
             }
             if ($code -eq 2) { return 'test signing is off (Install-BlorgFS.ps1 exit 2) -- -Step Prepare and a reboot should have handled this' }
             if ($code -ne 0) { return "Install-BlorgFS.ps1 exited $code" }

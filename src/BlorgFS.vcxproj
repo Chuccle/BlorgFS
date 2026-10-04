@@ -150,6 +150,7 @@
     <ClCompile Include="TlsHandshake.c" />
     <ClCompile Include="PathCache.c" />
     <ClCompile Include="Statistics.c" />
+    <ClCompile Include="GhostCache.c" />
     <ClCompile Include="..\third_party\picohttpparser\picohttpparser.c" />
     <ClCompile Include="Shutdown.c" />
     <ClCompile Include="Structs.c" />
@@ -171,6 +172,7 @@
     <ClInclude Include="Tls.h" />
     <ClInclude Include="TlsHandshake.h" />
     <ClInclude Include="Statistics.h" />
+    <ClInclude Include="GhostCache.h" />
     <ClInclude Include="metadata_flatbuffer_reader.h" />
     <ClInclude Include="metadata_flatbuffer_verifier.h" />
     <ClInclude Include="..\third_party\picohttpparser\picohttpparser.h" />

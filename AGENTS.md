@@ -51,6 +51,7 @@ a task needs it.
 | Build + test (default gate) | `powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Fast` | [Build and test tiers](#build-and-test-tiers) |
 | Deploy to the dev VM | `.\deploy\Deploy-ToVM.ps1 -Configuration Release` | [Deploying to a VM](#deploying-to-a-vm) |
 | Benchmark (Release, Verifier off) | `powershell -File deploy/Deploy-ToVM.ps1 -ForBenchmark` | [Measuring performance](#measuring-performance) |
+| Measure what a disk cache would serve | `deploy/Deploy-ToVM.ps1 -ForBenchmark -GhostCacheMb 64`, use `B:` normally, `PerfHarness.exe stats` | [Would a disk cache help?](#would-a-disk-cache-help-the-ghost-cache) |
 | Accept new perf baseline | `powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Perf -PerfFile <path> -UpdateBaseline` | [Measuring performance](#measuring-performance) |
 | Package the driver with server-rs | `tools/blorg package --driver x64/Release` | [Package and test guest](#package-and-test-guest) |
 | Test a package in a local KVM guest | `tools/blorg guest test --package <dir>` | [The test guest](#the-test-guest) |
@@ -113,7 +114,9 @@ Full derivation in [Read-ahead policy: current state](#read-ahead-policy-current
 The **on-disk hot cache is an unstarted future project** ([design
 doc](#future-work-on-disk-hot-cache-not-implemented)). There is no
 `DiskCache.c`/`.h` in the tree yet; nothing described there is live driver
-behaviour.
+behaviour. What does exist is `GhostCache.c`, a data-free model that
+measures what that cache would have served -- off unless `GhostCacheMb` is
+set. See [Would a disk cache help?](#would-a-disk-cache-help-the-ghost-cache).
 
 ## What is expected of you here
 
@@ -1385,6 +1388,51 @@ the workload. `--report` writes flat `key=value` metrics for
 (every inline paging read must have a fetch; fetch issues must balance
 terminations) and perf deltas against a baseline in `tools\baselines\`.
 
+### Would a disk cache help? The ghost cache
+
+The on-disk hot cache (see "Future work" below) can only serve bytes that
+are read again after the Windows cache has dropped them, so whether it is
+worth building depends on how often that happens in real use, not on any
+benchmark. `GhostCache.c` measures exactly that. With `GhostCacheMb` set in
+the service's `Parameters` key, every range GET the driver makes is
+replayed against a memory-only table of the 64 KB blocks recent fetches
+covered, and the `Ghost*` counters in `Statistics.h` say how many fetches,
+demand fetches and bytes a cache of 1, 4, 16, 64 and 256 GB would have
+served from local disk, under first-miss and second-miss admission, and how
+many bytes each policy would have written.
+
+```powershell
+.\deploy\Deploy-ToVM.ps1 -ForBenchmark -GhostCacheMb 64   # or GhostCacheMb= in blorgfs.env
+PerfHarness.exe reset
+#   ... use B: the way it is really used, for as long as possible ...
+PerfHarness.exe stats            # "ghost cache" block; --report adds Ghost* keys
+```
+
+How to read it:
+
+- **Demand hits are the number.** A demand fetch is one an application was
+  blocked on, so a demand hit is a stall that would have gone from a network
+  round trip to a local disk read. Byte hits only say how much link
+  bandwidth would be handed back.
+- **It is a floor.** It counts blocks fetched since, not distinct blocks,
+  as the distance to an earlier fetch; a block counts as cached only once a
+  fetch covered all of it; and a table eviction forgets a block. All three
+  can only turn a real hit into a reported miss.
+- **High `GhostEvictions` means the table is too small** for the history
+  being asked about. Each MB of table remembers 4 GB of blocks; 64 MB covers
+  the 256 GB row.
+- **A synthetic workload proves nothing here.** Re-reading the same file in
+  a benchmark hits by construction. Only real use, over days rather than a
+  run, says how often the Windows cache loses something that is read again.
+- **The table survives `PerfHarness reset`**, which zeroes only the
+  counters, so a reset starts a new measurement window without forgetting
+  what was fetched before it. A reboot or reinstall forgets everything,
+  which a real on-disk cache would not.
+
+Off by default, and a no-op when off. The guest tests in CI turn it on
+(`GhostCacheMb = 16`) so the model runs under Driver Verifier on every
+build; `GhostCacheTest.cpp` pins its arithmetic.
+
 Accept new numbers deliberately, never silently:
 
 ```bash
@@ -1692,8 +1740,17 @@ returns `STATUS_PENDING` and is completed later from a network completion
 1. `BlorgDiskCacheLookup` — in-memory index, no I/O, no blocking.
 2. **Hit**: queue a cache read; a worker fills `Irp->MdlAddress` and
    completes the IRP.
-3. **Miss**: issue the HTTP fetch exactly as now. On completion, complete the
-   IRP *first*, then queue the write-behind from the buffer already in hand.
+3. **Miss**: issue the HTTP fetch exactly as now. On completion, copy the
+   blocks being admitted into a private buffer, complete the IRP, then queue
+   the write-behind from that copy.
+
+The copy is not optional. An earlier draft said to write behind "from the
+buffer already in hand", but there is no such buffer: `BlorgHttpGetFileMdl`
+receives the body straight into the IRP's MDL (`Client.c`, zero-copy mode),
+which for a paging read is the cache manager's own pages, and they belong
+to Mm again the moment the IRP completes. Copying before completion costs a
+memcpy of the admitted blocks against a network fetch, and with
+second-miss admission only blocks already fetched once are copied.
 
 The reader never waits on the cache in either direction. A miss costs
 nothing it did not already cost, and a write-behind failure is invisible.
@@ -1866,7 +1923,9 @@ bandwidth and, on SSD, wasted endurance.
   whether anything more is warranted.
 
 Measure hit rate, bytes served from cache, and write amplification before
-tuning any of it.
+tuning any of it -- and before building any of it: `GhostCache.c` already
+reports all three for both admission policies against real use, without
+storing a byte. See [Would a disk cache help?](#would-a-disk-cache-help-the-ghost-cache).
 
 Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),
 [size-aware admission for CDN memory caches (CMU)](http://reports-archive.adm.cs.cmu.edu/anon/2016/CMU-CS-16-120.pdf),

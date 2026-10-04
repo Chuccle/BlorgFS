@@ -14,7 +14,7 @@
       3. Runs BlorgFS.inf's DefaultInstall section (rundll32 setupapi.dll,InstallHinfSection),
          which copies BlorgFS.sys to System32\drivers and registers the service, including
          the INF's seeded Parameters\RemoteHost default (see BlorgFS.inf).
-      4. Optionally overrides TlsEnabled / TlsPin / RemotePort / RemoteHost under the
+      4. Optionally overrides TlsEnabled / TlsPin / RemotePort / RemoteHost / GhostCacheMb under the
          service's Parameters key (see Driver.c's ReadBlorgfsRegistryConfig) on top of
          whatever the INF seeded.
       5. Starts the service and polls for the B: drive to come up (the driver
@@ -50,6 +50,12 @@
     Required for -TlsEnabled to actually complete a handshake -- without it every TLS
     connection fails closed at the Certificate message (see Driver.h's TlsEnabled comment).
 
+.PARAMETER GhostCacheMb
+    If passed and non-zero, writes GhostCacheMb (REG_DWORD): the size in MB of the
+    ghost cache table (src/GhostCache.c), which models what an on-disk block cache
+    would have served and reports it through PerfHarness. Each MB remembers 4 GB of
+    fetched blocks; 64 covers every capacity the counters report. Off when unset.
+
 .EXAMPLE
     .\Install-BlorgFS.ps1
     Installs against the plaintext default (port 8080, no TLS, RemoteHost from the INF).
@@ -67,6 +73,7 @@ param(
     [switch]$TlsEnabled,
     [string]$RemotePort,
     [string]$TlsPinHex,
+    [int]$GhostCacheMb = 0,
     [char]$DriveLetter = 'B',
     [int]$MountTimeoutSeconds = 20
 )
@@ -148,7 +155,7 @@ if ($installed -match "1060") {
     throw "INF install did not register the '$ServiceName' service. Check %windir%\inf\setupapi.dev.log for the setupapi-side error."
 }
 
-if ($RemoteHost -or $TlsEnabled -or $RemotePort -or $TlsPinHex) {
+if ($RemoteHost -or $TlsEnabled -or $RemotePort -or $TlsPinHex -or $GhostCacheMb) {
     Write-Step "Applying registry Parameters overrides"
     $paramsKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters"
     New-Item -Path $paramsKey -Force | Out-Null
@@ -168,6 +175,9 @@ if ($RemoteHost -or $TlsEnabled -or $RemotePort -or $TlsPinHex) {
         }
         $bytes = [byte[]]($TlsPinHex -split '(?<=\G.{2})(?!$)' | ForEach-Object { [Convert]::ToByte($_, 16) })
         New-ItemProperty -Path $paramsKey -Name "TlsPin" -PropertyType Binary -Value $bytes -Force | Out-Null
+    }
+    if ($GhostCacheMb) {
+        New-ItemProperty -Path $paramsKey -Name "GhostCacheMb" -PropertyType DWord -Value $GhostCacheMb -Force | Out-Null
     }
 }
 

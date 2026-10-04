@@ -155,6 +155,15 @@
 #define BLORGFS_SLOW_FETCH_THRESHOLD_US 250000
 
 //
+// Shape of the ghost cache counters (GhostCache.c): two admission
+// policies, first miss and second miss, and six capacity buckets whose
+// upper bounds are 1, 4, 16, 64 and 256 GB, the last catching everything
+// beyond. Bucket i's bound is 1 GB << (2 * i).
+//
+#define BLORGFS_GHOST_POLICIES          2
+#define BLORGFS_GHOST_DISTANCE_BUCKETS  6
+
+//
 // Slots per processor, and the total the query merges them into. Small,
 // because a processor filing more than four outliers inside one
 // measurement window has a problem the newest four will describe just as
@@ -482,6 +491,39 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 FetchBodyMaxUs;
     ULONG64 FetchSplitSamples;
 
+    //
+    // What an on-disk block cache would have served, from the ghost cache
+    // (GhostCache.c), which replays every fetch against a table of recently
+    // fetched blocks and stores no data. All zero unless GhostCacheMb is
+    // set, so GhostFetches == 0 with FetchesIssued > 0 means "not
+    // measured", not "no hits".
+    //
+    // Indexed [policy][distance]: policy 0 admits a block on its first
+    // miss, policy 1 on its second (BLORGFS_GHOST_POLICIES); distance is
+    // how much was fetched between the fetch that left the block cached
+    // and this one, bucketed at 1, 4, 16, 64 and 256 GB with a last bucket
+    // for anything beyond (BLORGFS_GHOST_DISTANCE_BUCKETS). A cache of C
+    // bytes would have served the sum of the buckets at or below C. The
+    // model only errs towards a miss -- see GhostCache.c -- so these are a
+    // floor on what a real cache would do.
+    //
+    // Demand fetches are the ones someone was blocked on, so their hits
+    // are the stalls a cache would have removed, and the number that
+    // decides whether users would feel it; speculative hits only save
+    // bandwidth. A partial is a fetch with some blocks held and not all,
+    // which a first version would send to the network whole. AdmitBytes is
+    // what each policy would have written to the disk, which is the wear.
+    //
+    ULONG64 GhostFetches;
+    ULONG64 GhostFetchBytes;
+    ULONG64 GhostDemandFetches;
+    ULONG64 GhostEvictions;              // table entries displaced, losing history; high means GhostCacheMb is too small
+    ULONG64 GhostAdmitBytes[BLORGFS_GHOST_POLICIES];
+    ULONG64 GhostPartialFetches[BLORGFS_GHOST_POLICIES];
+    ULONG64 GhostHitFetches[BLORGFS_GHOST_POLICIES][BLORGFS_GHOST_DISTANCE_BUCKETS];
+    ULONG64 GhostHitBytes[BLORGFS_GHOST_POLICIES][BLORGFS_GHOST_DISTANCE_BUCKETS];
+    ULONG64 GhostHitDemandFetches[BLORGFS_GHOST_POLICIES][BLORGFS_GHOST_DISTANCE_BUCKETS];
+
 
     //
     // Everything from here down is per-processor diagnostic state rather
@@ -512,7 +554,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
 
-#define BLORGFS_STATISTICS_VERSION 14
+#define BLORGFS_STATISTICS_VERSION 15
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {
