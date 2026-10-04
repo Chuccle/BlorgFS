@@ -29,6 +29,7 @@ occasionally, not every session.
 | [Conventions](#conventions) | Naming, style, and hard rules |
 | [Build and test tiers](#build-and-test-tiers) | How to build and run the regression tiers |
 | [Continuous integration](#continuous-integration) | What each CI workflow gates |
+| [Package and test guest](#package-and-test-guest) | The driver + server-rs package, Linux tooling, and the Windows test guest |
 | [Sanitizers](#sanitizers) | ASan/KASAN requirements |
 | [Deploying to a VM](#deploying-to-a-vm) | The deploy pipeline and its quirks |
 | [Debugging the VM: what's real and what's noise](#debugging-the-vm-whats-real-and-whats-noise) | Decision tree for VM/debugger flakiness |
@@ -51,6 +52,8 @@ a task needs it.
 | Deploy to the dev VM | `.\deploy\Deploy-ToVM.ps1 -Configuration Release` | [Deploying to a VM](#deploying-to-a-vm) |
 | Benchmark (Release, Verifier off) | `powershell -File deploy/Deploy-ToVM.ps1 -ForBenchmark` | [Measuring performance](#measuring-performance) |
 | Accept new perf baseline | `powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Perf -PerfFile <path> -UpdateBaseline` | [Measuring performance](#measuring-performance) |
+| Package the driver with server-rs | `tools/blorg package --driver x64/Release` | [Package and test guest](#package-and-test-guest) |
+| Test a package in a local KVM guest | `tools/blorg guest test --package <dir>` | [The test guest](#the-test-guest) |
 | KASAN driver build | `msbuild src\BlorgFS.vcxproj -p:Configuration=Debug -p:Platform=x64 -p:EnableKASAN=true` | [Sanitizers](#sanitizers) |
 
 ### Always true
@@ -383,11 +386,12 @@ test directory.
 
 ## Continuous integration
 
-Three workflows, split by what a failure should cost you.
+Four workflows, split by what a failure should cost you.
 
 | Workflow | Runs on | What it does |
 |---|---|---|
-| `build.yml` | push and PR to master | Both configurations, Fast tier. The merge gate. |
+| `build.yml` | push and PR to master, `v*` tags, on demand | Both configurations, Fast tier, the package, then the package in the Windows test guest. The merge gate. |
+| `guest.yml` | called by `build.yml`, or on demand | The Windows test guest; see [The guest in CI](#the-guest-in-ci). |
 | `verify.yml` | 03:00 UTC daily, or on demand | CBMC proofs and extended fuzz/interleaving runs. |
 | `codeql.yml` | Saturdays 23:41 UTC, on demand, and on any PR touching its own config | CodeQL with the pinned Microsoft driver query packs. |
 
@@ -410,6 +414,180 @@ coverage, and the windows-drivers pack is the one carrying the
 driver-specific IRQL and annotation queries. Bump it deliberately, let the
 PR trigger run it, and re-triage: previous false-positive verdicts do not
 carry across a pack version.
+
+## Package and test guest
+
+BlorgFS ships together with its backend,
+[server-rs](https://github.com/Chuccle/server-rs), pinned as the
+`third_party/server-rs` submodule. The repositories stay separate and this
+one is the package root: a BlorgFS commit names the exact server it ships
+with. Everything on the Linux side, in CI or by hand, goes through one
+entrypoint, the one script `tools/blorg` (`tools/blorg help` lists every
+command). Windows is needed only for the driver build (`build.yml`'s
+Windows job, or `Invoke-BlorgChecks.ps1`), for analysing a guest's crash
+dumps (`guest.yml`'s crash job) and inside the test guest. Everything that
+runs inside the guest is one script,
+`tools/guest/Invoke-BlorgGuest.ps1 -Step Image|Prepare|Test|Diagnostics`.
+
+### The package
+
+```
+manifest.json   version; blorgfs, server_rs and schemas commits;
+                signer thumbprint; SHA-256 of every file
+driver/         BlorgFS.sys, .inf, .cat, .cer, Install-BlorgFS.ps1,
+                Uninstall-BlorgFS.ps1
+server/         linux-x64/server-rs        static (musl); where the backend runs
+                windows-x64/server-rs.exe  single-machine fallback (mingw)
+```
+
+`build.yml` builds it on every push and PR and uploads it as the artifact
+`blorg-package-windows-x64`. Only the driver job runs on Windows; the pins
+check, both server builds and the packaging run on Linux. `blorg server`
+keeps the binaries of a clean server-rs checkout in its cache, keyed by
+commit, target and compiler, and CI caches that by the pin and the
+toolchain, so an unchanged pin costs a copy rather than a build:
+
+| Command | Does |
+|---|---|
+| `tools/blorg pins` | Fails unless the driver and the pinned server-rs compile the same `schemas` commit |
+| `tools/blorg server [--out DIR]` | Cross-builds the pinned server-rs for both platforms, with `flatc` built from server-rs's own pinned flatbuffers (the generated Rust must match the crate) |
+| `tools/blorg package --driver x64/Release [--servers DIR]` | Assembles the package and its `manifest.json` into `out/package` |
+
+The Rust toolchain that builds server-rs is pinned once, in
+`rust-toolchain.toml`: rustup uses it anywhere under this checkout, and CI
+installs it.
+
+The driver and server agree on the wire only because both compile the same
+FlatBuffers schema, so Dependabot bumps the two submodules together
+(`package-contract` in `.github/dependabot.yml`). There is no separate API
+contract check: an API break shows up as a red guest run, below.
+
+`VERSION` holds the package version. Untagged builds append both commits
+(`0.1.0+g417fc40.s2fa2955`: BlorgFS, then server-rs). A `v*` tag must equal
+`v` + `VERSION` and publishes the zipped package as a GitHub release. The
+driver is signed with the WDK test certificate the build generates, so it
+installs only where test signing is on, which `Install-BlorgFS.ps1` turns on.
+Artifact zips drop the executable bit: `chmod +x server/linux-x64/server-rs`.
+
+### The test guest
+
+A Windows Server 2025 Core guest under KVM/QEMU loads the packaged driver
+into a real kernel and tests it against the packaged Linux server. It runs
+on any Linux host with `/dev/kvm`; GitHub's `ubuntu-latest` runners are
+one, and that is what CI uses.
+
+```bash
+tools/blorg guest host-setup     # once per host: QEMU and /dev/kvm access
+tools/blorg guest image          # once per host: unattended install, 20-30 min
+tools/blorg guest test --package <unpacked blorg-package-windows-x64>
+```
+
+`guest test` boots a fresh guest from the golden image, pushes the package,
+prepares it (test signing, Driver Verifier on `BlorgFS.sys` unless
+`--no-verifier`; reboots if needed), runs the tests, collects diagnostics,
+pulls everything to `--out` (default `guest-results/`) and powers the guest
+off (`--keep` leaves it up). Exit 0 pass, 1 fail, 2 the rig broke before a
+verdict. `verdict.txt` is the one-screen answer; `results.json` is rewritten
+after every step, so a run that died still says how far it got.
+
+**Topology.** server-rs runs on the host, the way the product is deployed,
+and the guest reaches it at `10.0.2.2:18080` (QEMU user networking's
+address for the host). The driver's WSK traffic crosses a real emulated NIC
+and the backend's filesystem is case-sensitive. The TLS path is not
+exercised yet.
+
+What a run checks, in order: the package matches `manifest.json`; a
+deterministic corpus (generated by `blorg guest test`: sizes either side of page,
+64 KiB, read-ahead granule and ceiling; a 300-entry directory; awkward and
+non-ASCII names; deep and empty directories) is served and reachable from
+the guest; `Install-BlorgFS.ps1` installs and `B:` mounts; the tree on `B:`
+matches the corpus path for path and size for size;
+`Test-BlorgCorrectness.ps1` passes; server errors reach a program as the
+Win32 error it expects (a missing file is `FileNotFound`, a missing
+directory `DirectoryNotFound`, reading past the end returns 0 bytes); the
+service is still RUNNING. A bugcheck or unexplained reboot anywhere
+fails the run, and the minidumps come back in `diag/dumps`. CI then
+analyses them on `windows-latest` with the driver's PDB from the same
+build (`tools\Get-CrashVerdict.ps1 -SymbolServer -SymbolDir <build>`, the
+same command by hand) and reports the bugcheck, faulting line and stack as
+a `blorg guest-crash` annotation.
+
+**Adding a check.** Add an `Invoke-Step` to `-Step Test` in
+`Invoke-BlorgGuest.ps1`; it is recorded in `results.json` and the verdict
+like the others. Anything a check needs on the volume goes in the corpus,
+in `tools/blorg`. Guest code runs in Windows PowerShell 5.1: no PowerShell
+7 syntax, and build non-ASCII strings from code points.
+
+**Working in the guest.** Everything goes through `tools/blorg guest`:
+
+| Do this | Command |
+|---|---|
+| Boot a fresh guest | `blorg guest up --fresh` |
+| Run PowerShell in it | `blorg guest ssh 'Get-Service BlorgFS'` |
+| Run a local script in it | `blorg guest ps ./thing.ps1 -Arg value` |
+| Copy in / out | `blorg guest push ./dir C:/x/dir`, `blorg guest pull C:/x/file .` |
+| Reboot and wait | `blorg guest reboot` |
+| Checkpoint / go back | `blorg guest snapshot clean`, `blorg guest revert clean` |
+| See the screen (bugcheck?) | `blorg guest screenshot screen.png` |
+| SSH is down, Windows is not | `blorg guest qga-exec 'Get-NetAdapter'` |
+| A bash script of the above, with a transcript | `blorg guest run script.sh` |
+| Power off | `blorg guest down` |
+
+SSH listens only on the host's loopback (127.0.0.1:2222, key-only,
+Administrator, PowerShell as the shell); the key lives next to the golden
+image. Inline `ssh` commands lose double quotes to Windows argv parsing:
+use single quotes, or `ps` for anything longer than a line. Install with
+`Install-BlorgFS.ps1`, never by copying the `.sys`, and a second install in
+the same boot needs a reboot or a `revert`, because `sc stop` wedges in
+`STOP_PENDING`.
+
+**The golden image** is Windows Server 2025 (build 26100), the oldest
+Windows the driver loads on: `BlorgFS.vcxproj` targets NTDDI 0x0A000010, so
+on Server 2022 it fails to start with "procedure not found". It is built
+unattended from Microsoft's 180-day evaluation ISO: `autounattend.xml` on a
+generated config ISO, then `Invoke-BlorgGuest.ps1 -Step Image` installs
+OpenSSH and the QEMU guest agent, turns test signing on and boot recovery
+off, sets Driver Verifier, keeps kernel dumps and turns Windows Update off.
+The build then boots the result once and checks it over SSH. Every download
+is a versioned URL pinned by SHA-256 in `tools/blorg` (`guest_image`), so
+the same recipe always builds from the same bytes; a moved download fails
+the build with its new hash. The answer file is checked to be well-formed
+first: Setup silently ignores a broken one and waits at its language screen.
+The install gives up after 45 min, or after 20 min on one unchanged screen
+(it is stuck), with a `blorg image-build` annotation holding the tail of the
+setup transcript. SeaBIOS, because Secure Boot blocks
+`bcdedit /set testsigning on`; AHCI disk and e1000e NIC, because Windows has
+inbox drivers for both.
+
+### The guest in CI
+
+`guest.yml` runs the same commands on a GitHub Linux runner. `build.yml`
+calls it alongside its build jobs, so every push and PR is tested in the
+guest: the guest boots while the driver builds, then waits for the `Package`
+job and tests that package (`blorg guest test --booted`). It caches the
+golden image keyed by `tools/blorg guest image-key` (a hash of the image's
+own inputs, so a change to the tests reuses it) and the calendar quarter (so
+the evaluation never expires under a cached image); a miss costs one
+unattended install in that run. Each run also exercises every guest channel
+once (`blorg guest selftest`, into `guest-results/selftest/`). It uploads
+`guest-results` and, when it fails, the image build's screens.
+
+Dispatch `guest.yml` to test an earlier build's package again
+(`package_run_id`, default the newest build on the branch whose `Package`
+job succeeded, whatever its guest tests said), without Driver Verifier
+(`verifier`), or with a `script`: bash run against the live guest
+afterwards, with `blorg` on `PATH` and `$SESSION_OUT`
+(`guest-results/session/`) for files to bring back. This is how to work in
+a guest without a KVM host of your own. The script never changes the
+verdict above it.
+
+To run the pipeline for a pushed commit from a shell, use the GitHub CLI:
+`gh workflow run build.yml --ref <branch>` builds, packages and guest-tests
+it, and `gh workflow run guest.yml --ref <branch>` tests an earlier build's
+package again. Logs and artifacts are served from blob storage that a
+restrictive egress proxy may block; the `blorg guest-verdict` and
+`blorg guest-crash` check annotations are served by the API and say the
+same in brief.
 
 ## Sanitizers
 

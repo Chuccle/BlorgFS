@@ -1,0 +1,1406 @@
+#!/usr/bin/env bash
+#
+# blorg -- package BlorgFS with server-rs and test it in a Windows guest.
+#
+# The one entrypoint for everything that runs on Linux, in CI or by hand;
+# build.yml and guest.yml run exactly these commands. Windows is needed only
+# for the driver build (build.yml's Windows job, or
+# tools\Invoke-BlorgChecks.ps1), for analysing a guest's crash dumps
+# (tools\Get-CrashVerdict.ps1) and inside the guest itself
+# (tools/guest/Invoke-BlorgGuest.ps1). See AGENTS.md, "Package and test
+# guest".
+#
+#   pins                    the driver and the pinned server-rs compile the
+#                           same schemas commit
+#   server [--out DIR] [linux-x64|windows-x64 ...]
+#                           cross-build the pinned server-rs
+#   package --driver DIR [--servers DIR] [--out DIR] [--release]
+#                           assemble the package and its manifest.json
+#
+#   guest host-setup        QEMU and /dev/kvm access (Debian/Ubuntu)
+#   guest image [--iso PATH|URL] [--virtio-iso PATH|URL] [--image-index N]
+#                           build the golden image a guest boots from
+#   guest image-key         hash of the image's inputs, for caching it
+#   guest test --package DIR [--out DIR] [--server-bin PATH]
+#              [--no-verifier] [--kernel-dump] [--keep] [--booted]
+#                           one end-to-end runtime test run
+#   guest run [--out DIR] SCRIPT
+#                           run a bash script against the live guest, with
+#                           `blorg` on PATH; transcript kept
+#   guest selftest [--out DIR]
+#                           every channel below, once (CI runs it after
+#                           every guest test run)
+#
+#   guest up [--fresh]              boot the guest (a fresh disk from the
+#                                   golden image with --fresh or when none
+#                                   exists), wait for SSH
+#   guest down [--graceful]         power off (hard by default: the disk is
+#                                   disposable; --graceful asks Windows first)
+#   guest status                    is it running, and is SSH answering
+#   guest wait [timeout-s]          block until SSH answers (default 600)
+#   guest ssh [command...]          PowerShell in the guest; no command =
+#                                   interactive
+#   guest ps <file.ps1> [args...]   copy a local script in and run it; exits
+#                                   with the script's exit code
+#   guest push <local> <guest-path> copy into the guest (guest paths: C:/x/y)
+#   guest pull <guest-path> <local> copy out of the guest
+#   guest reboot [timeout-s]        restart Windows and wait until it is back
+#   guest boot-id                   the guest's last boot time (changes on any
+#                                   reboot, including a bugcheck's)
+#   guest snapshot|revert <name>    save a live snapshot (RAM + disk), or
+#                                   return to it
+#   guest snapshots                 list them
+#   guest screenshot <out.png>      what the guest's screen shows right now --
+#                                   the way to see a bugcheck or a stuck boot
+#   guest qga-exec <powershell>     run PowerShell through the QEMU guest
+#                                   agent, for when SSH is down but Windows is
+#                                   not
+#   guest qmp <command> [json]      raw QMP, for anything else
+#
+# Exit codes: 0 pass, 1 checks/tests failed, 2 the tool or environment broke.
+
+set -uo pipefail
+
+BLORG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/blorg"
+REPO="$(cd "$(dirname "$BLORG")/.." && pwd)"
+CACHE="${BLORG_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/blorg}"
+OUT="${BLORG_OUT:-$REPO/out}"
+export BLORG
+mkdir -p "$CACHE"
+
+die()  { echo "blorg: $*" >&2; exit 2; }
+note() { echo "blorg: $*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+hdr()  { echo; echo "==> $*"; }
+
+# --------------------------------------------------------------- package
+#
+# pins | server | package: the combined BlorgFS + server-rs package. The one
+# recipe: build.yml runs these commands, and a package built by hand is
+# built the same way.
+
+SERVER_TARGETS=(linux-x64:x86_64-unknown-linux-musl:server-rs windows-x64:x86_64-pc-windows-gnu:server-rs.exe)
+
+# Gitlink of PATH in REPO's index (mode 160000), or fail.
+gitlink() {
+    local line
+    line="$(git -C "$1" ls-files -s -- "$2")" || return 1
+    [[ "$line" == 160000\ * ]] || { note "'$2' is not a submodule in $1"; return 1; }
+    awk '{print $2}' <<<"$line"
+}
+
+# blorg pins: the driver's schemas pin must equal the schemas pin inside
+# the pinned server-rs commit, or the two sides compile different schemas
+# and only a mounted volume shows it. Reads the index, not the working tree,
+# so it answers for what is committed. Prints "server_rs schemas".
+cmd_pins() {
+    local srv="$REPO/third_party/server-rs" server_pin driver_schemas server_schemas
+    [[ -e "$srv/.git" ]] || die "third_party/server-rs is not checked out (git submodule update --init third_party/server-rs)"
+    server_pin="$(gitlink "$REPO" third_party/server-rs)" || exit 2
+    driver_schemas="$(gitlink "$REPO" third_party/schemas)" || exit 2
+    server_schemas="$(git -C "$srv" ls-tree "$server_pin" -- schemas | awk '{print $3}')"
+    [[ -n "$server_schemas" ]] || die "cannot read schemas at server-rs $server_pin (is that commit fetched?)"
+    note "server-rs $server_pin; schemas: driver $driver_schemas, server $server_schemas"
+    if [[ "$driver_schemas" != "$server_schemas" ]]; then
+        local msg="schema mismatch: the driver builds schemas $driver_schemas, the pinned server-rs ($server_pin) builds $server_schemas. Bump third_party/schemas and third_party/server-rs together."
+        [[ -n "${GITHUB_ACTIONS:-}" ]] && echo "::error title=Package pins::$msg"
+        echo "blorg: $msg" >&2
+        return 1
+    fi
+    echo "$server_pin $driver_schemas"
+}
+
+# flatc built from server-rs's own buildtools/flatbuffers submodule: its
+# build.rs runs flatc, and the generated code must match its flatbuffers
+# crate. Cached by submodule commit. Prints the directory holding flatc.
+server_flatc() {
+    local srv="$1" rev dir
+    rev="$(git -C "$srv" rev-parse HEAD:buildtools/flatbuffers 2>/dev/null)" || die "no buildtools/flatbuffers in $srv"
+    dir="$CACHE/flatc-${rev:0:12}"
+    if [[ ! -x "$dir/flatc" ]]; then
+        have cmake || die "cmake missing; cannot build flatc"
+        git -C "$srv" submodule update --init --recursive >/dev/null || die "submodule update failed in $srv"
+        note "building flatc from $srv/buildtools/flatbuffers"
+        { cmake -S "$srv/buildtools/flatbuffers" -B "$dir-build" -DCMAKE_BUILD_TYPE=Release \
+              -DFLATBUFFERS_BUILD_TESTS=OFF -DFLATBUFFERS_BUILD_FLATLIB=OFF -DFLATBUFFERS_BUILD_FLATHASH=OFF >/dev/null &&
+          cmake --build "$dir-build" --target flatc -j"$(nproc)" >/dev/null 2>&1; } || die "flatc build failed"
+        mkdir -p "$dir" && cp "$dir-build/flatc" "$dir/" && rm -rf "$dir-build"
+    fi
+    echo "$dir"
+}
+
+# blorg server [--out DIR] [linux-x64|windows-x64 ...]: cross-builds the
+# pinned server-rs (cargo build --release --locked, default features) into
+# DIR/<platform>/. Default: both platforms into out/server.
+#
+# A clean server-rs checkout's binaries are kept in the cache, keyed by its
+# commit, the target and the compiler, so an unchanged pin is a copy rather
+# than a build. A checkout with local changes is always built.
+cmd_server() {
+    local out="$OUT/server" want=() srv flatc="" t plat triple bin rev="" key
+    while (( $# )); do
+        case "$1" in
+            --out) out="$2"; shift 2 ;;
+            *) want+=("$1"); shift ;;
+        esac
+    done
+    srv="$REPO/third_party/server-rs"
+    [[ -f "$srv/Cargo.toml" ]] || die "third_party/server-rs is not checked out (git submodule update --init --recursive third_party/server-rs)"
+    [[ -z "$(git -C "$srv" status --porcelain --untracked-files=no 2>/dev/null)" ]] &&
+        rev="$(git -C "$srv" rev-parse HEAD 2>/dev/null)"
+    for t in "${SERVER_TARGETS[@]}"; do
+        IFS=: read -r plat triple bin <<<"$t"
+        (( ${#want[@]} == 0 )) || [[ " ${want[*]} " == *" $plat "* ]] || continue
+        mkdir -p "$out/$plat"
+        key=""
+        [[ -n "$rev" ]] && key="$CACHE/server-rs/${rev:0:12}-$triple-$(cd "$srv" && rustc -V | sha256sum | cut -c1-8)"
+        if [[ -n "$key" && -f "$key/$bin" ]]; then
+            note "server-rs for $plat: cached build of ${rev:0:12}"
+            cp "$key/$bin" "$out/$plat/"
+            continue
+        fi
+        hdr "server-rs for $plat ($triple)"
+        [[ -n "$flatc" ]] || flatc="$(server_flatc "$srv")"
+        (cd "$srv" && rustup target add "$triple" >/dev/null 2>&1) || true
+        (cd "$srv" && PATH="$flatc:$PATH" cargo build --release --locked --target "$triple") || return 1
+        cp "$srv/target/$triple/release/$bin" "$out/$plat/"
+        [[ -n "$key" ]] && mkdir -p "$key" && cp "$srv/target/$triple/release/$bin" "$key/"
+    done
+    note "servers in $out"
+}
+
+# The driver build file NAME from the first of DIRS that has it, any case:
+# Inf2Cat writes blorgfs.cat, and the package may be assembled on Linux.
+find_build_file() {
+    local name="$1" d hit; shift
+    for d in "$@"; do
+        [[ -d "$d" ]] || continue
+        hit="$(find "$d" -maxdepth 1 -type f -iname "$name" | head -1)"
+        [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+    done
+    return 1
+}
+
+# blorg package --driver DIR [--servers DIR] [--out DIR] [--release]
+#   --driver   the driver build output, x64\Release as msbuild left it
+#              (BlorgFS.sys/.cer there, the staged INF/catalog in BlorgFS\)
+#   --servers  blorg server's output (default out/server)
+#   --release  use VERSION as is (a tagged release); otherwise the version
+#              carries both commits, e.g. 0.1.0+g417fc40.s2fa2955
+# Prints the version. Layout: manifest.json, driver/, server/<platform>/.
+cmd_package() {
+    local driver="" servers="$OUT/server" out="$OUT/package" release=0
+    while (( $# )); do
+        case "$1" in
+            --driver)  driver="$2"; shift 2 ;;
+            --servers) servers="$2"; shift 2 ;;
+            --out)     out="$2"; shift 2 ;;
+            --release) release=1; shift ;;
+            *) die "unknown package argument '$1'" ;;
+        esac
+    done
+    [[ -d "$driver" ]] || die "usage: blorg package --driver <x64/Release> [--servers DIR] [--out DIR] [--release]"
+    have openssl || die "openssl missing"
+    local pins server_pin schemas base commit version
+    pins="$(cmd_pins)" || return 1
+    read -r server_pin schemas <<<"$pins"
+    base="$(tr -d '[:space:]' < "$REPO/VERSION")"
+    [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "VERSION must be MAJOR.MINOR.PATCH, got '$base'"
+    commit="$(git -C "$REPO" rev-parse HEAD)"
+    if (( release )); then version="$base"; else version="$base+g${commit:0:7}.s${server_pin:0:7}"; fi
+
+    [[ -e "$out" && -n "$(ls -A "$out" 2>/dev/null)" ]] && die "$out is not empty"
+    mkdir -p "$out/driver" "$out/server"
+    local name src d1 d2
+    for name in BlorgFS.sys:BlorgFS:. BlorgFS.inf:BlorgFS BlorgFS.cat:BlorgFS BlorgFS.cer:.; do
+        IFS=: read -r name d1 d2 <<<"$name"
+        src="$(find_build_file "$name" "$driver/$d1" ${d2:+"$driver/$d2"})" ||
+            die "$name not found in $driver (was the driver built?)"
+        cp "$src" "$out/driver/$name"
+    done
+    cp "$REPO/deploy/Install-BlorgFS.ps1" "$REPO/deploy/Uninstall-BlorgFS.ps1" "$out/driver/"
+    local t plat triple bin targets=()
+    for t in "${SERVER_TARGETS[@]}"; do
+        IFS=: read -r plat triple bin <<<"$t"
+        [[ -f "$servers/$plat/$bin" ]] || die "no $plat server at $servers/$plat/$bin (blorg server)"
+        mkdir -p "$out/server/$plat"
+        cp "$servers/$plat/$bin" "$out/server/$plat/"
+        targets+=("$plat=$triple")
+    done
+    chmod +x "$out/server/linux-x64/server-rs"
+
+    local cer="$out/driver/BlorgFS.cer" fmt=DER
+    openssl x509 -inform DER -in "$cer" -noout 2>/dev/null || fmt=PEM
+    BLORG_SUBJECT="$(openssl x509 -inform "$fmt" -in "$cer" -noout -subject -nameopt RFC2253 | sed 's/^subject=//')" \
+    BLORG_THUMB="$(openssl x509 -inform "$fmt" -in "$cer" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')" \
+    python3 - "$out" "$version" "$commit" "$server_pin" "$schemas" \
+        "$(sed -n '/^\[package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' "$REPO/third_party/server-rs/Cargo.toml" | head -1)" \
+        "${targets[@]}" <<'PY'
+import hashlib, json, os, sys
+out, version, commit, server, schemas, crate, *targets = sys.argv[1:]
+files = {}
+for root, _, names in os.walk(out):
+    for n in names:
+        p = os.path.join(root, n)
+        rel = os.path.relpath(p, out).replace(os.sep, "/")
+        with open(p, "rb") as f:
+            files[rel] = hashlib.sha256(f.read()).hexdigest()
+manifest = {
+    "schema": 1, "name": "blorg", "version": version,
+    "components": {
+        "blorgfs": {"commit": commit, "configuration": "Release", "platform": "x64", "signing": "test",
+                    "signer": {"subject": os.environ["BLORG_SUBJECT"], "thumbprint": os.environ["BLORG_THUMB"].upper()}},
+        "server_rs": {"commit": server, "version": crate, "targets": dict(t.split("=", 1) for t in targets)},
+        "schemas": {"commit": schemas},
+    },
+    "files": dict(sorted(files.items())),
+}
+if os.environ.get("GITHUB_ACTIONS"):
+    manifest["ci"] = {"run": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                      "ref": os.environ.get("GITHUB_REF")}
+with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2)
+    f.write("\n")
+PY
+    note "packaged blorg $version into $out"
+    echo "$version"
+}
+
+# ----------------------------------------------------------------- guest
+#
+# The one interface to the Windows test guest on a KVM/QEMU host, for CI
+# and for a person at a shell on the host alike.
+#
+# Settings. Everything is overridable from the environment, so CI, a cloud
+# host and a developer's Linux box all drive the same guest the same way:
+#
+#   GUEST_HOME      state root (image + current run)
+#   GUEST_IMAGE_DIR golden image and its key (default: $GUEST_HOME/image)
+#   GUEST_RUN_DIR   the running guest's disk, sockets and logs
+#                   (default: $GUEST_HOME/run)
+#   GUEST_GOLDEN    base image every run starts from
+#                   (default: $GUEST_IMAGE_DIR/golden.qcow2)
+#   GUEST_KEY       SSH key the image trusts (default: next to the image)
+#   GUEST_CPUS      vCPUs              (default: min(nproc, 4))
+#   GUEST_MEM_MB    RAM in MiB         (default: 4096)
+#   GUEST_SSH_PORT  host port forwarded to the guest's sshd (default: 2222)
+#   GUEST_ALLOW_TCG set to 1 to run without KVM -- works, but Windows is
+#                   unusably slow under pure emulation; meant for smoke
+#                   tests of the tooling itself, never for a real run.
+
+GUEST_HOME="${GUEST_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/blorgfs-guest}"
+GUEST_IMAGE_DIR="${GUEST_IMAGE_DIR:-$GUEST_HOME/image}"
+GUEST_RUN_DIR="${GUEST_RUN_DIR:-$GUEST_HOME/run}"
+GUEST_SSH_PORT="${GUEST_SSH_PORT:-2222}"
+GUEST_MEM_MB="${GUEST_MEM_MB:-4096}"
+if [[ -z "${GUEST_CPUS:-}" ]]; then
+    GUEST_CPUS="$(nproc)"
+    (( GUEST_CPUS > 4 )) && GUEST_CPUS=4
+fi
+
+GUEST_GOLDEN="${GUEST_GOLDEN:-$GUEST_IMAGE_DIR/golden.qcow2}"
+GUEST_KEY="${GUEST_KEY:-$GUEST_IMAGE_DIR/id_ed25519}"
+# The files of one running guest, under GUEST_RUN_DIR; called again by
+# whatever points GUEST_RUN_DIR somewhere else (the image build).
+guest_paths() {
+    GUEST_DISK="$GUEST_RUN_DIR/disk.qcow2"
+    GUEST_PIDFILE="$GUEST_RUN_DIR/qemu.pid"
+    GUEST_QMP="$GUEST_RUN_DIR/qmp.sock"
+    GUEST_QGA="$GUEST_RUN_DIR/qga.sock"
+    GUEST_SERIAL="$GUEST_RUN_DIR/serial.log"
+    GUEST_QEMU_LOG="$GUEST_RUN_DIR/qemu.log"
+}
+guest_paths
+
+guest_accel() {
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+        echo "kvm"
+    elif [[ "${GUEST_ALLOW_TCG:-0}" == "1" ]]; then
+        note "no usable /dev/kvm; falling back to TCG emulation (very slow)"
+        echo "tcg"
+    else
+        die "/dev/kvm is missing or not accessible. Run on a host with KVM (see blorg guest host-setup), or set GUEST_ALLOW_TCG=1 to emulate."
+    fi
+}
+
+# Prints the QEMU argument list, one per line, for a guest booting from
+# $1 (a qcow2). Extra arguments (CD-ROMs for the image build) follow.
+#
+# Device choices are deliberate:
+#   - SeaBIOS (QEMU's default firmware): no Secure Boot, so test signing
+#     can be switched on at all.
+#   - q35's built-in AHCI + ide-hd and e1000e: both have inbox Windows
+#     drivers. discard=unmap lets the guest's TRIM shrink the qcow2.
+#   - virtio-serial port named org.qemu.guest_agent.0: the QEMU guest
+#     agent's channel, a fallback way in when the guest network is down.
+#   - user-mode networking with only sshd forwarded, and only on loopback:
+#     nothing outside this host can reach the guest.
+#   - std VGA, so QMP screendump can show a bugcheck screen.
+guest_qemu_args() {
+    local disk="$1"; shift
+    local accel cpu
+    accel="$(guest_accel)"
+    if [[ "$accel" == "kvm" ]]; then
+        # Hyper-V enlightenments: a large win for Windows under KVM and
+        # invisible to the driver under test.
+        cpu="host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time"
+    else
+        cpu="max"
+    fi
+    printf '%s\n' \
+        -name blorgfs-guest \
+        -machine "q35,accel=$accel" \
+        -cpu "$cpu" \
+        -smp "$GUEST_CPUS" \
+        -m "$GUEST_MEM_MB" \
+        -rtc base=utc,driftfix=slew \
+        -drive "file=$disk,if=none,id=sys,format=qcow2,discard=unmap,detect-zeroes=unmap,cache=unsafe" \
+        -device ide-hd,drive=sys,bus=ide.0,bootindex=1 \
+        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$GUEST_SSH_PORT-:22" \
+        -device e1000e,netdev=net0 \
+        -device virtio-serial-pci \
+        -chardev "socket,path=$GUEST_QGA,server=on,wait=off,id=qga0" \
+        -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
+        -qmp "unix:$GUEST_QMP,server=on,wait=off" \
+        -serial "file:$GUEST_SERIAL" \
+        -vga std \
+        -display none \
+        "$@"
+}
+
+guest_running() {
+    [[ -f "$GUEST_PIDFILE" ]] && kill -0 "$(cat "$GUEST_PIDFILE")" 2>/dev/null
+}
+
+guest_qmp() { python3 -c "$QMP_PY" qmp "$GUEST_QMP" "$@"; }
+guest_qga() { python3 -c "$QMP_PY" qga "$GUEST_QGA" "$@"; }
+
+guest_ssh_opts() {
+    printf '%s\n' \
+        -i "$GUEST_KEY" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=10 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=4 \
+        -o BatchMode=yes
+}
+
+GUEST_STAGE='C:/blorgfs-ci/stage'
+
+ssh_guest() {
+    local -a opts
+    mapfile -t opts < <(guest_ssh_opts)
+    ssh "${opts[@]}" -p "$GUEST_SSH_PORT" Administrator@127.0.0.1 "$@"
+}
+
+scp_guest() {
+    local -a opts
+    mapfile -t opts < <(guest_ssh_opts)
+    scp -q -r "${opts[@]}" -P "$GUEST_SSH_PORT" "$@"
+}
+
+guest_wait() {
+    local timeout="${1:-600}" start=$SECONDS
+    while (( SECONDS - start < timeout )); do
+        guest_running || die "QEMU is not running (see $GUEST_QEMU_LOG)"
+        if ssh_guest 'exit 0' >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 5
+    done
+    guest_report
+    die "SSH did not answer within ${timeout}s"
+}
+
+# What a guest that stopped answering is doing, written to the log so it can
+# be read wherever the log can (CI artifacts may not be): the VM's run state,
+# whether Windows' guest agent still answers, the serial tail, and the screen
+# as a base64 PNG (a bugcheck screen names its stop code).
+guest_report() {
+    local png="$GUEST_RUN_DIR/screen-unanswered.png"
+    echo "blorg: VM state: $(guest_qmp query-status 2>&1 | tr -d '\n')"
+    echo "blorg: guest agent: $(guest_qga guest-ping 2>&1 | tr -d '\n' || echo 'no answer')"
+    [[ -s "$GUEST_SERIAL" ]] && { echo "blorg: serial tail:"; tail -n 20 "$GUEST_SERIAL"; }
+    if guest_qmp screendump "{\"filename\": \"$png\", \"format\": \"png\"}" >/dev/null 2>&1 && [[ -s "$png" ]]; then
+        echo "SCREEN unanswered png-base64 $(base64 -w0 "$png")"
+    fi
+}
+
+guest_up() {
+    local fresh=0
+    [[ "${1:-}" == "--fresh" ]] && fresh=1
+    guest_running && { note "already running"; guest_wait; return; }
+    [[ -f "$GUEST_GOLDEN" ]] || die "no golden image at $GUEST_GOLDEN; build one with: blorg guest image"
+    mkdir -p "$GUEST_RUN_DIR"
+    if (( fresh )) || [[ ! -f "$GUEST_DISK" ]]; then
+        rm -f "$GUEST_DISK"
+        # A thin overlay: the golden image is never written, so every fresh
+        # run starts from exactly the same disk.
+        qemu-img create -q -f qcow2 -F qcow2 -b "$GUEST_GOLDEN" "$GUEST_DISK"
+    fi
+    rm -f "$GUEST_QMP" "$GUEST_QGA" "$GUEST_PIDFILE"
+    : > "$GUEST_SERIAL"
+    local -a args
+    mapfile -t args < <(guest_qemu_args "$GUEST_DISK")
+    qemu-system-x86_64 "${args[@]}" -daemonize -pidfile "$GUEST_PIDFILE" >"$GUEST_QEMU_LOG" 2>&1 \
+        || die "QEMU failed to start: $(cat "$GUEST_QEMU_LOG")"
+    note "booting (cpus=$GUEST_CPUS mem=${GUEST_MEM_MB}MiB ssh=127.0.0.1:$GUEST_SSH_PORT)"
+    guest_wait 900
+    note "up"
+}
+
+guest_down() {
+    guest_running || { note "not running"; return 0; }
+    if [[ "${1:-}" == "--graceful" ]]; then
+        guest_qmp system_powerdown >/dev/null || true
+        local start=$SECONDS
+        while guest_running && (( SECONDS - start < 180 )); do sleep 2; done
+    fi
+    if guest_running; then
+        guest_qmp quit >/dev/null 2>&1 || kill "$(cat "$GUEST_PIDFILE")" 2>/dev/null || true
+        local start=$SECONDS
+        while guest_running && (( SECONDS - start < 30 )); do sleep 1; done
+    fi
+    rm -f "$GUEST_PIDFILE"
+    note "down"
+}
+
+guest_status() {
+    if ! guest_running; then echo "stopped"; return 1; fi
+    if ssh_guest 'exit 0' >/dev/null 2>&1; then echo "running, ssh up"; else echo "running, ssh not answering"; fi
+}
+
+guest_boot_id() {
+    ssh_guest "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')" | tr -d '\r'
+}
+
+guest_reboot() {
+    local timeout="${1:-900}" before after start=$SECONDS
+    before="$(guest_boot_id)"
+    ssh_guest 'Restart-Computer -Force' >/dev/null 2>&1 || true
+    # Wait for the boot id to change, not merely for SSH to answer: sshd
+    # can still accept a connection in the seconds before shutdown begins.
+    while (( SECONDS - start < timeout )); do
+        sleep 10
+        after="$(guest_boot_id 2>/dev/null || true)"
+        if [[ -n "$after" && "$after" != "$before" ]]; then
+            note "rebooted"
+            return 0
+        fi
+    done
+    die "guest did not come back within ${timeout}s"
+}
+
+guest_ps() {
+    local script="${1:?usage: blorg guest ps <file.ps1> [args...]}"; shift
+    [[ -f "$script" ]] || die "no such script: $script"
+    ssh_guest "New-Item -ItemType Directory -Force -Path '$GUEST_STAGE' | Out-Null"
+    local name
+    name="$(basename "$script")"
+    scp_guest "$script" "Administrator@127.0.0.1:$GUEST_STAGE/$name"
+    local quoted=() a
+    for a in "$@"; do quoted+=("'${a//\'/\'\'}'"); done
+    # A child powershell so the script's own `exit N` becomes ssh's exit code.
+    ssh_guest "powershell -NoProfile -ExecutionPolicy Bypass -File '$GUEST_STAGE/$name' ${quoted[*]:-}; exit \$LASTEXITCODE"
+}
+
+guest_snapshot() {
+    local name="${1:?usage: blorg guest snapshot <name>}"
+    guest_qmp hmp "savevm $name"
+    note "saved snapshot '$name'"
+}
+
+guest_revert() {
+    local name="${1:?usage: blorg guest revert <name>}"
+    guest_qmp hmp "loadvm $name"
+    note "reverted to '$name'"
+}
+
+# Prepares a Debian/Ubuntu machine to host the guest: QEMU, the image-build
+# tools, and /dev/kvm for the current user. GitHub's ubuntu runners expose
+# KVM; on a cloud VM pick a size with nested virtualization.
+guest_host_setup() {
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        qemu-system-x86 qemu-utils xorriso openssh-client python3 curl openssl ca-certificates
+
+    if [[ ! -e /dev/kvm ]]; then
+        echo "blorg: /dev/kvm does not exist -- this machine has no hardware virtualization exposed." >&2
+        echo "blorg: on a cloud VM, pick a size with nested virtualization (e.g. Azure Dsv5)." >&2
+        return 1
+    fi
+
+    # GitHub's runners ship /dev/kvm root-only. A udev rule (rather than a
+    # one-off chmod) keeps it usable if the device node is recreated.
+    echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+        | sudo tee /etc/udev/rules.d/99-blorgfs-kvm.rules >/dev/null
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --name-match=kvm
+    sudo chmod 0666 /dev/kvm
+
+    echo "blorg: ready ($(qemu-system-x86_64 --version | head -n1))"
+}
+
+# blorg guest run [--out DIR] SCRIPT: runs SCRIPT (bash, with `blorg` on
+# PATH and $SESSION_OUT for files to keep) against the live guest -- the one
+# a `blorg guest test --keep` left up, or a fresh one. Commands are echoed
+# (bash -x) into DIR/session/transcript.txt. Exits with the script's code.
+guest_run() { guest_session session "$@"; }
+
+# guest_session NAME [--out DIR] SCRIPT: guest run, into DIR/NAME.
+guest_session() (
+    set +e -uo pipefail
+    local name="$1" out="$PWD/guest-results" script rc bindir
+    shift
+    while (( $# > 1 )); do
+        case "$1" in
+            --out) out="$2"; shift 2 ;;
+            *) die "unknown guest run argument '$1'" ;;
+        esac
+    done
+    (( $# == 1 )) || die "usage: blorg guest run [--out DIR] SCRIPT"
+    script="$1"
+    [[ -f "$script" ]] || die "no such script '$script'"
+    bindir="$(dirname "$BLORG")"
+    export PATH="$bindir:$PATH"
+    export SESSION_OUT="$out/$name"
+    mkdir -p "$SESSION_OUT"
+    cp "$script" "$SESSION_OUT/script.sh"
+
+    "$BLORG" guest status >/dev/null 2>&1 || "$BLORG" guest up --fresh
+
+    bash -x "$script" 2>&1 | tee "$SESSION_OUT/transcript.txt"
+    rc=${PIPESTATUS[0]}
+    echo "exit=$rc" >> "$SESSION_OUT/transcript.txt"
+
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        {
+            echo "## Guest $name: exit $rc"
+            echo
+            echo '```'
+            tail -n 200 "$SESSION_OUT/transcript.txt"
+            echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    fi
+    exit "$rc"
+)
+
+# blorg guest selftest [--out DIR]: every way of acting in the guest, once,
+# against a guest a test run left up (package installed, B: mounted).
+# Transcript and files in DIR/selftest/.
+guest_selftest() {
+    local script
+    script="$(mktemp)"
+    cat > "$script" <<'SH'
+set -euo pipefail
+# Run a command, read its output. The driver's own state is the tests'
+# business, not the probe's: those lines show it but cannot fail the probe.
+blorg guest ssh '[Environment]::OSVersion.VersionString; hostname'
+blorg guest ssh 'sc.exe query BlorgFS' || true
+blorg guest ssh 'Get-ChildItem B:\ | Select-Object -ExpandProperty Name' || true
+
+# Copy a file in, have the guest transform it, copy the result out.
+echo "selftest $(date -u +%FT%TZ)" > "$SESSION_OUT/in.txt"
+blorg guest push "$SESSION_OUT/in.txt" C:/blorgfs-ci/probe/in.txt
+blorg guest ssh '(Get-Content C:/blorgfs-ci/probe/in.txt).ToUpper() | Set-Content C:/blorgfs-ci/probe/out.txt'
+blorg guest pull C:/blorgfs-ci/probe/out.txt "$SESSION_OUT/out.txt"
+[[ "$(tr -d '\r' < "$SESSION_OUT/out.txt")" == "$(tr '[:lower:]' '[:upper:]' < "$SESSION_OUT/in.txt")" ]]
+
+# Read a file the driver serves, through B:.
+blorg guest ssh '(Get-FileHash B:\names\no-extension -Algorithm SHA256).Hash' || true
+
+# See the screen; use the guest agent, which works when SSH does not.
+blorg guest screenshot "$SESSION_OUT/screen.png"
+blorg guest qga-exec 'Get-Service sshd | Select-Object -ExpandProperty Status'
+
+# Snapshot, change something, revert: the change must be gone.
+blorg guest snapshot selftest
+blorg guest ssh 'New-Item -ItemType File -Force C:/blorgfs-ci/probe/after-snapshot.txt | Out-Null'
+blorg guest revert selftest
+blorg guest wait 300
+[[ "$(blorg guest ssh 'Test-Path C:/blorgfs-ci/probe/after-snapshot.txt' | tr -d '\r')" == "False" ]]
+
+echo "selftest: every channel works"
+SH
+    guest_session selftest "$@" "$script"
+}
+
+cmd_guest() {
+    local sub="${1:-}"; shift || true
+    set -e
+    case "$sub" in
+        up)         guest_up "$@" ;;
+        down)       guest_down "$@" ;;
+        status)     guest_status ;;
+        wait)       guest_wait "$@" ;;
+        ssh)        ssh_guest "$@" ;;
+        ps)         guest_ps "$@" ;;
+        push)       ssh_guest "New-Item -ItemType Directory -Force -Path (Split-Path '${2:?}') | Out-Null"
+                    scp_guest "${1:?}" "Administrator@127.0.0.1:$2" ;;
+        pull)       scp_guest "Administrator@127.0.0.1:${1:?}" "${2:?}" ;;
+        reboot)     guest_reboot "$@" ;;
+        boot-id)    guest_boot_id ;;
+        snapshot)   guest_snapshot "$@" ;;
+        revert)     guest_revert "$@" ;;
+        snapshots)  guest_qmp hmp "info snapshots" ;;
+        screenshot) guest_qmp screendump "{\"filename\": \"$(realpath -m "${1:?}")\", \"format\": \"png\"}" >/dev/null
+                    note "wrote $1" ;;
+        qga-exec)   guest_qga exec 600 "$@" ;;
+        qmp)        guest_qmp "$@" ;;
+        host-setup) guest_host_setup ;;
+        image)      guest_image "$@" ;;
+        image-key)  guest_image_key ;;
+        test)       guest_test "$@" ;;
+        run)        guest_run "$@" ;;
+        selftest)   guest_selftest "$@" ;;
+        ""|-h|--help|help)
+                    sed -n '2,/^$/p' "$BLORG" | sed 's/^# \{0,1\}//' ;;
+        *)          die "unknown guest command '$sub' (blorg guest help)" ;;
+    esac
+}
+
+# ----------------------------------------------------------- guest image
+#
+# Builds the golden Windows image the BlorgFS test guest boots from.
+#
+# Unattended end to end: Windows Setup runs from the install ISO with
+# autounattend.xml from a generated config ISO, Invoke-BlorgGuest.ps1
+# -Step Image does the guest-side configuration and powers off, then this
+# script boots the result once to prove SSH and test signing work before
+# publishing it.
+#
+#   blorg guest image [--iso PATH|URL] [--virtio-iso PATH|URL]
+#                     [--image-index N]
+#
+# Defaults build Windows Server 2025 Standard (Server Core) from Microsoft's
+# public 180-day evaluation ISO: build 26100, the oldest Windows the driver
+# loads on (src/BlorgFS.vcxproj targets NTDDI 0x0A000010, 24H2; on 2022 it
+# fails to start with "procedure not found"). Server Core because a
+# filesystem driver test needs no desktop, and the image is a fraction of
+# the size to build, cache and boot. The evaluation clock starts when the
+# image is built, so CI keys its image cache by quarter and rebuilds well
+# inside 180 days.
+#
+# Environment (all optional):
+#   WINDOWS_ISO_URL      install ISO (default: Server 2025 evaluation, en-US)
+#   WINDOWS_IMAGE_INDEX  index in install.wim (default 1: Standard Core)
+#   VIRTIO_ISO_URL       virtio-win ISO, for the QEMU guest agent; set to
+#                        "none" to skip the agent
+#   OPENSSH_ZIP_URL      Win32-OpenSSH release zip
+#   *_SHA256             the pin for each of the three (below)
+#   BUILD_TIMEOUT_MIN    give up on Windows Setup after this (default 45)
+#   STALL_MIN            give up sooner if the guest's screen has not
+#                        changed for this long (default 20): it is stuck
+# plus the GUEST_* settings above.
+#
+# Every input is pinned by SHA-256, so the same recipe always builds from
+# the same bytes and a moved download fails the build instead of silently
+# changing the guest. Overriding a URL means overriding its pin too; an
+# empty pin (VAR=) uses the input unchecked and prints its hash.
+#
+# Output: $GUEST_IMAGE_DIR/golden.qcow2 and the SSH key it trusts,
+# $GUEST_IMAGE_DIR/id_ed25519.
+
+# blorg guest image-key: a hash of everything the image is built from (this
+# recipe, the machine it installs on, the answer file and
+# Invoke-BlorgGuest.ps1's Image step), and nothing else, so changing how
+# tests run never forces a rebuild.
+guest_image_key() {
+    {
+        declare -f guest_image guest_qemu_args
+        cat "$REPO/tools/guest/autounattend.xml.in"
+        sed -n '/^function Invoke-ImageStep/,/^function /p' "$REPO/tools/guest/Invoke-BlorgGuest.ps1"
+    } | sha256sum | cut -c1-16
+}
+
+guest_image() (
+    set -euo pipefail
+    WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso}"
+    WINDOWS_IMAGE_INDEX="${WINDOWS_IMAGE_INDEX:-1}"
+    VIRTIO_ISO_URL="${VIRTIO_ISO_URL:-https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso}"
+    OPENSSH_ZIP_URL="${OPENSSH_ZIP_URL:-https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64.zip}"
+    WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256-d0ef4502e350e3c6c53c15b1b3020d38a5ded011bf04998e950720ac8579b23d}"
+    VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256-303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d}"
+    OPENSSH_ZIP_SHA256="${OPENSSH_ZIP_SHA256-23f50f3458c4c5d0b12217c6a5ddfde0137210a30fa870e98b29827f7b43aba5}"
+    BUILD_TIMEOUT_MIN="${BUILD_TIMEOUT_MIN:-45}"
+    STALL_MIN="${STALL_MIN:-20}"
+
+    iso_src="$WINDOWS_ISO_URL"
+    virtio_src="$VIRTIO_ISO_URL"
+    while (( $# )); do
+        case "$1" in
+            --iso)         iso_src="$2"; shift 2 ;;
+            --virtio-iso)  virtio_src="$2"; shift 2 ;;
+            --image-index) WINDOWS_IMAGE_INDEX="$2"; shift 2 ;;
+            *) die "unknown argument '$1'" ;;
+        esac
+    done
+
+    for tool in qemu-system-x86_64 qemu-img xorriso ssh-keygen curl python3 openssl; do
+        command -v "$tool" >/dev/null || die "missing $tool (run: blorg guest host-setup)"
+    done
+    guest_accel >/dev/null
+
+    WORK="$GUEST_IMAGE_DIR/build"
+    DOWNLOADS="$GUEST_HOME/downloads"
+    mkdir -p "$WORK" "$DOWNLOADS"
+
+    # Local path or URL -> local path, checked against its pin. URLs are cached
+    # under downloads/ so a retried build does not fetch a 5 GB ISO twice.
+    fetch() {
+        local src="$1" name="$2" pin="$3" path="$1" from="$1"
+        if [[ ! -f "$src" ]]; then
+            path="$DOWNLOADS/$name"
+            if [[ ! -s "$path" ]]; then
+                note "downloading $name"
+                # A stalled transfer (under 100 KB/s for a minute) fails and is
+                # retried rather than hanging the build.
+                from="$(curl -fL --retry 4 --retry-delay 5 --speed-limit 102400 --speed-time 60 \
+                        -o "$path.part" -w '%{url_effective}' "$src")"
+                mv "$path.part" "$path"
+            fi
+        fi
+        local sum
+        sum="$(sha256sum "$path" | cut -d' ' -f1)"
+        note "input $name sha256=$sum from $from"
+        if [[ -z "$pin" ]]; then
+            [[ -n "${GITHUB_ACTIONS:-}" ]] &&
+                echo "::warning title=Unpinned image input::$name sha256=$sum is not pinned in tools/blorg" >&2
+        elif [[ "$sum" != "$pin" ]]; then
+            die "$name is not the pinned input (sha256 $sum, pinned $pin)"
+        fi
+        echo "$path"
+    }
+
+    iso="$(fetch "$iso_src" windows.iso "$WINDOWS_ISO_SHA256")"
+    virtio=""
+    if [[ "$virtio_src" != "none" ]]; then
+        virtio="$(fetch "$virtio_src" virtio-win.iso "$VIRTIO_ISO_SHA256")"
+    fi
+    openssh_zip="$(fetch "$OPENSSH_ZIP_URL" OpenSSH-Win64.zip "$OPENSSH_ZIP_SHA256")"
+
+    # A fresh key and password per image. Both only ever reach a guest that
+    # listens on this host's loopback, but there is no reason to share them
+    # between images either.
+    rm -f "$WORK/id_ed25519" "$WORK/id_ed25519.pub"
+    ssh-keygen -q -t ed25519 -N '' -C blorgfs-guest -f "$WORK/id_ed25519"
+    # Base64 plus a fixed tail: always meets Windows' complexity rule.
+    password="$(openssl rand -base64 18 | tr -d '\n')Aa1!"
+
+    cfg="$WORK/config"
+    rm -rf "$cfg"; mkdir -p "$cfg"
+    xml="$(<"$REPO/tools/guest/autounattend.xml.in")"
+    xml="${xml//@ADMIN_PASSWORD@/$password}"
+    xml="${xml//@IMAGE_INDEX@/$WINDOWS_IMAGE_INDEX}"
+    printf '%s\n' "$xml" > "$cfg/autounattend.xml"
+    # Setup silently ignores an answer file that is not well-formed XML and
+    # waits at its language screen, which only shows up as a timeout.
+    python3 -c 'import sys, xml.dom.minidom as m; m.parse(sys.argv[1])' "$cfg/autounattend.xml" \
+        || die "autounattend.xml is not well-formed XML"
+    cp "$REPO/tools/guest/Invoke-BlorgGuest.ps1" "$cfg/"
+    cp "$WORK/id_ed25519.pub" "$cfg/authorized_keys"
+    cp "$openssh_zip" "$cfg/OpenSSH-Win64.zip"
+    xorriso -as mkisofs -quiet -J -joliet-long -r -V BLORGCFG -o "$WORK/config.iso" "$cfg"
+
+    disk="$WORK/disk.qcow2"
+    rm -f "$disk"
+    qemu-img create -q -f qcow2 "$disk" 64G
+
+    # Install pass. Same machine as a test run, plus the install and config
+    # CDs and, when there is one, the virtio-win CD.
+    GUEST_RUN_DIR="$WORK/install"
+    guest_paths
+    mkdir -p "$GUEST_RUN_DIR/screens"
+    rm -f "$GUEST_QMP" "$GUEST_QGA" "$GUEST_PIDFILE"
+
+    # shellcheck disable=SC2054 # commas are QEMU option syntax, not separators
+    cds=(
+        -drive "file=$iso,media=cdrom,if=none,id=cd0,readonly=on" -device ide-cd,drive=cd0,bus=ide.1,bootindex=2
+        -drive "file=$WORK/config.iso,media=cdrom,if=none,id=cd1,readonly=on" -device ide-cd,drive=cd1,bus=ide.2
+    )
+    if [[ -n "$virtio" ]]; then
+        # shellcheck disable=SC2054
+        cds+=(-drive "file=$virtio,media=cdrom,if=none,id=cd2,readonly=on" -device ide-cd,drive=cd2,bus=ide.3)
+    fi
+    mapfile -t args < <(guest_qemu_args "$disk" "${cds[@]}")
+    qemu-system-x86_64 "${args[@]}" -daemonize -pidfile "$GUEST_PIDFILE" >"$GUEST_QEMU_LOG" 2>&1 \
+        || die "QEMU failed to start: $(cat "$GUEST_QEMU_LOG")"
+
+    # Windows Setup reboots several times on its own; the run is over when
+    # Invoke-BlorgGuest.ps1 -Step Image powers off and QEMU exits. A screenshot
+    # every two minutes shows where a build that hangs stopped (a setup dialog,
+    # a missing driver), so keep them -- CI uploads the directory on failure.
+    note "installing Windows (timeout ${BUILD_TIMEOUT_MIN} min, or ${STALL_MIN} min on one screen); screenshots in $GUEST_RUN_DIR/screens"
+    # Why an install was abandoned, as a check annotation: readable through the
+    # API from places where the log and the screenshots are not.
+    install_failed() {
+        local why="$1" tail_serial agent_log
+        guest_qmp screendump "{\"filename\": \"$GUEST_RUN_DIR/screens/failed.png\", \"format\": \"png\"}" >/dev/null 2>&1 || true
+        tail_serial="$(tail -c 600 "$GUEST_SERIAL" 2>/dev/null | tr -cd '[:print:]\n')"
+        agent_log="$(timeout 60 python3 -c "$QMP_PY" qga "$GUEST_QGA" exec 45 \
+            "Get-Content C:\\blorgfs-image.log -Tail 15 -ErrorAction SilentlyContinue" 2>/dev/null | tail -c 1500)"
+        guest_qmp quit >/dev/null 2>&1 || true
+        local body="$why
+setup transcript (C:\\blorgfs-image.log, via the guest agent): ${agent_log:-unreachable (not installed yet, or Windows is not up)}
+serial: ${tail_serial:-empty}"
+        [[ -n "${GITHUB_ACTIONS:-}" ]] &&
+            echo "::error title=blorg image-build::$(printf '%s' "$body" | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}')"
+        die "$why; screens in $GUEST_RUN_DIR/screens"
+    }
+    start=$SECONDS
+    last_change=$SECONDS
+    shot=0
+    while guest_running; do
+        if (( SECONDS - start > BUILD_TIMEOUT_MIN * 60 )); then
+            install_failed "Windows Setup did not finish within ${BUILD_TIMEOUT_MIN} min"
+        fi
+        if (( SECONDS - last_change > STALL_MIN * 60 )); then
+            install_failed "the guest's screen has not changed for ${STALL_MIN} min ($(( (SECONDS - start) / 60 )) min into the install): stuck"
+        fi
+        if (( (SECONDS - start) / 120 >= shot )); then
+            png="$GUEST_RUN_DIR/screens/$(printf %03d "$shot").png"
+            guest_qmp screendump "{\"filename\": \"$png\", \"format\": \"png\"}" >/dev/null 2>&1 || true
+            # Also into the log, base64, whenever the screen changed: a log is
+            # readable from places an artifact download is not (behind an
+            # egress proxy), and a stuck install is diagnosed by its screen.
+            if [[ -s "$png" ]]; then
+                sum="$(sha256sum "$png" | cut -c1-16)"
+                if [[ "$sum" != "${last_sum:-}" ]]; then
+                    echo "SCREEN $(printf %03d "$shot") t=$(( SECONDS - start ))s png-base64 $(base64 -w0 "$png")"
+                    last_sum="$sum"
+                    last_change=$SECONDS
+                fi
+            fi
+            # A heartbeat every two minutes, so a slow install and a stuck one
+            # read differently in the log.
+            note "installing: $(( (SECONDS - start) / 60 )) min, screen unchanged for $(( (SECONDS - last_change) / 60 )) min"
+            shot=$(( shot + 1 ))
+        fi
+        sleep 10
+    done
+    note "install finished in $(( (SECONDS - start) / 60 )) min"
+
+    # Verify pass: boot the result through blorg guest exactly as a test run will,
+    # and check what Invoke-BlorgGuest.ps1 -Step Image was meant to leave behind.
+    verify_env=(GUEST_GOLDEN="$disk" GUEST_KEY="$WORK/id_ed25519" GUEST_RUN_DIR="$WORK/verify")
+    env "${verify_env[@]}" "$BLORG" guest up --fresh
+    # A script file, not an inline command: OpenSSH hands an inline command to
+    # powershell.exe through Windows argv parsing, which mangles quotes.
+    cat > "$WORK/check.ps1" <<'PS1'
+$f = @()
+if ((bcdedit /enum '{current}' | Out-String) -notmatch 'testsigning\s+Yes') { $f += 'testsigning off' }
+if ((Get-Service sshd).StartType -ne 'Automatic') { $f += 'sshd not automatic' }
+$info = Get-Content C:\blorgfs-ci\image-info.json -Raw | ConvertFrom-Json
+if ($info.failedSteps) { $f += "setup steps failed: $($info.failedSteps -join ', ')" }
+$info | ConvertTo-Json -Compress
+if ($f) { Write-Output ('IMAGE CHECK FAILED: ' + ($f -join '; ')); exit 1 }
+exit 0
+PS1
+    set +e
+    info="$(env "${verify_env[@]}" "$BLORG" guest ps "$WORK/check.ps1" | tr -d '\r')"
+    rc=$?
+    set -e
+    env "${verify_env[@]}" "$BLORG" guest down --graceful
+    echo "$info"
+    (( rc == 0 )) || die "golden image failed verification (C:\\blorgfs-image.log in the guest has the setup transcript)"
+
+    # Publish: verification booted an overlay, so $disk itself is untouched.
+    # Compressed, because CI caches it.
+    note "compressing"
+    # zstd rather than zlib: several times faster to decompress, which is
+    # paid on every warm run's first reads; -m/-W parallelise the compression.
+    qemu-img convert -c -O qcow2 -o compression_type=zstd -m 8 -W "$disk" "$GUEST_GOLDEN.tmp"
+    mv "$GUEST_GOLDEN.tmp" "$GUEST_GOLDEN"
+    mv "$WORK/id_ed25519" "$GUEST_KEY"
+    mv "$WORK/id_ed25519.pub" "$GUEST_KEY.pub"
+    printf '%s\n' "$info" | head -n1 > "$GUEST_IMAGE_DIR/image-info.json"
+    rm -rf "$WORK"
+    note "golden image ready: $GUEST_GOLDEN ($(du -h "$GUEST_GOLDEN" | cut -f1))"
+)
+
+# ------------------------------------------------------------ guest test
+#
+# One runtime test run, end to end, on a KVM host: boot a fresh guest from
+# the golden image, deploy the blorg package into it, run the in-guest
+# tests, collect results and diagnostics, and exit with the verdict.
+#
+#   blorg guest test --package DIR [--out DIR]
+#                    [--server-bin PATH]
+#                    [--no-verifier] [--kernel-dump] [--keep] [--booted]
+#
+#   --package DIR   the unpacked blorg-package-windows-x64 artifact
+#                   (manifest.json, driver/, server/)
+#   --out DIR       where results land (default ./guest-results)
+#   --server-bin PATH
+#                   the Linux server-rs to run on this host (default: the
+#                   package's server/linux-x64/server-rs)
+#   --no-verifier   run without Driver Verifier on BlorgFS.sys
+#   --kernel-dump   bring MEMORY.DMP back too after a bugcheck (large)
+#   --keep          leave the guest (and the host's server-rs) running
+#                   afterwards, to investigate with blorg guest ...
+#   --booted        use the guest already running instead of booting one:
+#                   for a guest just started with `blorg guest up --fresh`,
+#                   so the boot can overlap with fetching the package
+#
+# Environment (all optional):
+#   SERVER_PORT   the host port server-rs listens on (default 18080)
+#   LOST_WAIT_S   how long a guest lost mid-run gets to come back before
+#                 it is reset (default 300)
+# plus the GUEST_* settings above.
+#
+# Exit: 0 pass, 1 fail (tests failed or the guest bugchecked), 2 the rig
+# itself broke before a verdict existed.
+#
+# The same script runs in CI and by hand; under GitHub Actions it only
+# adds log groups, annotations and a step summary.
+#
+# Topology: server-rs runs here on the host, as Linux, the way the product
+# is deployed, and the guest reaches it at 10.0.2.2 (QEMU user networking's
+# address for the host). So the driver's WSK traffic crosses a real NIC,
+# and the backend's filesystem is case-sensitive.
+guest_test() (
+    set +e -uo pipefail
+    package="" out="$PWD/guest-results" verifier=1 kernel_dump=0 keep=0 booted=0
+    server_bin="" server_pid="" gone=0
+    SERVER_PORT="${SERVER_PORT:-18080}"
+    while (( $# )); do
+        case "$1" in
+            --package)     package="$2"; shift 2 ;;
+            --out)         out="$2"; shift 2 ;;
+            --no-verifier) verifier=0; shift ;;
+            --kernel-dump) kernel_dump=1; shift ;;
+            --server-bin)  server_bin="$2"; shift 2 ;;
+            --keep)        keep=1; shift ;;
+            --booted)      booted=1; shift ;;
+            *) echo "blorg guest test: unknown argument '$1'" >&2; exit 2 ;;
+        esac
+    done
+
+    rig_fail() { echo "blorg guest test: $*" >&2; finish 2; }
+    # Collapsible sections in a GitHub Actions log; plain headers elsewhere.
+    step() {
+        echo
+        if [[ -n "${GITHUB_ACTIONS:-}" ]]; then echo "::group::$*"; else echo "==> $*"; fi
+    }
+    endstep() { [[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::endgroup::"; }
+
+    finish() {
+        local code="$1"
+        # Host-side evidence, whatever happened in the guest.
+        mkdir -p "$out/host"
+        cp -f "$GUEST_SERIAL" "$GUEST_QEMU_LOG" "$out/host/" 2>/dev/null || true
+        "$BLORG" guest screenshot "$out/host/screen.png" >/dev/null 2>&1 || true
+        if (( keep )); then
+            # The server and its corpus stay too: B: is only useful with both.
+            echo "blorg guest test: guest left running (--keep); drive it with: blorg guest ..."
+            [[ -n "$server_pid" ]] && echo "blorg guest test: server-rs (pid $server_pid) serving $work/corpus"
+        else
+            "$BLORG" guest down >/dev/null 2>&1 || true
+            [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
+            [[ -n "${work:-}" ]] && rm -rf "$work"
+        fi
+        exit "$code"
+    }
+
+    [[ -f "$package/manifest.json" ]] || { echo "blorg guest test: --package must be an unpacked blorg package (no manifest.json in '$package')" >&2; exit 2; }
+    mkdir -p "$out"
+    out="$(cd "$out" && pwd)"
+
+    server_bin="${server_bin:-$package/server/linux-x64/server-rs}"
+    [[ -f "$server_bin" ]] || { echo "blorg guest test: no Linux server-rs at '$server_bin' (package server/linux-x64/server-rs, or --server-bin)" >&2; exit 2; }
+    # Artifact zips drop the executable bit.
+    chmod +x "$server_bin" 2>/dev/null || true
+
+    step "Assembling the bundle"
+    work="$(mktemp -d)"
+    bundle="$work/bundle"
+    mkdir -p "$bundle/tools"
+    cp -r "$package" "$bundle/package"
+    cp "$REPO/tools/guest/Invoke-BlorgGuest.ps1" "$bundle/"
+    cp "$REPO/tools/Test-BlorgCorrectness.ps1" "$bundle/tools/"
+
+    # The corpus is generated here and served by server-rs on this host; only
+    # its manifest goes into the guest.
+    python3 -c "$CORPUS_PY" "$work" || rig_fail "could not generate the corpus"
+    python3 -c 'import json,sys; m=json.load(open(sys.argv[1], encoding="utf-8-sig")); print("  package", m.get("version"))' "$package/manifest.json"
+    endstep
+
+    step "Starting server-rs on the host (port $SERVER_PORT)"
+    mkdir -p "$out/host"
+    PORT="$SERVER_PORT" RUST_LOG=info "$server_bin" "$work/corpus" >"$out/host/server.log" 2>&1 &
+    server_pid=$!
+    for _ in $(seq 60); do
+        curl -fsS "http://127.0.0.1:$SERVER_PORT/healthcheck" >/dev/null 2>&1 && break
+        kill -0 "$server_pid" 2>/dev/null || rig_fail "server-rs exited at startup: $(tail -n 20 "$out/host/server.log")"
+        sleep 0.5
+    done
+    curl -fsS "http://127.0.0.1:$SERVER_PORT/healthcheck" >/dev/null || rig_fail "server-rs did not answer /healthcheck"
+    endstep
+
+    if (( booted )); then
+        step "Using the running guest"
+        "$BLORG" guest wait 600 || rig_fail "--booted, but no guest is answering"
+    else
+        step "Booting a fresh guest"
+        "$BLORG" guest up --fresh || rig_fail "guest did not boot"
+    fi
+    endstep
+
+    step "Deploying the bundle"
+    "$BLORG" guest ssh "Remove-Item -Recurse -Force C:/blorgfs-ci/bundle, C:/blorgfs-ci/results -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force C:/blorgfs-ci | Out-Null" \
+        || rig_fail "could not prepare the guest's staging directory"
+    "$BLORG" guest push "$bundle" C:/blorgfs-ci/bundle || rig_fail "could not copy the bundle into the guest"
+    "$BLORG" guest push "$work/corpus-manifest.json" C:/blorgfs-ci/corpus-manifest.json || rig_fail "could not copy the corpus manifest into the guest"
+    endstep
+
+    step "Preparing the guest"
+    prep_args=()
+    (( verifier )) || prep_args+=(-NoVerifier)
+    "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Prepare ${prep_args[*]:-}; exit \$LASTEXITCODE"
+    rc=$?
+    if (( rc == 3010 )); then
+        "$BLORG" guest reboot || rig_fail "guest did not come back from the preparation reboot"
+    elif (( rc != 0 )); then
+        rig_fail "the Prepare step failed ($rc)"
+    fi
+    endstep
+
+    step "Running the tests in the guest"
+    boot_before="$("$BLORG" guest boot-id)"
+    test_args="-Port $SERVER_PORT"
+    "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Test $test_args; exit \$LASTEXITCODE"
+    test_rc=$?
+    endstep
+
+    # ssh's own failures are 255. Anything else is the test runner's verdict.
+    # Losing the guest mid-run almost always means a bugcheck: Windows writes
+    # its dump and reboots by itself (AutoReboot), and the dump is collected
+    # below. Bounded either way: if it is not back within LOST_WAIT_S, it is
+    # reset, which still finds a dump that was written before the reset.
+    if (( test_rc == 255 )); then
+        step "Lost the guest mid-run (likely a bugcheck); waiting for it to reboot"
+        "$BLORG" guest screenshot "$out/screen-at-loss.png" >/dev/null 2>&1 || true
+        if ! "$BLORG" guest wait "${LOST_WAIT_S:-300}" 2>/dev/null; then
+            echo "blorg guest test: not back after ${LOST_WAIT_S:-300}s; resetting it"
+            "$BLORG" guest screenshot "$out/screen-before-reset.png" >/dev/null 2>&1 || true
+            "$BLORG" guest qmp system_reset >/dev/null 2>&1 || true
+            # Still a verdict, not a rig failure: the driver took the guest down.
+            "$BLORG" guest wait 600 || { echo "blorg guest test: the guest did not come back even after a reset"; gone=1; }
+        fi
+        endstep
+    fi
+    boot_after="$("$BLORG" guest boot-id 2>/dev/null || true)"
+
+    step "Collecting diagnostics"
+    diag_args=()
+    (( kernel_dump )) && diag_args+=(-IncludeKernelDump)
+    "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Diagnostics ${diag_args[*]:-}" || true
+    rm -rf "$out/results"
+    if (( gone )); then
+        echo "blorg guest test: no results to collect from a guest that never came back"
+    else
+        "$BLORG" guest pull C:/blorgfs-ci/results "$out/" || rig_fail "could not copy results out of the guest"
+    fi
+    endstep
+
+    # The verdict: the runner's own, overridden by a bugcheck or an unexplained
+    # reboot -- a crash after the last step still counts.
+    python3 - "$out" "$test_rc" "$boot_before" "$boot_after" "$gone" <<'PY'
+import json, os, sys
+out, rc, before, after, gone = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1"
+def load(p):
+    try:
+        with open(os.path.join(out, p), encoding="utf-8-sig") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+res = load("results/results.json") or {}
+crash = load("results/diag/crash.json") or {}
+reasons = []
+if res.get("verdict") != "pass":
+    reasons.append(f"tests: {res.get('verdict', 'no results')}")
+if crash.get("bugchecked"):
+    reasons.append("guest bugchecked")
+if before and after and before != after:
+    reasons.append("guest rebooted during the run")
+if rc == 255:
+    reasons.append("lost contact with the guest mid-run")
+if gone:
+    reasons.append("the guest never came back, even after a reset (screen-at-loss.png shows why)")
+verdict = "fail" if reasons else "pass"
+lines = [f"verdict={verdict}", f"package={res.get('package')}"]
+lines += [f"reason={r}" for r in reasons]
+for s in res.get("steps", []):
+    lines.append(f"step.{s['name']}={s['status']}" + (f" ({s['detail']})" if s.get("detail") else ""))
+with open(os.path.join(out, "verdict.txt"), "w") as f:
+    f.write("\n".join(lines) + "\n")
+print("\n".join(lines))
+
+def annotate(level, title, text):
+    # Workflow-command escaping; an annotation is readable through the
+    # checks API from places that cannot download logs or artifacts.
+    body = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{level} title={title}::{body}")
+
+if os.environ.get("GITHUB_ACTIONS"):
+    annotate("notice" if verdict == "pass" else "error", "blorg guest-verdict", "\n".join(lines))
+
+summary = os.environ.get("GITHUB_STEP_SUMMARY")
+if summary:
+    with open(summary, "a", encoding="utf-8") as f:
+        f.write(f"## Windows guest runtime tests: {verdict.upper()}\n\n")
+        f.write(f"Package `{res.get('package')}`\n\n")
+        for r in reasons:
+            f.write(f"- **{r}**\n")
+        f.write("\n| Step | Result | Time | Detail |\n|---|---|---|---|\n")
+        for s in res.get("steps", []):
+            f.write(f"| {s['name']} | {s['status']} | {s['seconds']}s | {s.get('detail') or ''} |\n")
+sys.exit(0 if verdict == "pass" else 1)
+PY
+    finish $?
+)
+
+# -------------------------------------------------------- Python helpers
+#
+# Run with python3 -c: QEMU's control channels and the corpus need what
+# bash cannot do cleanly (JSON over a socket, deterministic bytes, hashes).
+
+read -r -d '' QMP_PY <<'PY' || true
+"""Tiny QMP / QEMU guest agent client for blorg guest. Standard library only.
+
+    QMP_PY qmp SOCK <command> [json-args]      one QMP command, prints the return
+    QMP_PY qmp SOCK hmp "<monitor command>"    a human-monitor command (savevm, ...)
+    QMP_PY qga SOCK <command> [json-args]      one guest-agent command
+    QMP_PY qga SOCK exec <timeout-s> <powershell...>
+                                                run PowerShell in the guest via the
+                                                agent; prints stdout/stderr, exits
+                                                with the guest process's exit code
+
+QMP is the hypervisor's control channel (snapshots, screenshots, power).
+The guest agent is the fallback way into Windows when SSH is not answering,
+e.g. after a driver bug has taken the network stack down with it.
+"""
+
+import base64
+import json
+import socket
+import sys
+import time
+
+
+class Channel:
+    def __init__(self, path, timeout):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
+        self.sock.connect(path)
+        self.buf = b""
+
+    def send(self, obj):
+        self.sock.sendall(json.dumps(obj).encode() + b"\n")
+
+    def recv(self):
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("channel closed")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return json.loads(line)
+
+    def reply(self):
+        # QMP interleaves asynchronous events with replies; skip them.
+        while True:
+            msg = self.recv()
+            if "event" in msg:
+                continue
+            if "error" in msg:
+                raise RuntimeError(msg["error"].get("desc", str(msg["error"])))
+            return msg.get("return")
+
+    def call(self, command, args=None):
+        req = {"execute": command}
+        if args:
+            req["arguments"] = args
+        self.send(req)
+        return self.reply()
+
+
+def open_qmp(path):
+    ch = Channel(path, timeout=600)  # savevm of a busy guest can take a while
+    ch.recv()  # greeting
+    ch.call("qmp_capabilities")
+    return ch
+
+
+def open_qga(path):
+    ch = Channel(path, timeout=30)
+    # The agent channel is a byte stream with no framing guarantee across
+    # reconnects; guest-sync with a fresh id discards stale output.
+    token = int(time.time() * 1000) % 2**31
+    ch.send({"execute": "guest-sync", "arguments": {"id": token}})
+    while ch.reply() != token:
+        pass
+    return ch
+
+
+def qga_exec(ch, timeout, script):
+    pid = ch.call("guest-exec", {
+        "path": "powershell.exe",
+        "arg": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        "capture-output": True,
+    })["pid"]
+    deadline = time.time() + timeout
+    while True:
+        st = ch.call("guest-exec-status", {"pid": pid})
+        if st.get("exited"):
+            break
+        if time.time() > deadline:
+            print(f"qga exec: timed out after {timeout}s (pid {pid})", file=sys.stderr)
+            return 124
+        time.sleep(1)
+    for key, stream in (("out-data", sys.stdout), ("err-data", sys.stderr)):
+        if key in st:
+            stream.write(base64.b64decode(st[key]).decode("utf-8", "replace"))
+    return st.get("exitcode", 1)
+
+
+def main(argv):
+    if len(argv) < 4:
+        print(__doc__, file=sys.stderr)
+        return 2
+    kind, path, command = argv[1], argv[2], argv[3]
+    rest = argv[4:]
+    try:
+        if kind == "qmp":
+            ch = open_qmp(path)
+            if command == "hmp":
+                out = ch.call("human-monitor-command", {"command-line": " ".join(rest)})
+                sys.stdout.write(out or "")
+                # HMP reports failures as text, not as a QMP error.
+                if out and out.lower().startswith(("error", "could not")):
+                    return 1
+                return 0
+            args = json.loads(rest[0]) if rest else None
+        elif kind == "qga":
+            ch = open_qga(path)
+            if command == "exec":
+                return qga_exec(ch, int(rest[0]), " ".join(rest[1:]))
+            args = json.loads(rest[0]) if rest else None
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+        result = ch.call(command, args)
+        print(json.dumps(result, indent=2))
+        return 0
+    except (OSError, ConnectionError, RuntimeError, ValueError) as e:
+        print(f"{kind}: {command}: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+PY
+
+read -r -d '' CORPUS_PY <<'PY' || true
+"""Writes the deterministic file tree server-rs serves to the driver during a
+guest run, plus corpus-manifest.json describing it.
+
+    python3 -c "$CORPUS_PY" OUT_DIR
+
+OUT_DIR/corpus is the served root; OUT_DIR/corpus-manifest.json lists every
+file (Windows-style relative path, size, SHA-256) and every directory, which
+the in-guest listing check compares the mounted volume against.
+
+Generated on the host and served by the Linux server-rs there. The same
+seed always produces the same bytes, so a failure on one run replays byte
+for byte on the next.
+
+The shape is chosen for what tends to break a network filesystem:
+  boundaries/  sizes either side of sector, page, 64 KiB, the read-ahead
+               granule (128 KiB) and ceiling (2 MiB)
+  large/       one file past Test-BlorgCorrectness's whole-file hash limit
+  many/        enough entries that a listing spans more than one buffer
+  names/       spaces, brackets, dots, no extension, non-ASCII, a long name
+  nested/      a deep path
+  empty/       an empty directory and a zero-byte file
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import shutil
+import sys
+
+KIB = 1024
+MIB = 1024 * KIB
+SEED = 20261003
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out")
+    args = ap.parse_args()
+
+    root = os.path.join(args.out, "corpus")
+    if os.path.exists(root):
+        shutil.rmtree(root)
+    os.makedirs(root)
+    rng = random.Random(SEED)
+    files = []
+
+    def add(rel, size):
+        full = os.path.join(root, *rel.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        h = hashlib.sha256()
+        with open(full, "wb") as f:
+            left = size
+            while left:
+                n = min(left, MIB)
+                chunk = rng.randbytes(n)
+                f.write(chunk)
+                h.update(chunk)
+                left -= n
+        files.append({"path": rel.replace("/", "\\"), "size": size, "sha256": h.hexdigest()})
+
+    for s in (1, 511, 512, 513, 4095, 4096, 4097, 65535, 65536, 65537,
+              128 * KIB - 1, 128 * KIB, 128 * KIB + 1,
+              MIB - 1, MIB + 1, 2 * MIB - 1, 2 * MIB + 1, 2 * MIB + 4097, 8 * MIB + 3):
+        add(f"boundaries/size-{s:09d}.bin", s)
+    add("large/past-hash-limit.bin", 40 * MIB + 5)
+    for i in range(300):
+        add(f"many/entry-{i:04d}.dat", (i * 37) % 3000 + 1)
+    for name in ("with spaces.bin",
+                 "[bracketed] (parens) {braces}.bin",
+                 "many.dots.in.the.name.bin",
+                 "no-extension",
+                 "café über 日本.bin",
+                 "long" * 50 + ".bin"):
+        add(f"names/{name}", 4099)
+    add("nested/a/b/c/d/e/f/g/deep.bin", 70001)
+    os.makedirs(os.path.join(root, "empty", "nothing-here"))
+    add("empty/zero-bytes.bin", 0)
+
+    dirs = sorted(os.path.relpath(d, root).replace(os.sep, "\\")
+                  for d, _, _ in os.walk(root) if d != root)
+    with open(os.path.join(args.out, "corpus-manifest.json"), "w", encoding="utf-8") as f:
+        json.dump({"seed": SEED, "files": files, "directories": dirs}, f, ensure_ascii=False, indent=1)
+    total = sum(x["size"] for x in files)
+    print(f"Corpus: {len(files)} files, {len(dirs)} directories, {total / MIB:.1f} MiB in {root}")
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+case "${1:-}" in
+    pins)    shift; cmd_pins >/dev/null ;;
+    server)  shift; cmd_server "$@" ;;
+    package) shift; cmd_package "$@" ;;
+    guest)   shift; cmd_guest "$@" ;;
+    ""|-h|--help|help) sed -n '2,/^$/p' "$BLORG" | sed 's/^# \{0,1\}//' ;;
+    *)       die "unknown command '$1' (blorg help)" ;;
+esac

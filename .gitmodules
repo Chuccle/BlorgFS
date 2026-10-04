@@ -10,3 +10,6 @@
 [submodule "third_party/googletest"]
 	path = third_party/googletest
 	url = https://github.com/google/googletest.git
+[submodule "third_party/server-rs"]
+	path = third_party/server-rs
+	url = https://github.com/Chuccle/server-rs.git

@@ -14,6 +14,15 @@ updates:
       - schemas # Allow version updates for dependencies in this registry
     schedule:
       interval: "weekly"
+    # The driver and the server must compile the same schema (`tools/blorg
+    # pins` fails the build otherwise), so a schemas bump and the server-rs
+    # bump that adopts it have to arrive as one PR, not two that are each
+    # red alone.
+    groups:
+      package-contract:
+        patterns:
+          - "third_party/schemas"
+          - "third_party/server-rs"
 
   - package-ecosystem: "github-actions"
     directory: "/"
