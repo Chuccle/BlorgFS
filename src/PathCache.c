@@ -18,6 +18,10 @@
 // 4 seconds, in 100ns units (KeQueryInterruptTime).
 #define PATH_CACHE_TTL_100NS       (4LL * 10LL * 1000LL * 1000LL)
 
+// Most entries one listing may seed: a quarter of the cache's capacity (see
+// BlorgPathCacheSeedListing).
+#define PATH_CACHE_SEED_MAX        ((PATH_CACHE_BUCKETS * PATH_CACHE_MAX_PER_BUCKET) / 4u)
+
 //
 // One cached path-lookup result (exists+metadata, or not-found).
 // Reserved is explicit tail padding so CHECK_PADDING_END can verify layout.
@@ -438,19 +442,16 @@ static BOOLEAN PathCacheIsUnder(const UNICODE_STRING* Dir, const UNICODE_STRING*
 }
 
 //
-//  Drop a directory and its entire subtree. A subtree's paths hash to
-//  different buckets, so this sweeps every bucket -- acceptable because
-//  invalidation is a rare event (a listing refresh or a directory mutation),
-//  unlike the per-probe lookup path. Each bucket is taken and released in
-//  turn, so no two locks are ever held together.
+//  Drop everything beneath a directory, and the directory's own entry too
+//  unless KeepDir. A subtree's paths hash to different buckets, so this
+//  sweeps every bucket -- once per listing publish (BlorgPathCacheSeedListing),
+//  which is a network round trip's worth of time apart at the very least,
+//  so 256 uncontended push-lock acquisitions are noise beside it. Each
+//  bucket is taken and released in turn, so no two locks are ever held
+//  together.
 //
-VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
+static VOID PathCacheInvalidateUnder(const UNICODE_STRING* Dir, BOOLEAN KeepDir)
 {
-    if (!PathCache.Ready || !Dir || 0 == Dir->Length || !Dir->Buffer)
-    {
-        return;
-    }
-
     for (ULONG i = 0; i < PATH_CACHE_BUCKETS; i++)
     {
         PATH_CACHE_BUCKET* bucket = &PathCache.Buckets[i];
@@ -465,7 +466,8 @@ VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
             PPATH_CACHE_ENTRY entry = CONTAINING_RECORD(e, PATH_CACHE_ENTRY, Link);
             PLIST_ENTRY next = e->Flink;
 
-            if (PathCacheIsUnder(Dir, &entry->Path))
+            if (PathCacheIsUnder(Dir, &entry->Path) &&
+                !(KeepDir && entry->Path.Length == Dir->Length))
             {
                 PathCacheRemoveEntry(bucket, entry);
             }
@@ -476,6 +478,154 @@ VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
         ExReleasePushLockExclusive(&bucket->Lock);
         KeLeaveCriticalRegion();
     }
+}
+
+//
+//  Drop a directory and its entire subtree, the directory itself included.
+//
+VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
+{
+    if (!PathCache.Ready || !Dir || 0 == Dir->Length || !Dir->Buffer)
+    {
+        return;
+    }
+
+    PathCacheInvalidateUnder(Dir, FALSE);
+}
+
+//
+//  Appends one listing entry's name to the directory path already in
+//  Scratch, inserts it with Meta, and trims Scratch back to the directory.
+//  Names the listing could not have produced -- empty, or longer than its
+//  own MAX_NAME_LEN field -- and paths past the cache's own limit are
+//  skipped rather than truncated, since a truncated path would cache a
+//  result for a different file.
+//
+static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const WCHAR* Name, SIZE_T NameLength, const DIRECTORY_ENTRY_METADATA* Meta)
+{
+    if (0 == NameLength || NameLength > MAX_NAME_LEN ||
+        DirLength + (NameLength * sizeof(WCHAR)) > Scratch->MaximumLength)
+    {
+        return;
+    }
+
+    RtlCopyMemory(C_CAST(PUCHAR, Scratch->Buffer) + DirLength, Name, NameLength * sizeof(WCHAR));
+    Scratch->Length = C_CAST(USHORT, DirLength + (NameLength * sizeof(WCHAR)));
+
+    PathCacheInsert(Scratch, TRUE, Meta);
+
+    Scratch->Length = DirLength;
+}
+
+//
+//  Makes a freshly published listing of Dir the path cache's answer for
+//  everything directly in it.
+//
+//  This replaced a plain BlorgPathCacheInvalidatePrefix on publish, which
+//  was correct and cost a round trip per file: a DCB's listing lives only
+//  as long as the DCB, so after `dir` closed its handle every child open
+//  missed the node table, the path cache (just emptied) and the parent's
+//  listing (just freed), and went to the network for metadata the driver
+//  had held a moment earlier. Measured in the CI guest at 31 ms RTT: 300
+//  opens after a listing made 300 fileinfo GETs with 0 path-cache hits, so
+//  a cold small-file open cost two round trips (63 ms) instead of one, and
+//  a repeated listing cost two (the directory's own entry was evicted too).
+//
+//  What the listing is authoritative for, and so what this does:
+//   - Every direct child is inserted as existing, with the listing's
+//     metadata. That also replaces a stale not-found for a child that has
+//     since appeared, which was the reason the publish invalidated at all.
+//   - Everything deeper is still dropped: the listing says nothing about
+//     grandchildren, and a child directory may be gone.
+//   - The directory's own entry is kept. A listing that arrived is proof the
+//     directory exists, and evicting it is what made a repeated `dir` pay a
+//     fileinfo GET before its dirinfo GET.
+//
+//  Two details keep it equivalent to the per-open listing scan in Create.c
+//  (FindEntryByName), which it stands in for once the DCB is gone:
+//   - Names are matched case-insensitively there, first match winning, files
+//     before subdirectories; on a case-sensitive backend two entries can
+//     collide. Insertion refreshes an existing entry in place, so entries go
+//     in subdirectories-last-first then files-last-first, and the entry
+//     FindEntryByName would have returned is the one inserted last.
+//   - At most PATH_CACHE_SEED_MAX entries, the first ones in listing order.
+//     The cache holds PATH_CACHE_BUCKETS * PATH_CACHE_MAX_PER_BUCKET entries
+//     and evicts FIFO per bucket, so seeding a very large directory in full
+//     would flush everything else for entries mostly never opened; the rest
+//     resolve the way they always did.
+//
+//  Runs from DirCtrlComplete at PASSIVE_LEVEL, as every path-cache entry
+//  point does (PagedPool, push locks). One scratch path buffer for the whole
+//  listing, from pool rather than the stack.
+//
+VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing)
+{
+    if (!PathCache.Ready || !Dir || 0 == Dir->Length || !Dir->Buffer)
+    {
+        return;
+    }
+
+    PathCacheInvalidateUnder(Dir, TRUE);
+
+    if (!Listing || Dir->Length + sizeof(WCHAR) > PATH_CACHE_MAX_PATH_BYTES)
+    {
+        return;
+    }
+
+    UNICODE_STRING scratch;
+    scratch.Buffer = C_CAST(PWCH, ExAllocatePoolUninitialized(PagedPool, PATH_CACHE_MAX_PATH_BYTES, PATH_CACHE_TAG));
+
+    if (!scratch.Buffer)
+    {
+        return;
+    }
+
+    scratch.MaximumLength = PATH_CACHE_MAX_PATH_BYTES;
+    RtlCopyMemory(scratch.Buffer, Dir->Buffer, Dir->Length);
+
+    USHORT dirLength = Dir->Length;
+
+    if (L'\\' != Dir->Buffer[(Dir->Length / sizeof(WCHAR)) - 1])
+    {
+        scratch.Buffer[dirLength / sizeof(WCHAR)] = L'\\';
+        dirLength = C_CAST(USHORT, dirLength + sizeof(WCHAR));
+    }
+
+    scratch.Length = dirLength;
+
+    const SIZE_T files = (Listing->FileCount < PATH_CACHE_SEED_MAX) ? Listing->FileCount : PATH_CACHE_SEED_MAX;
+    const SIZE_T subDirs = (Listing->SubDirCount < PATH_CACHE_SEED_MAX - files) ? Listing->SubDirCount : PATH_CACHE_SEED_MAX - files;
+
+    DIRECTORY_ENTRY_METADATA meta;
+    RtlZeroMemory(&meta, sizeof(meta));
+    meta.IsDirectory = TRUE;
+
+    for (SIZE_T i = subDirs; i > 0; i--)
+    {
+        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(Listing, i - 1);
+
+        meta.CreationTime = sub->CreationTime;
+        meta.LastAccessedTime = sub->LastAccessedTime;
+        meta.LastModifiedTime = sub->LastModifiedTime;
+
+        PathCacheSeedEntry(&scratch, dirLength, sub->Name, sub->NameLength, &meta);
+    }
+
+    meta.IsDirectory = FALSE;
+
+    for (SIZE_T i = files; i > 0; i--)
+    {
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(Listing, i - 1);
+
+        meta.Size = file->Size;
+        meta.CreationTime = file->CreationTime;
+        meta.LastAccessedTime = file->LastAccessedTime;
+        meta.LastModifiedTime = file->LastModifiedTime;
+
+        PathCacheSeedEntry(&scratch, dirLength, file->Name, file->NameLength, &meta);
+    }
+
+    ExFreePool(scratch.Buffer);
 }
 
 //

@@ -1,8 +1,8 @@
 ﻿//
 // Functional tests for PathCache.c: the sharded full-path resolution
 // cache wired into the create path (via BlorgPathCacheLookup/InsertExists/
-// InsertNotFound) and into DirCtrlComplete (via BlorgPathCacheInvalidatePrefix
-// on a listing refresh). Exercised here through its own public API rather
+// InsertNotFound) and into DirCtrlComplete (via BlorgPathCacheSeedListing
+// on a listing publish). Exercised here through its own public API rather
 // than through IRP dispatch -- the cache's state machine (TTL, targeted/
 // prefix invalidation, per-bucket FIFO eviction) is what OpenCppCoverage
 // showed as never exercised at all, compile-only.
@@ -16,6 +16,8 @@
 extern "C" {
 #include "..\..\src\Driver.h"
 }
+
+#include "ListingBuilder.h"
 
 namespace
 {
@@ -204,9 +206,10 @@ TEST_F(PathCacheTest, PrefixInvalidationRemovesSubtreeButNotSiblings)
 //
 // The volume root is a real, reachable value for this API, not a
 // hypothetical: Driver.c creates the root DCB with
-// RTL_CONSTANT_STRING(L"\\"), and DirCtrlComplete invalidates with
-// BlorgPathCacheInvalidatePrefix(&dcb->FullPath) on every listing publish --
-// so a refresh of the volume root passes exactly this Dir.
+// RTL_CONSTANT_STRING(L"\\"), and DirCtrlComplete hands
+// &dcb->FullPath to BlorgPathCacheSeedListing on every listing publish,
+// which sweeps the same subtree -- so a refresh of the volume root passes
+// exactly this Dir.
 //
 // PathCacheIsUnder's boundary check reads Path->Buffer[Dir->Length /
 // sizeof(WCHAR)] and requires it to be '\'. For Dir = "\" that index is
@@ -310,6 +313,133 @@ TEST_F(PathCacheTest, InsertUnderPressureEvictsRatherThanGrowingUnbounded)
     EXPECT_LT(hits, kPaths)
         << "all " << kPaths << " distinct paths are still cached -- "
            "eviction under the per-bucket cap did not fire";
+}
+
+//
+// BlorgPathCacheSeedListing: a published listing becomes the path cache's
+// answer for the directory's children. Before it, DirCtrlComplete only
+// invalidated, and since a DCB frees its listing when its last handle
+// closes, every open after a `dir` paid a fileinfo GET (measured: 300 opens
+// after a listing, 300 GETs, 0 path-cache hits). Nothing in the dispatch
+// sandbox drives DirCtrlComplete's success path, so the contract is pinned
+// here, on the cache, where a regression to "invalidate only" shows up as a
+// miss.
+//
+class PathCacheSeedTest : public PathCacheTest
+{
+protected:
+    static UNICODE_STRING Path(const std::wstring& Text)
+    {
+        UNICODE_STRING path;
+        path.Buffer = const_cast<PWSTR>(Text.c_str());
+        path.Length = C_CAST(USHORT, Text.size() * sizeof(wchar_t));
+        path.MaximumLength = path.Length;
+        return path;
+    }
+
+    static void Seed(const std::wstring& Dir, PDIRECTORY_INFO Listing)
+    {
+        UNICODE_STRING dir = Path(Dir);
+        BlorgPathCacheSeedListing(&dir, Listing);
+        BlorgFreeHttpDirectoryInfo(Listing);
+    }
+
+    static PATH_CACHE_RESULT Lookup(const std::wstring& Text, DIRECTORY_ENTRY_METADATA* Meta = nullptr)
+    {
+        UNICODE_STRING path = Path(Text);
+        return BlorgPathCacheLookup(&path, Meta);
+    }
+};
+
+TEST_F(PathCacheSeedTest, SeededChildrenHitWithTheListingsMetadata)
+{
+    Seed(L"\\seed\\basic", BuildSyntheticListing(3, 2));
+
+    DIRECTORY_ENTRY_METADATA out = {};
+    ASSERT_EQ(PathCacheExists, Lookup(L"\\seed\\basic\\file2.bin", &out))
+        << "a child the listing named must resolve without a fileinfo GET";
+    EXPECT_EQ(1002u, out.Size);
+    EXPECT_FALSE(out.IsDirectory);
+
+    ASSERT_EQ(PathCacheExists, Lookup(L"\\seed\\basic\\dir1", &out));
+    EXPECT_TRUE(out.IsDirectory);
+    EXPECT_EQ(0u, out.Size);
+
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\seed\\basic\\file3.bin"))
+        << "only names the listing contains may be seeded";
+}
+
+//
+// The listing is authoritative for its children and for the directory's own
+// existence, and says nothing about anything deeper: a child directory may
+// have been replaced since its own entries were cached.
+//
+TEST_F(PathCacheSeedTest, KeepsTheDirectoryReplacesStaleChildrenDropsDeeperEntries)
+{
+    UNICODE_STRING dir = RTL_CONSTANT_STRING(L"\\seed\\keep");
+    UNICODE_STRING staleChild = RTL_CONSTANT_STRING(L"\\seed\\keep\\file0.bin");
+    UNICODE_STRING grandchild = RTL_CONSTANT_STRING(L"\\seed\\keep\\dir0\\inner.bin");
+    DIRECTORY_ENTRY_METADATA dirMeta = MakeMeta(0, TRUE);
+
+    BlorgPathCacheInsertExists(&dir, &dirMeta);
+    BlorgPathCacheInsertNotFound(&staleChild);
+    BlorgPathCacheInsertNotFound(&grandchild);
+
+    Seed(L"\\seed\\keep", BuildSyntheticListing(1, 1));
+
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\seed\\keep"))
+        << "evicting the directory's own entry is what made a repeated `dir` "
+           "pay a fileinfo GET before its dirinfo GET";
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\seed\\keep\\file0.bin"))
+        << "a not-found memoized before the file appeared must not shadow the listing";
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\seed\\keep\\dir0\\inner.bin"))
+        << "entries below a child are not covered by this listing";
+}
+
+//
+// The volume root's FullPath already ends in its separator; joining it
+// naively would seed "\\file0.bin", which no open ever looks up.
+//
+TEST_F(PathCacheSeedTest, RootListingSeedsSingleSeparatorPaths)
+{
+    Seed(L"\\", BuildSyntheticListingNamed(L"seedroot.bin", L"seedrootdir"));
+
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\seedroot.bin"));
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\seedrootdir"));
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\\\seedroot.bin"));
+}
+
+//
+// On a case-sensitive backend a file and a subdirectory can differ only in
+// case. Create.c's listing scan (FindEntryByName) is case-insensitive and
+// returns the file, so the seeded entry -- which stands in for that scan
+// once the DCB is gone -- must say file too, or the same open would get a
+// directory or a file depending on whether the DCB happened to be alive.
+//
+TEST_F(PathCacheSeedTest, CaseCollisionResolvesToTheFileAsTheListingScanDoes)
+{
+    Seed(L"\\seed\\case", BuildSyntheticListingNamed(L"Clip", L"clip"));
+
+    DIRECTORY_ENTRY_METADATA out = {};
+    ASSERT_EQ(PathCacheExists, Lookup(L"\\seed\\case\\CLIP", &out));
+    EXPECT_FALSE(out.IsDirectory);
+    EXPECT_EQ(2048u, out.Size);
+}
+
+//
+// The cache evicts FIFO per bucket, so seeding a huge directory in full
+// would flush every other entry for names that are mostly never opened.
+// Seeding stops at PATH_CACHE_SEED_MAX, keeping the first entries in
+// listing order. Two thousand files is past any cap that leaves room for
+// the rest of the cache, so this does not depend on the constant's value.
+//
+TEST_F(PathCacheSeedTest, VeryLargeListingSeedsOnlyItsFirstEntries)
+{
+    Seed(L"\\seed\\huge", BuildSyntheticListing(2000, 0));
+
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\seed\\huge\\file0.bin"));
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\seed\\huge\\file1999.bin"))
+        << "a 2000-entry listing was seeded in full, flushing the rest of the cache";
 }
 
 } // namespace
