@@ -132,7 +132,7 @@ jobs:
 
     - name: Download this run's package
       if: inputs.package_run_id == github.run_id
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@v8
       with:
         name: ${{ env.PACKAGE_ARTIFACT }}
         path: package
@@ -233,14 +233,14 @@ jobs:
         persist-credentials: false
 
     - name: Download the guest results
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@v8
       with:
         name: guest-results
         path: guest-results
 
     - name: Download the driver's symbols (this run)
       if: needs.guest.outputs.package_run == github.run_id
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@v8
       with:
         name: BlorgFS-Release-x64
         path: symbols
