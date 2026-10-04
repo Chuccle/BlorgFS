@@ -490,7 +490,7 @@ function Invoke-TestStep {
         Invoke-Step 'corpus' {
             param($log)
             if (-not (Test-Path $corpusManifest)) { return 'corpus-manifest.json was not pushed into the guest' }
-            $m = Get-Content $corpusManifest -Raw | ConvertFrom-Json
+            $m = Get-Content $corpusManifest -Raw -Encoding UTF8 | ConvertFrom-Json
             "corpus: $($m.files.Count) files, $($m.directories.Count) directories" | Write-StepLog -Log $log
             $true
         } | Out-Null
@@ -543,7 +543,7 @@ function Invoke-TestStep {
 
         Invoke-Step 'listing' -NeedsMount {
             param($log)
-            $want = Get-Content $corpusManifest -Raw | ConvertFrom-Json
+            $want = Get-Content $corpusManifest -Raw -Encoding UTF8 | ConvertFrom-Json
             $root = "${Drive}:\"
             $haveFiles = @{}
             foreach ($p in [System.IO.Directory]::EnumerateFiles($root, '*', [System.IO.SearchOption]::AllDirectories)) {
@@ -581,10 +581,12 @@ function Invoke-TestStep {
         $suiteDir = Join-Path $BundleDir 'suites'
         if (Test-Path $suiteDir) {
             foreach ($suite in Get-ChildItem $suiteDir -Filter '*.ps1' | Sort-Object Name) {
-                $name = $suite.BaseName
-                Invoke-Step "suite:$name" -NeedsMount {
+                # Not $name: inside the step body that would be Invoke-Step's
+                # own -Name ("suite:<name>"), and a ':' is no path.
+                $suiteName = $suite.BaseName
+                Invoke-Step "suite:$suiteName" -NeedsMount {
                     param($log)
-                    $out = New-Item -ItemType Directory -Force -Path (Join-Path $ResultsDir "suites\$name")
+                    $out = New-Item -ItemType Directory -Force -Path (Join-Path $ResultsDir "suites\$suiteName")
                     $offered = @{
                         Drive = $Drive; BackendUrl = $backendUrl
                         CorpusManifest = $corpusManifest; ResultsDir = $out.FullName
