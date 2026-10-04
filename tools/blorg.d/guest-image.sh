@@ -10,14 +10,16 @@
 #
 #   blorg guest image [--iso PATH|URL] [--virtio-iso PATH|URL] [--image-index N]
 #
-# Defaults build Windows Server 2022 Standard (Server Core) from Microsoft's
-# public 180-day evaluation ISO. Server Core because a filesystem driver
-# test needs no desktop, and the image is a fraction of the size to build,
-# cache and boot. The evaluation clock starts when the image is built, so
+# Defaults build Windows Server 2025 Standard (Server Core) from Microsoft's
+# public 180-day evaluation ISO: build 26100, the oldest Windows the driver
+# loads on (src/BlorgFS.vcxproj targets NTDDI 0x0A000010, 24H2; on 2022 it
+# fails to start with "procedure not found"). Server Core because a
+# filesystem driver test needs no desktop, and the image is a fraction of
+# the size to build, cache and boot. The evaluation clock starts when the image is built, so
 # CI keys its image cache by quarter and rebuilds well inside 180 days.
 #
 # Environment (all optional):
-#   WINDOWS_ISO_URL      install ISO (default: Server 2022 evaluation, en-US)
+#   WINDOWS_ISO_URL      install ISO (default: Server 2025 evaluation, en-US)
 #   WINDOWS_IMAGE_INDEX  index in install.wim (default 1: Standard Core)
 #   VIRTIO_ISO_URL       virtio-win ISO, for the QEMU guest agent; set to
 #                        "none" to skip the agent
@@ -26,8 +28,8 @@
 #
 # Every input is pinned by SHA-256, so the same recipe always builds from
 # the same bytes and a moved download fails the build instead of silently
-# changing the guest. An input with an empty pin is used and its hash
-# printed ("input ... sha256=..."), ready to be pinned here.
+# changing the guest. Overriding a URL means overriding its pin too; an
+# empty pin (VAR=) uses the input unchecked and prints its hash.
 #   BUILD_TIMEOUT_MIN    give up on Windows Setup after this (default 45)
 #   STALL_MIN            give up sooner if the guest's screen has not
 #                        changed for this long (default 20): it is stuck
@@ -46,13 +48,15 @@ guest_image_key() {
 
 guest_image() (
     set -euo pipefail
-WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US}"
+WINDOWS_ISO_URL="${WINDOWS_ISO_URL:-https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso}"
 WINDOWS_IMAGE_INDEX="${WINDOWS_IMAGE_INDEX:-1}"
-VIRTIO_ISO_URL="${VIRTIO_ISO_URL:-https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso}"
+VIRTIO_ISO_URL="${VIRTIO_ISO_URL:-https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.302-1/virtio-win-0.1.302.iso}"
 OPENSSH_ZIP_URL="${OPENSSH_ZIP_URL:-https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip}"
-WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256:-3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325}"
-VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256:-303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d}"
-OPENSSH_ZIP_SHA256="${OPENSSH_ZIP_SHA256:-23f50f3458c4c5d0b12217c6a5ddfde0137210a30fa870e98b29827f7b43aba5}"
+WINDOWS_ISO_SHA256="${WINDOWS_ISO_SHA256-d0ef4502e350e3c6c53c15b1b3020d38a5ded011bf04998e950720ac8579b23d}"
+VIRTIO_ISO_SHA256="${VIRTIO_ISO_SHA256-303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d}"
+# Win32-OpenSSH publishes no stable per-version URL here; the pin is what
+# keeps "latest" from changing the image underneath the recipe.
+OPENSSH_ZIP_SHA256="${OPENSSH_ZIP_SHA256-23f50f3458c4c5d0b12217c6a5ddfde0137210a30fa870e98b29827f7b43aba5}"
 BUILD_TIMEOUT_MIN="${BUILD_TIMEOUT_MIN:-45}"
 STALL_MIN="${STALL_MIN:-20}"
 
@@ -123,6 +127,10 @@ xml="$(<"$REPO/tools/guest/autounattend.xml.in")"
 xml="${xml//@ADMIN_PASSWORD@/$password}"
 xml="${xml//@IMAGE_INDEX@/$WINDOWS_IMAGE_INDEX}"
 printf '%s\n' "$xml" > "$cfg/autounattend.xml"
+# Setup silently ignores an answer file that is not well-formed XML and
+# waits at its language screen, which only shows up as a timeout.
+python3 -c 'import sys, xml.dom.minidom as m; m.parse(sys.argv[1])' "$cfg/autounattend.xml" \
+    || die "autounattend.xml is not well-formed XML"
 cp "$REPO/tools/guest/Invoke-BlorgGuest.ps1" "$cfg/"
 cp "$WORK/id_ed25519.pub" "$cfg/authorized_keys"
 cp "$openssh_zip" "$cfg/OpenSSH-Win64.zip"

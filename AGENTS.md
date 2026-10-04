@@ -482,7 +482,7 @@ No container can load `BlorgFS.sys`: that is what the guest is for.
 
 ### The test guest
 
-A Windows Server 2022 Core guest under KVM/QEMU loads the packaged driver
+A Windows Server 2025 Core guest under KVM/QEMU loads the packaged driver
 into a real kernel and tests it against the packaged Linux server. It runs
 on any Linux host with `/dev/kvm`; GitHub's `ubuntu-latest` runners are
 one, and that is what CI uses.
@@ -516,8 +516,11 @@ the guest; `Install-BlorgFS.ps1` installs and `B:` mounts; the tree on `B:`
 matches the corpus path for path and size for size;
 `Test-BlorgCorrectness.ps1` passes; every `tests/guest-suites/*.ps1` passes;
 the service is still RUNNING. A bugcheck or unexplained reboot anywhere
-fails the run, and the minidumps come back in `diag/dumps` for
-`tools\Get-CrashVerdict.ps1`.
+fails the run, and the minidumps come back in `diag/dumps`. CI then
+analyses them on `windows-latest` with the driver's PDB from the same
+build (`tools\Get-CrashVerdict.ps1 -SymbolServer -SymbolDir <build>`, the
+same command by hand) and reports the bugcheck, faulting line and stack as
+a `blorg guest-crash` annotation.
 
 **Adding a suite.** Put `<name>.ps1` in `tests/guest-suites/`. It exits 0
 on pass and is given whichever of `-Drive`, `-BackendUrl`,
@@ -549,15 +552,19 @@ use single quotes, or `ps` for anything longer than a line. Install with
 the same boot needs a reboot or a `revert`, because `sc stop` wedges in
 `STOP_PENDING`.
 
-**The golden image** is built unattended from Microsoft's 180-day
-evaluation ISO: `autounattend.xml` on a generated config ISO, then
+**The golden image** is Windows Server 2025 (build 26100), the oldest
+Windows the driver loads on: `BlorgFS.vcxproj` targets NTDDI 0x0A000010, so
+on Server 2022 it fails to start with "procedure not found". It is built
+unattended from Microsoft's 180-day evaluation ISO: `autounattend.xml` on a generated config ISO, then
 `Invoke-BlorgGuest.ps1 -Step Image` installs OpenSSH and the QEMU guest
 agent, turns test signing on and boot recovery off, sets Driver Verifier,
 keeps kernel dumps and turns Windows Update off. The build then boots the
 result once and checks it over SSH. Every download is pinned by SHA-256 in
-`tools/blorg.d/guest-image.sh`, so the same recipe always builds from the
-same bytes; when an upstream URL moves to a new file, the build fails with
-the new hash, ready to review and pin. The install gives up after 45 min,
+`tools/blorg.d/guest-image.sh` (versioned URLs, except OpenSSH's "latest",
+which the pin holds still), so the same recipe always builds from the same
+bytes; a moved download fails the build with its new hash. The answer
+file is checked to be well-formed first: Setup silently ignores a broken
+one and waits at its language screen. The install gives up after 45 min,
 or after 20 min on one unchanged screen (it is stuck), with a
 `blorg image-build` annotation holding the tail of the setup transcript. SeaBIOS, because Secure Boot blocks
 `bcdedit /set testsigning on`; AHCI disk and e1000e NIC, because Windows

@@ -242,9 +242,11 @@ function Invoke-ImageStep {
             return
         }
         # vioserial carries the agent's channel; without it the service starts
-        # and never sees its port. The 2k22 build also loads on 2025.
+        # and never sees its port. The newest Server build in the ISO (2k25,
+        # else 2k22) is the one for this image.
         $inf = Get-ChildItem (Join-Path $virtio 'vioserial') -Recurse -Filter 'vioser.inf' |
-            Where-Object { $_.FullName -match '\\2k22\\amd64\\' } | Select-Object -First 1
+            Where-Object { $_.FullName -match '\\2k2[25]\\amd64\\' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
         if ($inf) { Invoke-Native pnputil.exe @('/add-driver', $inf.FullName, '/install') }
         $msi = Join-Path $virtio 'guest-agent\qemu-ga-x86_64.msi'
         $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart') -Wait -PassThru
@@ -423,9 +425,11 @@ function Invoke-TestStep {
             try {
                 $r = & $Body $log
                 if ($r -is [array]) { $r = $r[-1] }
-                if ($r -eq 'skip') { $status = 'skip'; $detail = 'not applicable' }
-                elseif ($r -is [string]) { $status = 'fail'; $detail = $r }
-                elseif ($r) { $status = 'pass' }
+                # Strings first: `$true -eq 'skip'` is true in PowerShell.
+                if ($r -is [string]) {
+                    if ($r -eq 'skip') { $status = 'skip'; $detail = 'not applicable' }
+                    else { $status = 'fail'; $detail = $r }
+                } elseif ($r) { $status = 'pass' }
             } catch {
                 $detail = $_.Exception.Message
             }
@@ -451,7 +455,10 @@ function Invoke-TestStep {
             if ($v -is [switch] -or $v -is [bool]) { if ($v) { $argList += "-$k" } }
             else { $argList += "-$k"; $argList += "$v" }
         }
-        & powershell.exe @argList 2>&1 | Write-StepLog -Log $Log
+        # Under 'Stop', Windows PowerShell 5.1 turns the child's first stderr
+        # line into a terminating error; the exit code is the result here.
+        $ErrorActionPreference = 'Continue'
+        & powershell.exe @argList 2>&1 | ForEach-Object { "$_" } | Write-StepLog -Log $Log
         return $LASTEXITCODE
     }
 
@@ -494,7 +501,11 @@ function Invoke-TestStep {
 
         Invoke-Step 'install' {
             param($log)
-            $code = Invoke-ChildScript $log (Join-Path $package 'driver\Install-BlorgFS.ps1') @{
+            # Paths passed explicitly: under `powershell -File`, Windows
+            # PowerShell 5.1 leaves $PSScriptRoot empty in param() defaults.
+            $driver = Join-Path $package 'driver'
+            $code = Invoke-ChildScript $log (Join-Path $driver 'Install-BlorgFS.ps1') @{
+                InfPath = (Join-Path $driver 'BlorgFS.inf'); CertPath = (Join-Path $driver 'BlorgFS.cer')
                 RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive
             }
             if ($code -eq 2) { return 'test signing is off (Install-BlorgFS.ps1 exit 2) -- -Step Prepare and a reboot should have handled this' }
@@ -517,7 +528,8 @@ function Invoke-TestStep {
             $exe = @((Join-Path $package 'tests\VolumeTester.exe'), (Join-Path $BundleDir 'tests\VolumeTester.exe')) |
                 Where-Object { Test-Path $_ } | Select-Object -First 1
             if (-not $exe) { 'VolumeTester.exe not in the package' | Set-Content $log; return 'skip' }
-            & $exe 2>&1 | Write-StepLog -Log $log
+            $ErrorActionPreference = 'Continue'   # see Invoke-ChildScript
+            & $exe 2>&1 | ForEach-Object { "$_" } | Write-StepLog -Log $log
             if ($LASTEXITCODE -ne 0) { return "VolumeTester exited $LASTEXITCODE" }
             $true
         } | Out-Null

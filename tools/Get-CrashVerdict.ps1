@@ -31,6 +31,11 @@
     Also consult the Microsoft public symbol server. Slower, but resolves
     OS frames the local cache has never seen.
 
+.PARAMETER SymbolDir
+    A directory holding the driver's own .pdb (the build artifact next to
+    BlorgFS.sys, searched recursively), consulted before anything else.
+    Without it the driver's frames are module+offset only.
+
 .PARAMETER DriverName
     Module name to look for on the faulting stack, without extension.
     A bugcheck whose stack names this is ours; one that does not may still
@@ -42,11 +47,20 @@
 
 .EXAMPLE
     .\Get-CrashVerdict.ps1 -DumpPath C:\dumps\MEMORY.DMP
+
+.EXAMPLE
+    .\Get-CrashVerdict.ps1 -DumpPath guest-results\results\diag\dumps\x.dmp -SymbolServer -SymbolDir BlorgFS-Release-x64
+
+    A dump a guest run brought back, with the PDB from the same build.
+    Besides the verdict it prints the bugcheck arguments, faulting line and
+    stack; under GitHub Actions that summary is also a "blorg guest-crash"
+    check annotation.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$DumpPath,
     [switch]$SymbolServer,
+    [string]$SymbolDir,
     [string]$DriverName = 'BlorgFS',
     [string]$ReportPath
 )
@@ -110,6 +124,12 @@ $env:_NT_SYMBOL_PATH = if ($SymbolServer) {
     "srv*$symbolCache*https://msdl.microsoft.com/download/symbols"
 } else {
     "cache*$symbolCache"
+}
+if ($SymbolDir) {
+    # Build artifacts keep their x64\Release\ layout: use wherever the PDB is.
+    $pdb = Get-ChildItem $SymbolDir -Recurse -Filter "$DriverName.pdb" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pdb) { $env:_NT_SYMBOL_PATH = "$($pdb.DirectoryName);$env:_NT_SYMBOL_PATH" }
+    else { Write-Warning "no $DriverName.pdb under $SymbolDir" }
 }
 
 #
@@ -241,6 +261,35 @@ Set-Content -Encoding utf8 -Path $logPath -Value $output
 Write-Host ""
 foreach ($kv in $report.GetEnumerator()) {
     Write-Host ("  {0,-17} {1}" -f $kv.Key, $kv.Value)
+}
+
+#
+# The parts of !analyze -v worth reading first, and the stack: enough to
+# start on a crash without opening the full analysis. Under GitHub Actions
+# it is also a check annotation, readable through the API where logs and
+# artifacts may not be.
+#
+if ($bugcheck) {
+    $sections = 'BUGCHECK_CODE', 'BUGCHECK_P1', 'BUGCHECK_P2', 'BUGCHECK_P3', 'BUGCHECK_P4',
+                'READ_ADDRESS', 'WRITE_ADDRESS', 'CURRENT_IRQL', 'FAULTING_IP', 'IMAGE_NAME',
+                'SYMBOL_NAME', 'FAULTING_SOURCE_FILE', 'FAULTING_SOURCE_LINE_NUMBER'
+    $picked = foreach ($line in $lines) {
+        foreach ($sec in $sections) { if ($line -match "^$sec\s*:") { $line.Trim(); break } }
+    }
+    $stack = @()
+    $inStack = $false
+    foreach ($line in $lines) {
+        if ($line -match '^STACK_TEXT:') { $inStack = $true; continue }
+        if ($inStack) { if ($line -match '^\s*$') { break }; $stack += $line.TrimEnd() }
+    }
+    $summary = @("dump=$(Split-Path -Leaf $DumpPath) bugcheck=$bugcheck driver_on_stack=$([int]$driverOnStack)") +
+               $picked + 'STACK_TEXT:' + ($stack | Select-Object -First 40)
+    Write-Host ""
+    $summary | ForEach-Object { Write-Host $_ }
+    if ($env:GITHUB_ACTIONS) {
+        $annotation = ($summary -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+        Write-Host "::error title=blorg guest-crash::$annotation"
+    }
 }
 
 Write-Host ""

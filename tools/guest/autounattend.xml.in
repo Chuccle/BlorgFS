@@ -116,7 +116,7 @@
           The config ISO's drive letter depends on how many CD drives setup
           enumerated first, so look for the script rather than assume one.
           Its transcript lands in C:\blorgfs-image.log, which blorg guest image
-          has no way to read -- a screenshot is how a stuck build is
+          has no way to read; a screenshot is how a stuck build is
           diagnosed, so the script also echoes each step to the console.
         -->
         <SynchronousCommand wcm:action="add">

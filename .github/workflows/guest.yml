@@ -47,6 +47,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     name: Windows guest (KVM)
+    outputs:
+      package_run: ${{ steps.earlier.outputs.run_id || github.run_id }}
+      dumps: ${{ steps.dumps.outputs.found }}
     env:
       GUEST_HOME: /mnt/blorgfs-guest
       PACKAGE_ARTIFACT: blorg-package-windows-x64
@@ -134,6 +137,7 @@ jobs:
         path: package
 
     - name: Download an earlier build's package
+      id: earlier
       if: github.event_name == 'workflow_dispatch' || inputs.package_run_id != ''
       env:
         GH_TOKEN: ${{ github.token }}
@@ -147,6 +151,7 @@ jobs:
         fi
         echo "Testing the package from https://github.com/$REPO/actions/runs/$RUN_ID"
         gh run download "$RUN_ID" -R "$REPO" -n "$PACKAGE_ARTIFACT" -D package
+        echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
     - name: Run the tests in the guest
       timeout-minutes: 45
@@ -173,6 +178,14 @@ jobs:
       if: always()
       run: tools/blorg guest down || true
 
+    - name: Look for crash dumps
+      id: dumps
+      if: always()
+      run: |
+        if compgen -G 'guest-results/results/diag/dumps/*.dmp' >/dev/null; then
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Upload results
       if: always()
       uses: actions/upload-artifact@v7
@@ -190,3 +203,50 @@ jobs:
           ${{ env.GUEST_HOME }}/image/build/install/screens/
           ${{ env.GUEST_HOME }}/image/build/install/qemu.log
         if-no-files-found: ignore
+
+  # A bugcheck's dumps are analysed on Windows, where the debugger is, with
+  # the driver's PDB from the build that made the package. The bugcheck,
+  # faulting line and stack go to the log and to a "blorg guest-crash"
+  # annotation. The guest job has already failed the run; this fails only
+  # if the analysis itself does not work.
+  crash:
+    needs: guest
+    if: always() && needs.guest.outputs.dumps == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    name: Analyse the guest's crash dumps
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+    - name: Download the guest results
+      uses: actions/download-artifact@v5
+      with:
+        name: guest-results
+        path: guest-results
+
+    - name: Download the driver's symbols (this run)
+      if: needs.guest.outputs.package_run == github.run_id
+      uses: actions/download-artifact@v5
+      with:
+        name: BlorgFS-Release-x64
+        path: symbols
+
+    - name: Download the driver's symbols (earlier build)
+      if: needs.guest.outputs.package_run != github.run_id
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh run download "${{ needs.guest.outputs.package_run }}" -R "${{ github.repository }}" -n BlorgFS-Release-x64 -D symbols
+
+    - name: Analyse
+      shell: pwsh
+      run: |
+        $triageFailed = $false
+        foreach ($dump in Get-ChildItem guest-results/results/diag/dumps -Filter '*.dmp') {
+          & tools/Get-CrashVerdict.ps1 -DumpPath $dump.FullName -SymbolServer -SymbolDir symbols
+          if ($LASTEXITCODE -eq 3) { $triageFailed = $true }
+        }
+        if ($triageFailed) { exit 3 }
+        exit 0
