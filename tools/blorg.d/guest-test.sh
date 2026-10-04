@@ -164,10 +164,19 @@ test_rc=$?
 endstep
 
 # ssh's own failures are 255. Anything else is the test runner's verdict.
+# Losing the guest mid-run almost always means a bugcheck: Windows writes
+# its dump and reboots by itself (AutoReboot), and the dump is collected
+# below. Bounded either way: if it is not back within LOST_WAIT_S, it is
+# reset, which still finds a dump that was written before the reset.
 if (( test_rc == 255 )); then
-    step "Lost the guest mid-run; waiting for it to come back"
+    step "Lost the guest mid-run (likely a bugcheck); waiting for it to reboot"
     "$BLORG" guest screenshot "$out/screen-at-loss.png" >/dev/null 2>&1 || true
-    "$BLORG" guest wait 900 || rig_fail "guest never came back after losing it mid-run (see $out/screen-at-loss.png)"
+    if ! "$BLORG" guest wait "${LOST_WAIT_S:-300}" 2>/dev/null; then
+        echo "blorg guest test: not back after ${LOST_WAIT_S:-300}s; resetting it"
+        "$BLORG" guest screenshot "$out/screen-before-reset.png" >/dev/null 2>&1 || true
+        "$BLORG" guest qmp system_reset >/dev/null 2>&1 || true
+        "$BLORG" guest wait 600 || rig_fail "guest did not come back after a reset (see $out/screen-before-reset.png)"
+    fi
     endstep
 fi
 boot_after="$("$BLORG" guest boot-id 2>/dev/null || true)"
