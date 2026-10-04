@@ -1417,7 +1417,10 @@ How to read it:
 - **It is a floor.** It counts blocks fetched since, not distinct blocks,
   as the distance to an earlier fetch; a block counts as cached only once a
   fetch covered all of it; and a table eviction forgets a block. All three
-  can only turn a real hit into a reported miss.
+  can only turn a real hit into a reported miss. In practice the floor sits
+  about 5% low: re-reading a file whose every block had been fetched, Cc's
+  fetch boundaries land differently the second time, and those fetches
+  count as partials (`GhostPartialFetches`) rather than hits.
 - **High `GhostEvictions` means the table is too small** for the history
   being asked about. Each MB of table remembers 4 GB of blocks; 64 MB covers
   the 256 GB row.
@@ -1428,6 +1431,17 @@ How to read it:
   counters, so a reset starts a new measurement window without forgetting
   what was fetched before it. A reboot or reinstall forgets everything,
   which a real on-disk cache would not.
+
+What one synthetic run in the CI guest showed (guest.yml run 37226872350,
+Release, Verifier off, 6 GB guest, ten 1 GiB files): re-reading a file
+after an 8 GB pass had pushed it out of the Windows cache, 95% of demand
+fetches and 93% of bytes would have come from a 16 GB cache; repeats that
+had not been pushed out never reached the driver at all, so a disk cache
+had nothing to add to them; and first-miss admission wrote every byte
+fetched once (776 MiB of random reads that were never re-fetched), where
+second-miss admission wrote nothing until the second pass. That validates
+the instrument and the admission trade-off, not the case for building the
+cache, for the reason in the list above.
 
 Off by default, and a no-op when off. The guest tests in CI turn it on
 (`GhostCacheMb = 16`) so the model runs under Driver Verifier on every
