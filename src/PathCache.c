@@ -526,10 +526,11 @@ static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const 
 //  as long as the DCB, so after `dir` closed its handle every child open
 //  missed the node table, the path cache (just emptied) and the parent's
 //  listing (just freed), and went to the network for metadata the driver
-//  had held a moment earlier. Measured in the CI guest at 31 ms RTT: 300
-//  opens after a listing made 300 fileinfo GETs with 0 path-cache hits, so
-//  a cold small-file open cost two round trips (63 ms) instead of one, and
-//  a repeated listing cost two (the directory's own entry was evicted too).
+//  had held a moment earlier, and a repeated listing paid a fileinfo GET for
+//  the directory's own (evicted) entry before its dirinfo GET. Measured in
+//  the CI guest on the reference link: 100 opens straight after a listing
+//  went from 101 fileinfo GETs and 5.9 ms per open to 1 GET and 3.2 ms, and
+//  a repeated listing from 5.5 ms to 3.1 ms.
 //
 //  What the listing is authoritative for, and so what this does:
 //   - Every direct child is inserted as existing, with the listing's

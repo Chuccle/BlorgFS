@@ -106,8 +106,8 @@
 // How many connects one request may start when each one times out
 // (SOCKET_CONNECT_TIMEOUT_MS in Socket.c). The connect watchdog used to be
 // a single 15 s attempt, and one lost connection cost a reader the whole
-// 15 s: measured in the CI guest, an app read of 15,003 ms against a 31 ms
-// median. A connect that is merely unlucky (a dropped SYN, a NAT that
+// 15 s: measured in the CI guest on the reference link, four concurrent
+// readers saw an app read of 15,001 ms against a p50 under 0.3 ms. A connect that is merely unlucky (a dropped SYN, a NAT that
 // stopped answering for that source port) is better replaced than waited
 // on, since a new socket gets a new port and a new SYN. Four attempts at
 // 4 s each keep a dead backend failing in about the same 16 s it used to,

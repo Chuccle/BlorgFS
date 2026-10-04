@@ -653,7 +653,7 @@ TEST_F(HttpClientTest, IdleClosedPooledConnectionIsRetriedOnce)
 //
 // A connect that times out is replaced by a new one rather than failing the
 // read. The connect watchdog used to be a single 15 s attempt, and one lost
-// connect cost a reader all of it (a measured 15,003 ms app read). The
+// connect cost a reader all of it (a measured 15,001 ms app read). The
 // sandbox completes acquisitions inline, so these pin the client's decision
 // -- retry on STATUS_IO_TIMEOUT, how many times, and nothing else -- not
 // the watchdog timing, which lives in Socket.c. HTTP_CONNECT_ATTEMPTS is
