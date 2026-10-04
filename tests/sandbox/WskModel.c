@@ -375,6 +375,11 @@ static const WSK_PROVIDER_CONNECTION_DISPATCH ConnectionDispatch =
     WskModelReceive
 };
 
+//
+// Documented as callable at DISPATCH_LEVEL, but with no owning process the
+// transport captures the caller's security context in pageable code, so a
+// connect must be issued below DISPATCH_LEVEL.
+//
 static NTSTATUS WskModelSocketConnect(
     PWSK_CLIENT Client, USHORT SocketType, ULONG Protocol,
     PSOCKADDR LocalAddress, PSOCKADDR RemoteAddress,
@@ -384,6 +389,8 @@ static NTSTATUS WskModelSocketConnect(
     (void)Client; (void)SocketType; (void)Protocol; (void)Flags;
     (void)SocketContext; (void)Dispatch;
     (void)OwningProcess; (void)OwningThread; (void)SecurityDescriptor;
+
+    KmRequireIrqlAtMost(APC_LEVEL, "WskSocketConnect");
 
     LastLocalFamily = LocalAddress ? LocalAddress->sa_family : 0;
     LastRemoteFamily = RemoteAddress ? RemoteAddress->sa_family : 0;

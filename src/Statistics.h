@@ -461,9 +461,11 @@ typedef struct _BLORGFS_STATISTICS
     // 164.7 ms max during real playback for a request of about two hundred
     // bytes -- and the worst time-to-first-byte was almost entirely send.
     //
-    // Submit is this driver building the request and WskSend accepting it.
-    // Settle is the stack acknowledging it and the completion being
-    // delivered. An allocation or a lock shows up in the first; TCP and DPC
+    // Submit is this driver building the request. Settle is WskSend taking
+    // it, the stack acknowledging it and the completion being delivered.
+    // The stamp between them is taken just before WskSend, never after: a
+    // send can complete inline and free the request before the call
+    // returns. An allocation or a lock shows up in the first; TCP and DPC
     // scheduling under a saturated link show up in the second, and nothing
     // could tell them apart while they shared one counter.
     //

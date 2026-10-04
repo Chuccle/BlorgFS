@@ -421,10 +421,11 @@ static VOID DriverDeleteFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceOb
 // every fresh TLS connection -- are only freed after BlorgCleanupHttpClient
 // has drained the client.
 //
-// The drain runs before anything is torn down. It refuses new work and
-// waits for what is already outstanding, and must complete while the
-// filesystem device object still exists, because an in-flight request holds
-// an IO work item queued against it.
+// The drains run before anything is torn down: the HTTP client's, then
+// the socket pre-warm DriverEntry started. Each refuses new work and waits
+// for what is already outstanding, and both must complete while the
+// filesystem device object still exists, because an in-flight request or
+// pre-warm connect may queue an IO work item against it.
 //
 // This used to be two drains in a fixed order, rings before requests, since
 // a live prefetch ring would otherwise keep issuing into a drained client.
@@ -434,6 +435,7 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
     BlorgDrainHttpClient();
+    BlorgDrainWskSocketPrewarm();
 
     ObDereferenceObject(global.FileSystemDeviceObject);
     DriverDeleteFileSystemDeviceObject(global.FileSystemDeviceObject);

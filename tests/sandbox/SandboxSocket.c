@@ -540,6 +540,11 @@ static VOID SandboxDestroySocket(PKSOCKET Socket)
     SocketsLive--;
 }
 
+//
+// A fresh socket is a WskSocketConnect, which the transport runs partly in
+// pageable code (see WskModelSocketConnect), so a fresh acquire is held to
+// the same IRQL limit as the real one.
+//
 NTSTATUS BlorgAcquireReusableWskSocketAsync(
     const SOCKADDR* RemoteAddress,
     BOOLEAN ForceFresh,
@@ -564,6 +569,8 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
         CompletionRoutine(STATUS_SUCCESS, reused, TRUE, CompletionContext);
         return STATUS_PENDING;
     }
+
+    KmRequireIrqlAtMost(APC_LEVEL, "WskSocketConnect");
 
     PKSOCKET fresh = SandboxCreateSocket();
 
