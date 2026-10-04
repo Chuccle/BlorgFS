@@ -468,13 +468,13 @@ jobs:
 
     # Restores x64/Release/... exactly as the build job left it.
     - name: Download driver build
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@v8
       with:
         name: BlorgFS-Release-x64
         path: ${{ github.workspace }}
 
     - name: Download server builds
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@v8
       with:
         name: server-rs
         path: ${{ runner.temp }}/server-bin
