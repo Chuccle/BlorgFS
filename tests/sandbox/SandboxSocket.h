@@ -106,6 +106,12 @@ VOID SandboxSetPeerScript(const SANDBOX_STEP* Steps, SIZE_T StepCount);
 // Fails the next N socket acquisitions, for the connect-failure paths.
 VOID SandboxFailNextAcquires(ULONG Count);
 
+//
+// The same, with the status a failed connect reports: STATUS_IO_TIMEOUT is
+// what the real connect watchdog produces, and the client retries only that.
+//
+VOID SandboxFailNextAcquiresWith(ULONG Count, NTSTATUS Status);
+
 // Runs deferred (non-inline) completions until none remain.
 VOID SandboxDrainCompletions(VOID);
 

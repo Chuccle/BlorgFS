@@ -103,6 +103,19 @@
 #define HTTP_MAX_HEADER_BYTES C_CAST(ULONG, (64 * 1024))
 
 //
+// How many connects one request may start when each one times out
+// (SOCKET_CONNECT_TIMEOUT_MS in Socket.c). The connect watchdog used to be
+// a single 15 s attempt, and one lost connection cost a reader the whole
+// 15 s: measured in the CI guest, an app read of 15,003 ms against a 31 ms
+// median. A connect that is merely unlucky (a dropped SYN, a NAT that
+// stopped answering for that source port) is better replaced than waited
+// on, since a new socket gets a new port and a new SYN. Four attempts at
+// 4 s each keep a dead backend failing in about the same 16 s it used to,
+// while a stuck connect is abandoned after 4.
+//
+#define HTTP_CONNECT_ATTEMPTS 4u
+
+//
 // Checked SIZE_T addition. Returns FALSE (and leaves *Result unspecified)
 // on overflow instead of wrapping. Every BodyOffset + ContentLength
 // computation in this file -- combining a wire-parsed, untrusted length
@@ -422,6 +435,7 @@ typedef struct _HTTP_CONTEXT
     ULONG RequestLength;
     ULONG Capacity;
     ULONG Length;
+    ULONG ConnectTimeouts; // connects that hit SOCKET_CONNECT_TIMEOUT_MS; see HttpOnSocket
 
     //
     // QPC stamp taken when the request is built, so HttpComplete can fold
@@ -1251,11 +1265,12 @@ static BOOLEAN HttpNeedsWorkItem(HTTP_OPERATION Operation)
 // Stage-machine dispatcher: drives Ctx forward one step per call by
 // switching on Ctx->Stage and issuing the next async op (or completing).
 // Central re-entry point for every stage transition in this file.
-// HttpStageAcquireSocket bypasses the pool only on the post-retry attempt
-// (the retry path forced ConnectionSource to Fresh); the initial attempt
-// is free to reuse a pooled connection. That fresh attempt is a
-// WskSocketConnect, which reaches pageable code in tcpip and so is issued
-// below DISPATCH_LEVEL; the retry runs from a receive completion, so at
+// HttpStageAcquireSocket bypasses the pool only on a retry attempt (the
+// idle-close retry or a timed-out connect, both of which force
+// ConnectionSource to Fresh); the initial attempt is free to reuse a pooled
+// connection. That fresh attempt is a WskSocketConnect, which reaches
+// pageable code in tcpip and so is issued below DISPATCH_LEVEL; a retry
+// runs from a receive or connect completion, so at
 // DISPATCH_LEVEL it bounces to PASSIVE first, allocating the work item a
 // plaintext file read does not carry. HttpStageTlsHandshake bounces to
 // PASSIVE unconditionally (unlike HttpMustBounceToPassive, independent of
@@ -1498,9 +1513,25 @@ static VOID HttpFailOrRetryReusedConnection(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 // everything before it -- including any handshake attempted on this
 // socket -- already succeeded.
 //
+// A connect that timed out is retried on a new socket, up to
+// HTTP_CONNECT_ATTEMPTS in all; any other acquisition failure (refused,
+// unreachable, out of memory) fails at once, since an immediate second
+// attempt would get the same answer. Only a fresh connect can time out,
+// so the retry forces a fresh connect too, and HttpKick takes it to
+// PASSIVE first because this completion usually runs at DISPATCH_LEVEL.
+//
 static VOID HttpOnSocket(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
 {
     HTTP_CONTEXT* ctx = C_CAST(HTTP_CONTEXT*, CompletionContext);
+
+    if (STATUS_IO_TIMEOUT == Status && ctx->ConnectTimeouts + 1 < HTTP_CONNECT_ATTEMPTS)
+    {
+        ctx->ConnectTimeouts++;
+        ctx->ConnectionSource = HttpConnectionFresh;
+        ctx->Stage = HttpStageAcquireSocket;
+        HttpKick(ctx);
+        return;
+    }
 
     if (!NT_SUCCESS(Status))
     {

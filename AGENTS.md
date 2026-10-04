@@ -1200,7 +1200,8 @@ Test-NetConnection -ComputerName 10.0.50.17 -Port 8080
 
 Note that a driver pointed at a dead backend also makes service **stop**
 pathological: every in-flight request has to burn its full socket timeout
-(connect 15s / send 15s / receive 30s, `Socket.c`) before unload can
+(connect 4s per attempt, up to 4 attempts / send 15s / receive 30s,
+`Socket.c` and `HTTP_CONNECT_ATTEMPTS` in `Client.c`) before unload can
 proceed, so `STOP_PENDING` can persist for minutes and look like a hang.
 
 ### Solved: the vendor IOCTLs returned `ERROR_INVALID_FUNCTION` (device type)

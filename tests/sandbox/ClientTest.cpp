@@ -650,6 +650,97 @@ TEST_F(HttpClientTest, IdleClosedPooledConnectionIsRetriedOnce)
     FreeMdl();
 }
 
+//
+// A connect that times out is replaced by a new one rather than failing the
+// read. The connect watchdog used to be a single 15 s attempt, and one lost
+// connect cost a reader all of it (a measured 15,003 ms app read). The
+// sandbox completes acquisitions inline, so these pin the client's decision
+// -- retry on STATUS_IO_TIMEOUT, how many times, and nothing else -- not
+// the watchdog timing, which lives in Socket.c. HTTP_CONNECT_ATTEMPTS is
+// 4: three timeouts are survivable, a fourth is not.
+//
+TEST_F(HttpClientTest, TimedOutConnectIsRetriedOnANewSocket)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nGOOD")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+    SandboxFailNextAcquiresWith(3, STATUS_IO_TIMEOUT);
+
+    unsigned char target[4] = {};
+    Read(target, sizeof(target));
+    Drain();
+
+    EXPECT_EQ(1, LastRead.Calls);
+    ASSERT_EQ(STATUS_SUCCESS, LastRead.Status)
+        << "a timed-out connect failed the read instead of being retried";
+    EXPECT_EQ(0, memcmp(target, "GOOD", sizeof(target)));
+
+    FreeMdl();
+}
+
+//
+// The budget is what keeps a dead backend failing in bounded time. The
+// follow-up read proves the failed one stopped after exactly four
+// attempts: had it made fewer, a scripted failure would still be pending
+// and would fail the second read too.
+//
+TEST_F(HttpClientTest, ConnectThatKeepsTimingOutFailsAfterTheAttemptBudget)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nGOOD")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+    SandboxFailNextAcquiresWith(4, STATUS_IO_TIMEOUT);
+
+    unsigned char first[4] = {};
+    Read(first, sizeof(first));
+    Drain();
+
+    EXPECT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_IO_TIMEOUT, LastRead.Status)
+        << "four timed-out connects must fail the read, not retry forever";
+    FreeMdl();
+
+    LastRead = {};
+    unsigned char second[4] = {};
+    Read(second, sizeof(second));
+    Drain();
+
+    EXPECT_EQ(STATUS_SUCCESS, LastRead.Status)
+        << "the failed read gave up before using all four attempts";
+    FreeMdl();
+}
+
+//
+// Only a timeout is retried. A refused or reset connect is an answer from
+// the peer, and asking again at once would get the same one, so it must
+// fail on the first attempt as it always has.
+//
+TEST_F(HttpClientTest, RefusedConnectIsNotRetried)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nGOOD")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+    SandboxFailNextAcquiresWith(1, STATUS_CONNECTION_REFUSED);
+
+    unsigned char target[4] = {};
+    Read(target, sizeof(target));
+    Drain();
+
+    EXPECT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_CONNECTION_REFUSED, LastRead.Status);
+
+    FreeMdl();
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Request shaping
 ///////////////////////////////////////////////////////////////////////////

@@ -249,7 +249,13 @@ static VOID FreeKSocket(PKSOCKET Socket)
 // connect/send rarely block on a healthy LAN peer; receive is given more
 // room because the server may legitimately take longer to produce a chunk.
 //
-#define SOCKET_CONNECT_TIMEOUT_MS  15000
+// Connect is the shortest because a timed-out connect is retried on a new
+// socket (HTTP_CONNECT_ATTEMPTS in Client.c) rather than failing the
+// request. 4 s covers the SYN and its first two retransmissions (sent at
+// 0, 1 and 3 s with Windows' 1 s initial RTO), so a connect that a
+// retransmission would have rescued is not cut short.
+//
+#define SOCKET_CONNECT_TIMEOUT_MS  4000
 #define SOCKET_SEND_TIMEOUT_MS     15000
 #define SOCKET_RECEIVE_TIMEOUT_MS  30000
 
