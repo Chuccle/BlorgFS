@@ -439,6 +439,17 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // replaced was doing.
     //
     ULONG   ReadLastStreamIndex;
+
+    //
+    // Whether the last completed window found this reader greedy
+    // (ReadIsGreedy), kept past the window's reset because the read path
+    // consults it on every paging read: a greedy reader's read-ahead
+    // yields to everyone else's fetches (Read.c, ReadYield). FALSE until a
+    // window completes, so a new reader starts with priority, and never
+    // set while ReadAheadAdapt is off.
+    //
+    BOOLEAN ReadGreedy;
+    UCHAR   Reserved[7];       // Pad to 8-byte alignment
 } FCB, * PFCB;
 
 CHECK_PADDING_BETWEEN(FCB, Header, NonPaged);
@@ -468,7 +479,9 @@ CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadAheadGranularity);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadGranularity, ReadAheadAgreement);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadAgreement, ReadMaxPagingBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadMaxPagingBytes, ReadLastStreamIndex);
-CHECK_PADDING_END(FCB, ReadLastStreamIndex);
+CHECK_PADDING_BETWEEN(FCB, ReadLastStreamIndex, ReadGreedy);
+CHECK_PADDING_BETWEEN(FCB, ReadGreedy, Reserved);
+CHECK_PADDING_END(FCB, Reserved);
 
 //
 // Per-directory context node. Extends COMMON_CONTEXT with child linkage and

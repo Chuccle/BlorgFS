@@ -219,6 +219,10 @@ BOOLEAN BlorgFastIoRead(
     PVOID Buffer,
     PIO_STATUS_BLOCK IoStatus,
     PDEVICE_OBJECT DeviceObject);
+
+// Initializes the read path's yield state (Read.c). DriverEntry, before
+// any read can arrive.
+VOID BlorgReadInit(VOID);
 _Dispatch_type_(IRP_MJ_WRITE)                    DRIVER_DISPATCH BlorgWrite;
 _Dispatch_type_(IRP_MJ_QUERY_INFORMATION)        DRIVER_DISPATCH BlorgQueryInformation;
 _Dispatch_type_(IRP_MJ_SET_INFORMATION)          DRIVER_DISPATCH BlorgSetInformation;

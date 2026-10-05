@@ -470,6 +470,8 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
         t.ReadsDemand,
         (t.ReadsDemand > 0) ? (t.DemandLatencySumUs / t.ReadsDemand) : 0ull,
         t.DemandLatencyMaxUs);
+    printf("    yielded (held RA)     %12llu  (%.1f%% of speculative)\n",
+        t.ReadsYielded, SafeRatio(t.ReadsYielded, t.ReadsSpeculative));
     printf("    granularity shrink/grow%11llu / %llu\n",
         t.ReadAheadShrinks, t.ReadAheadGrows);
     printf("    adapt windows         %12llu  (%llu shrink votes, %llu grow votes)\n",
@@ -2654,6 +2656,7 @@ static bool WriteReport(
     fprintf(f, "ReadsEndOfFile=%llu\n", t.ReadsEndOfFile);
     fprintf(f, "ReadsSpeculative=%llu\n", t.ReadsSpeculative);
     fprintf(f, "ReadsDemand=%llu\n", t.ReadsDemand);
+    fprintf(f, "ReadsYielded=%llu\n", t.ReadsYielded);
     fprintf(f, "ReadAheadShrinks=%llu\n", t.ReadAheadShrinks);
     fprintf(f, "ReadAheadGrows=%llu\n", t.ReadAheadGrows);
     fprintf(f, "SpeculativeLatencyMeanUs=%llu\n",

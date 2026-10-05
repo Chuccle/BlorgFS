@@ -45,6 +45,14 @@
 //
 #define IRP_CONTEXT_FLAG_SPECULATIVE_READ           0x00008000
 
+//
+//  This read's fetch is counted in the priority fetches that greedy
+//  read-ahead yields to (Read.c, ReadYield). Set when the fetch is issued
+//  and cleared by whichever of ReadComplete or a failed issue settles it,
+//  so each priority fetch is uncounted exactly once.
+//
+#define IRP_CONTEXT_FLAG_PRIORITY_FETCH             0x00010000
+
 #if (NTDDI_VERSION >= NTDDI_WINTHRESHOLD)
 #define IRP_CONTEXT_FLAG_SWAPPED_STACK              0x00100000
 #endif

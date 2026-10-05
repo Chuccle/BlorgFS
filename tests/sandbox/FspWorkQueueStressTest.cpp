@@ -285,6 +285,7 @@ TEST_F(FspWorkQueueStressTest, ConcurrentPostersAndWorkersCompleteEveryIrpExactl
 TEST_F(FspWorkQueueStressTest, UnhandledMajorFunctionIsCompletedRatherThanStranded)
 {
     SandboxInitialize();
+    BlorgReadInit();
 
     static const SANDBOX_STEP script[] =
     {

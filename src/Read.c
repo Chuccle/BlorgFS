@@ -268,6 +268,169 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
 }
 
 //
+// Read-ahead for a greedy reader waits while anyone else's fetch is in
+// flight.
+//
+// Every fetch shares one link, and TCP splits it per connection. A file
+// copy keeps one or two large read-ahead fetches open at all times; a
+// player keeps one smaller one open only while it is behind, and its
+// throughput is that fetch's size over its latency. Beside three copies on
+// the reference link a 6 MB/s player got 3.2-4.3 MiB/s and missed about 29%
+// of its 40 ms deadlines, waiting 116-151 ms for each fetch's first byte.
+// Its fetches were nearly all speculative too, so putting demand reads
+// first does not reach it. What separates it from the copies is the one
+// signal the adaptive policy already measures: whether the consumer ever
+// stops asking (ReadIsGreedy). A player starving at the link ceiling still
+// idles over 90% of the time (READ_AHEAD_ADAPT_GREEDY_IDLE_PERCENT), so it
+// keeps its priority when it needs it most.
+//
+// So a priority fetch is any fetch an application is blocked on, or any
+// read-ahead for a reader that is not greedy. While one is in flight, a
+// greedy reader's read-ahead is held here instead of issued, and released
+// when the priority fetches drain. A copy loses only the gaps it would have
+// filled while a player was fetching; a lone copy, or copies alone, never
+// meet a priority fetch on someone else's file and are not held at all.
+//
+// Held, not waited for: Cc issues read-ahead from its own worker threads,
+// which every file on the system shares, and blocking one there would stall
+// the player's read-ahead behind the copy's. A held IRP is already marked
+// pending and costs nothing until it is released. Release happens at
+// <= DISPATCH_LEVEL on a fetch completion, and a request can only be built
+// at PASSIVE_LEVEL (HttpBuildRequest), so each held IRP is issued from a
+// work item allocated when it was held.
+//
+// A greedy reader is never starved. Each priority completion releases at
+// least the oldest held IRP, and all of them once none remain in flight,
+// so continuous priority traffic still lets one greedy fetch through per
+// priority fetch.
+//
+// The count needs the lock rather than an interlocked counter because the
+// decision to hold and the insertion must be one step against the release:
+// holding after the last priority fetch has already drained would strand
+// the IRP with nothing left to release it.
+//
+static struct
+{
+    KSPIN_LOCK Lock;
+    ULONG PriorityFetches;      // Priority fetches issued and not yet completed
+    LIST_ENTRY Held;            // Greedy read-ahead IRPs, oldest first
+} ReadYield;
+
+VOID BlorgReadInit(VOID)
+{
+    KeInitializeSpinLock(&ReadYield.Lock);
+    ReadYield.PriorityFetches = 0;
+    InitializeListHead(&ReadYield.Held);
+}
+
+static IO_WORKITEM_ROUTINE ReadYieldWorker;
+
+static VOID ReadPriorityBegin(PIRP Irp)
+{
+    BlorgSetIrpContextFlag(Irp, IRP_CONTEXT_FLAG_PRIORITY_FETCH);
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&ReadYield.Lock, &oldIrql);
+    ReadYield.PriorityFetches++;
+    KeReleaseSpinLock(&ReadYield.Lock, oldIrql);
+}
+
+//
+// Settles a priority fetch, whether it completed or failed to issue, and
+// releases the held IRPs it was holding back. A fetch that was not a
+// priority fetch carries no flag and releases nothing.
+//
+// <= DISPATCH_LEVEL: called from ReadComplete on the WSK completion chain.
+//
+static VOID ReadPriorityEnd(PIRP Irp)
+{
+    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_PRIORITY_FETCH))
+    {
+        return;
+    }
+
+    BlorgClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_PRIORITY_FETCH);
+
+    LIST_ENTRY released;
+    InitializeListHead(&released);
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&ReadYield.Lock, &oldIrql);
+
+    ReadYield.PriorityFetches--;
+
+    if (0 == ReadYield.PriorityFetches)
+    {
+        while (!IsListEmpty(&ReadYield.Held))
+        {
+            InsertTailList(&released, RemoveHeadList(&ReadYield.Held));
+        }
+    }
+    else if (!IsListEmpty(&ReadYield.Held))
+    {
+        InsertTailList(&released, RemoveHeadList(&ReadYield.Held));
+    }
+
+    KeReleaseSpinLock(&ReadYield.Lock, oldIrql);
+
+    while (!IsListEmpty(&released))
+    {
+        PIRP held = CONTAINING_RECORD(RemoveHeadList(&released), IRP, Tail.Overlay.ListEntry);
+
+        IoQueueWorkItem(C_CAST(PIO_WORKITEM, held->Tail.Overlay.DriverContext[2]), ReadYieldWorker, DelayedWorkQueue, held);
+    }
+}
+
+//
+// Holds a greedy reader's read-ahead if a priority fetch is in flight,
+// returning TRUE when it did; FALSE means issue it now.
+//
+// The work item that will release it is allocated before the lock, and
+// lives in DriverContext[2] until then -- the slot ReadIssueFetch stamps
+// with the issue time, which a held IRP has not reached. The unlocked read
+// of the count only saves the allocation in the common case of nothing in
+// flight; the locked one decides.
+//
+static BOOLEAN ReadYieldHold(PIRP Irp)
+{
+    if (0 == ReadYield.PriorityFetches)
+    {
+        return FALSE;
+    }
+
+    PIO_WORKITEM workItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
+
+    if (!workItem)
+    {
+        return FALSE;
+    }
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&ReadYield.Lock, &oldIrql);
+
+    const BOOLEAN hold = (0 != ReadYield.PriorityFetches);
+
+    if (hold)
+    {
+        Irp->Tail.Overlay.DriverContext[2] = workItem;
+        InsertTailList(&ReadYield.Held, &Irp->Tail.Overlay.ListEntry);
+    }
+
+    KeReleaseSpinLock(&ReadYield.Lock, oldIrql);
+
+    if (!hold)
+    {
+        IoFreeWorkItem(workItem);
+    }
+    else
+    {
+        BLORGFS_STAT_INC(ReadsYielded);
+    }
+
+    return hold;
+}
+
+//
 // Re-tunes Cc's read-ahead granularity for this file from what the reader
 // has actually been doing.
 //
@@ -374,9 +537,11 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     const ULONG64 fetched = Fcb->ReadAheadFetchedBytes;
     const ULONG honoured = Fcb->ReadMaxPagingBytes;
 
+    Fcb->ReadGreedy = ReadIsGreedy(Fcb);
+
     const BOOLEAN greedy = global.ReadAheadSlackGrowth &&
                            BlorgStatisticsFetchesActive() < READ_AHEAD_ADAPT_QUIET_DEPTH &&
-                           ReadIsGreedy(Fcb);
+                           Fcb->ReadGreedy;
 
     Fcb->ReadAheadConsumedBytes = 0;
     Fcb->ReadAheadFetchedBytes = 0;
@@ -611,6 +776,8 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
 
     LONG64 issueQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[2]));
 
+    ReadPriorityEnd(irp);
+
     if (!NT_SUCCESS(Status))
     {
         BLORGFS_PRINT("ReadComplete: http read failed: %8lx\n", Status);
@@ -732,6 +899,76 @@ static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG B
     }
 
     return STATUS_SUCCESS;
+}
+
+//
+// Issues the direct fetch for a non-cached read whose IRP is already marked
+// pending, and does the issue-time accounting BlorgVolumeRead's header
+// describes. Shared by the inline path and by ReadYieldWorker, so a held
+// read is counted when it actually reaches the network rather than when it
+// arrived.
+//
+// PASSIVE_LEVEL: HttpBuildRequest is. A return other than STATUS_PENDING
+// means ReadComplete never ran and the IRP is still the caller's.
+//
+static NTSTATUS ReadIssueFetch(PIRP Irp, PFCB Fcb, LONGLONG StartingByte, ULONG Length)
+{
+    Irp->Tail.Overlay.DriverContext[2] =
+        C_CAST(PVOID, C_CAST(ULONG_PTR, BlorgStatisticsNow()));
+
+    BLORGFS_STAT_INC(FetchesIssued);
+    BLORGFS_STAT_INC(UserDiskReads);
+    BLORGFS_STAT_INC(NonCachedDiskReads);
+
+    NTSTATUS fetchStatus = BlorgHttpGetFileMdl(
+        &Fcb->FullPath,
+        StartingByte,
+        Length,
+        Irp->MdlAddress,
+        ReadComplete,
+        Irp);
+
+    if (STATUS_PENDING != fetchStatus)
+    {
+        BLORGFS_STAT_INC(FetchesFailed);
+    }
+
+    return fetchStatus;
+}
+
+//
+// Issues a read ReadYieldHold held, at PASSIVE_LEVEL. The length is trimmed
+// again rather than carried: the file size of a read-only volume does not
+// change, so the trim gives the same answer it gave on arrival, and the IRP
+// has no free slot to carry it in.
+//
+// Nothing else will complete this IRP: BlorgVolumeRead already returned
+// STATUS_PENDING for it.
+//
+static VOID ReadYieldWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    PIRP irp = Context;
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
+    PFCB fcb = irpSp->FileObject->FsContext;
+
+    IoFreeWorkItem(C_CAST(PIO_WORKITEM, irp->Tail.Overlay.DriverContext[2]));
+
+    ULONG realLength = 0;
+
+    NTSTATUS status = ReadTrimToFileSize(
+        fcb, irpSp->Parameters.Read.ByteOffset, irpSp->Parameters.Read.Length, irp, &realLength);
+
+    if (NT_SUCCESS(status))
+    {
+        status = ReadIssueFetch(irp, fcb, irpSp->Parameters.Read.ByteOffset.QuadPart, realLength);
+    }
+
+    if (STATUS_PENDING != status)
+    {
+        BlorgCompleteRequest(irp, status, IO_DISK_INCREMENT);
+    }
 }
 
 //
@@ -870,6 +1107,13 @@ static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG B
 // zero means leave Cc's own default in place -- the one setting no override
 // value can express.
 //
+// A greedy reader's read-ahead may be held rather than issued, while
+// another reader's fetch is in flight (ReadYield). It is still marked
+// pending and returns STATUS_PENDING; ReadYieldWorker issues it later, and
+// the issue-time counters above are raised then, by ReadIssueFetch, so a
+// held read is not in flight until it is. Every other fetch is a priority
+// fetch, counted from its issue to ReadComplete or a failed issue.
+//
 NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
@@ -985,6 +1229,8 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             return BlorgFsdPostRequest(Irp, IrpSp);
         }
 
+        BOOLEAN yields = FALSE;
+
         if (BooleanFlagOn(Irp->Flags, IRP_PAGING_IO))
         {
             BLORGFS_STAT_INC(ReadsPagingInline);
@@ -993,6 +1239,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     IRP_CONTEXT_FLAG_SPECULATIVE_READ))
             {
                 BLORGFS_STAT_INC(ReadsSpeculative);
+                yields = fcb->ReadGreedy;
             }
             else
             {
@@ -1021,31 +1268,22 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             }
         }
 
-        Irp->Tail.Overlay.DriverContext[2] =
-            C_CAST(PVOID, C_CAST(ULONG_PTR, BlorgStatisticsNow()));
-
-        BLORGFS_STAT_INC(FetchesIssued);
-
-        BLORGFS_STAT_INC(UserDiskReads);
-
-        if (BooleanFlagOn(Irp->Flags, IRP_NOCACHE))
-        {
-            BLORGFS_STAT_INC(NonCachedDiskReads);
-        }
-
         IoMarkIrpPending(Irp);
 
-        NTSTATUS fetchStatus = BlorgHttpGetFileMdl(
-            &fcb->FullPath,
-            startingByte.QuadPart,
-            realLength,
-            Irp->MdlAddress,
-            ReadComplete,
-            Irp);
+        if (!yields)
+        {
+            ReadPriorityBegin(Irp);
+        }
+        else if (ReadYieldHold(Irp))
+        {
+            return STATUS_PENDING;
+        }
+
+        NTSTATUS fetchStatus = ReadIssueFetch(Irp, fcb, startingByte.QuadPart, realLength);
 
         if (STATUS_PENDING != fetchStatus)
         {
-            BLORGFS_STAT_INC(FetchesFailed);
+            ReadPriorityEnd(Irp);
         }
 
         return fetchStatus;

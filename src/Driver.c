@@ -904,6 +904,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     BlorgPathCacheInit();
 
+    BlorgReadInit();
+
     NTSTATUS statisticsInitStatus = BlorgStatisticsInitialize();
     if (!NT_SUCCESS(statisticsInitStatus))
     {

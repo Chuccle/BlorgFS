@@ -1424,6 +1424,7 @@ budget are gone (git history only) and are not coming back as-is — see
 | Growth ceiling | **2 MB** (`ReadAheadMaxGranularityKb`), chosen because Cc itself caps around ~1.1 MB on this rig and going further bought nothing. |
 | Feedback loop | On by default; `ReadAheadAdapt=0` pins the granule (useful for A/B measurement). |
 | Slack-based growth | On by default; `ReadAheadSlackGrowth=0` disables it. |
+| Yield | A greedy reader's speculative read-ahead (`ReadGreedy`, set from `ReadIsGreedy` at each window) is **held** while any other fetch is in flight: a demand fault, or read-ahead for a reader that idles. Each such fetch's completion releases the oldest held read, and all of them once none remain (`ReadYield` in `Read.c`). Copies alone are never held. Counted as `ReadsYielded`. Not active while `ReadAheadAdapt=0`, since no window ever marks a reader greedy. |
 | **Removed**: "loaded transport grows the granule" | Was in the tree, measured to be up to **12x worse** on paced/deadline workloads, deleted outright. Growth today is slack-only. |
 
 **What this gets right, measured:** a greedy sequential reader (file copy)
@@ -1437,8 +1438,10 @@ consumers demanding the *entire* link at once miss 0.5%-33% of deadlines in
 every configuration tried, pinned or adaptive. That's bandwidth
 starvation, not something a granule choice can fix. When those streams
 starve at the ceiling they also stop idling and get misclassified as
-"greedy" by the slack signal — recorded as a known, harmless (net) edge
-case, not fixed.
+"greedy" by the slack signal — recorded as a known edge case, not fixed.
+Since the yield rule, that misclassification also costs a stream its
+priority over copies; it was harmless only while the label gated growth
+alone.
 
 **The identified next lever, untried:** raise the number of fetches in
 flight for a sequential reader without raising the granule. The

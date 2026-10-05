@@ -16,6 +16,10 @@
 // ShimForceNextCcCopyReadMiss() is armed, which is what makes the
 // posted-on-cache-miss branch reachable at all.
 //
+// The yield tests at the end hold a greedy reader's read-ahead behind a
+// player's fetch. Deferred (non-inline) peer steps keep a fetch in flight
+// across calls, which is what lets them observe a held IRP at all.
+//
 
 #include <gtest/gtest.h>
 
@@ -44,6 +48,9 @@ const ULONGLONG kFileSize = 64ull * 1024 * 1024;
 #define DELIVER(bytes) \
     { SandboxStepDeliver, (const unsigned char*)(bytes), sizeof(bytes) - 1, STATUS_SUCCESS, TRUE }
 
+#define DELIVER_LATER(bytes) \
+    { SandboxStepDeliver, (const unsigned char*)(bytes), sizeof(bytes) - 1, STATUS_SUCCESS, FALSE }
+
 #define CLOSE_STEP \
     { SandboxStepClose, nullptr, 0, STATUS_SUCCESS, TRUE }
 
@@ -53,6 +60,7 @@ protected:
     void SetUp() override
     {
         SandboxInitialize();
+        BlorgReadInit();
 
         Volume = StructsModelCreateVolume();
         ASSERT_NE(nullptr, Volume);
@@ -594,6 +602,205 @@ TEST_F(ReadTest, DirectFetchThatFailsToIssueSettlesItsOwnAccounting)
 
     EXPECT_EQ(response.Totals.FetchesIssued, response.Totals.FetchesCompleted + response.Totals.FetchesFailed)
         << "every issued fetch must terminate as completed or failed";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Greedy read-ahead yielding to priority fetches
+///////////////////////////////////////////////////////////////////////////
+
+//
+// Two files, a player's and a copy's, each read by Cc's read-ahead. The
+// copy's FCB is marked greedy directly, as a completed adaptive window
+// would mark it; what is under test is what the read path does with the
+// mark, not the classification, which ReadIsGreedy's own measurements
+// cover.
+//
+class ReadYieldTest : public ReadTest
+{
+protected:
+    void SetUp() override
+    {
+        ReadTest::SetUp();
+
+        UNICODE_STRING name = Path(L"\\media\\copy.bin");
+        ASSERT_EQ(STATUS_SUCCESS,
+            BlorgCreateFCB(&CopyFcb, (CSHORT)BLORGFS_FCB_SIGNATURE, &name, Volume, kFileSize));
+        InitializeListHead(&CopyFcb->Links);
+        CopyFcb->ReadGreedy = TRUE;
+
+        BlorgStatisticsReset();
+    }
+
+    void TearDown() override
+    {
+        IoSetTopLevelIrp(nullptr);
+        Drain();
+        BlorgFreeFileContext(CopyFcb, Volume);
+        ReadTest::TearDown();
+    }
+
+    ReadRequest* ReadAhead(PFCB fcb, unsigned char* buffer)
+    {
+        ReadRequest* req = PrepareRead(fcb, 0, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, buffer);
+
+        IoSetTopLevelIrp(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP));
+        EXPECT_EQ(STATUS_PENDING, BlorgRead(Volume, &req->Irp));
+        IoSetTopLevelIrp(nullptr);
+
+        return req;
+    }
+
+    ULONG64 Yielded()
+    {
+        BLORGFS_STATISTICS_RESPONSE response;
+        BlorgStatisticsQuery(&response);
+        return response.Totals.ReadsYielded;
+    }
+
+    PFCB CopyFcb = nullptr;
+};
+
+//
+// The case the mechanism exists for. Beside three copies a 6 MB/s player
+// missed about 29% of its deadlines on the reference link because the
+// copies' read-ahead was always on the wire with its own. While the
+// player's fetch is in flight the copy's read-ahead must not reach the
+// network -- no socket for it -- and once the player's completes it must
+// be issued and land like any other read.
+//
+// Asserting on sockets rather than on completion is the point: a held read
+// and an issued read that has not completed yet look the same from the
+// IRP, and only the second one competes for the link.
+//
+TEST_F(ReadYieldTest, GreedyReadAheadWaitsForAPlayersFetchThenIssues)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char* playerBuffer = NewBuffer(4);
+    unsigned char* copyBuffer = NewBuffer(4);
+
+    ReadRequest* player = ReadAhead(Fcb, playerBuffer);
+    ReadRequest* copy = ReadAhead(CopyFcb, copyBuffer);
+
+    EXPECT_EQ(1u, SandboxSocketsCreated())
+        << "the copy's read-ahead went to the network beside the player's fetch";
+    EXPECT_EQ(1ull, Yielded());
+    EXPECT_EQ(0, copy->Irp.CompletionCount);
+
+    Drain();
+
+    EXPECT_EQ(1, player->Irp.CompletionCount);
+    EXPECT_EQ(2u, SandboxSocketsCreated())
+        << "the player's completion never released the held read";
+    EXPECT_EQ(1, copy->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, copy->Irp.IoStatus.Status);
+    EXPECT_EQ(4u, copy->Irp.IoStatus.Information);
+    EXPECT_EQ(0, memcmp(copyBuffer, "WXYZ", 4))
+        << "the released read must fetch the range it was held with";
+}
+
+//
+// Copies alone must run exactly as before: with no priority fetch in
+// flight a greedy reader's read-ahead is issued at once. Without this a
+// hold with nothing left to release it would strand the IRP -- the failure
+// the lock around the count exists to prevent -- and every copy would
+// stall.
+//
+TEST_F(ReadYieldTest, GreedyReadAheadWithNothingInFlightIsIssuedAtOnce)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    ReadRequest* copy = ReadAhead(CopyFcb, NewBuffer(4));
+
+    EXPECT_EQ(1u, SandboxSocketsCreated());
+    EXPECT_EQ(0ull, Yielded());
+
+    Drain();
+
+    EXPECT_EQ(1, copy->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, copy->Irp.IoStatus.Status);
+}
+
+//
+// Continuous priority traffic must not starve a copy. Each priority
+// completion releases the oldest held read even while another priority
+// fetch is still in flight; releasing only when the count reaches zero
+// would hold a copy for as long as two players' fetches overlap, which on
+// a busy link is indefinitely.
+//
+// The second player read's peer answers inline and the first's only on
+// SandboxDrainCompletions, so draining work items alone finishes the second
+// -- and whatever it releases -- while the first is still in flight: the
+// overlap, made deterministic.
+//
+TEST_F(ReadYieldTest, EachPriorityCompletionReleasesAHeldReadEvenWhileOthersAreInFlight)
+{
+    static const SANDBOX_STEP later[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    static const SANDBOX_STEP now[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+
+    SandboxSetPeerScript(later, RTL_NUMBER_OF(later));
+    ReadRequest* first = ReadAhead(Fcb, NewBuffer(4));
+    ReadRequest* copy = ReadAhead(CopyFcb, NewBuffer(4));
+
+    ASSERT_EQ(1ull, Yielded());
+    ASSERT_EQ(0u, ShimPendingWorkItems());
+
+    SandboxSetPeerScript(now, RTL_NUMBER_OF(now));
+    ReadRequest* second = ReadAhead(Fcb, NewBuffer(4));
+
+    ShimDrainWorkItems();
+
+    EXPECT_EQ(1, second->Irp.CompletionCount);
+    EXPECT_EQ(0, first->Irp.CompletionCount);
+    EXPECT_EQ(1, copy->Irp.CompletionCount)
+        << "the copy stayed held behind a priority fetch that had already completed";
+    EXPECT_EQ(STATUS_SUCCESS, copy->Irp.IoStatus.Status);
+
+    Drain();
+
+    EXPECT_EQ(1, first->Irp.CompletionCount);
+}
+
+//
+// A demand fault is a priority fetch whoever's file it is on: an
+// application is blocked on it. A greedy reader's own fault must therefore
+// hold other greedy read-ahead, and must never itself be held.
+//
+TEST_F(ReadYieldTest, DemandFaultOnAGreedyFileIsNeverHeld)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    ReadRequest* player = ReadAhead(Fcb, NewBuffer(4));
+
+    ReadRequest* fault = PrepareRead(CopyFcb, 0, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, NewBuffer(4));
+    ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &fault->Irp));
+
+    EXPECT_EQ(2u, SandboxSocketsCreated())
+        << "a fault with an application blocked on it was held behind read-ahead";
+    EXPECT_EQ(0ull, Yielded());
+
+    Drain();
+
+    EXPECT_EQ(1, player->Irp.CompletionCount);
+    EXPECT_EQ(1, fault->Irp.CompletionCount);
 }
 
 } // namespace
