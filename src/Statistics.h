@@ -286,7 +286,7 @@ typedef struct _BLORGFS_STATISTICS
     //
     ULONG64 ReadsSpeculative;            // Cc read-ahead: nobody is waiting
     ULONG64 ReadsDemand;                 // fault: an application is blocked
-    ULONG64 ReadsYielded;                // greedy read-ahead held behind a priority fetch (Read.c, ReadYield)
+    ULONG64 ReadsHeld;                   // read-ahead held for the link's budget (Read.c, ReadFair)
 
     //
     // Adaptive read-ahead granularity decisions. Both directions are

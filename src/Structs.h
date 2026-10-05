@@ -190,12 +190,20 @@ typedef struct _NON_PAGED_NODE
     FAST_MUTEX HdrFastMutex;         // Header synchronization (FastMutex variant)
     ERESOURCE  HdrResource;          // Header synchronization (Resource variant)
     ERESOURCE  HdrPagingIoResource;  // Serializes paging I/O against the header
+
+    //
+    // Virtual finish tag of this file's last fetch admitted to the shared
+    // link (Read.c, ReadFair). Here rather than on the FCB because it is
+    // only touched under ReadFair's spin lock, and the FCB is paged.
+    //
+    ULONG64 ReadFinishTag;
 } NON_PAGED_NODE, * PNON_PAGED_NODE;
 
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, SectionObjectPointers, HdrFastMutex);
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, HdrFastMutex, HdrResource);
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, HdrResource, HdrPagingIoResource);
-CHECK_PADDING_END(NON_PAGED_NODE, HdrPagingIoResource);
+CHECK_PADDING_BETWEEN(NON_PAGED_NODE, HdrPagingIoResource, ReadFinishTag);
+CHECK_PADDING_END(NON_PAGED_NODE, ReadFinishTag);
 
 //
 // Fields shared by every file-context node (FCB/DCB); embedded as the first
@@ -439,17 +447,6 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // replaced was doing.
     //
     ULONG   ReadLastStreamIndex;
-
-    //
-    // Whether the last completed window found this reader greedy
-    // (ReadIsGreedy), kept past the window's reset because the read path
-    // consults it on every paging read: a greedy reader's read-ahead
-    // yields to everyone else's fetches (Read.c, ReadYield). FALSE until a
-    // window completes, so a new reader starts with priority, and never
-    // set while ReadAheadAdapt is off.
-    //
-    BOOLEAN ReadGreedy;
-    UCHAR   Reserved[7];       // Pad to 8-byte alignment
 } FCB, * PFCB;
 
 CHECK_PADDING_BETWEEN(FCB, Header, NonPaged);
@@ -479,9 +476,7 @@ CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadAheadGranularity);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadGranularity, ReadAheadAgreement);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadAgreement, ReadMaxPagingBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadMaxPagingBytes, ReadLastStreamIndex);
-CHECK_PADDING_BETWEEN(FCB, ReadLastStreamIndex, ReadGreedy);
-CHECK_PADDING_BETWEEN(FCB, ReadGreedy, Reserved);
-CHECK_PADDING_END(FCB, Reserved);
+CHECK_PADDING_END(FCB, ReadLastStreamIndex);
 
 //
 // Per-directory context node. Extends COMMON_CONTEXT with child linkage and
@@ -619,15 +614,12 @@ VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path);
 //
 //  Invalidation. TTL keeps us eventually-consistent with the backing store
 //  changing out of band; these drop entries early when we learn of a change
-//  ourselves. Wire Invalidate/InvalidatePrefix to rename/delete once
-//  mutating SetInformation lands. SeedListing is the directory-listing
-//  refresh (DirCtrlComplete): it drops the directory's subtree and re-seeds
-//  its children from the listing. InvalidateAll is the O(1) wholesale flush
-//  for backend reconnect / remount.
+//  ourselves. Wire Invalidate/InvalidatePrefix to rename/delete and
+//  directory-listing refresh once mutating SetInformation lands;
+//  InvalidateAll is the O(1) wholesale flush for backend reconnect / remount.
 //
 VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path);
 VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir);
-VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing);
 VOID BlorgPathCacheInvalidateAll(VOID);
 
 /////////////////////////////////////////////

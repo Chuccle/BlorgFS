@@ -268,166 +268,194 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
 }
 
 //
-// Read-ahead for a greedy reader waits while anyone else's fetch is in
-// flight.
+// Read-ahead takes turns on the link, file by file, by bytes.
 //
-// Every fetch shares one link, and TCP splits it per connection. A file
-// copy keeps one or two large read-ahead fetches open at all times; a
-// player keeps one smaller one open only while it is behind, and its
-// throughput is that fetch's size over its latency. Beside three copies on
-// the reference link a 6 MB/s player got 3.2-4.3 MiB/s and missed about 29%
-// of its 40 ms deadlines, waiting 116-151 ms for each fetch's first byte.
-// Its fetches were nearly all speculative too, so putting demand reads
-// first does not reach it. What separates it from the copies is the one
-// signal the adaptive policy already measures: whether the consumer ever
-// stops asking (ReadIsGreedy). A player starving at the link ceiling still
-// idles over 90% of the time (READ_AHEAD_ADAPT_GREEDY_IDLE_PERCENT), so it
-// keeps its priority when it needs it most.
+// Every fetch shares one link, and TCP splits it per connection, so a file
+// gets bandwidth in proportion to the bytes it has in flight. A file copy
+// keeps one or two large read-ahead fetches open at all times; a player
+// keeps a smaller one open, and its throughput is that fetch's size over
+// its latency. Beside three copies on the reference link a 6 MB/s player
+// got 3.2-4.3 MiB/s and missed about 29% of its 40 ms deadlines: each of
+// its fetches waited 116-151 ms for a first byte, queued behind the copies'
+// bytes at the bottleneck.
 //
-// So a priority fetch is any fetch an application is blocked on, or any
-// read-ahead for a reader that is not greedy. While one is in flight, a
-// greedy reader's read-ahead is held here instead of issued, and released
-// when the priority fetches drain. A copy loses only the gaps it would have
-// filled while a player was fetching; a lone copy, or copies alone, never
-// meet a priority fetch on someone else's file and are not held at all.
+// Telling the player from the copies does not work. The one signal that
+// separates them, whether the consumer ever idles (ReadIsGreedy), is lost
+// exactly when it matters: a player that falls behind reads back to back
+// to catch up, and from here it is then a copy. Holding greedy read-ahead
+// behind everyone else's fetches was built and measured that way: it
+// halved the four-stream tail, and the player beside copies still missed
+// 29-30%, because by then it was being held too.
+//
+// So nothing is classified. While the bytes in flight are under
+// ReadFairBudget every fetch is issued at once, which is every fetch a
+// lone reader or a quiet link ever makes. Past it, read-ahead is held, and
+// each completion releases held reads in start-time fair order (SFQ): a
+// fetch's start tag is the later of the link's virtual time and the finish
+// tag of its file's previous fetch, and its finish tag adds its length. A
+// file that has fetched less recently than the others starts at the
+// current virtual time and goes to the front; a file with fetches queued
+// is charged for every byte of them. Every backlogged file therefore gets
+// the same bytes, however large its fetches are, and a reader that asks
+// for less than an equal share gets all of it.
+//
+// A fetch an application is blocked on, a demand fault or an uncached
+// read, is never held. It is charged to its file and counted in flight,
+// so a file that faults does not also get extra read-ahead.
 //
 // Held, not waited for: Cc issues read-ahead from its own worker threads,
-// which every file on the system shares, and blocking one there would stall
-// the player's read-ahead behind the copy's. A held IRP is already marked
-// pending and costs nothing until it is released. Release happens at
-// <= DISPATCH_LEVEL on a fetch completion, and a request can only be built
-// at PASSIVE_LEVEL (HttpBuildRequest), so each held IRP is issued from a
-// work item allocated when it was held.
+// which every file on the system shares, and blocking one there would
+// stall the player's read-ahead behind the copy's. A held IRP is already
+// marked pending and costs nothing until it is released. Release happens
+// at <= DISPATCH_LEVEL on a fetch completion, and a request can only be
+// built at PASSIVE_LEVEL (HttpBuildRequest), so each held IRP is issued
+// from a work item allocated when it was held.
 //
-// A greedy reader is never starved. Each priority completion releases at
-// least the oldest held IRP, and all of them once none remain in flight,
-// so continuous priority traffic still lets one greedy fetch through per
-// priority fetch.
-//
-// The count needs the lock rather than an interlocked counter because the
-// decision to hold and the insertion must be one step against the release:
-// holding after the last priority fetch has already drained would strand
-// the IRP with nothing left to release it.
+// Nothing is held unless something is in flight, so a completion is always
+// coming to release it. Admission and release both decide under the lock:
+// holding after the last fetch has already settled would strand the IRP.
+// The bytes counted are the IRP's own Parameters.Read.Length, not the
+// trimmed length, so admission and settlement always agree.
 //
 static struct
 {
     KSPIN_LOCK Lock;
-    ULONG PriorityFetches;      // Priority fetches issued and not yet completed
-    LIST_ENTRY Held;            // Greedy read-ahead IRPs, oldest first
-} ReadYield;
+    ULONG64 InFlightBytes;      // Bytes of admitted fetches not yet settled
+    ULONG64 VirtualTime;        // Start tag of the latest fetch admitted
+    LIST_ENTRY Held;            // Held read-ahead IRPs, in arrival order
+} ReadFair;
 
 VOID BlorgReadInit(VOID)
 {
-    KeInitializeSpinLock(&ReadYield.Lock);
-    ReadYield.PriorityFetches = 0;
-    InitializeListHead(&ReadYield.Held);
+    KeInitializeSpinLock(&ReadFair.Lock);
+    ReadFair.InFlightBytes = 0;
+    ReadFair.VirtualTime = 0;
+    InitializeListHead(&ReadFair.Held);
 }
 
-static IO_WORKITEM_ROUTINE ReadYieldWorker;
+static IO_WORKITEM_ROUTINE ReadFairWorker;
 
-static VOID ReadPriorityBegin(PIRP Irp)
+//
+// Charges a fetch to its file and admits it to the link, or holds it when
+// MayHold and the link is past its budget. TRUE means it was held.
+//
+// The work item that will release it is allocated before the lock, and
+// lives in DriverContext[2] until then -- the slot ReadIssueFetch stamps
+// with the issue time, which a held IRP has not reached. Its start tag
+// waits in DriverContext[1], which only the create path otherwise uses.
+// The unlocked read of the bytes in flight only saves the allocation in
+// the common case of room on the link; the locked one decides.
+//
+// PASSIVE_LEVEL: BlorgVolumeRead's inline path.
+//
+static BOOLEAN ReadFairAdmit(PIRP Irp, PNON_PAGED_NODE Node, BOOLEAN MayHold)
 {
-    BlorgSetIrpContextFlag(Irp, IRP_CONTEXT_FLAG_PRIORITY_FETCH);
+    const ULONG length = IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
+    const ULONG64 budget = global.ReadFairBudget;
+
+    PIO_WORKITEM workItem = NULL;
+
+    if (MayHold && 0 != budget && ReadFair.InFlightBytes >= budget)
+    {
+        workItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
+    }
 
     KIRQL oldIrql;
-    KeAcquireSpinLock(&ReadYield.Lock, &oldIrql);
-    ReadYield.PriorityFetches++;
-    KeReleaseSpinLock(&ReadYield.Lock, oldIrql);
+    KeAcquireSpinLock(&ReadFair.Lock, &oldIrql);
+
+    const ULONG64 start = (Node->ReadFinishTag > ReadFair.VirtualTime) ? Node->ReadFinishTag : ReadFair.VirtualTime;
+    Node->ReadFinishTag = start + length;
+
+    const BOOLEAN hold = (NULL != workItem) && (ReadFair.InFlightBytes >= budget);
+
+    if (hold)
+    {
+        Irp->Tail.Overlay.DriverContext[1] = C_CAST(PVOID, C_CAST(ULONG_PTR, start));
+        Irp->Tail.Overlay.DriverContext[2] = workItem;
+        InsertTailList(&ReadFair.Held, &Irp->Tail.Overlay.ListEntry);
+    }
+    else
+    {
+        ReadFair.VirtualTime = start;
+        ReadFair.InFlightBytes += length;
+        BlorgSetIrpContextFlag(Irp, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
+    }
+
+    KeReleaseSpinLock(&ReadFair.Lock, oldIrql);
+
+    if (hold)
+    {
+        BLORGFS_STAT_INC(ReadsHeld);
+    }
+    else if (workItem)
+    {
+        IoFreeWorkItem(workItem);
+    }
+
+    return hold;
 }
 
 //
-// Settles a priority fetch, whether it completed or failed to issue, and
-// releases the held IRPs it was holding back. A fetch that was not a
-// priority fetch carries no flag and releases nothing.
+// Settles an admitted fetch, whether it completed or failed to issue, and
+// admits held reads, lowest start tag first, while the link has room. A
+// read that was never admitted carries no flag and settles nothing.
 //
 // <= DISPATCH_LEVEL: called from ReadComplete on the WSK completion chain.
 //
-static VOID ReadPriorityEnd(PIRP Irp)
+static VOID ReadFairSettle(PIRP Irp)
 {
-    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_PRIORITY_FETCH))
+    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_FETCH_ADMITTED))
     {
         return;
     }
 
-    BlorgClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_PRIORITY_FETCH);
+    BlorgClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
 
     LIST_ENTRY released;
     InitializeListHead(&released);
 
     KIRQL oldIrql;
-    KeAcquireSpinLock(&ReadYield.Lock, &oldIrql);
+    KeAcquireSpinLock(&ReadFair.Lock, &oldIrql);
 
-    ReadYield.PriorityFetches--;
+    ReadFair.InFlightBytes -= IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
 
-    if (0 == ReadYield.PriorityFetches)
+    while (!IsListEmpty(&ReadFair.Held) && ReadFair.InFlightBytes < global.ReadFairBudget)
     {
-        while (!IsListEmpty(&ReadYield.Held))
+        PIRP next = NULL;
+        ULONG64 nextStart = MAXULONG64;
+
+        for (PLIST_ENTRY entry = ReadFair.Held.Flink; entry != &ReadFair.Held; entry = entry->Flink)
         {
-            InsertTailList(&released, RemoveHeadList(&ReadYield.Held));
+            PIRP held = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+            const ULONG64 start = C_CAST(ULONG64, C_CAST(ULONG_PTR, held->Tail.Overlay.DriverContext[1]));
+
+            if (start < nextStart)
+            {
+                next = held;
+                nextStart = start;
+            }
         }
-    }
-    else if (!IsListEmpty(&ReadYield.Held))
-    {
-        InsertTailList(&released, RemoveHeadList(&ReadYield.Held));
+
+        RemoveEntryList(&next->Tail.Overlay.ListEntry);
+
+        if (nextStart > ReadFair.VirtualTime)
+        {
+            ReadFair.VirtualTime = nextStart;
+        }
+        ReadFair.InFlightBytes += IoGetCurrentIrpStackLocation(next)->Parameters.Read.Length;
+        BlorgSetIrpContextFlag(next, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
+
+        InsertTailList(&released, &next->Tail.Overlay.ListEntry);
     }
 
-    KeReleaseSpinLock(&ReadYield.Lock, oldIrql);
+    KeReleaseSpinLock(&ReadFair.Lock, oldIrql);
 
     while (!IsListEmpty(&released))
     {
         PIRP held = CONTAINING_RECORD(RemoveHeadList(&released), IRP, Tail.Overlay.ListEntry);
 
-        IoQueueWorkItem(C_CAST(PIO_WORKITEM, held->Tail.Overlay.DriverContext[2]), ReadYieldWorker, DelayedWorkQueue, held);
+        IoQueueWorkItem(C_CAST(PIO_WORKITEM, held->Tail.Overlay.DriverContext[2]), ReadFairWorker, DelayedWorkQueue, held);
     }
-}
-
-//
-// Holds a greedy reader's read-ahead if a priority fetch is in flight,
-// returning TRUE when it did; FALSE means issue it now.
-//
-// The work item that will release it is allocated before the lock, and
-// lives in DriverContext[2] until then -- the slot ReadIssueFetch stamps
-// with the issue time, which a held IRP has not reached. The unlocked read
-// of the count only saves the allocation in the common case of nothing in
-// flight; the locked one decides.
-//
-static BOOLEAN ReadYieldHold(PIRP Irp)
-{
-    if (0 == ReadYield.PriorityFetches)
-    {
-        return FALSE;
-    }
-
-    PIO_WORKITEM workItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
-
-    if (!workItem)
-    {
-        return FALSE;
-    }
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&ReadYield.Lock, &oldIrql);
-
-    const BOOLEAN hold = (0 != ReadYield.PriorityFetches);
-
-    if (hold)
-    {
-        Irp->Tail.Overlay.DriverContext[2] = workItem;
-        InsertTailList(&ReadYield.Held, &Irp->Tail.Overlay.ListEntry);
-    }
-
-    KeReleaseSpinLock(&ReadYield.Lock, oldIrql);
-
-    if (!hold)
-    {
-        IoFreeWorkItem(workItem);
-    }
-    else
-    {
-        BLORGFS_STAT_INC(ReadsYielded);
-    }
-
-    return hold;
 }
 
 //
@@ -537,11 +565,9 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
     const ULONG64 fetched = Fcb->ReadAheadFetchedBytes;
     const ULONG honoured = Fcb->ReadMaxPagingBytes;
 
-    Fcb->ReadGreedy = ReadIsGreedy(Fcb);
-
     const BOOLEAN greedy = global.ReadAheadSlackGrowth &&
                            BlorgStatisticsFetchesActive() < READ_AHEAD_ADAPT_QUIET_DEPTH &&
-                           Fcb->ReadGreedy;
+                           ReadIsGreedy(Fcb);
 
     Fcb->ReadAheadConsumedBytes = 0;
     Fcb->ReadAheadFetchedBytes = 0;
@@ -776,7 +802,7 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
 
     LONG64 issueQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, irp->Tail.Overlay.DriverContext[2]));
 
-    ReadPriorityEnd(irp);
+    ReadFairSettle(irp);
 
     if (!NT_SUCCESS(Status))
     {
@@ -904,7 +930,7 @@ static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG B
 //
 // Issues the direct fetch for a non-cached read whose IRP is already marked
 // pending, and does the issue-time accounting BlorgVolumeRead's header
-// describes. Shared by the inline path and by ReadYieldWorker, so a held
+// describes. Shared by the inline path and by ReadFairWorker, so a held
 // read is counted when it actually reaches the network rather than when it
 // arrived.
 //
@@ -937,15 +963,17 @@ static NTSTATUS ReadIssueFetch(PIRP Irp, PFCB Fcb, LONGLONG StartingByte, ULONG 
 }
 
 //
-// Issues a read ReadYieldHold held, at PASSIVE_LEVEL. The length is trimmed
-// again rather than carried: the file size of a read-only volume does not
-// change, so the trim gives the same answer it gave on arrival, and the IRP
-// has no free slot to carry it in.
+// Issues a read ReadFairAdmit held, at PASSIVE_LEVEL, once ReadFairSettle
+// has admitted it. The length is trimmed again rather than carried: the
+// file size of a read-only volume does not change, so the trim gives the
+// same answer it gave on arrival, and the IRP has no free slot to carry it
+// in.
 //
 // Nothing else will complete this IRP: BlorgVolumeRead already returned
-// STATUS_PENDING for it.
+// STATUS_PENDING for it. A failed issue settles its admission first, as
+// ReadComplete would have.
 //
-static VOID ReadYieldWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+static VOID ReadFairWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
 
@@ -970,6 +998,7 @@ static VOID ReadYieldWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 
     if (STATUS_PENDING != status)
     {
+        ReadFairSettle(irp);
         BlorgCompleteRequest(irp, status, IO_DISK_INCREMENT);
     }
 }
@@ -1110,12 +1139,12 @@ static VOID ReadYieldWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // zero means leave Cc's own default in place -- the one setting no override
 // value can express.
 //
-// A greedy reader's read-ahead may be held rather than issued, while
-// another reader's fetch is in flight (ReadYield). It is still marked
-// pending and returns STATUS_PENDING; ReadYieldWorker issues it later, and
-// the issue-time counters above are raised then, by ReadIssueFetch, so a
-// held read is not in flight until it is. Every other fetch is a priority
-// fetch, counted from its issue to ReadComplete or a failed issue.
+// Read-ahead may be held rather than issued while the link is past its
+// budget (ReadFair). It is still marked pending and returns STATUS_PENDING;
+// ReadFairWorker issues it later, and the issue-time counters above are
+// raised then, by ReadIssueFetch, so a held read is not in flight until it
+// is. Every fetch is counted in flight from its admission to ReadComplete
+// or a failed issue.
 //
 NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
@@ -1232,7 +1261,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             return BlorgFsdPostRequest(Irp, IrpSp);
         }
 
-        BOOLEAN yields = FALSE;
+        BOOLEAN speculative = FALSE;
 
         if (BooleanFlagOn(Irp->Flags, IRP_PAGING_IO))
         {
@@ -1242,7 +1271,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     IRP_CONTEXT_FLAG_SPECULATIVE_READ))
             {
                 BLORGFS_STAT_INC(ReadsSpeculative);
-                yields = fcb->ReadGreedy;
+                speculative = TRUE;
             }
             else
             {
@@ -1273,11 +1302,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         IoMarkIrpPending(Irp);
 
-        if (!yields)
-        {
-            ReadPriorityBegin(Irp);
-        }
-        else if (ReadYieldHold(Irp))
+        if (ReadFairAdmit(Irp, fcb->NonPaged, speculative))
         {
             return STATUS_PENDING;
         }
@@ -1286,7 +1311,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         if (STATUS_PENDING != fetchStatus)
         {
-            ReadPriorityEnd(Irp);
+            ReadFairSettle(Irp);
         }
 
         return fetchStatus;
