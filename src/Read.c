@@ -289,7 +289,8 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
 //
 // So nothing is classified. While the bytes in flight are under
 // ReadFairBudget every fetch is issued at once, which is every fetch a
-// lone reader or a quiet link ever makes. Past it, read-ahead is held, and
+// lone reader or a quiet link ever makes. Past it, read-ahead from a file
+// that already has a fetch in flight is held, and
 // each completion releases held reads in start-time fair order (SFQ): a
 // fetch's start tag is the later of the link's virtual time and the finish
 // tag of its file's previous fetch, and its finish tag adds its length. A
@@ -298,6 +299,14 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
 // is charged for every byte of them. Every backlogged file therefore gets
 // the same bytes, however large its fetches are, and a reader that asks
 // for less than an equal share gets all of it.
+//
+// A file with nothing in flight is never held. Cc keeps a player to one
+// read-ahead at a time, so fair order alone still made it wait for a
+// completion before every fetch: at a 2 MB budget its fetches waited 3-6 ms
+// for a first byte instead of 97, and it still missed 31% of its deadlines,
+// because each 409 KB fetch first waited for a slot. A file's first fetch
+// costs the others at most one fetch's worth of queue, and it is the one a
+// reader that asks for less than its share is always waiting on.
 //
 // A fetch an application is blocked on, a demand fault or an uncached
 // read, is never held. It is charged to its file and counted in flight,
@@ -336,8 +345,22 @@ VOID BlorgReadInit(VOID)
 static IO_WORKITEM_ROUTINE ReadFairWorker;
 
 //
+// The nonpaged node of the file a read is for. A file object's
+// SectionObjectPointer is the address of its node's SectionObjectPointers
+// (Create.c), so this needs nothing from the paged FCB and is safe at
+// DISPATCH_LEVEL; the IRP holds the file object, and the file object the
+// node, for as long as the read is outstanding.
+//
+static PNON_PAGED_NODE ReadFairNode(PIRP Irp)
+{
+    return CONTAINING_RECORD(IoGetCurrentIrpStackLocation(Irp)->FileObject->SectionObjectPointer,
+        NON_PAGED_NODE, SectionObjectPointers);
+}
+
+//
 // Charges a fetch to its file and admits it to the link, or holds it when
-// MayHold and the link is past its budget. TRUE means it was held.
+// MayHold, the link is past its budget and the file already has a fetch in
+// flight. TRUE means it was held.
 //
 // The work item that will release it is allocated before the lock, and
 // lives in DriverContext[2] until then -- the slot ReadIssueFetch stamps
@@ -348,14 +371,15 @@ static IO_WORKITEM_ROUTINE ReadFairWorker;
 //
 // PASSIVE_LEVEL: BlorgVolumeRead's inline path.
 //
-static BOOLEAN ReadFairAdmit(PIRP Irp, PNON_PAGED_NODE Node, BOOLEAN MayHold)
+static BOOLEAN ReadFairAdmit(PIRP Irp, BOOLEAN MayHold)
 {
+    PNON_PAGED_NODE node = ReadFairNode(Irp);
     const ULONG length = IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
     const ULONG64 budget = global.ReadFairBudget;
 
     PIO_WORKITEM workItem = NULL;
 
-    if (MayHold && 0 != budget && ReadFair.InFlightBytes >= budget)
+    if (MayHold && 0 != budget && ReadFair.InFlightBytes >= budget && 0 != node->ReadFetchesInFlight)
     {
         workItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
     }
@@ -363,10 +387,10 @@ static BOOLEAN ReadFairAdmit(PIRP Irp, PNON_PAGED_NODE Node, BOOLEAN MayHold)
     KIRQL oldIrql;
     KeAcquireSpinLock(&ReadFair.Lock, &oldIrql);
 
-    const ULONG64 start = (Node->ReadFinishTag > ReadFair.VirtualTime) ? Node->ReadFinishTag : ReadFair.VirtualTime;
-    Node->ReadFinishTag = start + length;
+    const ULONG64 start = (node->ReadFinishTag > ReadFair.VirtualTime) ? node->ReadFinishTag : ReadFair.VirtualTime;
+    node->ReadFinishTag = start + length;
 
-    const BOOLEAN hold = (NULL != workItem) && (ReadFair.InFlightBytes >= budget);
+    const BOOLEAN hold = (NULL != workItem) && (ReadFair.InFlightBytes >= budget) && (0 != node->ReadFetchesInFlight);
 
     if (hold)
     {
@@ -378,6 +402,7 @@ static BOOLEAN ReadFairAdmit(PIRP Irp, PNON_PAGED_NODE Node, BOOLEAN MayHold)
     {
         ReadFair.VirtualTime = start;
         ReadFair.InFlightBytes += length;
+        node->ReadFetchesInFlight++;
         BlorgSetIrpContextFlag(Irp, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
     }
 
@@ -418,6 +443,7 @@ static VOID ReadFairSettle(PIRP Irp)
     KeAcquireSpinLock(&ReadFair.Lock, &oldIrql);
 
     ReadFair.InFlightBytes -= IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
+    ReadFairNode(Irp)->ReadFetchesInFlight--;
 
     while (!IsListEmpty(&ReadFair.Held) && ReadFair.InFlightBytes < global.ReadFairBudget)
     {
@@ -443,6 +469,7 @@ static VOID ReadFairSettle(PIRP Irp)
             ReadFair.VirtualTime = nextStart;
         }
         ReadFair.InFlightBytes += IoGetCurrentIrpStackLocation(next)->Parameters.Read.Length;
+        ReadFairNode(next)->ReadFetchesInFlight++;
         BlorgSetIrpContextFlag(next, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
 
         InsertTailList(&released, &next->Tail.Overlay.ListEntry);
@@ -1302,7 +1329,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         IoMarkIrpPending(Irp);
 
-        if (ReadFairAdmit(Irp, fcb->NonPaged, speculative))
+        if (ReadFairAdmit(Irp, speculative))
         {
             return STATUS_PENDING;
         }

@@ -320,10 +320,9 @@ TEST_F(FspWorkQueueStressTest, UnhandledMajorFunctionIsCompletedRatherThanStrand
     //
     unsigned char readBuffer[4] = {};
     StressIrpSlot readSlot{};
-    SECTION_OBJECT_POINTERS sectionObject{};
     readSlot.FileObject.FsContext = fcb;
     readSlot.FileObject.DeviceObject = volume;
-    readSlot.FileObject.SectionObjectPointer = &sectionObject;
+    readSlot.FileObject.SectionObjectPointer = &fcb->NonPaged->SectionObjectPointers;
     readSlot.Stack.MajorFunction = IRP_MJ_READ;
     readSlot.Stack.FileObject = &readSlot.FileObject;
     readSlot.Stack.DeviceObject = volume;
