@@ -16,6 +16,12 @@
 // every interleaving the scheduler can construct, rather than the one or
 // two orderings a hand-written test would think to try.
 //
+// The invalidate is the long thread: it takes its path bucket and then the
+// listing buckets of the path and of its parent, three lock pairs to the
+// others' one each. Every acquire and release is a scheduling point, so the
+// space is at most 13!/(3! 3! 7!) = 34320 schedules -- past the 1680 it was
+// before invalidation dropped listings, and past a cap sized for that.
+//
 // The proofs after it cover the two places the listing cache depends on an
 // ordering: the invalidation ticket, and the one-shot refresh claim.
 //
@@ -143,18 +149,18 @@ TEST_F(PathCacheSchedTest, NoInterleavingOfCrossShardOpsCorruptsState)
     proof = {};
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PathCacheProofSetup, PathCacheProofTeardown, &proof, 20000);
+        KmExploreInterleavings(PathCacheProofSetup, PathCacheProofTeardown, &proof, 100000);
 
     //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
 
-    EXPECT_LT(result.Schedules, 20000)
+    EXPECT_LT(result.Schedules, 100000)
         << "hit the schedule cap -- sampled, not exhausted";
 
     EXPECT_GT(proof.InsertRan, 0) << "no schedule ever ran the insert";
