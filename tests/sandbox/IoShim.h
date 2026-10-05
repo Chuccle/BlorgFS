@@ -138,6 +138,7 @@ extern "C" {
 #define SL_RETURN_SINGLE_ENTRY          0x02
 #define SL_INDEX_SPECIFIED              0x04
 #define SL_WATCH_TREE                   0x01
+#define SL_FORCE_ACCESS_CHECK           0x01
 
 #define FILE_SUPERSEDED                 0x00000000
 #define FILE_OPENED                     0x00000001

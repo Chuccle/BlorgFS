@@ -118,6 +118,7 @@ NTSTATUS BlorgCreateFCB(_Outptr_result_nullonfailure_ FCB** Fcb, CSHORT NodeType
     fcb->NonPaged = nonPaged;
     fcb->VolumeDeviceObject = C_CAST(PDEVICE_OBJECT, VolumeDeviceObject);
     fcb->TableBucketIndex = NodeTableBucketIndexFor(&fcb->FullPath);
+    fcb->SecurityId = BLORGFS_SECURITY_UNKNOWN;
 
     *Fcb = fcb;
 
@@ -128,7 +129,9 @@ NTSTATUS BlorgCreateFCB(_Outptr_result_nullonfailure_ FCB** Fcb, CSHORT NodeType
 // Allocates and initializes a DCB (directory node) from the volume's
 // lookaside lists: non-paged header resources, paged node, copied name,
 // and advanced header/oplock setup. Mirrors BlorgCreateFCB's allocation
-// and rollback ordering.
+// and rollback ordering. Like an FCB it resolves to no descriptor until
+// the caller says which, except the root, which starts on the volume's
+// default: nothing is ever asked about the root by its parent.
 //
 _Success_(return >= 0)
 NTSTATUS BlorgCreateDCB(_Outptr_result_nullonfailure_ DCB** Dcb, CSHORT NodeType, const UNICODE_STRING* Name, const DEVICE_OBJECT* VolumeDeviceObject)
@@ -215,6 +218,7 @@ NTSTATUS BlorgCreateDCB(_Outptr_result_nullonfailure_ DCB** Dcb, CSHORT NodeType
     dcb->NonPaged = nonPaged;
     dcb->VolumeDeviceObject = C_CAST(PDEVICE_OBJECT, VolumeDeviceObject);
     dcb->TableBucketIndex = NodeTableBucketIndexFor(&dcb->FullPath);
+    dcb->SecurityId = (BLORGFS_ROOT_DCB_SIGNATURE == NodeType) ? BLORGFS_SECURITY_DEFAULT : BLORGFS_SECURITY_UNKNOWN;
 
     *Dcb = dcb;
 
@@ -1080,8 +1084,10 @@ PCOMMON_CONTEXT BlorgSearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Pa
 // Ensures every component of Path exists in the tree under ParentDcb,
 // creating intermediate DCBs and a terminal FCB or DCB (per
 // DirEntryInfo->IsDirectory) for any components not already present.
-// *Out is the newly created terminal node, or NULL if the full path
-// already existed. On a node-creation failure partway down, any
+// The terminal node resolves to DirEntryInfo's descriptor; an intermediate
+// DCB's own metadata is not in hand, so it resolves to none until an open
+// of it reads some (DcbIsCurrent, Create.c). *Out is the newly created
+// terminal node, or NULL if the full path already existed. On a node-creation failure partway down, any
 // intermediate DCBs created earlier in this walk that remain empty and
 // unopened are reaped before returning, so a failed insert cannot strand
 // zero-ref nodes in the tree. Caller must hold the VCB resource exclusive.
@@ -1160,6 +1166,7 @@ NTSTATUS BlorgInsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIR
             newFcb->LastAccessedTime = DirEntryInfo->LastAccessedTime;
             newFcb->LastModifiedTime = DirEntryInfo->LastModifiedTime;
             newFcb->CreationTime = DirEntryInfo->CreationTime;
+            newFcb->SecurityId = DirEntryInfo->Security;
 
             newFcb->ParentDcb = currentDcb;
             InsertTailList(&currentDcb->ChildrenList, &newFcb->Links);
@@ -1190,6 +1197,11 @@ NTSTATUS BlorgInsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIR
         }
 
         newDcb->ParentDcb = currentDcb;
+
+        if (isLastComponent)
+        {
+            newDcb->SecurityId = DirEntryInfo->Security;
+        }
 
 #pragma warning(suppress: 28182)
         InsertTailList(&currentDcb->ChildrenList, &newDcb->Links);

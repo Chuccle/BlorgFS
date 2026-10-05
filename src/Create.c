@@ -100,6 +100,16 @@ static inline BOOLEAN CheckDirectoryAccess(const ACCESS_MASK* DesiredAccess)
 }
 
 //
+//  The descriptor a node resolves to, read without its resource: the id is
+//  written whole, so this is the old one or the new one, and an open racing
+//  a refresh is checked against either.
+//
+static inline ULONG NodeSecurity(PCOMMON_CONTEXT Node)
+{
+    return C_CAST(ULONG, ReadNoFence(C_CAST(LONG*, &Node->SecurityId)));
+}
+
+//
 //  Establishes or checks share access for an open: the first handle to a
 //  node seeds the SHARE_ACCESS state via IoSetShareAccess, every
 //  subsequent handle is validated against it via IoCheckShareAccess.
@@ -175,6 +185,13 @@ static inline NTSTATUS OpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const 
         return STATUS_ACCESS_DENIED;
     }
 
+    NTSTATUS access = BlorgSecurityCheckOpen(NodeSecurity(C_CAST(PCOMMON_CONTEXT, Fcb)), Irp);
+
+    if (!NT_SUCCESS(access))
+    {
+        return access;
+    }
+
     ASSERT((0 < Fcb->PinCount) ||
            ExIsResourceAcquiredExclusiveLite(BlorgGetVolumeDeviceExtension(Fcb->VolumeDeviceObject)->Vcb->Header.Resource));
 
@@ -227,45 +244,91 @@ static inline NTSTATUS OpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const 
 //  entry there has the same size and write time. Anything else sends the
 //  open down the cold path for current metadata, which FcbRefresh applies.
 //
-//  A file some handle still has open is trusted as it is. Its handles share
-//  one FCB and one cache, and changing the size under them would tear the
-//  view a reader is in the middle of, so the refresh waits for the first
-//  open after the last cleanup: NFS's close-to-open rule.
+//  A file some handle still has open is trusted at its size and times. Its
+//  handles share one FCB and one cache, and changing the size under them
+//  would tear the view a reader is in the middle of, so that refresh waits
+//  for the first open after the last cleanup: NFS's close-to-open rule.
 //  ShareAccess.OpenCount is that count, set on every open and removed on
 //  every cleanup. Read here without the FCB resource it is a hint;
-//  FcbRefresh re-reads it under the resource before acting on it.
+//  FcbRefresh re-reads it under the resource before acting on it. Its
+//  descriptor is not trusted the same way: an open is checked against it,
+//  and a revoked grant must not outlive the handles already open, so an
+//  open file is current only while the path cache still names its
+//  descriptor.
 //
 static BOOLEAN FcbIsCurrent(PFCB Fcb)
 {
-    if ((0 != ReadNoFence(C_CAST(LONG*, &Fcb->ShareAccess.OpenCount))) ||
-        BlorgPathCacheTicketCurrent(&Fcb->MetaTicket))
+    if (BlorgPathCacheTicketCurrent(&Fcb->MetaTicket))
     {
         return TRUE;
     }
 
     DIRECTORY_ENTRY_METADATA cached;
 
-    if (PathCacheExists != BlorgPathCacheLookup(&Fcb->FullPath, &cached))
+    if ((PathCacheExists != BlorgPathCacheLookup(&Fcb->FullPath, &cached)) ||
+        cached.IsDirectory ||
+        (cached.Security != NodeSecurity(C_CAST(PCOMMON_CONTEXT, Fcb))))
     {
         return FALSE;
     }
 
-    return !cached.IsDirectory &&
-           (C_CAST(LONGLONG, cached.Size) == Fcb->Header.FileSize.QuadPart) &&
-           (cached.LastModifiedTime == Fcb->LastModifiedTime);
+    return (0 != ReadNoFence(C_CAST(LONG*, &Fcb->ShareAccess.OpenCount))) ||
+           ((C_CAST(LONGLONG, cached.Size) == Fcb->Header.FileSize.QuadPart) &&
+            (cached.LastModifiedTime == Fcb->LastModifiedTime));
+}
+
+//
+//  Whether a resident DCB may answer an open as it is, by the rule
+//  FcbIsCurrent follows for its descriptor, which is all an open of a
+//  directory reads from it. An intermediate DCB, created on the way to a
+//  deeper path, has none yet and is never current; neither is one whose
+//  handles are open, since its descriptor governs every new one.
+//
+static BOOLEAN DcbIsCurrent(PDCB Dcb)
+{
+    const ULONG security = NodeSecurity(C_CAST(PCOMMON_CONTEXT, Dcb));
+
+    if (BLORGFS_SECURITY_UNKNOWN == security)
+    {
+        return FALSE;
+    }
+
+    if (BlorgPathCacheTicketCurrent(&Dcb->MetaTicket))
+    {
+        return TRUE;
+    }
+
+    DIRECTORY_ENTRY_METADATA cached;
+
+    return (PathCacheExists == BlorgPathCacheLookup(&Dcb->FullPath, &cached)) &&
+           cached.IsDirectory &&
+           (cached.Security == security);
+}
+
+//
+//  Applies current metadata, read under Ticket, to a resident DCB on the
+//  cold path: its descriptor, and the stamp that says when it was read.
+//  Under the VCB resource exclusive, like FcbRefresh; the id is written
+//  whole for the warm path's unlocked read.
+//
+static VOID DcbRefresh(PDCB Dcb, const DIRECTORY_ENTRY_METADATA* Meta, const PATH_CACHE_TICKET* Ticket)
+{
+    WriteNoFence(C_CAST(LONG*, &Dcb->SecurityId), C_CAST(LONG, Meta->Security));
+    Dcb->MetaTicket = *Ticket;
 }
 
 //
 //  Applies current metadata, read under Ticket, to a resident FCB on the
 //  cold path, under the VCB resource exclusive and before OpenExistingFcb.
-//  When the size and write time match, which is the usual case, only the
-//  stamp moves: the FCB is known current as of Ticket. Otherwise what Cc
-//  and Mm hold of the old contents is dropped and the FCB takes the new
-//  size and times. Dropping them needs no handle open, no user-mapped view
-//  left (a view outlives its handle) and no image section (a running
-//  executable). When any of those holds the old pages the FCB keeps the
-//  old copy, which is still internally consistent, and the next open tries
-//  again.
+//  The descriptor is taken whatever else happens, open handles or not: it
+//  governs the open about to be made. When the size and write time match,
+//  which is the usual case, only the stamp moves: the FCB is known current
+//  as of Ticket. Otherwise what Cc and Mm hold of the old contents is
+//  dropped and the FCB takes the new size and times. Dropping them needs
+//  no handle open, no user-mapped view left (a view outlives its handle)
+//  and no image section (a running executable). When any of those holds
+//  the old pages the FCB keeps the old copy, which is still internally
+//  consistent, and the next open tries again.
 //
 //  The sizes change under the paging resource as well, which is what Mm
 //  reads them under. A shared cache map can outlive the purge until Cc's
@@ -277,6 +340,8 @@ static VOID FcbRefresh(PFCB Fcb, const DIRECTORY_ENTRY_METADATA* Meta, const PAT
     PSECTION_OBJECT_POINTERS sections = &Fcb->NonPaged->SectionObjectPointers;
 
     ExAcquireResourceExclusiveLite(Fcb->Header.Resource, TRUE);
+
+    WriteNoFence(C_CAST(LONG*, &Fcb->SecurityId), C_CAST(LONG, Meta->Security));
 
     if ((C_CAST(LONGLONG, Meta->Size) == Fcb->Header.FileSize.QuadPart) &&
         (Meta->LastModifiedTime == Fcb->LastModifiedTime))
@@ -328,6 +393,13 @@ static inline NTSTATUS OpenExistingDcb(PIRP Irp, PFILE_OBJECT FileObject, const 
     if (!CheckDirectoryAccess(DesiredAccess))
     {
         return STATUS_ACCESS_DENIED;
+    }
+
+    NTSTATUS access = BlorgSecurityCheckOpen(NodeSecurity(C_CAST(PCOMMON_CONTEXT, Dcb)), Irp);
+
+    if (!NT_SUCCESS(access))
+    {
+        return access;
     }
 
     ASSERT((0 < Dcb->PinCount) ||
@@ -425,6 +497,13 @@ static inline NTSTATUS OpenRootDcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCE
     if (!CheckDirectoryAccess(DesiredAccess))
     {
         return STATUS_ACCESS_DENIED;
+    }
+
+    NTSTATUS access = BlorgSecurityCheckOpen(NodeSecurity(C_CAST(PCOMMON_CONTEXT, Dcb)), Irp);
+
+    if (!NT_SUCCESS(access))
+    {
+        return access;
     }
 
     ExAcquireResourceExclusiveLite(Dcb->Header.Resource, TRUE);
@@ -614,6 +693,7 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
             Out->LastAccessedTime = file->LastAccessedTime;
             Out->LastModifiedTime = file->LastModifiedTime;
             Out->IsDirectory = FALSE;
+            Out->Security = file->Security;
             return TRUE;
         }
     }
@@ -639,6 +719,7 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
             Out->LastAccessedTime = sub->LastAccessedTime;
             Out->LastModifiedTime = sub->LastModifiedTime;
             Out->IsDirectory = TRUE;
+            Out->Security = sub->Security;
             return TRUE;
         }
     }
@@ -883,6 +964,12 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         {
             case BLORGFS_DCB_SIGNATURE:
             {
+                if (!BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE) && !DcbIsCurrent(C_CAST(PDCB, desiredNode)))
+                {
+                    BlorgNodeUnpin(desiredNode);
+                    break;
+                }
+
                 NTSTATUS result;
 
                 if (BooleanFlagOn(options, FILE_NON_DIRECTORY_FILE))
@@ -1111,6 +1198,8 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     return STATUS_FILE_IS_A_DIRECTORY;
                 }
 
+                DcbRefresh(C_CAST(PDCB, desiredNode), &dirEntInfo, &resolvedTicket);
+
                 result = OpenExistingDcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PDCB, desiredNode), VolumeDeviceObject);
 
                 if (STATUS_SUCCESS == result)
@@ -1190,6 +1279,8 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         {
             case BLORGFS_DCB_SIGNATURE:
             {
+                C_CAST(PDCB, desiredNode)->MetaTicket = resolvedTicket;
+
                 result = OpenExistingDcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PDCB, desiredNode), VolumeDeviceObject);
 
                 if (STATUS_SUCCESS == result)

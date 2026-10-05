@@ -167,6 +167,7 @@ typedef PSTRING PANSI_STRING;
 #define ReadNoFence(p)        (*(volatile LONG*)(p))
 #define ReadNoFence64(p)      (*(volatile LONG64*)(p))
 #define ReadPointerAcquire(p) (*(PVOID volatile*)(p))
+#define WriteNoFence(p, v)    (*(volatile LONG*)(p) = (v))
 
 ///////////////////////////////////////////////////////////////////////////
 // IRQL, routed through the model so every rule is enforced

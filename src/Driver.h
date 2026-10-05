@@ -272,8 +272,25 @@ _Dispatch_type_(IRP_MJ_CLEANUP)                  DRIVER_DISPATCH BlorgCleanup;
 _Dispatch_type_(IRP_MJ_QUERY_SECURITY)           DRIVER_DISPATCH BlorgQuerySecurity;
 _Dispatch_type_(IRP_MJ_SET_SECURITY)             DRIVER_DISPATCH BlorgSetSecurity;
 
-NTSTATUS BlorgInitializeSecurityDescriptor(VOID);
-VOID BlorgFreeSecurityDescriptor(VOID);
+//
+// Interned security descriptors (Security.c). An id names one descriptor
+// for the life of the driver. The first four are built at load: the
+// volume's default for the root, the one that stands in for any descriptor
+// that cannot be held, and what a file and a directory inherit from the
+// default, which is what every entry in a tree with no stored descriptor
+// resolves to.
+//
+#define BLORGFS_SECURITY_DEFAULT            0u
+#define BLORGFS_SECURITY_LOCKED             1u
+#define BLORGFS_SECURITY_DEFAULT_FILE       2u
+#define BLORGFS_SECURITY_DEFAULT_DIRECTORY  3u
+#define BLORGFS_SECURITY_UNKNOWN            MAXULONG
+
+NTSTATUS BlorgSecurityInitialize(VOID);
+VOID BlorgSecurityCleanup(VOID);
+ULONG BlorgSecurityIntern(const VOID* Descriptor, SIZE_T Length);
+ULONG BlorgSecurityInherit(ULONG Source, ULONG Depth, BOOLEAN IsDirectory);
+NTSTATUS BlorgSecurityCheckOpen(ULONG Id, PIRP Irp);
 
 NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT* VolumeDeviceObject);
 
@@ -407,15 +424,6 @@ extern struct GLOBAL
     // ReadAcquire/WriteRelease.
     //
     LONG ChangeFeedLive;
-
-    //
-    //  A single self-relative security descriptor handed out (in the
-    //  requested portions) for every IRP_MJ_QUERY_SECURITY. BlorgFS does not
-    //  store per-file security -- the volume is a read-only public share --
-    //  so one permissive descriptor serves all nodes. Built once in
-    //  DriverEntry, freed in DriverUnload.
-    //
-    PSECURITY_DESCRIPTOR FileSecurityDescriptor;
 
     //
     //  Master switch for the TLS client (Tls.c/TlsHandshake.c). Defaults to

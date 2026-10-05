@@ -128,6 +128,7 @@
     </ClCompile>
     <ClCompile Include="StructsModel.c" />
     <ClCompile Include="NoStatisticsStub.c" />
+    <ClCompile Include="NoSecurityStub.c" />
     <ClCompile Include="NoTlsHandshakeStub.c" />
     <ClCompile Include="SandboxSocket.c" />
     <ClCompile Include="..\..\src\Client.c" />

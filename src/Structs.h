@@ -41,7 +41,8 @@ typedef struct _DIRECTORY_ENTRY_METADATA
     ULONG64 LastModifiedTime;  // Last write time, NT FILETIME
     BOOLEAN IsDirectory;       // Nonzero if this entry is a directory
     BOOLEAN NoStore;           // Server marked the answer Cache-Control: no-store; never cached
-    UCHAR   Reserved[6];       // Pad to 8-byte alignment
+    UCHAR   Reserved[2];       // explicit padding
+    ULONG   Security;          // Interned descriptor the entry resolves to (Security.c)
 } DIRECTORY_ENTRY_METADATA, * PDIRECTORY_ENTRY_METADATA;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, Size, CreationTime);
@@ -50,7 +51,8 @@ CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, LastAccessedTime, LastModifiedTi
 CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, LastModifiedTime, IsDirectory);
 CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, IsDirectory, NoStore);
 CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, NoStore, Reserved);
-CHECK_PADDING_END(DIRECTORY_ENTRY_METADATA, Reserved);
+CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, Reserved, Security);
+CHECK_PADDING_END(DIRECTORY_ENTRY_METADATA, Security);
 
 //
 //  What a reader saw of the cache before it went to look something up: the
@@ -86,6 +88,8 @@ typedef struct _DIRECTORY_FILE_METADATA
     ULONG64 LastAccessedTime;  // Last access time, NT FILETIME
     ULONG64 LastModifiedTime;  // Last write time, NT FILETIME
     SIZE_T  NameLength;        // Length of Name in characters
+    ULONG   Security;          // Interned descriptor the entry resolves to (Security.c)
+    ULONG   Reserved;          // explicit padding
     WCHAR   Name[MAX_NAME_LEN];// File name
 } DIRECTORY_FILE_METADATA, * PDIRECTORY_FILE_METADATA;
 
@@ -93,7 +97,9 @@ CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, Size, CreationTime);
 CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, CreationTime, LastAccessedTime);
 CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, LastAccessedTime, LastModifiedTime);
 CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, LastModifiedTime, NameLength);
-CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, NameLength, Name);
+CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, NameLength, Security);
+CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, Security, Reserved);
+CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, Reserved, Name);
 CHECK_PADDING_END(DIRECTORY_FILE_METADATA, Name);
 
 // A single subdirectory entry in a directory listing.
@@ -103,13 +109,17 @@ typedef struct _DIRECTORY_SUBDIR_METADATA
     ULONG64 LastAccessedTime;  // Last access time, NT FILETIME
     ULONG64 LastModifiedTime;  // Last write time, NT FILETIME
     SIZE_T  NameLength;        // Length of Name in characters
+    ULONG   Security;          // Interned descriptor the entry resolves to (Security.c)
+    ULONG   Reserved;          // explicit padding
     WCHAR   Name[MAX_NAME_LEN];// Directory name
 } DIRECTORY_SUBDIR_METADATA, * PDIRECTORY_SUBDIR_METADATA;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, CreationTime, LastAccessedTime);
 CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, LastAccessedTime, LastModifiedTime);
 CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, LastModifiedTime, NameLength);
-CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, NameLength, Name);
+CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, NameLength, Security);
+CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, Security, Reserved);
+CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, Reserved, Name);
 CHECK_PADDING_END(DIRECTORY_SUBDIR_METADATA, Name);
 
 //
@@ -136,8 +146,9 @@ typedef struct _DIRECTORY_INFO
     struct _DIRECTORY_DESCENDANT* Descendants; // Subtree answer only, until DirCtrlPublish takes it
     SIZE_T DescendantCount; // Number of entries in Descendants
     LONG   RefCount;      // Interlocked: holders on different threads release independently
+    ULONG  Security;      // Interned descriptor the listed directory itself resolves to
     BOOLEAN NoStore;      // Server marked the answer Cache-Control: no-store; never cached
-    UCHAR  Reserved[3];   // explicit tail padding
+    UCHAR  Reserved[7];   // explicit tail padding
 } DIRECTORY_INFO, * PDIRECTORY_INFO;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FilesOffset, SubDirsOffset);
@@ -146,7 +157,8 @@ CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FileCount, SubDirCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirCount, Descendants);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, Descendants, DescendantCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, DescendantCount, RefCount);
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, NoStore);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, Security);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, Security, NoStore);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, NoStore, Reserved);
 CHECK_PADDING_END(DIRECTORY_INFO, Reserved);
 
@@ -423,6 +435,17 @@ typedef struct _COMMON_CONTEXT
     // drop. Occupies what was the struct's 8-byte tail-alignment pad.
     //
     ULONG TableBucketIndex;
+
+    //
+    // The interned descriptor this node resolves to (Security.c), checked
+    // at every open. BLORGFS_SECURITY_UNKNOWN on an intermediate DCB
+    // created on the way to a deeper path, whose own metadata was never
+    // read; such a node answers no open until it has been. A ULONG written
+    // whole, so a reader without the node resource sees the old id or the
+    // new one.
+    //
+    ULONG SecurityId;
+    ULONG SecurityReserved; // explicit tail padding
 } COMMON_CONTEXT, * PCOMMON_CONTEXT;
 
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, Header, NonPaged);
@@ -440,7 +463,9 @@ CHECK_PADDING_BETWEEN(COMMON_CONTEXT, LastAccessedTime, LastModifiedTime);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, LastModifiedTime, RefCount);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, RefCount, OnReapList);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, OnReapList, TableBucketIndex);
-CHECK_PADDING_END(COMMON_CONTEXT, TableBucketIndex);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, TableBucketIndex, SecurityId);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, SecurityId, SecurityReserved);
+CHECK_PADDING_END(COMMON_CONTEXT, SecurityReserved);
 
 
 //
@@ -633,7 +658,9 @@ CHECK_PADDING_BETWEEN(FCB, LastAccessedTime, LastModifiedTime);
 CHECK_PADDING_BETWEEN(FCB, LastModifiedTime, RefCount);
 CHECK_PADDING_BETWEEN(FCB, RefCount, OnReapList);
 CHECK_PADDING_BETWEEN(FCB, OnReapList, TableBucketIndex);
-CHECK_PADDING_BETWEEN(FCB, TableBucketIndex, FileLock);
+CHECK_PADDING_BETWEEN(FCB, TableBucketIndex, SecurityId);
+CHECK_PADDING_BETWEEN(FCB, SecurityId, SecurityReserved);
+CHECK_PADDING_BETWEEN(FCB, SecurityReserved, FileLock);
 CHECK_PADDING_BETWEEN(FCB, FileLock, LazyWriteThread);
 CHECK_PADDING_BETWEEN(FCB, LazyWriteThread, MetaTicket);
 CHECK_PADDING_BETWEEN(FCB, MetaTicket, Streams);
@@ -658,6 +685,15 @@ typedef struct _DCB BLORGFS_COMMON_CONTEXT_BASE
 {
     BLORGFS_COMMON_CONTEXT_MEMBER
     LIST_ENTRY ChildrenList; // Head of this directory's child node list
+
+    //
+    // When SecurityId was read from the server, by the rule FCB.MetaTicket
+    // follows. A directory's descriptor is the one thing about it an open
+    // depends on, so this is what lets a resident DCB answer an open
+    // without asking again. Zero, as on an intermediate DCB, is never
+    // current. See DcbIsCurrent (Create.c).
+    //
+    PATH_CACHE_TICKET MetaTicket;
 } DCB, * PDCB;
 
 CHECK_PADDING_BETWEEN(DCB, Header, NonPaged);
@@ -675,8 +711,11 @@ CHECK_PADDING_BETWEEN(DCB, LastAccessedTime, LastModifiedTime);
 CHECK_PADDING_BETWEEN(DCB, LastModifiedTime, RefCount);
 CHECK_PADDING_BETWEEN(DCB, RefCount, OnReapList);
 CHECK_PADDING_BETWEEN(DCB, OnReapList, TableBucketIndex);
-CHECK_PADDING_BETWEEN(DCB, TableBucketIndex, ChildrenList);
-CHECK_PADDING_END(DCB, ChildrenList);
+CHECK_PADDING_BETWEEN(DCB, TableBucketIndex, SecurityId);
+CHECK_PADDING_BETWEEN(DCB, SecurityId, SecurityReserved);
+CHECK_PADDING_BETWEEN(DCB, SecurityReserved, ChildrenList);
+CHECK_PADDING_BETWEEN(DCB, ChildrenList, MetaTicket);
+CHECK_PADDING_END(DCB, MetaTicket);
 
 // Per-handle context for an open directory search.
 typedef struct _CCB

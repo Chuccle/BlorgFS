@@ -946,6 +946,7 @@ VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listin
         meta.CreationTime = sub->CreationTime;
         meta.LastAccessedTime = sub->LastAccessedTime;
         meta.LastModifiedTime = sub->LastModifiedTime;
+        meta.Security = sub->Security;
 
         PathCacheSeedEntry(&scratch, dirLength, sub->Name, sub->NameLength, &meta, Ticket);
     }
@@ -960,6 +961,7 @@ VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listin
         meta.CreationTime = file->CreationTime;
         meta.LastAccessedTime = file->LastAccessedTime;
         meta.LastModifiedTime = file->LastModifiedTime;
+        meta.Security = file->Security;
 
         PathCacheSeedEntry(&scratch, dirLength, file->Name, file->NameLength, &meta, Ticket);
     }

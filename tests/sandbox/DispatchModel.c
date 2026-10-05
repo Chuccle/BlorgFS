@@ -681,6 +681,44 @@ NTSTATUS RtlAbsoluteToSelfRelativeSD(PVOID A, PVOID S, PULONG L)
     return STATUS_SUCCESS;
 }
 
+BOOLEAN RtlValidRelativeSecurityDescriptor(PVOID D, ULONG L, SECURITY_INFORMATION R) { (void)D; (void)L; (void)R; return FALSE; }
+ULONG RtlLengthSecurityDescriptor(PVOID D) { (void)D; return 0; }
+ULONG RtlLengthSid(PSID S) { (void)S; return 0; }
+NTSTATUS RtlCreateAcl(PACL A, ULONG L, ULONG R) { (void)A; (void)L; (void)R; return STATUS_NOT_SUPPORTED; }
+NTSTATUS RtlAddAccessAllowedAceEx(PACL A, ULONG R, ULONG F, ACCESS_MASK M, PSID S) { (void)A; (void)R; (void)F; (void)M; (void)S; return STATUS_NOT_SUPPORTED; }
+VOID SeCaptureSubjectContext(PSECURITY_SUBJECT_CONTEXT S) { RtlZeroMemory(S, sizeof(*S)); }
+VOID SeReleaseSubjectContext(PSECURITY_SUBJECT_CONTEXT S) { (void)S; }
+VOID SeLockSubjectContext(PSECURITY_SUBJECT_CONTEXT S) { (void)S; }
+VOID SeUnlockSubjectContext(PSECURITY_SUBJECT_CONTEXT S) { (void)S; }
+
+NTSTATUS SeAssignSecurityEx(PVOID P, PVOID E, PVOID* C, GUID* T, BOOLEAN D, ULONG F, PSECURITY_SUBJECT_CONTEXT S, PGENERIC_MAPPING M, POOL_TYPE Pool)
+{
+    (void)P; (void)E; (void)T; (void)D; (void)F; (void)S; (void)M; (void)Pool;
+    *C = NULL;
+    return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS SeDeassignSecurity(PVOID* D) { *D = NULL; return STATUS_SUCCESS; }
+
+BOOLEAN SeAccessCheck(PVOID D, PSECURITY_SUBJECT_CONTEXT S, BOOLEAN L, ACCESS_MASK Desired, ACCESS_MASK Previously,
+    PPRIVILEGE_SET* P, PGENERIC_MAPPING M, KPROCESSOR_MODE Mode, PACCESS_MASK Granted, NTSTATUS* Status)
+{
+    (void)D; (void)S; (void)L; (void)M; (void)Mode;
+    *P = NULL;
+    *Granted = Desired | Previously;
+    *Status = STATUS_SUCCESS;
+    return TRUE;
+}
+
+NTSTATUS SeAppendPrivileges(PACCESS_STATE A, PPRIVILEGE_SET P) { (void)A; (void)P; return STATUS_SUCCESS; }
+VOID SeFreePrivileges(PPRIVILEGE_SET P) { (void)P; }
+
+PGENERIC_MAPPING IoGetFileObjectGenericMapping(VOID)
+{
+    static GENERIC_MAPPING mapping = { FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
+    return &mapping;
+}
+
 NTSTATUS SeQuerySecurityDescriptorInfo(PULONG I, PVOID D, PULONG L, PVOID* O)
 {
     (void)I; (void)D; (void)O;

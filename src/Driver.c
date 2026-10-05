@@ -478,7 +478,7 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 
     BlorgStatisticsCleanup();
 
-    BlorgFreeSecurityDescriptor();
+    BlorgSecurityCleanup();
 }
 
 //
@@ -1027,7 +1027,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
-    result = BlorgInitializeSecurityDescriptor();
+    result = BlorgSecurityInitialize();
 
     if (!NT_SUCCESS(result))
     {
@@ -1042,7 +1042,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     if (!NT_SUCCESS(result))
     {
-        BlorgFreeSecurityDescriptor();
+        BlorgSecurityCleanup();
         BlorgCleanupHttpClient();
         BlorgStatisticsCleanup();
         BlorgTlsGlobalCleanup();
@@ -1060,7 +1060,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         ObDereferenceObject(global.FileSystemDeviceObject);
         DriverDeleteFileSystemDeviceObject(global.FileSystemDeviceObject);
         global.FileSystemDeviceObject = NULL;
-        BlorgFreeSecurityDescriptor();
+        BlorgSecurityCleanup();
         BlorgCleanupHttpClient();
         BlorgStatisticsCleanup();
         BlorgTlsGlobalCleanup();
@@ -1138,7 +1138,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         ObDereferenceObject(global.DiskDeviceObject);
         DriverDeleteDiskDeviceObject(global.DiskDeviceObject);
         global.DiskDeviceObject = NULL;
-        BlorgFreeSecurityDescriptor();
+        BlorgSecurityCleanup();
         BlorgStatisticsCleanup();
         BlorgTlsGlobalCleanup();
         return STATUS_FAILED_DRIVER_ENTRY;
@@ -1171,7 +1171,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         ObDereferenceObject(global.DiskDeviceObject);
         DriverDeleteDiskDeviceObject(global.DiskDeviceObject);
         global.DiskDeviceObject = NULL;
-        BlorgFreeSecurityDescriptor();
+        BlorgSecurityCleanup();
         BlorgStatisticsCleanup();
         BlorgTlsGlobalCleanup();
         return STATUS_FAILED_DRIVER_ENTRY;

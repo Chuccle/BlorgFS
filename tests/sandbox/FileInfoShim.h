@@ -429,9 +429,30 @@ typedef struct _SE_EXPORTS
     PSID SeLocalSystemSid;
     PSID SeAliasAdminsSid;
     PSID SeAliasUsersSid;
+    PSID SeAuthenticatedUsersSid;
 } SE_EXPORTS, * PSE_EXPORTS;
 
 extern PSE_EXPORTS SeExports;
+
+typedef struct _SECURITY_SUBJECT_CONTEXT
+{
+    PVOID ClientToken;
+    ULONG ImpersonationLevel;
+    PVOID PrimaryToken;
+    PVOID ProcessAuditId;
+} SECURITY_SUBJECT_CONTEXT, * PSECURITY_SUBJECT_CONTEXT;
+
+//
+// The fields of the kernel's ACCESS_STATE an open's access check reads
+// and writes (Security.c, BlorgSecurityCheckOpen).
+//
+typedef struct _ACCESS_STATE
+{
+    ULONG Flags;
+    ACCESS_MASK RemainingDesiredAccess;
+    ACCESS_MASK PreviouslyGrantedAccess;
+    SECURITY_SUBJECT_CONTEXT SubjectSecurityContext;
+} ACCESS_STATE, * PACCESS_STATE;
 
 #ifdef __cplusplus
 }

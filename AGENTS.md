@@ -1875,3 +1875,38 @@ Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),
 [FSCTL_MARK_HANDLE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ni-ntifs-fsctl_mark_handle),
 [Defragmenting Files](https://learn.microsoft.com/en-us/windows/win32/fileio/defragmenting-files).
 
+## Access control: current state
+
+The server stores each file's Windows security descriptor opaquely with
+the file (`user.blorgfs.sd` on Unix, the `:blorgfs.sd` stream on Windows;
+see `server-rs/src/utils/security.rs`) and never interprets it. The driver
+does the access check at open with `SeAccessCheck`, against the caller's
+own token, so SIDs mean the same on both sides and there is no mapping.
+**The server does not authenticate callers**: this guards a volume against
+local users of one machine, not against anyone who can reach the server.
+
+- **Only stored descriptors travel.** An entry with none inherits from the
+  nearest ancestor with one; the server sends that ancestor's bytes and
+  its distance (`inherited`, `inherited_depth`), and a listing names its
+  entries' own descriptors once each. A tree with no descriptor stored
+  encodes exactly as it did before, so ACL-free volumes pay nothing on the
+  wire.
+- **The root's default** (`BlorgSecurityInitialize`) is SYSTEM and
+  Administrators full control, Authenticated Users modify, Everyone read
+  and execute, all inheritable. The root DCB itself always takes it;
+  a descriptor stored on the served root reaches its children only.
+- **`Security.c` interns every descriptor** into a table bounded at
+  16384 entries and 16 MB; nodes and cached entries hold its index
+  (`SecurityId`). What a child inherits is worked out once per source,
+  kind and depth (`BlorgSecurityInherit`), not per entry. **It fails
+  closed:** a descriptor that does not validate, or that the full table
+  cannot hold, resolves to `BLORGFS_SECURITY_LOCKED`, which only SYSTEM
+  and Administrators can open.
+- **Currency.** A resident node is reused for an open only while the path
+  cache still names its descriptor (`FcbIsCurrent`, `DcbIsCurrent`). Open
+  handles keep an FCB's size and times, by close-to-open, but never its
+  descriptor, so a revoked grant stops new opens at once. The server
+  publishes a directory's descriptor change as a structural change, which
+  drops the subtree, since everything under it may inherit differently.
+- Setting a descriptor is `PUT /set_security`, accepted only from a server
+  started with `WRITABLE=1`. `IRP_MJ_SET_SECURITY` is not implemented yet.

@@ -995,6 +995,86 @@ static PCHAR HttpAlignBodyInPlace(PCHAR Body, SIZE_T BodyLen)
 }
 
 //
+// The id of the descriptor an entry resolves to (Security.c): Own, the one
+// it has stored, if any; otherwise what it inherits from Inherited, Depth
+// levels up; otherwise, with nothing stored above it, what it inherits
+// from the root's default, which costs nothing to look up. PASSIVE only.
+//
+static ULONG HttpResolveSecurity(flatbuffers_uint8_vec_t Own, flatbuffers_uint8_vec_t Inherited, ULONG Depth, BOOLEAN IsDirectory)
+{
+    if (Own)
+    {
+        return BlorgSecurityIntern(Own, flatbuffers_uint8_vec_len(Own));
+    }
+
+    if (Inherited)
+    {
+        return BlorgSecurityInherit(BlorgSecurityIntern(Inherited, flatbuffers_uint8_vec_len(Inherited)), Depth, IsDirectory);
+    }
+
+    return IsDirectory ? BLORGFS_SECURITY_DEFAULT_DIRECTORY : BLORGFS_SECURITY_DEFAULT_FILE;
+}
+
+//
+// The descriptors a listing holds once for its entries to name, interned,
+// in a PagedPool array the caller frees; NULL with *Count zero when it
+// holds none. An entry naming one past the end, or one that is missing,
+// resolves to BLORGFS_SECURITY_LOCKED. A count the body could not hold is
+// rejected, as the entry counts are.
+//
+static NTSTATUS HttpDecodeSecurities(BlorgMetaFlat_Directory_table_t Directory, SIZE_T BodyLen, PULONG* Ids, PSIZE_T Count)
+{
+    BlorgMetaFlat_Security_vec_t flatSecurities = BlorgMetaFlat_Directory_security(Directory);
+    const SIZE_T count = flatSecurities ? BlorgMetaFlat_Security_vec_len(flatSecurities) : 0;
+
+    *Ids = NULL;
+    *Count = 0;
+
+    if (0 == count)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    if (count > (BodyLen / HTTP_MIN_LISTING_ENTRY_WIRE_BYTES))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    PULONG ids = ExAllocatePoolUninitialized(PagedPool, count * sizeof(ULONG), 'DBLR');
+
+    if (!ids)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    for (SIZE_T i = 0; i < count; i++)
+    {
+        BlorgMetaFlat_Security_table_t flatSecurity = BlorgMetaFlat_Security_vec_at(flatSecurities, i);
+        flatbuffers_uint8_vec_t descriptor = flatSecurity ? BlorgMetaFlat_Security_descriptor(flatSecurity) : NULL;
+
+        ids[i] = descriptor ? BlorgSecurityIntern(descriptor, flatbuffers_uint8_vec_len(descriptor)) : BLORGFS_SECURITY_LOCKED;
+    }
+
+    *Ids = ids;
+    *Count = count;
+    return STATUS_SUCCESS;
+}
+
+//
+// What an entry of a listing resolves to: the listing's Index'th
+// descriptor when it names one (1-based), or Inherited otherwise.
+//
+static ULONG HttpListingEntrySecurity(ULONG Index, const ULONG* Ids, SIZE_T Count, ULONG Inherited)
+{
+    if (0 == Index)
+    {
+        return Inherited;
+    }
+
+    return (Index <= Count) ? Ids[Index - 1] : BLORGFS_SECURITY_LOCKED;
+}
+
+//
 // Decodes one verified Directory table into a newly allocated
 // PDIRECTORY_INFO (header + inline file/subdir arrays): the listing a
 // response answers, or one a subtree answer carries beneath it. BodyLen is
@@ -1014,6 +1094,11 @@ static PCHAR HttpAlignBodyInPlace(PCHAR Body, SIZE_T BodyLen)
 // EnumerateDirectoryEntries reads Name as null-terminated). A name too
 // long for the field fails its conversion outright and rejects the
 // listing, the same policy the old explicit length check enforced.
+//
+// Each entry and the listing itself carry the id of the descriptor they
+// resolve to. What an entry without its own inherits is worked out once
+// per kind for the whole listing, from what the listed directory resolves
+// to, one level further down.
 //
 static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZE_T BodyLen, BOOLEAN NoStore, PDIRECTORY_INFO* OutDirInfo)
 {
@@ -1044,13 +1129,41 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         return STATUS_INVALID_PARAMETER;
     }
 
+    PULONG securities = NULL;
+    SIZE_T securityCount = 0;
+    NTSTATUS securityStatus = HttpDecodeSecurities(Directory, BodyLen, &securities, &securityCount);
+
+    if (!NT_SUCCESS(securityStatus))
+    {
+        BLORGFS_PRINT("HttpDecodeListing() - security vector rejected: %8lx\n", securityStatus);
+        return securityStatus;
+    }
+
     PDIRECTORY_INFO dirInfo = ExAllocatePoolZero(PagedPool, allocationSize, 'DBLR');
 
     if (!dirInfo)
     {
         BLORGFS_PRINT("HttpDecodeListing() - failed entries alloc\n");
+
+        if (securities)
+        {
+            ExFreePool(securities);
+        }
+
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    flatbuffers_uint8_vec_t inherited = BlorgMetaFlat_Directory_inherited(Directory);
+    const ULONG inheritedDepth = BlorgMetaFlat_Directory_inherited_depth(Directory);
+    const ULONG inheritedSource = inherited ? BlorgSecurityIntern(inherited, flatbuffers_uint8_vec_len(inherited)) : BLORGFS_SECURITY_DEFAULT;
+    const ULONG childDepth = (0 == inheritedDepth) ? 1 : 2;
+
+    dirInfo->Security = inherited ? BlorgSecurityInherit(inheritedSource, inheritedDepth, TRUE) : BLORGFS_SECURITY_DEFAULT_DIRECTORY;
+
+    const ULONG fileInherits = inherited ? BlorgSecurityInherit(inheritedSource, childDepth, FALSE) : BLORGFS_SECURITY_DEFAULT_FILE;
+    const ULONG directoryInherits = inherited ? BlorgSecurityInherit(inheritedSource, childDepth, TRUE) : BLORGFS_SECURITY_DEFAULT_DIRECTORY;
+
+    NTSTATUS status = STATUS_SUCCESS;
 
     dirInfo->FilesOffset = headerSize;
     dirInfo->SubDirsOffset = headerSize + filesEntryArraySize;
@@ -1067,8 +1180,8 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         if (!flatFileEntry)
         {
             BLORGFS_PRINT("HttpDecodeListing() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
+            status = STATUS_INVALID_PARAMETER;
+            break;
         }
 
         flatbuffers_string_t name = BlorgMetaFlat_FileEntryMetadata_name(flatFileEntry);
@@ -1076,12 +1189,12 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         if (!name || flatbuffers_string_len(name) == 0)
         {
             BLORGFS_PRINT("HttpDecodeListing() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
+            status = STATUS_INVALID_PARAMETER;
+            break;
         }
 
         ULONG nameBytes = 0;
-        NTSTATUS status = RtlUTF8ToUnicodeN(
+        status = RtlUTF8ToUnicodeN(
             fileEntries[i].Name,
             (MAX_NAME_LEN - 1) * sizeof(WCHAR),
             &nameBytes,
@@ -1091,8 +1204,7 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         if (!NT_SUCCESS(status))
         {
             BLORGFS_PRINT("HttpDecodeListing() - file name conversion failed: %8lx\n", status);
-            ExFreePool(dirInfo);
-            return status;
+            break;
         }
 
         fileEntries[i].NameLength = nameBytes / sizeof(WCHAR);
@@ -1101,19 +1213,20 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         fileEntries[i].CreationTime = BlorgMetaFlat_FileEntryMetadata_created(flatFileEntry);
         fileEntries[i].LastAccessedTime = BlorgMetaFlat_FileEntryMetadata_accessed(flatFileEntry);
         fileEntries[i].LastModifiedTime = BlorgMetaFlat_FileEntryMetadata_modified(flatFileEntry);
+        fileEntries[i].Security = HttpListingEntrySecurity(BlorgMetaFlat_FileEntryMetadata_security(flatFileEntry), securities, securityCount, fileInherits);
     }
 
     PDIRECTORY_SUBDIR_METADATA subdirEntries = BlorgGetSubDirEntry(dirInfo, 0);
 
-    for (size_t i = 0; i < subdirCount; ++i)
+    for (size_t i = 0; NT_SUCCESS(status) && (i < subdirCount); ++i)
     {
         BlorgMetaFlat_SubdirectoryMetadata_table_t flatSubdirEntry = BlorgMetaFlat_SubdirectoryMetadata_vec_at(flatSubdirEntries, i);
 
         if (!flatSubdirEntry)
         {
             BLORGFS_PRINT("HttpDecodeListing() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
+            status = STATUS_INVALID_PARAMETER;
+            break;
         }
 
         flatbuffers_string_t name = BlorgMetaFlat_SubdirectoryMetadata_name(flatSubdirEntry);
@@ -1121,12 +1234,12 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         if (!name || flatbuffers_string_len(name) == 0)
         {
             BLORGFS_PRINT("HttpDecodeListing() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
+            status = STATUS_INVALID_PARAMETER;
+            break;
         }
 
         ULONG nameBytes = 0;
-        NTSTATUS status = RtlUTF8ToUnicodeN(
+        status = RtlUTF8ToUnicodeN(
             subdirEntries[i].Name,
             (MAX_NAME_LEN - 1) * sizeof(WCHAR),
             &nameBytes,
@@ -1136,8 +1249,7 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         if (!NT_SUCCESS(status))
         {
             BLORGFS_PRINT("HttpDecodeListing() - subdir name conversion failed: %8lx\n", status);
-            ExFreePool(dirInfo);
-            return status;
+            break;
         }
 
         subdirEntries[i].NameLength = nameBytes / sizeof(WCHAR);
@@ -1145,6 +1257,18 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         subdirEntries[i].CreationTime = BlorgMetaFlat_SubdirectoryMetadata_created(flatSubdirEntry);
         subdirEntries[i].LastAccessedTime = BlorgMetaFlat_SubdirectoryMetadata_accessed(flatSubdirEntry);
         subdirEntries[i].LastModifiedTime = BlorgMetaFlat_SubdirectoryMetadata_modified(flatSubdirEntry);
+        subdirEntries[i].Security = HttpListingEntrySecurity(BlorgMetaFlat_SubdirectoryMetadata_security(flatSubdirEntry), securities, securityCount, directoryInherits);
+    }
+
+    if (securities)
+    {
+        ExFreePool(securities);
+    }
+
+    if (!NT_SUCCESS(status))
+    {
+        ExFreePool(dirInfo);
+        return status;
     }
 
     dirInfo->NoStore = NoStore;
@@ -1291,7 +1415,8 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
 
 //
 // Verifies and decodes a FlatBuffer DirectoryEntryMetadata response body
-// (single file/dir's stat info) directly into caller-provided DirEntryInfo.
+// (single file/dir's stat info) directly into caller-provided DirEntryInfo,
+// with the id of the descriptor it resolves to (HttpResolveSecurity).
 //
 static NTSTATUS HttpDeserializeDirectoryEntryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_ENTRY_METADATA DirEntryInfo)
 {
@@ -1327,6 +1452,11 @@ static NTSTATUS HttpDeserializeDirectoryEntryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_
     DirEntryInfo->LastModifiedTime = BlorgMetaFlat_DirectoryEntryMetadata_modified(dirEntMeta);
     DirEntryInfo->IsDirectory = BlorgMetaFlat_DirectoryEntryMetadata_directory(dirEntMeta);
     DirEntryInfo->NoStore = Ctx->NoStore;
+    DirEntryInfo->Security = HttpResolveSecurity(
+        BlorgMetaFlat_DirectoryEntryMetadata_security(dirEntMeta),
+        BlorgMetaFlat_DirectoryEntryMetadata_inherited(dirEntMeta),
+        BlorgMetaFlat_DirectoryEntryMetadata_inherited_depth(dirEntMeta),
+        DirEntryInfo->IsDirectory);
 
     return STATUS_SUCCESS;
 }

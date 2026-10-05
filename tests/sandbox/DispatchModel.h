@@ -86,6 +86,31 @@ NTSTATUS RtlSetGroupSecurityDescriptor(PVOID Descriptor, PSID Group, BOOLEAN Def
 NTSTATUS RtlAbsoluteToSelfRelativeSD(PVOID Absolute, PVOID SelfRelative, PULONG Length);
 NTSTATUS SeQuerySecurityDescriptorInfo(PULONG Information, PVOID Descriptor, PULONG Length, PVOID* ObjectsSecurityDescriptor);
 
+//
+// What Security.c calls to intern, inherit and check descriptors. The
+// sandbox never builds the descriptor table (BlorgSecurityInitialize runs
+// from DriverEntry), and its opens are kernel-mode, which the access check
+// trusts, so these only need to link.
+//
+BOOLEAN RtlValidRelativeSecurityDescriptor(PVOID Descriptor, ULONG Length, SECURITY_INFORMATION Required);
+ULONG RtlLengthSecurityDescriptor(PVOID Descriptor);
+ULONG RtlLengthSid(PSID Sid);
+NTSTATUS RtlCreateAcl(PACL Acl, ULONG Length, ULONG Revision);
+NTSTATUS RtlAddAccessAllowedAceEx(PACL Acl, ULONG Revision, ULONG Flags, ACCESS_MASK Mask, PSID Sid);
+VOID SeCaptureSubjectContext(PSECURITY_SUBJECT_CONTEXT Subject);
+VOID SeReleaseSubjectContext(PSECURITY_SUBJECT_CONTEXT Subject);
+VOID SeLockSubjectContext(PSECURITY_SUBJECT_CONTEXT Subject);
+VOID SeUnlockSubjectContext(PSECURITY_SUBJECT_CONTEXT Subject);
+NTSTATUS SeAssignSecurityEx(PVOID Parent, PVOID Explicit, PVOID* Created, GUID* ObjectType, BOOLEAN IsDirectory,
+    ULONG AutoInheritFlags, PSECURITY_SUBJECT_CONTEXT Subject, PGENERIC_MAPPING Mapping, POOL_TYPE PoolType);
+NTSTATUS SeDeassignSecurity(PVOID* Descriptor);
+BOOLEAN SeAccessCheck(PVOID Descriptor, PSECURITY_SUBJECT_CONTEXT Subject, BOOLEAN Locked, ACCESS_MASK Desired,
+    ACCESS_MASK Previously, PPRIVILEGE_SET* Privileges, PGENERIC_MAPPING Mapping, KPROCESSOR_MODE Mode,
+    PACCESS_MASK Granted, NTSTATUS* Status);
+NTSTATUS SeAppendPrivileges(PACCESS_STATE AccessState, PPRIVILEGE_SET Privileges);
+VOID SeFreePrivileges(PPRIVILEGE_SET Privileges);
+PGENERIC_MAPPING IoGetFileObjectGenericMapping(VOID);
+
 VOID RtlInitUnicodeString(PUNICODE_STRING Destination, PCWSTR Source);
 BOOLEAN RtlPrefixUnicodeString(PCUNICODE_STRING Prefix, PCUNICODE_STRING String, BOOLEAN IgnoreCase);
 NTSTATUS RtlUpcaseUnicodeString(PUNICODE_STRING Destination, PCUNICODE_STRING Source, BOOLEAN Allocate);
