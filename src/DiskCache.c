@@ -535,15 +535,12 @@ static NTSTATUS DiskCacheOpen(const UNICODE_STRING* Path, ACCESS_MASK Access, UL
         status = RtlSetDaclSecurityDescriptor(&descriptor, TRUE, acl, FALSE);
     }
 
-    if (NT_SUCCESS(status))
-    {
-        status = RtlSetControlSecurityDescriptor(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED);
-    }
-
     if (!NT_SUCCESS(status))
     {
         return status;
     }
+
+    descriptor.Control |= SE_DACL_PROTECTED;
 
     OBJECT_ATTRIBUTES attributes;
     InitializeObjectAttributes(&attributes, C_CAST(PUNICODE_STRING, Path), OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE, NULL, &descriptor);
