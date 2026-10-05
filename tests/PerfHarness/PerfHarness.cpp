@@ -634,6 +634,10 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
         t.ChangeFeedPolls, t.ChangeFeedFailures, t.ChangeFeedResets);
     printf("    changes invalidated   %12llu  (%llu batches flushed whole)\n",
         t.ChangeFeedPaths, t.ChangeFeedFlushes);
+    printf("    disk cache hits       %12llu  (%llu bytes, %llu failed)\n",
+        t.DiskCacheHits, t.DiskCacheHitBytes, t.DiskCacheReadFailures);
+    printf("    disk cache fills      %12llu  (%llu failed, %llu first misses, %llu dropped, %llu stale)\n",
+        t.DiskCacheFills, t.DiskCacheFillFailures, t.DiskCacheFirstMisses, t.DiskCacheDropped, t.DiskCacheStale);
 
     const unsigned long long acquires = t.ConnectionsPooled + t.ConnectionsFresh;
 
@@ -2787,6 +2791,14 @@ static bool WriteReport(
     fprintf(f, "ChangeFeedResets=%llu\n", t.ChangeFeedResets);
     fprintf(f, "ChangeFeedPaths=%llu\n", t.ChangeFeedPaths);
     fprintf(f, "ChangeFeedFlushes=%llu\n", t.ChangeFeedFlushes);
+    fprintf(f, "DiskCacheHits=%llu\n", t.DiskCacheHits);
+    fprintf(f, "DiskCacheHitBytes=%llu\n", t.DiskCacheHitBytes);
+    fprintf(f, "DiskCacheReadFailures=%llu\n", t.DiskCacheReadFailures);
+    fprintf(f, "DiskCacheFirstMisses=%llu\n", t.DiskCacheFirstMisses);
+    fprintf(f, "DiskCacheFills=%llu\n", t.DiskCacheFills);
+    fprintf(f, "DiskCacheFillFailures=%llu\n", t.DiskCacheFillFailures);
+    fprintf(f, "DiskCacheDropped=%llu\n", t.DiskCacheDropped);
+    fprintf(f, "DiskCacheStale=%llu\n", t.DiskCacheStale);
 
     fprintf(f, "ConnectionsPooled=%llu\n", t.ConnectionsPooled);
     fprintf(f, "ConnectionsFresh=%llu\n", t.ConnectionsFresh);

@@ -795,6 +795,36 @@ BOOLEAN BlorgFastIoRead(
 }
 
 //
+//  Completes a non-cached read whose bytes are in its buffer and whose
+//  IoStatus.Information is set, fetched or served from the disk cache
+//  alike. For non-paging reads, this mirrors the post-read bookkeeping the
+//  synchronous path used to do: advance the file position for synchronous
+//  file objects and note that a fast-IO read happened. <= DISPATCH_LEVEL.
+//
+static VOID ReadSucceeded(PIRP Irp, LONG64 ArrivedQpc)
+{
+    if (!BooleanFlagOn(Irp->Flags, IRP_PAGING_IO))
+    {
+        BLORGFS_STAT_INC(UserFileReads);
+        BLORGFS_STAT_ADD(UserFileReadBytes, Irp->IoStatus.Information);
+
+        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+
+        if (BooleanFlagOn(irpSp->FileObject->Flags, FO_SYNCHRONOUS_IO))
+        {
+            irpSp->FileObject->CurrentByteOffset.QuadPart =
+                irpSp->Parameters.Read.ByteOffset.QuadPart + Irp->IoStatus.Information;
+        }
+
+        SetFlag(irpSp->FileObject->Flags, FO_FILE_FAST_IO_READ);
+    }
+
+    ReadRecordUserLatency(NULL, ArrivedQpc);
+
+    BlorgCompleteRequest(Irp, STATUS_SUCCESS, IO_DISK_INCREMENT);
+}
+
+//
 //  Completion for an async non-cached read. Invoked from the WSK
 //  completion path at <= DISPATCH_LEVEL, so everything it touches must be
 //  legal there: the source body lives in the NonPagedPoolNx HTTP receive
@@ -817,9 +847,8 @@ BOOLEAN BlorgFastIoRead(
 //  here formats a %wZ/%Z: this runs at <= DISPATCH on the WSK completion
 //  chain, where that would touch paged code and bugcheck.
 //
-//  For non-paging reads, this mirrors the post-read bookkeeping the
-//  synchronous path used to do: advance the file position for
-//  synchronous file objects and note that a fast-IO read happened.
+//  What arrived is offered to the disk cache before the IRP is completed,
+//  while its pages are still this read's (BlorgDiskCacheAdmit).
 //
 static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
 {
@@ -871,25 +900,47 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
         }
     }
 
-    if (!BooleanFlagOn(irp->Flags, IRP_PAGING_IO))
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
+
+    BlorgDiskCacheAdmit(
+        ReadFairNode(irp),
+        FileBuffer,
+        C_CAST(ULONG64, irpSp->Parameters.Read.ByteOffset.QuadPart),
+        C_CAST(ULONG, FileBuffer->BodyBufferSize),
+        irp->MdlAddress);
+
+    ReadSucceeded(irp, arrivedQpc);
+}
+
+//
+//  Completion for a read the disk cache served (BlorgDiskCacheRead), at
+//  <= DISPATCH_LEVEL like ReadComplete. Valid is the trimmed length the
+//  read was offered with. One the cache could not finish is fetched
+//  instead: a fetch can only be built at PASSIVE_LEVEL, so it goes through
+//  ReadFairWorker, which trims and issues it as it would a held read.
+//
+static VOID ReadDiskComplete(PIRP Irp, NTSTATUS Status, ULONG Valid)
+{
+    const LONG64 arrivedQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[3]));
+
+    if (NT_SUCCESS(Status))
     {
-        BLORGFS_STAT_INC(UserFileReads);
-        BLORGFS_STAT_ADD(UserFileReadBytes, irp->IoStatus.Information);
-
-        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
-
-        if (BooleanFlagOn(irpSp->FileObject->Flags, FO_SYNCHRONOUS_IO))
-        {
-            irpSp->FileObject->CurrentByteOffset.QuadPart =
-                irpSp->Parameters.Read.ByteOffset.QuadPart + irp->IoStatus.Information;
-        }
-
-        SetFlag(irpSp->FileObject->Flags, FO_FILE_FAST_IO_READ);
+        Irp->IoStatus.Information = Valid;
+        ReadSucceeded(Irp, arrivedQpc);
+        return;
     }
 
-    ReadRecordUserLatency(NULL, arrivedQpc);
+    PIO_WORKITEM workItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
 
-    BlorgCompleteRequest(irp, STATUS_SUCCESS, IO_DISK_INCREMENT);
+    if (!workItem)
+    {
+        ReadRecordUserLatency(NULL, arrivedQpc);
+        BlorgCompleteRequest(Irp, Status, IO_DISK_INCREMENT);
+        return;
+    }
+
+    Irp->Tail.Overlay.DriverContext[2] = workItem;
+    IoQueueWorkItem(workItem, ReadFairWorker, DelayedWorkQueue, Irp);
 }
 
 //
@@ -991,10 +1042,11 @@ static NTSTATUS ReadIssueFetch(PIRP Irp, PFCB Fcb, LONGLONG StartingByte, ULONG 
 
 //
 // Issues a read ReadFairAdmit held, at PASSIVE_LEVEL, once ReadFairSettle
-// has admitted it. The length is trimmed again rather than carried: the
-// file size of a read-only volume does not change, so the trim gives the
-// same answer it gave on arrival, and the IRP has no free slot to carry it
-// in.
+// has admitted it, or one the disk cache could not finish
+// (ReadDiskComplete), which was never admitted and settles nothing. The
+// length is trimmed again rather than carried: the file size of a
+// read-only volume does not change, so the trim gives the same answer it
+// gave on arrival, and the IRP has no free slot to carry it in.
 //
 // Nothing else will complete this IRP: BlorgVolumeRead already returned
 // STATUS_PENDING for it. A failed issue settles its admission first, as
@@ -1327,7 +1379,18 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             }
         }
 
+        BlorgDiskCacheNoteFile(
+            fcb->NonPaged,
+            &fcb->FullPath,
+            C_CAST(ULONG64, fcb->Header.FileSize.QuadPart),
+            fcb->LastModifiedTime);
+
         IoMarkIrpPending(Irp);
+
+        if (BlorgDiskCacheRead(Irp, fcb->NonPaged, C_CAST(ULONG64, startingByte.QuadPart), bytesLength, realLength, ReadDiskComplete))
+        {
+            return STATUS_PENDING;
+        }
 
         if (ReadFairAdmit(Irp, speculative))
         {

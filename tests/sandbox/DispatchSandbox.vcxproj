@@ -121,6 +121,7 @@
     <ClCompile Include="PathCacheTest.cpp" />
     <ClCompile Include="PathCacheSchedTest.cpp" />
     <ClCompile Include="ChangeFeedTest.cpp" />
+    <ClCompile Include="DiskCacheIndexTest.cpp" />
     <ClCompile Include="KernelModel.c" />
     <ClCompile Include="NtShim.c" />
     <ClCompile Include="NtShimSync.c" />
@@ -143,9 +144,11 @@
     <ClCompile Include="StructsModel.c" />
     <ClCompile Include="DispatchModel.c" />
     <ClCompile Include="SandboxSocket.c" />
+    <ClCompile Include="NoDiskCacheStub.c" />
     <ClCompile Include="..\..\src\Statistics.c" />
     <ClCompile Include="..\..\src\PathCache.c" />
     <ClCompile Include="..\..\src\ChangeFeed.c" />
+    <ClCompile Include="..\..\src\DiskCacheIndex.c" />
     <ClCompile Include="..\..\src\FspWorkQueue.c" />
     <ClCompile Include="..\..\src\CacheManager.c" />
     <ClCompile Include="..\..\src\Cleanup.c" />

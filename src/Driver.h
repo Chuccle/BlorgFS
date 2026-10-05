@@ -167,6 +167,7 @@
 #define SUBTREE_ENTRIES 2048u
 
 #include "Structs.h"
+#include "DiskCache.h"
 #include "Util.h"
 #include "Client.h"
 #include "ChangeFeed.h"
@@ -187,6 +188,7 @@
 #define BLORGFS_DOS_DRIVELETTER_FORMAT_STRING L"\\DosDevices\\%C:"
 
 #define BLORGFS_REG_HOST_MAX_CHARS 128 // 127-char hostname + NUL, with headroom
+#define BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS 260 // NT path of the disk cache file + NUL
 #define BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES (BLORGFS_REG_HOST_MAX_CHARS + 8) // host plus ":65535" + NUL -- bounds global.RemoteHostAnsi (Client.c)
 
 #ifdef DBG
@@ -388,6 +390,13 @@ extern struct GLOBAL
     // SUBTREE_ENTRIES.
     //
     ULONG SubtreeEntries;
+
+    //
+    // Size of the disk cache in megabytes, from the DiskCacheMb registry
+    // value; zero, the default, leaves it off. Where its file lives comes
+    // from DiskCachePath, read alongside it (DISK_CACHE_DEFAULT_PATH).
+    //
+    ULONG DiskCacheMb;
 
     //
     // Nonzero while the change feed is live: every change the server sees
