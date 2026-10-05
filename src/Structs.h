@@ -614,12 +614,15 @@ VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path);
 //
 //  Invalidation. TTL keeps us eventually-consistent with the backing store
 //  changing out of band; these drop entries early when we learn of a change
-//  ourselves. Wire Invalidate/InvalidatePrefix to rename/delete and
-//  directory-listing refresh once mutating SetInformation lands;
-//  InvalidateAll is the O(1) wholesale flush for backend reconnect / remount.
+//  ourselves. Wire Invalidate/InvalidatePrefix to rename/delete once
+//  mutating SetInformation lands. SeedListing is the directory-listing
+//  refresh (DirCtrlComplete): it drops the directory's subtree and re-seeds
+//  its children from the listing. InvalidateAll is the O(1) wholesale flush
+//  for backend reconnect / remount.
 //
 VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path);
 VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir);
+VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing);
 VOID BlorgPathCacheInvalidateAll(VOID);
 
 /////////////////////////////////////////////
