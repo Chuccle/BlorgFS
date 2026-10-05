@@ -284,6 +284,8 @@ PY
 #   GUEST_CPUS      vCPUs              (default: min(nproc, 4))
 #   GUEST_MEM_MB    RAM in MiB         (default: 4096)
 #   GUEST_SSH_PORT  host port forwarded to the guest's sshd (default: 2222)
+#   GUEST_TAP       host tap device the guest's backend NIC is plugged into
+#                   (default: blorg0, created by blorg guest host-setup)
 #   GUEST_ALLOW_TCG set to 1 to run without KVM -- works, but Windows is
 #                   unusably slow under pure emulation; meant for smoke
 #                   tests of the tooling itself, never for a real run.
@@ -292,6 +294,12 @@ GUEST_HOME="${GUEST_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/blorgfs-guest}"
 GUEST_IMAGE_DIR="${GUEST_IMAGE_DIR:-$GUEST_HOME/image}"
 GUEST_RUN_DIR="${GUEST_RUN_DIR:-$GUEST_HOME/run}"
 GUEST_SSH_PORT="${GUEST_SSH_PORT:-2222}"
+GUEST_TAP="${GUEST_TAP:-blorg0}"
+# The backend link: the host's end of the tap, and the guest's, which
+# guest_up assigns to the NIC with this MAC.
+GUEST_TAP_HOST_IP=10.0.3.1
+GUEST_TAP_GUEST_IP=10.0.3.2
+GUEST_TAP_MAC=52:54:00:b1:0f:02
 GUEST_MEM_MB="${GUEST_MEM_MB:-4096}"
 if [[ -z "${GUEST_CPUS:-}" ]]; then
     GUEST_CPUS="$(nproc)"
@@ -444,11 +452,49 @@ guest_up() {
     : > "$GUEST_SERIAL"
     local -a args
     mapfile -t args < <(guest_qemu_args "$GUEST_DISK")
+    if guest_has_tap; then
+        mapfile -t -O "${#args[@]}" args < <(guest_tap_args)
+    else
+        note "no tap device '$GUEST_TAP' (blorg guest host-setup creates it); the backend is reached through user networking"
+    fi
     qemu-system-x86_64 "${args[@]}" -daemonize -pidfile "$GUEST_PIDFILE" >"$GUEST_QEMU_LOG" 2>&1 \
         || die "QEMU failed to start: $(cat "$GUEST_QEMU_LOG")"
     note "booting (cpus=$GUEST_CPUS mem=${GUEST_MEM_MB}MiB ssh=127.0.0.1:$GUEST_SSH_PORT)"
     guest_wait 900
+    if guest_has_tap; then
+        guest_tap_address || die "could not address the guest's backend NIC"
+    fi
     note "up"
+}
+
+# The backend NIC: a second e1000e on the host's tap device, plugged in only
+# when host-setup has created it. User networking (net0) proxies every TCP
+# connection through sockets in QEMU's own event loop, with its own buffers:
+# under four concurrent streams it held a fetch's first byte back ~227 ms and
+# left fresh connects averaging ~1 s, so it is kept for sshd alone. On the
+# tap the driver's traffic is ordinary routed packets the host kernel queues,
+# which tc can shape like a real link. Passed to QEMU by guest_up rather than
+# from guest_qemu_args, so the golden image (keyed on that function) is not
+# rebuilt for it.
+guest_has_tap() { ip link show "$GUEST_TAP" >/dev/null 2>&1; }
+
+guest_tap_args() {
+    printf '%s\n' \
+        -netdev "tap,id=net1,ifname=$GUEST_TAP,script=no,downscript=no" \
+        -device "e1000e,netdev=net1,mac=$GUEST_TAP_MAC"
+}
+
+# Windows offers the tap NIC to DHCP, which nothing answers, so it gets a
+# static address. The overlay disk is new on every fresh boot, so this runs on
+# every guest_up; on an existing disk the address is already there.
+guest_tap_address() {
+    ssh_guest "\$a = \$null; for (\$i = 0; \$i -lt 30 -and -not \$a; \$i++) { \$a = Get-NetAdapter | Where-Object MacAddress -eq '${GUEST_TAP_MAC//:/-}'; if (-not \$a) { Start-Sleep 1 } }; if (-not \$a) { exit 1 }; if (-not (Get-NetIPAddress -InterfaceIndex \$a.ifIndex -IPAddress $GUEST_TAP_GUEST_IP -ErrorAction SilentlyContinue)) { Set-NetIPInterface -InterfaceIndex \$a.ifIndex -Dhcp Disabled; New-NetIPAddress -InterfaceIndex \$a.ifIndex -IPAddress $GUEST_TAP_GUEST_IP -PrefixLength 24 | Out-Null }; exit 0" >/dev/null
+}
+
+# Where the guest reaches services on this host: the tap when there is one,
+# otherwise user networking's alias for the host.
+guest_backend_host() {
+    if guest_has_tap; then echo "$GUEST_TAP_HOST_IP"; else echo "10.0.2.2"; fi
 }
 
 guest_down() {
@@ -539,6 +585,14 @@ guest_host_setup() {
     sudo udevadm control --reload-rules
     sudo udevadm trigger --name-match=kvm
     sudo chmod 0666 /dev/kvm
+
+    # The guest's backend link (see guest_has_tap), owned by this user so
+    # QEMU opens it unprivileged. A host reboot removes it; run this again.
+    if ! guest_has_tap; then
+        sudo ip tuntap add dev "$GUEST_TAP" mode tap user "$(id -un)"
+    fi
+    sudo ip addr replace "$GUEST_TAP_HOST_IP/24" dev "$GUEST_TAP"
+    sudo ip link set "$GUEST_TAP" up
 
     echo "blorg: ready ($(qemu-system-x86_64 --version | head -n1))"
 }
@@ -957,8 +1011,9 @@ PS1
 # adds log groups, annotations and a step summary.
 #
 # Topology: server-rs runs here on the host, as Linux, the way the product
-# is deployed, and the guest reaches it at 10.0.2.2 (QEMU user networking's
-# address for the host). So the driver's WSK traffic crosses a real NIC,
+# is deployed, and the guest reaches it at 10.0.3.1 over the tap device
+# host-setup creates (10.0.2.2 through user networking on a host without
+# one; see guest_has_tap). So the driver's WSK traffic crosses a real NIC,
 # and the backend's filesystem is case-sensitive.
 guest_test() (
     set +e -uo pipefail
@@ -1069,7 +1124,7 @@ guest_test() (
 
     step "Running the tests in the guest"
     boot_before="$("$BLORG" guest boot-id)"
-    test_args="-Port $SERVER_PORT"
+    test_args="-BackendHost $(guest_backend_host) -Port $SERVER_PORT"
     "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Test $test_args; exit \$LASTEXITCODE"
     test_rc=$?
     endstep
