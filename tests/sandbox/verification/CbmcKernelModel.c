@@ -275,7 +275,7 @@ VOID FsRtlUninitializeFileLock(PFILE_LOCK F) { (void)F; }
 VOID FsRtlInitializeOplock(POPLOCK O) { (void)O; }
 VOID FsRtlUninitializeOplock(POPLOCK O) { (void)O; }
 
-void BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO D) { (void)D; }
+void BlorgReleaseDirectoryInfo(PDIRECTORY_INFO D) { (void)D; }
 
 //
 // One node lives in this proof, so every path hashes to the same bucket

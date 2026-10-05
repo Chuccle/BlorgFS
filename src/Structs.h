@@ -94,18 +94,29 @@ CHECK_PADDING_END(DIRECTORY_SUBDIR_METADATA, Name);
 // Header for a variable-length buffer holding a directory's file and
 // subdirectory entries, packed contiguously after this struct.
 //
+// A listing is an immutable snapshot once deserialized, shared by the
+// listing cache (PathCache.c) and by every handle enumerating it
+// (CCB.Entries), and freed by whichever drops the last reference
+// (BlorgReleaseDirectoryInfo). It is never edited in place: a newer listing
+// of the same directory is a new snapshot, so an enumeration in progress
+// keeps the one it started with.
+//
 typedef struct _DIRECTORY_INFO
 {
     SIZE_T FilesOffset;   // Offset from start of this struct to first file entry
     SIZE_T SubDirsOffset; // Offset from start of this struct to first subdir entry
     SIZE_T FileCount;     // Number of DIRECTORY_FILE_METADATA entries
     SIZE_T SubDirCount;   // Number of DIRECTORY_SUBDIR_METADATA entries
+    LONG   RefCount;      // Interlocked: holders on different threads release independently
+    UCHAR  Reserved[4];   // explicit tail padding
 } DIRECTORY_INFO, * PDIRECTORY_INFO;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FilesOffset, SubDirsOffset);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirsOffset, FileCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FileCount, SubDirCount);
-CHECK_PADDING_END(DIRECTORY_INFO, SubDirCount);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirCount, RefCount);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, Reserved);
+CHECK_PADDING_END(DIRECTORY_INFO, Reserved);
 
 //
 // Returns a pointer to the Index'th subdirectory entry packed after this
@@ -485,27 +496,15 @@ CHECK_PADDING_BETWEEN(FCB, ReadMaxPagingBytes, ReadLastStreamIndex);
 CHECK_PADDING_END(FCB, ReadLastStreamIndex);
 
 //
-// Per-directory context node. Extends COMMON_CONTEXT with child linkage and
-// a shared directory-listing cache.
+// Per-directory context node. Extends COMMON_CONTEXT with child linkage.
+// The directory's listing is not held here: it lives in the listing cache
+// (PathCache.c) keyed by path, so it outlives the DCB, and each handle
+// holds its own snapshot in CCB.Entries.
 //
 typedef struct _DCB BLORGFS_COMMON_CONTEXT_BASE
 {
     BLORGFS_COMMON_CONTEXT_MEMBER
     LIST_ENTRY ChildrenList; // Head of this directory's child node list
-
-    //
-    // Directory listing shared by every open handle on this directory.
-    // Populated once (under Header.Resource) and reused until the last
-    // handle closes, when the DCB and listing are freed together
-    // (BlorgFreeFileContext). Borrowed (not owned) by per-handle CCBs via
-    // CCB.Entries. Write-once: published NULL -> non-NULL exactly once
-    // via WritePointerRelease (DirCtrlComplete) and never replaced.
-    // BlorgVolumeCreate reads it with ReadPointerAcquire holding only the
-    // VCB resource -- not this DCB's -- so it is the release/acquire pair,
-    // not a common lock, that orders the listing's contents before the
-    // pointer on weakly-ordered architectures (ARM64).
-    //
-    PDIRECTORY_INFO CachedListing;
 } DCB, * PDCB;
 
 CHECK_PADDING_BETWEEN(DCB, Header, NonPaged);
@@ -524,8 +523,7 @@ CHECK_PADDING_BETWEEN(DCB, LastModifiedTime, RefCount);
 CHECK_PADDING_BETWEEN(DCB, RefCount, OnReapList);
 CHECK_PADDING_BETWEEN(DCB, OnReapList, TableBucketIndex);
 CHECK_PADDING_BETWEEN(DCB, TableBucketIndex, ChildrenList);
-CHECK_PADDING_BETWEEN(DCB, ChildrenList, CachedListing);
-CHECK_PADDING_END(DCB, CachedListing);
+CHECK_PADDING_END(DCB, ChildrenList);
 
 // Per-handle context for an open directory search.
 typedef struct _CCB
@@ -535,7 +533,7 @@ typedef struct _CCB
     ULONGLONG Flags;      // CCB_FLAG_* bits
     UINT64 CurrentIndex;  // Next entry index to return for this handle
     UNICODE_STRING SearchPattern; // Wildcard/name filter for this search
-    PDIRECTORY_INFO Entries;      // Borrowed listing (see DCB.CachedListing)
+    PDIRECTORY_INFO Entries;      // This handle's listing snapshot: one reference, released on restart or close
 } CCB, * PCCB;
 
 #define CCB_FLAG_MATCH_ALL 0x0001
@@ -611,24 +609,64 @@ typedef enum _PATH_CACHE_RESULT
     PathCacheNotFound
 } PATH_CACHE_RESULT;
 
+//
+//  What a reader saw of the cache before it went to look something up: the
+//  invalidation sequence and the time. Every insert of a result read from
+//  somewhere else -- the network, or a cached listing -- carries the ticket
+//  taken before that read, and is refused if any invalidation ran in
+//  between (see the protocol note above BlorgPathCacheTakeTicket). That is
+//  what stops a request issued before a change from re-caching what the
+//  change just invalidated, with no TTL left to correct it once one exists.
+//  A NULL ticket inserts unconditionally, for state that was not read from
+//  anywhere (tests, and nothing else).
+//
+typedef struct _PATH_CACHE_TICKET
+{
+    LONG64  Sequence;  // PathCache invalidation sequence when taken
+    ULONG64 IssueTime; // KeQueryInterruptTime when taken
+} PATH_CACHE_TICKET, * PPATH_CACHE_TICKET;
+
+CHECK_PADDING_BETWEEN(PATH_CACHE_TICKET, Sequence, IssueTime);
+CHECK_PADDING_END(PATH_CACHE_TICKET, IssueTime);
+
 VOID BlorgPathCacheInit(VOID);
 VOID BlorgPathCacheCleanup(VOID);
+VOID BlorgPathCacheTakeTicket(PPATH_CACHE_TICKET Ticket);
 PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta);
-VOID BlorgPathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta);
-VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path);
+VOID BlorgPathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket);
+VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path, _In_opt_ const PATH_CACHE_TICKET* Ticket);
+
+//
+//  Listing cache: one snapshot per directory path, fresh for the path
+//  cache's TTL and servable stale for a bounded time after while a refresh
+//  is fetched behind it. Lookups return a referenced snapshot (release with
+//  BlorgReleaseDirectoryInfo) or NULL. With AllowStale, a stale snapshot is
+//  returned too, and *RefreshOwed is set for exactly one caller per stale
+//  snapshot, which then owes the background refetch. Publish takes its own
+//  reference when it retains the listing, and returns whether the listing
+//  is current -- neither superseded by a newer fetch nor issued before an
+//  invalidation -- which is the condition for seeding the path cache from
+//  it.
+//
+PDIRECTORY_INFO BlorgPathCacheLookupListing(const UNICODE_STRING* Dir, BOOLEAN AllowStale, _Out_opt_ PBOOLEAN Stale, _Out_opt_ PBOOLEAN RefreshOwed);
+BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing, _In_opt_ const PATH_CACHE_TICKET* Ticket);
 
 //
 //  Invalidation. TTL keeps us eventually-consistent with the backing store
 //  changing out of band; these drop entries early when we learn of a change
-//  ourselves. Wire Invalidate/InvalidatePrefix to rename/delete once
-//  mutating SetInformation lands. SeedListing is the directory-listing
-//  refresh (DirCtrlComplete): it drops the directory's subtree and re-seeds
-//  its children from the listing. InvalidateAll is the O(1) wholesale flush
-//  for backend reconnect / remount.
+//  ourselves. Each one advances the invalidation sequence before it sweeps,
+//  so an insert ticketed before it is refused (see PATH_CACHE_TICKET).
+//  Invalidate and InvalidatePrefix also drop the listing of the path's
+//  parent, whose contents the change alters; wire them to rename/delete once
+//  mutating SetInformation lands, and to server change notifications.
+//  SeedListing is the directory-listing refresh (DirCtrlComplete): it drops
+//  the directory's subtree and re-seeds its children from the listing; it
+//  is not an invalidation and does not advance the sequence. InvalidateAll
+//  is the O(1) wholesale flush for backend reconnect / remount.
 //
 VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path);
 VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir);
-VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing);
+VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing, _In_opt_ const PATH_CACHE_TICKET* Ticket);
 VOID BlorgPathCacheInvalidateAll(VOID);
 
 /////////////////////////////////////////////

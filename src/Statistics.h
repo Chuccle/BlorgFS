@@ -392,6 +392,12 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 PathCacheHits;
     ULONG64 PathCacheMisses;
 
+    // --- listing cache (directory queries taking a snapshot) -------------
+    ULONG64 ListingCacheHits;            // fresh snapshot, no request
+    ULONG64 ListingCacheStaleHits;       // stale snapshot served, refresh owed
+    ULONG64 ListingCacheMisses;          // fetched in the foreground
+    ULONG64 ListingRefreshes;            // background refetches issued
+
     // --- connections -----------------------------------------------------
     ULONG64 ConnectionsPooled;           // acquire satisfied from the keep-alive pool
     ULONG64 ConnectionsFresh;            // acquire needed a new TCP connect
@@ -513,7 +519,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
 
-#define BLORGFS_STATISTICS_VERSION 15
+#define BLORGFS_STATISTICS_VERSION 16
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

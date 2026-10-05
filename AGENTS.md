@@ -34,6 +34,7 @@ occasionally, not every session.
 | [Deploying to a VM](#deploying-to-a-vm) | The deploy pipeline and its quirks |
 | [Debugging the VM: what's real and what's noise](#debugging-the-vm-whats-real-and-whats-noise) | Decision tree for VM/debugger flakiness |
 | [Measuring performance](#measuring-performance) | How to benchmark correctly |
+| [Metadata caching: current state](#metadata-caching-current-state) | The path and listing caches, and the rule any new invalidation or insert must keep |
 | [Read-ahead policy: current state](#read-ahead-policy-current-state) | What the driver does today, and why, in one place |
 | [Evidence trail: the playback-stutter investigation](#evidence-trail-the-playback-stutter-investigation) | Conclusions and reusable measurement lessons from the investigation behind that policy; full round-by-round history is in git log |
 | [Future work: on-disk hot cache (not implemented)](#future-work-on-disk-hot-cache-not-implemented) | Design for a not-yet-started project — nothing in it exists in the codebase |
@@ -1402,6 +1403,40 @@ powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Perf -PerfFile B:\media\big.
 The driver runs in a VM for testing — `deploy\Deploy-ToVM.ps1` builds, copies,
 and installs it via vmrun. Run the `Perf` tier inside the guest, where the
 volume is mounted.
+
+## Metadata caching: current state
+
+Every request costs about one round trip on the reference link however
+small it is, so the levers left on metadata are how many requests a
+workload makes, not how fast each one is. Two caches in `PathCache.c`
+remove them; both are in-memory only and both are lost on unload.
+
+| Cache | Answers | Kept for |
+|---|---|---|
+| Path cache | An open's exists/not-found and metadata, without a fileinfo GET | 4 s (`PATH_CACHE_TTL_100NS`) |
+| Listing cache | A directory query, without a dirinfo GET; an open's not-found from its parent's listing | Fresh 4 s, then served stale up to 30 s while one background refetch replaces it |
+
+A listing is an immutable, reference-counted snapshot. Each handle
+enumerates the one it took on its initial query until it restarts the
+scan, so a refresh landing mid-`dir` never moves entries under the
+handle's index; the cache holds its own reference and a 32 MB budget.
+Only directory queries take a stale listing: an open's not-found does not,
+since a stale listing would hide a file the server has gained.
+
+**The rule a change must keep: every result read from the server is
+inserted with the ticket taken before it was read.** Every invalidation
+advances one sequence before it sweeps, and an insert whose ticket is older
+is refused under the bucket lock (`BlorgPathCacheTakeTicket` states the
+argument in full). Without it, a fetch issued before a change and
+completing after the invalidation for it caches the old answer for a full
+TTL. Two fetches of one directory resolve the other way round: the
+later-issued one wins whichever completes first. `PathCacheSchedTest`
+proves both across every interleaving. A future change feed or write path
+invalidates through the same calls and inherits the guarantee; anything
+that inserts without a ticket does not.
+
+`PerfHarness stats` reports `listings hit/stale/miss` and the background
+refreshes issued.
 
 ## Read-ahead policy: current state
 

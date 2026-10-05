@@ -5,11 +5,11 @@
 // registration, and the dispatch-entry device-type routing -- none of
 // which any other sandbox target drives.
 //
-// Most tests here pre-populate dcb->CachedListing directly (via the
-// shared ListingBuilder.h, the same builder CreateDirectoryTest.cpp uses), the way
-// a warm directory's second and later queries actually resolve -- cheap,
-// and keeps the enumeration/pattern-matching tests independent of the
-// network. The regression test below is the exception: it drives a real
+// Most tests here publish a listing of the directory into the listing cache
+// directly (via the shared ListingBuilder.h, the same builder
+// CreateDirectoryTest.cpp uses), the way a warm directory's queries actually
+// resolve -- cheap, and keeps the enumeration/pattern-matching tests
+// independent of the network. The regression test below is the exception: it drives a real
 // BlorgHttpGetDirectoryInfo call (scripted to stall, via SandboxSocket.h)
 // to prove a real second query sees a real outstanding fetch, not a
 // hand-built stand-in for one. DirCtrlComplete's *success* path --
@@ -71,6 +71,8 @@ protected:
         ShimDrainWorkItems();
         BlorgCleanupWskClient();
 
+        BlorgPathCacheInvalidatePrefix(&Dcb->FullPath);
+
         BlorgFreeFileContext(Dcb, Volume);
         BlorgFreeFileContext(Ccb, Volume);
         BlorgFreeFileContext(WrongTypeNode, Volume);
@@ -95,16 +97,25 @@ protected:
     }
 
     //
-    // Publishes a listing on the DCB the way DirCtrlComplete would have --
-    // every test that isn't specifically about the cache-miss path starts
-    // from a warm directory so BlorgVolumeDirectoryControl never reaches
-    // the network fetch at all. The listing's layout arithmetic lives in
-    // ListingBuilder.h, shared with CreateDirectoryTest.cpp rather than
-    // copied per fixture.
+    // Publishes a listing of the DCB's directory the way DirCtrlComplete
+    // would have -- every test that isn't specifically about the cache-miss
+    // path starts from a warm directory so BlorgVolumeDirectoryControl never
+    // reaches the network fetch at all. The listing's layout arithmetic lives
+    // in ListingBuilder.h, shared with CreateDirectoryTest.cpp rather than
+    // copied per fixture. The cache takes its own reference and the
+    // builder's is dropped here, so once the cache lets go a handle's
+    // snapshot is all that keeps the listing alive.
     //
+    void Publish(PDIRECTORY_INFO listing)
+    {
+        ASSERT_NE(nullptr, listing);
+        EXPECT_TRUE(BlorgPathCachePublishListing(&Dcb->FullPath, listing, nullptr));
+        BlorgReleaseDirectoryInfo(listing);
+    }
+
     void SeedListing(int fileCount, int subDirCount)
     {
-        Dcb->CachedListing = BuildSyntheticListing(fileCount, subDirCount);
+        Publish(BuildSyntheticListing(fileCount, subDirCount));
     }
 
     struct QueryRequest
@@ -468,10 +479,10 @@ TEST_F(DirCtrlTest, NonVolumeDeviceReturnsInvalidDeviceRequest)
 // BlorgHttpGetDirectoryInfo call. The peer closes immediately, so the
 // fetch fails fast rather than genuinely stalling -- simpler to clean up
 // than a parked connection, and the state it leaves behind
-// (ccb->SearchPattern set, dcb->CachedListing still NULL, because
-// DirCtrlComplete's failure branch never publishes) is identical to the
-// state a still-outstanding fetch would leave, since dcb->CachedListing
-// only ever transitions on a *successful* publish. A second
+// (ccb->SearchPattern set, ccb->Entries still NULL, because
+// DirCtrlComplete's failure branch never installs a snapshot) is identical
+// to the state a still-outstanding fetch would leave, since ccb->Entries
+// only ever gains a snapshot from a cache hit or a *successful* fetch. A second
 // QUERY_DIRECTORY IRP on the same handle, issued right after (legal for a
 // caller with an asynchronous/overlapped handle -- Create.c never sets
 // FO_SYNCHRONOUS_IO on a directory open, and a real caller could just as
@@ -480,15 +491,13 @@ TEST_F(DirCtrlTest, NonVolumeDeviceReturnsInvalidDeviceRequest)
 // directory" (a genuinely empty one still publishes a real zero-count
 // DIRECTORY_INFO).
 //
-// Before the DirCtrl.c fix (gating the fetch-issuing check on
-// `(initialQuery || restartScan) && !netDone && !dcb->CachedListing`),
-// this second call fell straight through to `ccb->Entries =
-// dcb->CachedListing` (still NULL) and returned STATUS_NO_MORE_FILES --
-// confirmed directly against the real driver before the fix landed. The
-// fix drops the initialQuery/restartScan gate, so a second query in this
-// state now issues its own fetch too, which DirCtrlComplete's existing
-// duplicate-fetch handling (see its header comment) already knows how to
-// resolve safely.
+// Before the DirCtrl.c fix, the fetch was gated on
+// `(initialQuery || restartScan) && !netDone`, so this second call fell
+// straight through to a NULL listing and returned STATUS_NO_MORE_FILES --
+// confirmed directly against the real driver before the fix landed. A
+// snapshot is now looked for whenever the handle has none, so a second
+// query in this state issues its own fetch too, and DirCtrlComplete
+// installs whichever completes first (see its header comment).
 //
 TEST_F(DirCtrlTest, SecondQueryWhileFirstFetchIsOutstandingDoesNotReportNoMoreFiles)
 {
@@ -504,7 +513,7 @@ TEST_F(DirCtrlTest, SecondQueryWhileFirstFetchIsOutstandingDoesNotReportNoMoreFi
     Drain();
 
     ASSERT_NE(nullptr, Ccb->SearchPattern.Buffer) << "the first call must have set the pattern";
-    ASSERT_EQ(nullptr, Dcb->CachedListing) << "the first fetch must not have published a listing";
+    ASSERT_EQ(nullptr, Ccb->Entries) << "the failed first fetch must not have left a snapshot";
 
     static const SANDBOX_STEP secondScript[] = { CLOSE_STEP };
     SandboxSetPeerScript(secondScript, RTL_NUMBER_OF(secondScript));
@@ -522,6 +531,95 @@ TEST_F(DirCtrlTest, SecondQueryWhileFirstFetchIsOutstandingDoesNotReportNoMoreFi
         << "it should retry the fetch, same as the first call";
 
     Drain();
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Listing snapshots and serve-stale
+///////////////////////////////////////////////////////////////////////////
+
+//
+// A handle enumerates the snapshot it took on its initial query until it
+// restarts. A newer listing replacing the cached one mid-enumeration must
+// not move entries under the handle's index -- resuming at index 1 of a
+// different listing skips or repeats names, which is what a `dir` racing a
+// refresh would show. The restart is what picks the newer listing up. A
+// test that only ever enumerated one listing could not tell a shared
+// listing from a snapshot.
+//
+TEST_F(DirCtrlTest, NewerListingDoesNotMoveAnEnumerationInProgress)
+{
+    SeedListing(3, 0);
+
+    unsigned char buffer[512] = {};
+    auto* entry = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer);
+
+    QueryRequest* first = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+        buffer, sizeof(buffer), SL_RETURN_SINGLE_ENTRY);
+    ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&first->Irp, &first->Stack));
+    ASSERT_EQ(1u, Ccb->CurrentIndex);
+
+    Publish(BuildSyntheticListingNamed(L"other.bin", L"otherdir"));
+
+    memset(buffer, 0, sizeof(buffer));
+    QueryRequest* resume = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+        buffer, sizeof(buffer), SL_RETURN_SINGLE_ENTRY);
+    ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&resume->Irp, &resume->Stack));
+
+    ASSERT_EQ(sizeof(L"file1.bin") - sizeof(WCHAR), entry->FileNameLength);
+    EXPECT_EQ(0, memcmp(entry->FileName, L"file1.bin", entry->FileNameLength))
+        << "the resumed query must continue the handle's own snapshot";
+
+    memset(buffer, 0, sizeof(buffer));
+    QueryRequest* restart = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+        buffer, sizeof(buffer), SL_RETURN_SINGLE_ENTRY | SL_RESTART_SCAN);
+    ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&restart->Irp, &restart->Stack));
+
+    ASSERT_EQ(sizeof(L"other.bin") - sizeof(WCHAR), entry->FileNameLength);
+    EXPECT_EQ(0, memcmp(entry->FileName, L"other.bin", entry->FileNameLength))
+        << "a restart scan must take the newer listing";
+}
+
+//
+// Past the fresh window a re-list is still answered at once from the cached
+// snapshot, and exactly one query owes the refetch: a second handle listing
+// the same stale directory must not issue another. The refresh's peer closes
+// at once, so it fails and the snapshot stays as it was -- the case where a
+// per-query refresh would turn every re-list of a slow directory into its
+// own request. Counted through ListingRefreshes, the one place a refresh is
+// visible without a scripted listing response.
+//
+TEST_F(DirCtrlTest, StaleListingAnswersAtOnceAndOwesOneBackgroundRefresh)
+{
+    SeedListing(1, 0);
+    ShimAdvanceInterruptTime(5ULL * 10ULL * 1000ULL * 1000ULL);
+
+    static const SANDBOX_STEP script[] = { CLOSE_STEP };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    PBLORGFS_STATISTICS stats = BlorgStatisticsForCurrentProcessor();
+    ASSERT_NE(nullptr, stats);
+    const ULONG64 refreshesBefore = stats->ListingRefreshes;
+    const ULONG64 staleHitsBefore = stats->ListingCacheStaleHits;
+
+    unsigned char buffer[512] = {};
+    QueryRequest* first = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+        buffer, sizeof(buffer));
+    EXPECT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&first->Irp, &first->Stack))
+        << "a stale listing must answer without waiting on the wire";
+    EXPECT_EQ(refreshesBefore + 1, stats->ListingRefreshes);
+    Drain();
+
+    PCCB secondCcb = nullptr;
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateCCB(&secondCcb, Volume));
+
+    QueryRequest* second = PrepareQuery(Dcb, secondCcb, nullptr, FileBothDirectoryInformation,
+        buffer, sizeof(buffer));
+    EXPECT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&second->Irp, &second->Stack));
+    EXPECT_EQ(refreshesBefore + 1, stats->ListingRefreshes)
+        << "the refresh is owed once per snapshot, not once per query";
+    EXPECT_EQ(staleHitsBefore + 2, stats->ListingCacheStaleHits);
+
+    BlorgFreeFileContext(secondCcb, Volume);
 }
 
 } // namespace
