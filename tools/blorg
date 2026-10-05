@@ -1115,7 +1115,8 @@ guest_test() (
     (( verifier )) || prep_args+=(-NoVerifier)
     "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Prepare ${prep_args[*]:-}; exit \$LASTEXITCODE"
     rc=$?
-    if (( rc == 3010 )); then
+    # ssh exits with only the low byte of the guest's code: 3010 arrives as 194.
+    if (( rc == 3010 % 256 )); then
         "$BLORG" guest reboot || rig_fail "guest did not come back from the preparation reboot"
     elif (( rc != 0 )); then
         rig_fail "the Prepare step failed ($rc)"
