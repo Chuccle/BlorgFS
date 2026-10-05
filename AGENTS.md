@@ -1438,6 +1438,14 @@ that inserts without a ticket does not.
 `PerfHarness stats` reports `listings hit/stale/miss` and the background
 refreshes issued.
 
+**Index a path-keyed table by the top bits of `BlorgHashPath`, never by
+masking `RtlHashUnicodeString` directly.** Its default is x65599, and 65599
+is -1 mod 64, so the low bits are an alternating character sum and sibling
+paths pile into a few buckets. Measured: 121 directories of one tree in 19
+of 64 listing buckets, and a repeat `dir /s` refetched two thirds of them
+from evictions alone. The sandbox shim hashes with x65599 so a test sees the
+real spread (`PathCacheListingTest.EveryListingOfADeepTreeStaysCached`).
+
 ## Read-ahead policy: current state
 
 This is the driver's read-ahead behaviour as it stands today, stated
