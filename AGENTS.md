@@ -1433,6 +1433,14 @@ amplification stays under 1.2x on every pattern including sparse/random
 access; paced playback at realistic bitrates misses effectively no
 deadlines.
 
+**Fair share, measured** on the tap reference link (two runs per arm,
+interleaved): a 6 MB/s player beside three copies missed 27% of its 40 ms
+deadlines with `ReadFairBudgetKb=0` and got 2.8-4.1 MiB/s; at 1-2 MB it
+missed 5-14% and got 5.0-5.6 MiB/s. A fetch's wait for its first byte under
+that load fell from 129-189 ms to 11-24 ms, and the four-stream worst read
+from 2.0-3.8 s to 1.2-1.4 s. It costs a lone copy 3-4% (28.1 to 27.0-27.4
+MiB/s), and the paced player alone is unchanged at 0 late.
+
 **What is not solved, and isn't a granularity problem:** eight paced
 consumers demanding the *entire* link at once miss 0.5%-33% of deadlines in
 every configuration tried, pinned or adaptive. That's bandwidth
