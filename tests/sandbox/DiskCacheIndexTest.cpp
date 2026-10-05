@@ -90,6 +90,44 @@ TEST_F(DiskCacheIndexTest, ABlockIsAdmittedOnlyOnItsSecondMiss)
     EXPECT_TRUE(Held(key));
 }
 
+//
+// A file read twice is held whole after the second pass, as long as it
+// fits: no block of it loses its first miss to another block of the same
+// pass. A direct-mapped ghost table lost about a fifth of a file this way,
+// on every pass, measured in the guest.
+//
+TEST_F(DiskCacheIndexTest, EveryBlockMissedOnceIsAdmittedOnItsNextMiss)
+{
+    DISK_CACHE_INDEX wide;
+    ASSERT_EQ(STATUS_SUCCESS, BlorgDiskCacheIndexInitialize(&wide, 64));
+
+    ULONG slot = DISK_CACHE_NO_SLOT;
+
+    for (ULONG64 block = 0; block < 64; ++block)
+    {
+        const DISK_CACHE_KEY key = Key(1, block);
+        EXPECT_EQ(DiskCacheFirstMiss, BlorgDiskCacheIndexReserve(&wide, &key, &slot)) << "block " << block;
+    }
+
+    for (ULONG64 block = 0; block < 64; ++block)
+    {
+        const DISK_CACHE_KEY key = Key(1, block);
+        ASSERT_EQ(DiskCacheReserved, BlorgDiskCacheIndexReserve(&wide, &key, &slot)) << "block " << block;
+        BlorgDiskCacheIndexCommit(&wide, slot, TRUE);
+    }
+
+    ULONG slots[64];
+    const DISK_CACHE_KEY first = Key(1, 0);
+    EXPECT_TRUE(BlorgDiskCacheIndexPinRange(&wide, &first, 63, slots));
+
+    for (ULONG i = 0; i < 64; ++i)
+    {
+        BlorgDiskCacheIndexUnpin(&wide, slots[i]);
+    }
+
+    BlorgDiskCacheIndexCleanup(&wide);
+}
+
 TEST_F(DiskCacheIndexTest, ABlockBeingFilledIsNeitherServedNorReservedAgain)
 {
     const DISK_CACHE_KEY key = Key(1, 0);

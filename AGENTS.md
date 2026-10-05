@@ -1818,10 +1818,11 @@ RAM.
   explicit invalidation. This holds once the volume is writable too, as
   long as a write changes the version the FCB names.
 - **Admission and replacement.** A block is written on its second miss
-  only, through a direct-mapped ghost table of tags. Replacement is a
-  CLOCK over the slots, with a per-slot pin count so a slot is never
-  reused while a read or write is in flight on it. CLOCK and second-miss
-  admission cover what the earlier plan wanted from segmented LRU: a scan
+  only, through a four-way ghost table of tags (a direct-mapped one lost
+  about a fifth of a re-read file to blocks evicting each other's tag).
+  Replacement is a CLOCK over the slots, with a per-slot pin count so a
+  slot is never reused while a read or write is in flight on it. CLOCK
+  and second-miss admission cover what the earlier plan wanted from segmented LRU: a scan
   read once never gets in, and a block served since the hand last passed
   survives a turn.
 

@@ -19,8 +19,9 @@
 // written survives a pass and one never read again does not.
 //
 // Admission waits for a block's second miss. The first only records the
-// block's tag in a direct-mapped ghost table; the block is written when it
-// is fetched again while its tag is still there. A file read once, which is
+// block's tag in a small set-associative ghost table, newest first, oldest
+// falling out; the block is written when it is fetched again while its tag
+// is still there. A file read once, which is
 // most of what a copy or a scan touches, then costs the disk nothing, and
 // it cannot push out what is read repeatedly.
 //
@@ -30,7 +31,7 @@
 
 //
 // Mixes every field of Key, so the high half picks a chain and the low half
-// a ghost entry independently of it.
+// a ghost set independently of it.
 //
 static ULONG64 DiskCacheIndexMix(const DISK_CACHE_KEY* Key)
 {
@@ -129,7 +130,9 @@ NTSTATUS BlorgDiskCacheIndexInitialize(PDISK_CACHE_INDEX Index, ULONG SlotCount)
 
     Index->Slots = ExAllocatePoolZero(NonPagedPoolNx, C_CAST(SIZE_T, SlotCount) * sizeof(DISK_CACHE_SLOT), DISK_CACHE_INDEX_TAG);
     Index->Heads = ExAllocatePoolZero(NonPagedPoolNx, C_CAST(SIZE_T, heads) * sizeof(ULONG), DISK_CACHE_INDEX_TAG);
-    Index->Ghosts = ExAllocatePoolZero(NonPagedPoolNx, C_CAST(SIZE_T, heads) * sizeof(ULONG64), DISK_CACHE_INDEX_TAG);
+    const ULONG ghostSets = (heads > 1) ? heads / 2 : 1;
+
+    Index->Ghosts = ExAllocatePoolZero(NonPagedPoolNx, C_CAST(SIZE_T, ghostSets) * DISK_CACHE_GHOST_WAYS * sizeof(ULONG64), DISK_CACHE_INDEX_TAG);
 
     if (!Index->Slots || !Index->Heads || !Index->Ghosts)
     {
@@ -149,6 +152,7 @@ NTSTATUS BlorgDiskCacheIndexInitialize(PDISK_CACHE_INDEX Index, ULONG SlotCount)
 
     Index->SlotCount = SlotCount;
     Index->HashMask = heads - 1;
+    Index->GhostMask = ghostSets - 1;
 
     return STATUS_SUCCESS;
 }
@@ -236,15 +240,22 @@ DISK_CACHE_ADMIT BlorgDiskCacheIndexReserve(PDISK_CACHE_INDEX Index, const DISK_
     KIRQL oldIrql;
     KeAcquireSpinLock(&Index->Lock, &oldIrql);
 
-    PULONG64 ghost = &Index->Ghosts[C_CAST(ULONG, mix) & Index->HashMask];
+    PULONG64 ghosts = &Index->Ghosts[C_CAST(SIZE_T, C_CAST(ULONG, mix) & Index->GhostMask) * DISK_CACHE_GHOST_WAYS];
+    ULONG way = 0;
+
+    while (way < DISK_CACHE_GHOST_WAYS && tag != ghosts[way])
+    {
+        way++;
+    }
 
     if (DISK_CACHE_NO_SLOT != DiskCacheIndexFind(Index, Key, mix))
     {
         admit = DiskCacheHeld;
     }
-    else if (tag != *ghost)
+    else if (DISK_CACHE_GHOST_WAYS == way)
     {
-        *ghost = tag;
+        RtlMoveMemory(&ghosts[1], &ghosts[0], (DISK_CACHE_GHOST_WAYS - 1) * sizeof(ULONG64));
+        ghosts[0] = tag;
         admit = DiskCacheFirstMiss;
     }
     else
@@ -272,7 +283,7 @@ DISK_CACHE_ADMIT BlorgDiskCacheIndexReserve(PDISK_CACHE_INDEX Index, const DISK_
             entry->Next = *head;
             *head = slot;
 
-            *ghost = 0;
+            ghosts[way] = 0;
             *Slot = slot;
             admit = DiskCacheReserved;
         }

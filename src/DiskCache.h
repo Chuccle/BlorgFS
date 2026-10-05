@@ -27,6 +27,15 @@
 #define DISK_CACHE_NO_SLOT     MAXULONG
 
 //
+// Tags a set of the ghost table holds. A direct-mapped table lost about a
+// fifth of a 4096-block file to pairs of blocks evicting each other's tag
+// on every pass, so neither was ever admitted; with four ways and half as
+// many sets as chains, a set overflows only past several times as many
+// distinct misses as the cache has slots.
+//
+#define DISK_CACHE_GHOST_WAYS 4
+
+//
 // Where the cache file lives unless the DiskCachePath registry value says
 // otherwise. ProgramData is on the system volume and always exists; the
 // BlorgFS directory under it is created with the file.
@@ -86,11 +95,11 @@ typedef struct _DISK_CACHE_INDEX
     KSPIN_LOCK Lock;
     PDISK_CACHE_SLOT Slots; // SlotCount entries, NonPagedPoolNx
     PULONG Heads;           // Hash chain heads, HashMask + 1 of them
-    PULONG64 Ghosts;        // Tags of blocks missed once, HashMask + 1 of them
+    PULONG64 Ghosts;        // Tags of blocks missed once, DISK_CACHE_GHOST_WAYS per set, newest first
     ULONG SlotCount;
-    ULONG HashMask;         // Heads and Ghosts are a power of two long
+    ULONG HashMask;         // Heads are a power of two long
     ULONG Hand;             // Next slot the clock looks at for a victim
-    ULONG Reserved;         // explicit tail padding
+    ULONG GhostMask;        // Ghost sets are a power of two long
 } DISK_CACHE_INDEX, * PDISK_CACHE_INDEX;
 
 CHECK_PADDING_BETWEEN(DISK_CACHE_INDEX, Lock, Slots);
@@ -99,8 +108,8 @@ CHECK_PADDING_BETWEEN(DISK_CACHE_INDEX, Heads, Ghosts);
 CHECK_PADDING_BETWEEN(DISK_CACHE_INDEX, Ghosts, SlotCount);
 CHECK_PADDING_BETWEEN(DISK_CACHE_INDEX, SlotCount, HashMask);
 CHECK_PADDING_BETWEEN(DISK_CACHE_INDEX, HashMask, Hand);
-CHECK_PADDING_BETWEEN(DISK_CACHE_INDEX, Hand, Reserved);
-CHECK_PADDING_END(DISK_CACHE_INDEX, Reserved);
+CHECK_PADDING_BETWEEN(DISK_CACHE_INDEX, Hand, GhostMask);
+CHECK_PADDING_END(DISK_CACHE_INDEX, GhostMask);
 
 typedef enum _DISK_CACHE_ADMIT
 {
