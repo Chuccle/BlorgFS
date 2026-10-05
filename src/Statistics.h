@@ -397,6 +397,7 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ListingCacheStaleHits;       // stale snapshot served, refresh owed
     ULONG64 ListingCacheMisses;          // fetched in the foreground
     ULONG64 ListingRefreshes;            // background refetches issued
+    ULONG64 ListingsPrefetched;          // listings beneath a fetched one, cached from its subtree answer
 
     // --- resident files reopened (Create.c) ------------------------------
     ULONG64 FcbRefreshes;                // changed on the server: old pages dropped, new size taken
@@ -537,7 +538,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE 0x00000002
 
 
-#define BLORGFS_STATISTICS_VERSION 18
+#define BLORGFS_STATISTICS_VERSION 19
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

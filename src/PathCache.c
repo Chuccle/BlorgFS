@@ -1169,6 +1169,128 @@ BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO 
 }
 
 //
+//  Whether a listed name can stand as one path component: not empty, short
+//  enough for the listing's own Name field, and free of separators.
+//
+static BOOLEAN PathCacheIsComponent(const WCHAR* Name, SIZE_T NameLength)
+{
+    if (0 == NameLength || NameLength >= MAX_NAME_LEN)
+    {
+        return FALSE;
+    }
+
+    for (SIZE_T i = 0; i < NameLength; ++i)
+    {
+        if (L'\\' == Name[i])
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+//
+//  Publishes the listings a subtree answer carried beneath Dir, under the
+//  ticket the whole answer was fetched with, so an invalidation that
+//  overtook the fetch refuses every one of them as it would the listing of
+//  Dir. Each is offered as its own fetch of that directory would be
+//  (BlorgPathCachePublishListing); none seeds the path cache, since an open
+//  beneath Dir that misses it resolves from its parent's cached listing
+//  (Create.c) and seeding every descendant would flush the path cache for
+//  entries mostly never opened.
+//
+//  Paths are built parent first, which the answer's order guarantees: each
+//  descendant's path is its parent's, a separator, and the name its parent
+//  lists at SubDir. A descendant whose path cannot be built (a parent not
+//  before it, too long, a name the listing could not have produced, a parent
+//  that was skipped) is skipped with everything beneath it. Returns how many were published as
+//  current.
+//
+SIZE_T BlorgPathCachePublishDescendants(const UNICODE_STRING* Dir, PDIRECTORY_INFO Root, const DIRECTORY_DESCENDANT* Descendants, SIZE_T Count, _In_opt_ const PATH_CACHE_TICKET* Ticket)
+{
+    if (!PathCache.Ready || !Dir || 0 == Dir->Length || !Dir->Buffer || !Descendants || 0 == Count)
+    {
+        return 0;
+    }
+
+    PUNICODE_STRING paths = ExAllocatePoolZero(PagedPool, (Count + 1) * sizeof(UNICODE_STRING), PATH_CACHE_TAG);
+
+    if (!paths)
+    {
+        return 0;
+    }
+
+    paths[0] = *Dir;
+
+    SIZE_T published = 0;
+
+    for (SIZE_T i = 0; i < Count; ++i)
+    {
+        if (Descendants[i].Parent > i)
+        {
+            continue;
+        }
+
+        const UNICODE_STRING* parentPath = &paths[Descendants[i].Parent];
+        PDIRECTORY_INFO parent = (0 == Descendants[i].Parent) ? Root : Descendants[Descendants[i].Parent - 1].Listing;
+        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(parent, Descendants[i].SubDir);
+
+        if (!parentPath->Buffer || !sub || !PathCacheIsComponent(sub->Name, sub->NameLength))
+        {
+            continue;
+        }
+
+        BOOLEAN separator = (L'\\' != parentPath->Buffer[(parentPath->Length / sizeof(WCHAR)) - 1]);
+        SIZE_T length = parentPath->Length + (separator ? sizeof(WCHAR) : 0) + (sub->NameLength * sizeof(WCHAR));
+
+        if (length > PATH_CACHE_MAX_PATH_BYTES)
+        {
+            continue;
+        }
+
+        PUNICODE_STRING path = &paths[i + 1];
+        path->Buffer = ExAllocatePoolUninitialized(PagedPool, length, PATH_CACHE_TAG);
+
+        if (!path->Buffer)
+        {
+            continue;
+        }
+
+        path->MaximumLength = C_CAST(USHORT, length);
+
+        RtlCopyMemory(path->Buffer, parentPath->Buffer, parentPath->Length);
+        path->Length = parentPath->Length;
+
+        if (separator)
+        {
+            path->Buffer[path->Length / sizeof(WCHAR)] = L'\\';
+            path->Length = C_CAST(USHORT, path->Length + sizeof(WCHAR));
+        }
+
+        RtlCopyMemory(C_CAST(PUCHAR, path->Buffer) + path->Length, sub->Name, sub->NameLength * sizeof(WCHAR));
+        path->Length = C_CAST(USHORT, length);
+
+        if (BlorgPathCachePublishListing(path, Descendants[i].Listing, Ticket))
+        {
+            published++;
+        }
+    }
+
+    for (SIZE_T i = 1; i <= Count; ++i)
+    {
+        if (paths[i].Buffer)
+        {
+            ExFreePool(paths[i].Buffer);
+        }
+    }
+
+    ExFreePool(paths);
+
+    return published;
+}
+
+//
 //  Wholesale flush in O(1) for the path cache: bump the generation so every
 //  existing entry is now stale (a miss on lookup, a reap target on the next
 //  insert). Memory is reclaimed lazily rather than eagerly, which is fine --

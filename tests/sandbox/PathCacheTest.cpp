@@ -680,6 +680,113 @@ TEST_F(PathCacheListingTest, SnapshotOutlivesItsCacheEntry)
 }
 
 //
+// A subtree answer (DirCtrlPublish): the listings beneath the one fetched
+// are cached under the paths their parents' listings name, so a walk of the
+// tree finds each already there. Descendants holds (listing, parent,
+// subdirectory) as Client.c decodes them; the root listing itself is
+// published by the caller, not here.
+//
+class PathCacheSubtreeTest : public PathCacheListingTest
+{
+protected:
+    static SIZE_T PublishDescendants(const std::wstring& Dir, PDIRECTORY_INFO Root, std::vector<DIRECTORY_DESCENDANT> Descendants, const PATH_CACHE_TICKET* Ticket)
+    {
+        UNICODE_STRING dir = Path(Dir);
+        SIZE_T published = BlorgPathCachePublishDescendants(&dir, Root, Descendants.data(), Descendants.size(), Ticket);
+
+        for (const auto& descendant : Descendants)
+        {
+            BlorgReleaseDirectoryInfo(descendant.Listing);
+        }
+
+        BlorgReleaseDirectoryInfo(Root);
+        return published;
+    }
+
+    static constexpr SIZE_T kNotCached = ~C_CAST(SIZE_T, 0);
+
+    static SIZE_T CachedFileCount(const std::wstring& Dir)
+    {
+        PDIRECTORY_INFO listing = LookupListing(Dir, FALSE);
+        SIZE_T files = listing ? listing->FileCount : kNotCached;
+        BlorgReleaseDirectoryInfo(listing);
+        return files;
+    }
+};
+
+TEST_F(PathCacheSubtreeTest, DescendantsAreCachedUnderThePathsTheirParentsName)
+{
+    PDIRECTORY_INFO root = BuildSyntheticListing(1, 2);
+
+    SIZE_T published = PublishDescendants(L"\\sub\\root", root, {
+        { BuildSyntheticListing(2, 1), 0, 1 },
+        { BuildSyntheticListing(3, 0), 1, 0 },
+        { BuildSyntheticListing(4, 0), 0, 0 },
+    }, nullptr);
+
+    EXPECT_EQ(3u, published);
+    EXPECT_EQ(2u, CachedFileCount(L"\\sub\\root\\dir1"));
+    EXPECT_EQ(3u, CachedFileCount(L"\\sub\\root\\dir1\\dir0"));
+    EXPECT_EQ(4u, CachedFileCount(L"\\sub\\root\\dir0"));
+    EXPECT_EQ(kNotCached, CachedFileCount(L"\\sub\\root")) << "the root listing is the caller's to publish";
+}
+
+TEST_F(PathCacheSubtreeTest, DescendantsOfTheVolumeRootTakeSingleSeparatorPaths)
+{
+    SIZE_T published = PublishDescendants(L"\\", BuildSyntheticListing(0, 1), {
+        { BuildSyntheticListing(5, 0), 0, 0 },
+    }, nullptr);
+
+    EXPECT_EQ(1u, published);
+    EXPECT_EQ(5u, CachedFileCount(L"\\dir0"));
+}
+
+//
+// The whole answer was read under one ticket, so an invalidation that
+// overtook it refuses every listing in it, as it would the one asked for.
+//
+TEST_F(PathCacheSubtreeTest, AnInvalidationThatOvertookTheAnswerRefusesEveryDescendant)
+{
+    PATH_CACHE_TICKET ticket;
+    BlorgPathCacheTakeTicket(&ticket);
+
+    UNICODE_STRING changed = RTL_CONSTANT_STRING(L"\\sub\\raced\\dir0\\file0.bin");
+    BlorgPathCacheInvalidate(&changed);
+
+    SIZE_T published = PublishDescendants(L"\\sub\\raced", BuildSyntheticListing(0, 1), {
+        { BuildSyntheticListing(1, 0), 0, 0 },
+    }, &ticket);
+
+    EXPECT_EQ(0u, published);
+    EXPECT_EQ(kNotCached, CachedFileCount(L"\\sub\\raced\\dir0"));
+}
+
+//
+// A name that cannot be one path component (here one holding a separator,
+// which a unix server could list) would cache a listing under some other
+// directory's path; it is skipped, and so is everything beneath it, since
+// their paths are built from it.
+//
+TEST_F(PathCacheSubtreeTest, ADescendantWithAnUnusableNameIsSkippedWithEverythingBeneathIt)
+{
+    PDIRECTORY_INFO root = BuildSyntheticListing(0, 2);
+    PDIRECTORY_SUBDIR_METADATA bad = BlorgGetSubDirEntry(root, 0);
+    wcscpy_s(bad->Name, MAX_NAME_LEN, L"a\\b");
+    bad->NameLength = 3;
+
+    SIZE_T published = PublishDescendants(L"\\sub\\named", root, {
+        { BuildSyntheticListing(1, 1), 0, 0 },
+        { BuildSyntheticListing(2, 0), 1, 0 },
+        { BuildSyntheticListing(3, 0), 0, 1 },
+    }, nullptr);
+
+    EXPECT_EQ(1u, published);
+    EXPECT_EQ(kNotCached, CachedFileCount(L"\\sub\\named\\a\\b"));
+    EXPECT_EQ(kNotCached, CachedFileCount(L"\\sub\\named\\a\\b\\dir0"));
+    EXPECT_EQ(3u, CachedFileCount(L"\\sub\\named\\dir1"));
+}
+
+//
 // What the server marked no-store (Client.c's HttpForbidsStoring) is refused
 // by both caches. The server sends it for an answer it could not vouch for
 // against its own change feed -- a load an invalidation overtook, or a path

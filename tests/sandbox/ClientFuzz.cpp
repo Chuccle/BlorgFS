@@ -207,7 +207,7 @@ extern "C" int BlorgFuzzOnce(const unsigned char* Data, size_t Size)
     const bool fuzzDirectoryListing = (chunkMode & 0x04) != 0;
 
     NTSTATUS status = fuzzDirectoryListing
-        ? BlorgHttpGetDirectoryInfo(&pathString, OnDirInfo, nullptr)
+        ? BlorgHttpGetDirectoryInfo(&pathString, 0, OnDirInfo, nullptr)
         : BlorgHttpGetFileMdl(&pathString, 0, sizeof(target), mdl, OnFileRead, nullptr);
 
     SandboxDrainCompletions();
