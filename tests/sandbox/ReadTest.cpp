@@ -634,7 +634,7 @@ protected:
     void TearDown() override
     {
         IoSetTopLevelIrp(nullptr);
-        Drain();
+        Settle();
         BlorgFreeFileContext(CopyFcb, Volume);
         ReadTest::TearDown();
     }
@@ -648,6 +648,19 @@ protected:
         IoSetTopLevelIrp(nullptr);
 
         return req;
+    }
+
+    //
+    // Drain until nothing is left. A released read is issued from a work
+    // item and its deferred peer answers on the next completion drain, so
+    // one pass of Drain() stops half way through.
+    //
+    void Settle()
+    {
+        do
+        {
+            SandboxDrainCompletions();
+        } while (ShimDrainWorkItems() > 0);
     }
 
     ULONG64 Yielded()
@@ -691,7 +704,7 @@ TEST_F(ReadYieldTest, GreedyReadAheadWaitsForAPlayersFetchThenIssues)
     EXPECT_EQ(1ull, Yielded());
     EXPECT_EQ(0, copy->Irp.CompletionCount);
 
-    Drain();
+    Settle();
 
     EXPECT_EQ(1, player->Irp.CompletionCount);
     EXPECT_EQ(2u, SandboxSocketsCreated())
@@ -723,7 +736,7 @@ TEST_F(ReadYieldTest, GreedyReadAheadWithNothingInFlightIsIssuedAtOnce)
     EXPECT_EQ(1u, SandboxSocketsCreated());
     EXPECT_EQ(0ull, Yielded());
 
-    Drain();
+    Settle();
 
     EXPECT_EQ(1, copy->Irp.CompletionCount);
     EXPECT_EQ(STATUS_SUCCESS, copy->Irp.IoStatus.Status);
@@ -770,7 +783,7 @@ TEST_F(ReadYieldTest, EachPriorityCompletionReleasesAHeldReadEvenWhileOthersAreI
         << "the copy stayed held behind a priority fetch that had already completed";
     EXPECT_EQ(STATUS_SUCCESS, copy->Irp.IoStatus.Status);
 
-    Drain();
+    Settle();
 
     EXPECT_EQ(1, first->Irp.CompletionCount);
 }
@@ -797,7 +810,7 @@ TEST_F(ReadYieldTest, DemandFaultOnAGreedyFileIsNeverHeld)
         << "a fault with an application blocked on it was held behind read-ahead";
     EXPECT_EQ(0ull, Yielded());
 
-    Drain();
+    Settle();
 
     EXPECT_EQ(1, player->Irp.CompletionCount);
     EXPECT_EQ(1, fault->Irp.CompletionCount);

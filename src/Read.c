@@ -950,6 +950,9 @@ static VOID ReadYieldWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
     UNREFERENCED_PARAMETER(DeviceObject);
 
     PIRP irp = Context;
+
+    NT_ASSERT(NULL != irp);
+
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
     PFCB fcb = irpSp->FileObject->FsContext;
 
