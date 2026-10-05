@@ -22,7 +22,8 @@
 //  if an invalidation ran in between; see BlorgPathCacheTakeTicket.
 //
 
-#define PATH_CACHE_BUCKETS         256u   // power of two
+#define PATH_CACHE_BUCKET_BITS     8u
+#define PATH_CACHE_BUCKETS         (1u << PATH_CACHE_BUCKET_BITS)
 #define PATH_CACHE_MAX_PER_BUCKET  16u
 #define PATH_CACHE_MAX_PATH_BYTES  4096u
 #define PATH_CACHE_TAG             'CPHT'
@@ -34,7 +35,8 @@
 // BlorgPathCacheSeedListing).
 #define PATH_CACHE_SEED_MAX        ((PATH_CACHE_BUCKETS * PATH_CACHE_MAX_PER_BUCKET) / 4u)
 
-#define LISTING_CACHE_BUCKETS      64u    // power of two
+#define LISTING_CACHE_BUCKET_BITS  8u
+#define LISTING_CACHE_BUCKETS      (1u << LISTING_CACHE_BUCKET_BITS)
 #define LISTING_CACHE_MAX_PER_BUCKET 8u
 #define LISTING_CACHE_MAX_BYTES    (32LL * 1024LL * 1024LL)
 #define LISTING_CACHE_TAG          'CLHT'
@@ -159,34 +161,14 @@ typedef struct _PATH_CACHE_STATE
 
 static PATH_CACHE_STATE PathCache;
 
-//
-// Hashes Path case-insensitively. Falls back to a manual case-insensitive
-// hash on failure, which is belt-and-braces since RtlHashUnicodeString only
-// fails on bad args already excluded by every caller.
-//
-static ULONG PathCacheHash(const UNICODE_STRING* Path)
-{
-    ULONG hash = 0;
-
-    if (!NT_SUCCESS(RtlHashUnicodeString(Path, TRUE, HASH_STRING_ALGORITHM_DEFAULT, &hash)))
-    {
-        for (USHORT i = 0; i < Path->Length / sizeof(WCHAR); i++)
-        {
-            hash = (hash * 131u) + RtlUpcaseUnicodeChar(Path->Buffer[i]);
-        }
-    }
-
-    return hash;
-}
-
 static PATH_CACHE_BUCKET* PathCacheBucket(const UNICODE_STRING* Path)
 {
-    return &PathCache.Buckets[PathCacheHash(Path) & (PATH_CACHE_BUCKETS - 1u)];
+    return &PathCache.Buckets[BlorgHashPath(Path) >> (32u - PATH_CACHE_BUCKET_BITS)];
 }
 
 static PATH_CACHE_BUCKET* ListingCacheBucket(const UNICODE_STRING* Path)
 {
-    return &PathCache.ListingBuckets[PathCacheHash(Path) & (LISTING_CACHE_BUCKETS - 1u)];
+    return &PathCache.ListingBuckets[BlorgHashPath(Path) >> (32u - LISTING_CACHE_BUCKET_BITS)];
 }
 
 //

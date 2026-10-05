@@ -567,6 +567,7 @@ NTSTATUS BlorgCreateCCB(_Outptr_result_nullonfailure_ CCB** Ccb, const DEVICE_OB
 VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject);
 VOID BlorgReapEmptyAncestorDcbs(PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject);
 
+ULONG BlorgHashPath(const UNICODE_STRING* Path);
 PCOMMON_CONTEXT BlorgSearchByPath(const DCB* RootDcb, const UNICODE_STRING* Path);
 NTSTATUS BlorgInsertByPath(PDCB RootDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out);
 
