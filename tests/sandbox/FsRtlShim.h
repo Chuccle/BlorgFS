@@ -32,6 +32,17 @@ typedef struct _SECTION_OBJECT_POINTERS
     PVOID Reserved;
 } SECTION_OBJECT_POINTERS, * PSECTION_OBJECT_POINTERS;
 
+typedef enum _MMFLUSH_TYPE
+{
+    MmFlushForDelete,
+    MmFlushForWrite
+} MMFLUSH_TYPE;
+
+#define UNINITIALIZE_CACHE_MAPS 1
+
+#define CcIsFileCached(FO) (((FO)->SectionObjectPointer != NULL) && \
+    (((PSECTION_OBJECT_POINTERS)(FO)->SectionObjectPointer)->SharedCacheMap != NULL))
+
 //
 // FSRTL_ADVANCED_FCB_HEADER.IsFastIoPossible takes one of these; the
 // driver assigns FastIoIsQuestionable so Cc routes fast I/O through

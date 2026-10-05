@@ -6,7 +6,9 @@
 // FILES through BlorgCreate; a directory open takes a structurally
 // different branch in BlorgVolumeCreate (FILE_NON_DIRECTORY_FILE checks,
 // OpenExistingDcb's CCB allocation, the root-path shortcut) that a
-// file-only opener never touches.
+// file-only opener never touches. The same plumbing drives the reopen of
+// a resident file after the server's copy changed (FcbReopenTest, at the
+// end), the one file-open branch those targets do not reach.
 //
 // CheckFileAccess and CheckDirectoryAccess are `static inline` in
 // Create.c, unreachable from any other translation unit -- the same
@@ -176,7 +178,8 @@ protected:
 
     //
     // A node built and published the way a completed cold open leaves one
-    // (see BlorgInsertByPath/BlorgNodeTablePublish in Create.c).
+    // (see BlorgInsertByPath/BlorgNodeTablePublish in Create.c), a file
+    // stamped as just read so the warm path trusts it (FcbIsCurrent).
     //
     PCOMMON_CONTEXT MakePublishedNode(const wchar_t* path, BOOLEAN IsDirectory)
     {
@@ -191,6 +194,11 @@ protected:
 
         if (node)
         {
+            if (!IsDirectory)
+            {
+                BlorgPathCacheTakeTicket(&C_CAST(PFCB, node)->MetaTicket);
+            }
+
             BlorgNodeTablePublish(node);
         }
 
@@ -910,6 +918,174 @@ TEST_F(CreateDirectoryTest, FailedColdOpenDefersItsInsertedNodeForReap)
 
     EXPECT_EQ(nullptr, stranded)
         << "the resolved node was never reaped after its open failed";
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// Reopening a resident file -- FcbIsCurrent / FcbRefresh
+///////////////////////////////////////////////////////////////////////////
+
+//
+// A file read and closed stays resident while Cc holds its file object:
+// cleaned up, its close still owed. These drive the next open of it after
+// the server's copy changed, which is what the warm path used to answer
+// with the old size. The change arrives the way the change feed delivers
+// one: the path is invalidated, then the path cache learns the new answer.
+//
+class FcbReopenTest : public CreateDirectoryTest
+{
+protected:
+    void SetUp() override
+    {
+        CreateDirectoryTest::SetUp();
+
+        ASSERT_NE(nullptr, MakePublishedNode(L"\\media", TRUE));
+        File = C_CAST(PFCB, MakePublishedNode(L"\\media\\clip.bin", FALSE));
+        ASSERT_NE(nullptr, File);
+
+        Stats = BlorgStatisticsForCurrentProcessor();
+        ASSERT_NE(nullptr, Stats);
+    }
+
+    NTSTATUS Open(CreateOpener* opener)
+    {
+        PrepareOpener(opener, Path(L"\\media\\clip.bin"), FILE_READ_DATA, kShareAll, 0);
+        BlorgCreate(Volume, &opener->CreateIrp);
+        return opener->CreateIrp.IoStatus.Status;
+    }
+
+    static void ServerChanged(ULONG64 size, ULONG64 lastModified)
+    {
+        UNICODE_STRING path = Path(L"\\media\\clip.bin");
+        BlorgPathCacheInvalidate(&path);
+
+        DIRECTORY_ENTRY_METADATA meta = {};
+        meta.Size = size;
+        meta.LastModifiedTime = lastModified;
+        BlorgPathCacheInsertExists(&path, &meta, nullptr);
+    }
+
+    PFCB File = nullptr;
+    PBLORGFS_STATISTICS Stats = nullptr;
+};
+
+TEST_F(FcbReopenTest, ReopenAfterTheServerChangedTheFileTakesTheNewSize)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    ServerChanged(5096, 7);
+
+    const LONG purgesBefore = ShimCachePurges();
+    const ULONG64 refreshesBefore = Stats->FcbRefreshes;
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    EXPECT_EQ(File, second.FileObject.FsContext)
+        << "the resident FCB is refreshed in place, not replaced by a second one for the same file";
+    EXPECT_EQ(5096, File->Header.FileSize.QuadPart);
+    EXPECT_EQ(5096, File->Header.AllocationSize.QuadPart);
+    EXPECT_EQ(7u, File->LastModifiedTime);
+    EXPECT_EQ(purgesBefore + 1, ShimCachePurges()) << "the old pages must go before the new size is taken";
+    EXPECT_EQ(refreshesBefore + 1, Stats->FcbRefreshes);
+
+    CloseOpener(&second);
+    BlorgClose(Volume, &first.CloseIrp);
+}
+
+TEST_F(FcbReopenTest, ReopenWhileAHandleIsOpenSharesTheCopyThatHandleHas)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+
+    ServerChanged(5096, 7);
+
+    const LONG purgesBefore = ShimCachePurges();
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    EXPECT_EQ(File, second.FileObject.FsContext);
+    EXPECT_EQ(4096, File->Header.FileSize.QuadPart)
+        << "changing the size under an open handle would tear the view it is reading";
+    EXPECT_EQ(purgesBefore, ShimCachePurges());
+
+    CloseOpener(&second);
+    CloseOpener(&first);
+}
+
+TEST_F(FcbReopenTest, ReopenOfAFileRemovedOnTheServerIsNotFound)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    UNICODE_STRING path = Path(L"\\media\\clip.bin");
+    BlorgPathCacheInvalidate(&path);
+    BlorgPathCacheInsertNotFound(&path, nullptr);
+
+    CreateOpener second;
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, Open(&second))
+        << "a resident FCB must not answer for a file the server no longer has";
+
+    BlorgClose(Volume, &first.CloseIrp);
+}
+
+TEST_F(FcbReopenTest, ReopenOfAnUnchangedFileIsAnsweredWarm)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    ServerChanged(4096, 0);
+
+    const LONG purgesBefore = ShimCachePurges();
+    const ULONG64 refreshesBefore = Stats->FcbRefreshes;
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    EXPECT_EQ(File, second.FileObject.FsContext);
+    EXPECT_EQ(purgesBefore, ShimCachePurges()) << "nothing changed, so nothing cached may be dropped";
+    EXPECT_EQ(refreshesBefore, Stats->FcbRefreshes);
+
+    CloseOpener(&second);
+    BlorgClose(Volume, &first.CloseIrp);
+}
+
+//
+// A user-mapped view outlives its handle and keeps the old pages, which
+// is when the purge fails. The FCB then keeps its old copy whole rather
+// than taking a size its cached pages disagree with, and the next open
+// after the view is gone takes the new one.
+//
+TEST_F(FcbReopenTest, PurgeRefusedKeepsTheOldCopyUntilTheNextOpen)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    ServerChanged(5096, 7);
+
+    const ULONG64 deferredBefore = Stats->FcbRefreshesDeferred;
+
+    ShimRefuseNextCachePurge();
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+    EXPECT_EQ(4096, File->Header.FileSize.QuadPart);
+    EXPECT_EQ(0u, File->LastModifiedTime);
+    EXPECT_EQ(deferredBefore + 1, Stats->FcbRefreshesDeferred);
+    CloseOpener(&second);
+
+    CreateOpener third;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&third));
+    EXPECT_EQ(5096, File->Header.FileSize.QuadPart);
+    CloseOpener(&third);
+
+    BlorgClose(Volume, &first.CloseIrp);
 }
 
 } // namespace

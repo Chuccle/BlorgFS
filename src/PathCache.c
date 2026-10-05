@@ -392,6 +392,22 @@ VOID BlorgPathCacheTakeTicket(PPATH_CACHE_TICKET Ticket)
 }
 
 //
+// Whether what was read under Ticket is still as good as a cache entry read
+// then would be: no invalidation has run since, and it is younger than the
+// lifetime. For state kept outside these caches that follows their rule
+// without a lookup, which is a resident FCB's size (Create.c). The sequence
+// test is coarser than a lookup, since an invalidation of any path fails
+// it, and a caller falls back to a lookup rather than trusting less. A zero
+// IssueTime is a ticket never taken.
+//
+BOOLEAN BlorgPathCacheTicketCurrent(const PATH_CACHE_TICKET* Ticket)
+{
+    return (0 != Ticket->IssueTime) &&
+           (Ticket->Sequence == ReadNoFence64(&PathCache.Sequence)) &&
+           (PathCacheAge(Ticket->IssueTime, KeQueryInterruptTime()) < PathCacheLifetime());
+}
+
+//
 // Counts every resolution in MetaDataReads, not every miss: the number
 // means "how many create-time lookups ran", alongside PathCacheHits and
 // PathCacheMisses which split it, and MetaDataDiskReads (Client.c) which

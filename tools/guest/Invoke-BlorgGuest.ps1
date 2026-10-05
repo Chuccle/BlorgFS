@@ -660,12 +660,10 @@ function Invoke-TestStep {
         # visible within the deadline, and only the feed reports it to a
         # watcher: a short TTL would converge too, but silently.
         #
-        # Contents are never read. An FCB whose file was read lives on after
-        # its last close while the memory manager keeps its pages, and an
-        # open of it is answered from that FCB without asking the cache or
-        # the server; nothing refreshes it yet, feed or not. That is why
-        # feed\ is created here, after the correctness step has read
-        # everything else on the volume.
+        # grows.bin is read whole before it grows. Its FCB then lives on after
+        # the last close while the cache manager keeps its pages, so the
+        # reopen after the change is the one that must notice and drop them
+        # (FcbRefresh in Create.c): the new size, and reads to the new end.
         Invoke-Step 'changes' -NeedsMount {
             param($log)
             if (-not $HostChanges) { return 'skip' }
@@ -700,6 +698,7 @@ function Invoke-TestStep {
             $null = [System.IO.File]::Exists("$dir\born.bin")
             $null = [System.IO.Directory]::Exists("$dir\newdir")
             $null = ([System.IO.FileInfo]::new("$dir\grows.bin")).Length
+            $null = [System.IO.File]::ReadAllBytes("$dir\grows.bin")
 
             $watcher = New-Object System.IO.FileSystemWatcher $dir
             $watcher.IncludeSubdirectories = $false
@@ -718,6 +717,7 @@ function Invoke-TestStep {
                     elseif (([System.IO.FileInfo]::new("$dir\born.bin")).Length -ne 123) { 'born.bin not 123 bytes' }
                     if ([System.IO.File]::Exists("$dir\doomed.bin") -or $names -contains 'doomed.bin') { 'doomed.bin still there' }
                     if (([System.IO.FileInfo]::new("$dir\grows.bin")).Length -ne 5096) { 'grows.bin not 5096 bytes' }
+                    elseif ([System.IO.File]::ReadAllBytes("$dir\grows.bin").Length -ne 5096) { 'grows.bin reads short of 5096 bytes' }
                     if (-not [System.IO.File]::Exists("$dir\newdir\inner.bin")) { 'newdir\inner.bin not there' }
                     if ($seen.Count -eq 0) { 'no directory-change notification' }
                 }

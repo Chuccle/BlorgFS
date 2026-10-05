@@ -52,6 +52,26 @@ CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, IsDirectory, NoStore);
 CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, NoStore, Reserved);
 CHECK_PADDING_END(DIRECTORY_ENTRY_METADATA, Reserved);
 
+//
+//  What a reader saw of the cache before it went to look something up: the
+//  invalidation sequence and the time. Every insert of a result read from
+//  somewhere else -- the network, or a cached listing -- carries the ticket
+//  taken before that read, and is refused if any invalidation ran in
+//  between (see the protocol note above BlorgPathCacheTakeTicket). That is
+//  what stops a request issued before a change from re-caching what the
+//  change just invalidated, with no TTL left to correct it once one exists.
+//  A NULL ticket inserts unconditionally, for state that was not read from
+//  anywhere (tests, and nothing else).
+//
+typedef struct _PATH_CACHE_TICKET
+{
+    LONG64  Sequence;  // PathCache invalidation sequence when taken
+    ULONG64 IssueTime; // KeQueryInterruptTime when taken
+} PATH_CACHE_TICKET, * PPATH_CACHE_TICKET;
+
+CHECK_PADDING_BETWEEN(PATH_CACHE_TICKET, Sequence, IssueTime);
+CHECK_PADDING_END(PATH_CACHE_TICKET, IssueTime);
+
 ///////////////////////////////////////////////////////////
 //////// Structures for ListDirectory operation ///////////
 ///////////////////////////////////////////////////////////
@@ -414,6 +434,16 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     PVOID           LazyWriteThread;// Thread performing lazy write, if any
 
     //
+    // When the size and times above were read from the server, judged by
+    // the path cache's rule (BlorgPathCacheTicketCurrent): no invalidation
+    // since, and younger than the cache's lifetime. Stamped by the open
+    // that inserted this FCB, before publishing it, or that refreshed it,
+    // under the FCB resource. Zero is never current. See FcbIsCurrent
+    // (Create.c).
+    //
+    PATH_CACHE_TICKET MetaTicket;
+
+    //
     // Read-pattern trackers, touched only at PASSIVE_LEVEL from the
     // paging-read dispatch path. A read starting where a tracker's last
     // read ended extends that tracker's streak; anything else claims the
@@ -557,7 +587,8 @@ CHECK_PADDING_BETWEEN(FCB, RefCount, OnReapList);
 CHECK_PADDING_BETWEEN(FCB, OnReapList, TableBucketIndex);
 CHECK_PADDING_BETWEEN(FCB, TableBucketIndex, FileLock);
 CHECK_PADDING_BETWEEN(FCB, FileLock, LazyWriteThread);
-CHECK_PADDING_BETWEEN(FCB, LazyWriteThread, Streams);
+CHECK_PADDING_BETWEEN(FCB, LazyWriteThread, MetaTicket);
+CHECK_PADDING_BETWEEN(FCB, MetaTicket, Streams);
 CHECK_PADDING_BETWEEN(FCB, Streams, ReadAheadFetchedBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadFetchedBytes, ReadAheadConsumedBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadConsumedBytes, ReadIdleLastEndQpc);
@@ -684,29 +715,10 @@ typedef enum _PATH_CACHE_RESULT
     PathCacheNotFound
 } PATH_CACHE_RESULT;
 
-//
-//  What a reader saw of the cache before it went to look something up: the
-//  invalidation sequence and the time. Every insert of a result read from
-//  somewhere else -- the network, or a cached listing -- carries the ticket
-//  taken before that read, and is refused if any invalidation ran in
-//  between (see the protocol note above BlorgPathCacheTakeTicket). That is
-//  what stops a request issued before a change from re-caching what the
-//  change just invalidated, with no TTL left to correct it once one exists.
-//  A NULL ticket inserts unconditionally, for state that was not read from
-//  anywhere (tests, and nothing else).
-//
-typedef struct _PATH_CACHE_TICKET
-{
-    LONG64  Sequence;  // PathCache invalidation sequence when taken
-    ULONG64 IssueTime; // KeQueryInterruptTime when taken
-} PATH_CACHE_TICKET, * PPATH_CACHE_TICKET;
-
-CHECK_PADDING_BETWEEN(PATH_CACHE_TICKET, Sequence, IssueTime);
-CHECK_PADDING_END(PATH_CACHE_TICKET, IssueTime);
-
 VOID BlorgPathCacheInit(VOID);
 VOID BlorgPathCacheCleanup(VOID);
 VOID BlorgPathCacheTakeTicket(PPATH_CACHE_TICKET Ticket);
+BOOLEAN BlorgPathCacheTicketCurrent(const PATH_CACHE_TICKET* Ticket);
 PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta);
 VOID BlorgPathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket);
 VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path, _In_opt_ const PATH_CACHE_TICKET* Ticket);

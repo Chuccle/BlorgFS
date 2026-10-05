@@ -626,6 +626,8 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
         t.PathCacheHits, t.PathCacheMisses);
     printf("    listings hit/stale/miss %10llu / %llu / %llu  (%llu refreshed behind)\n",
         t.ListingCacheHits, t.ListingCacheStaleHits, t.ListingCacheMisses, t.ListingRefreshes);
+    printf("    reopened refreshed    %12llu  (%llu kept, still in use)\n",
+        t.FcbRefreshes, t.FcbRefreshesDeferred);
     printf("    change feed           %12s  (%llu polls, %llu failed, %llu resets)\n",
         (stats.Flags & BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE) ? "live" : "down",
         t.ChangeFeedPolls, t.ChangeFeedFailures, t.ChangeFeedResets);
@@ -2775,6 +2777,8 @@ static bool WriteReport(
     fprintf(f, "ListingCacheStaleHits=%llu\n", t.ListingCacheStaleHits);
     fprintf(f, "ListingCacheMisses=%llu\n", t.ListingCacheMisses);
     fprintf(f, "ListingRefreshes=%llu\n", t.ListingRefreshes);
+    fprintf(f, "FcbRefreshes=%llu\n", t.FcbRefreshes);
+    fprintf(f, "FcbRefreshesDeferred=%llu\n", t.FcbRefreshesDeferred);
     fprintf(f, "ChangeFeedLive=%u\n", (stats.Flags & BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE) ? 1u : 0u);
     fprintf(f, "ChangeFeedPolls=%llu\n", t.ChangeFeedPolls);
     fprintf(f, "ChangeFeedFailures=%llu\n", t.ChangeFeedFailures);

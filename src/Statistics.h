@@ -398,6 +398,10 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ListingCacheMisses;          // fetched in the foreground
     ULONG64 ListingRefreshes;            // background refetches issued
 
+    // --- resident files reopened (Create.c) ------------------------------
+    ULONG64 FcbRefreshes;                // changed on the server: old pages dropped, new size taken
+    ULONG64 FcbRefreshesDeferred;        // changed, but a handle, view or image still held the old copy
+
     // --- change feed (ChangeFeed.c) ------------------------------------------
     ULONG64 ChangeFeedPolls;             // long-polls issued
     ULONG64 ChangeFeedFailures;          // polls that failed, taking the feed down
@@ -533,7 +537,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE 0x00000002
 
 
-#define BLORGFS_STATISTICS_VERSION 17
+#define BLORGFS_STATISTICS_VERSION 18
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {
