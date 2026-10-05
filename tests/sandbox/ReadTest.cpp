@@ -683,7 +683,8 @@ protected:
 // The last read defends the accounting. Every admitted byte must be
 // settled, the released read's included; one leaked byte past a budget
 // and every later read-ahead on the volume is held behind a fetch that
-// will never complete.
+// will never complete. It is checked by the held count, not by sockets:
+// the earlier fetches left a pooled connection the read may reuse.
 //
 TEST_F(ReadFairTest, ReadAheadPastTheBudgetWaitsThenIssues)
 {
@@ -713,12 +714,14 @@ TEST_F(ReadFairTest, ReadAheadPastTheBudgetWaitsThenIssues)
     EXPECT_EQ(0, memcmp(secondBuffer, "WXYZ", 4))
         << "the released read must fetch the range it was held with";
 
-    const ULONG sockets = SandboxSocketsCreated();
-    ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* after = ReadAhead(CopyFcb, NewBuffer(4));
 
-    EXPECT_EQ(sockets + 1, SandboxSocketsCreated())
+    EXPECT_EQ(1ull, Held())
         << "bytes were left counted in flight with nothing on the link";
-    EXPECT_EQ(1ull, Held());
+
+    Settle();
+
+    EXPECT_EQ(1, after->Irp.CompletionCount);
 }
 
 //
