@@ -366,6 +366,11 @@ LONG KeSetEvent(PKEVENT Event, LONG Increment, BOOLEAN Wait)
     return 0;
 }
 
+VOID KeClearEvent(PKEVENT Event)
+{
+    ResetEvent(Event->Handle);
+}
+
 //
 // A real wait, because the drain paths under test are genuinely
 // cross-thread: the completion that satisfies the wait runs on the

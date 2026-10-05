@@ -93,7 +93,29 @@ VOID FsRtlNotifyFullChangeDirectory(
     PNOTIFY_SYNC Sync, PLIST_ENTRY List, PVOID Context, PSTRING FullName,
     BOOLEAN WatchTree, BOOLEAN IgnoreBuffer, ULONG Filter, PIRP Irp,
     PVOID TraverseCallback, PVOID SubjectContext);
+VOID FsRtlNotifyFullReportChange(
+    PNOTIFY_SYNC Sync, PLIST_ENTRY List, PSTRING FullTargetName, USHORT TargetNameOffset,
+    PSTRING StreamName, PSTRING NormalizedParentName, ULONG FilterMatch, ULONG Action,
+    PVOID TargetContext);
 BOOLEAN FsRtlIsNameInExpression(PUNICODE_STRING Expression, PUNICODE_STRING Name, BOOLEAN IgnoreCase, PWCH Upcase);
+
+//
+// What FsRtlNotifyFullReportChange was asked to report, oldest first, so a
+// test can assert on the directory a change was reported into and how. The
+// path is copied; ShimNotifyReportsReset forgets them all.
+//
+typedef struct _SHIM_NOTIFY_REPORT
+{
+    WCHAR  Path[260];
+    USHORT PathLength;
+    USHORT NameOffset;
+    ULONG  Filter;
+    ULONG  Action;
+} SHIM_NOTIFY_REPORT;
+
+ULONG ShimNotifyReportCount(VOID);
+const SHIM_NOTIFY_REPORT* ShimNotifyReport(ULONG Index);
+VOID ShimNotifyReportsReset(VOID);
 BOOLEAN FsRtlAreNamesEqual(PCUNICODE_STRING A, PCUNICODE_STRING B, BOOLEAN IgnoreCase, PCWCH Upcase);
 
 VOID CcInitializeCacheMap(PFILE_OBJECT F, PCC_FILE_SIZES Sizes, BOOLEAN PinAccess, PCACHE_MANAGER_CALLBACKS Callbacks, PVOID Context);

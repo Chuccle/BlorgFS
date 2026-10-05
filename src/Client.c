@@ -1,12 +1,13 @@
 ﻿//
 // Async HTTP client used to talk to the Blorg metadata/file server.
 // Every public entry point (BlorgHttpGetDirectoryInfo, BlorgHttpGetFileInfo,
-// BlorgHttpGetFile/BlorgHttpGetFileMdl) issues a request and returns
-// STATUS_PENDING; the result is delivered via a caller-supplied completion
-// callback once the request/response cycle finishes on the WSK/IRP
-// completion chain. Covers connection acquisition, optional TLS 1.3
-// record-layer send/receive, HTTP header/body parsing, and FlatBuffer
-// deserialization of directory/file metadata responses.
+// BlorgHttpGetFile/BlorgHttpGetFileMdl, BlorgHttpGetChanges) issues a
+// request and returns STATUS_PENDING; the result is delivered via a
+// caller-supplied completion callback once the request/response cycle
+// finishes on the WSK/IRP completion chain. Covers connection acquisition,
+// optional TLS 1.3 record-layer send/receive, HTTP header/body parsing, and
+// FlatBuffer deserialization of directory/file metadata and change-feed
+// responses.
 //
 
 #include "Driver.h"
@@ -271,7 +272,8 @@ typedef enum _HTTP_OPERATION
 {
     HttpOpDirInfo,  // GET directory listing metadata
     HttpOpFileInfo, // GET single file/dir entry metadata
-    HttpOpFileRead  // ranged GET of file content
+    HttpOpFileRead, // ranged GET of file content
+    HttpOpChanges   // held GET of the change feed
 } HTTP_OPERATION;
 
 // Current step of the async request/response state machine.
@@ -414,6 +416,11 @@ typedef struct _HTTP_CONTEXT
         {
             PBLORG_FILEREAD_COMPLETION Routine;
         } FileRead;
+
+        struct
+        {
+            PBLORG_CHANGES_COMPLETION Routine;
+        } Changes;
     } Completion;
 
     PVOID CallerContext;
@@ -436,6 +443,13 @@ typedef struct _HTTP_CONTEXT
     ULONG Capacity;
     ULONG Length;
     ULONG ConnectTimeouts; // connects that hit SOCKET_CONNECT_TIMEOUT_MS; see HttpOnSocket
+
+    //
+    // The response carried Cache-Control: no-store (HttpForbidsStoring).
+    // Decided in HttpParseHeaders, while Headers is valid, and copied onto
+    // the metadata result at dispatch.
+    //
+    BOOLEAN NoStore;
 
     //
     // QPC stamp taken when the request is built, so HttpComplete can fold
@@ -535,6 +549,7 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status);
 
 static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO* OutDirInfo);
 static NTSTATUS HttpDeserializeDirectoryEntryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_ENTRY_METADATA DirEntryInfo);
+static NTSTATUS HttpDeserializeChangeBatch(HTTP_CONTEXT* Ctx, PCHANGE_BATCH* OutBatch);
 
 ///////////////////////////////////////////////////////////////////////////
 // Small string/parsing helpers
@@ -570,13 +585,14 @@ static NTSTATUS StrToSize(const char* AsciiBuffer, SIZE_T Length, PSIZE_T Result
 }
 
 //
-// Case-insensitive ASCII header-name compare. Local by necessity, not
-// preference: RtlEqualString(CaseInSensitive=TRUE) is documented
-// PASSIVE_LEVEL only, and header parsing runs directly on the WSK
-// completion chain (<= DISPATCH) for file reads. Header names are ASCII
-// per RFC 9110, so a locale-free A-Z fold is exact.
+// Case-insensitive ASCII compare of a header name, or of a token in a
+// header's value. Local by necessity, not preference:
+// RtlEqualString(CaseInSensitive=TRUE) is documented PASSIVE_LEVEL only,
+// and header parsing runs directly on the WSK completion chain
+// (<= DISPATCH) for file reads. Header names and the tokens compared here
+// are ASCII per RFC 9110, so a locale-free A-Z fold is exact.
 //
-static BOOLEAN HttpHeaderNameEquals(const char* Name, SIZE_T NameLength, const char* LowerCaseExpected, SIZE_T ExpectedLength)
+static BOOLEAN HttpTokenEquals(const char* Name, SIZE_T NameLength, const char* LowerCaseExpected, SIZE_T ExpectedLength)
 {
     if (NameLength != ExpectedLength)
     {
@@ -626,7 +642,7 @@ static NTSTATUS GetContentLengthFromHeaders(const struct phr_header* Headers, SI
 
     for (SIZE_T i = 0; i < HeaderCount; ++i)
     {
-        if (!HttpHeaderNameEquals(Headers[i].name, Headers[i].name_len, contentLengthName, sizeof(contentLengthName) - 1))
+        if (!HttpTokenEquals(Headers[i].name, Headers[i].name_len, contentLengthName, sizeof(contentLengthName) - 1))
         {
             continue;
         }
@@ -640,6 +656,65 @@ static NTSTATUS GetContentLengthFromHeaders(const struct phr_header* Headers, SI
     }
 
     return result;
+}
+
+//
+// Whether the response carries Cache-Control: no-store. The server marks
+// an answer it cannot vouch for that way -- a load a change overtook, or a
+// path reached through a symlink, whose changes its feed reports under
+// another name -- and the path cache must not keep it. Every Cache-Control
+// header and every comma-separated directive in each is looked at, since
+// anything between the server and here may add its own; a directive's
+// argument, if it has one, is not.
+//
+static BOOLEAN HttpForbidsStoring(const struct phr_header* Headers, SIZE_T HeaderCount)
+{
+    static const char cacheControlName[] = "cache-control";
+    static const char noStore[] = "no-store";
+
+    for (SIZE_T i = 0; i < HeaderCount; ++i)
+    {
+        if (!HttpTokenEquals(Headers[i].name, Headers[i].name_len, cacheControlName, sizeof(cacheControlName) - 1))
+        {
+            continue;
+        }
+
+        const char* value = Headers[i].value;
+        SIZE_T valueLength = Headers[i].value_len;
+        SIZE_T start = 0;
+
+        while (start < valueLength)
+        {
+            SIZE_T end = start;
+
+            while (end < valueLength && ',' != value[end])
+            {
+                end++;
+            }
+
+            SIZE_T first = start;
+            SIZE_T last = end;
+
+            while (first < last && (' ' == value[first] || '\t' == value[first]))
+            {
+                first++;
+            }
+
+            while (last > first && (' ' == value[last - 1] || '\t' == value[last - 1]))
+            {
+                last--;
+            }
+
+            if (HttpTokenEquals(value + first, last - first, noStore, sizeof(noStore) - 1))
+            {
+                return TRUE;
+            }
+
+            start = end + 1;
+        }
+    }
+
+    return FALSE;
 }
 
 #define HEX_TO_CHAR(x) ((x) < 10 ? '0' + (x) : 'A' + (x) - 10)
@@ -970,6 +1045,8 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
         subdirEntries[i].LastModifiedTime = BlorgMetaFlat_SubdirectoryMetadata_modified(flatSubdirEntry);
     }
 
+    dirInfo->NoStore = Ctx->NoStore;
+
     *OutDirInfo = dirInfo;
     return STATUS_SUCCESS;
 }
@@ -1011,7 +1088,170 @@ static NTSTATUS HttpDeserializeDirectoryEntryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_
     DirEntryInfo->LastAccessedTime = BlorgMetaFlat_DirectoryEntryMetadata_accessed(dirEntMeta);
     DirEntryInfo->LastModifiedTime = BlorgMetaFlat_DirectoryEntryMetadata_modified(dirEntMeta);
     DirEntryInfo->IsDirectory = BlorgMetaFlat_DirectoryEntryMetadata_directory(dirEntMeta);
+    DirEntryInfo->NoStore = Ctx->NoStore;
 
+    return STATUS_SUCCESS;
+}
+
+//
+// Verifies and decodes a FlatBuffer ChangeBatch into one PagedPool
+// CHANGE_BATCH (Structs.h): the header, the entries, then every path's
+// characters. PASSIVE only, like the other deserializers.
+//
+// A path arrives as the server's key for it -- UTF-8, relative to the
+// share root, '/' between components, the root itself empty -- and leaves
+// spelled the way this volume names it, with a leading backslash and
+// backslashes between components, so it compares equal to an FCB's
+// FullPath and to what the path cache was keyed by. Each UTF-8 byte yields
+// at most one UTF-16 unit, which is what sizes the allocation before
+// converting.
+//
+// A batch past CHANGE_BATCH_MAX_ENTRIES or CHANGE_BATCH_MAX_PATH_BYTES is
+// delivered as a reset with no entries rather than rejected: it is a valid
+// answer, just one cheaper to act on wholesale. A path whose converted form
+// does not fit a UNICODE_STRING fails the batch, which the feed treats as
+// any other failed poll.
+//
+static NTSTATUS HttpDeserializeChangeBatch(HTTP_CONTEXT* Ctx, PCHANGE_BATCH* OutBatch)
+{
+    PCHAR body = Ctx->Buffer + Ctx->BodyOffset;
+    SIZE_T bodyLen = Ctx->ContentLength;
+
+    if (0 == bodyLen)
+    {
+        BLORGFS_PRINT("HttpDeserializeChangeBatch() - empty body\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    PCHAR alignedBuffer = HttpAlignBodyInPlace(body, bodyLen);
+
+    int verifyCode = BlorgMetaFlat_ChangeBatch_verify_as_root(alignedBuffer, bodyLen);
+
+    if (flatcc_verify_ok != verifyCode)
+    {
+        BLORGFS_PRINT("HttpDeserializeChangeBatch() - %s\n", flatcc_verify_error_string(verifyCode));
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    BlorgMetaFlat_ChangeBatch_table_t flatBatch = BlorgMetaFlat_ChangeBatch_as_root(alignedBuffer);
+
+    if (!flatBatch)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    const flatbuffers_string_vec_t lists[] =
+    {
+        BlorgMetaFlat_ChangeBatch_modified(flatBatch),
+        BlorgMetaFlat_ChangeBatch_created(flatBatch),
+        BlorgMetaFlat_ChangeBatch_removed(flatBatch)
+    };
+
+    const CHANGE_KIND kinds[] = { ChangeModified, ChangeCreated, ChangeRemoved };
+
+    C_ASSERT(ARRAYSIZE(lists) == ARRAYSIZE(kinds));
+
+    BOOLEAN reset = BlorgMetaFlat_ChangeBatch_reset(flatBatch);
+    SIZE_T count = 0;
+    SIZE_T pathBytes = 0;
+
+    for (SIZE_T k = 0; k < ARRAYSIZE(lists) && !reset; ++k)
+    {
+        SIZE_T listLength = lists[k] ? flatbuffers_string_vec_len(lists[k]) : 0;
+
+        count += listLength;
+
+        for (SIZE_T i = 0; i < listLength && count <= CHANGE_BATCH_MAX_ENTRIES; ++i)
+        {
+            pathBytes += flatbuffers_string_len(flatbuffers_string_vec_at(lists[k], i));
+        }
+
+        reset = (count > CHANGE_BATCH_MAX_ENTRIES) || (pathBytes > CHANGE_BATCH_MAX_PATH_BYTES);
+    }
+
+    if (reset)
+    {
+        count = 0;
+        pathBytes = 0;
+    }
+
+    SIZE_T allocationSize = sizeof(CHANGE_BATCH) +
+        (count * sizeof(CHANGE_ENTRY)) +
+        ((count + pathBytes) * sizeof(WCHAR));
+
+    PCHANGE_BATCH batch = ExAllocatePoolZero(PagedPool, allocationSize, 'CBLR');
+
+    if (!batch)
+    {
+        BLORGFS_PRINT("HttpDeserializeChangeBatch() - failed batch alloc\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    batch->Epoch = BlorgMetaFlat_ChangeBatch_epoch(flatBatch);
+    batch->Generation = BlorgMetaFlat_ChangeBatch_generation(flatBatch);
+    batch->Reset = reset;
+    batch->Entries = C_CAST(PCHANGE_ENTRY, batch + 1);
+    batch->Count = count;
+
+    PWCH cursor = C_CAST(PWCH, batch->Entries + count);
+    SIZE_T entry = 0;
+
+    for (SIZE_T k = 0; k < ARRAYSIZE(lists) && entry < count; ++k)
+    {
+        SIZE_T listLength = lists[k] ? flatbuffers_string_vec_len(lists[k]) : 0;
+
+        for (SIZE_T i = 0; i < listLength; ++i, ++entry)
+        {
+            flatbuffers_string_t path = flatbuffers_string_vec_at(lists[k], i);
+            SIZE_T pathLength = flatbuffers_string_len(path);
+            ULONG convertedBytes = 0;
+
+            cursor[0] = L'\\';
+
+            if (0 != pathLength)
+            {
+                NTSTATUS status = RtlUTF8ToUnicodeN(
+                    cursor + 1,
+                    C_CAST(ULONG, pathLength * sizeof(WCHAR)),
+                    &convertedBytes,
+                    path,
+                    C_CAST(ULONG, pathLength));
+
+                if (!NT_SUCCESS(status))
+                {
+                    BLORGFS_PRINT("HttpDeserializeChangeBatch() - path conversion failed: %8lx\n", status);
+                    ExFreePool(batch);
+                    return status;
+                }
+            }
+
+            SIZE_T pathChars = 1 + (convertedBytes / sizeof(WCHAR));
+
+            if (pathChars * sizeof(WCHAR) > MAXUSHORT)
+            {
+                BLORGFS_PRINT("HttpDeserializeChangeBatch() - path of %Iu characters\n", pathChars);
+                ExFreePool(batch);
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            for (SIZE_T c = 1; c < pathChars; ++c)
+            {
+                if (L'/' == cursor[c])
+                {
+                    cursor[c] = L'\\';
+                }
+            }
+
+            batch->Entries[entry].Kind = kinds[k];
+            batch->Entries[entry].Path.Buffer = cursor;
+            batch->Entries[entry].Path.Length = C_CAST(USHORT, pathChars * sizeof(WCHAR));
+            batch->Entries[entry].Path.MaximumLength = batch->Entries[entry].Path.Length;
+
+            cursor += pathChars;
+        }
+    }
+
+    *OutBatch = batch;
     return STATUS_SUCCESS;
 }
 
@@ -2229,7 +2469,7 @@ static NTSTATUS HttpStatusToNtStatus(int StatusCode)
 // operation -- deliberately no PASSIVE bounce here. Everything this
 // function touches directly is DISPATCH-safe by construction:
 // phr_parse_response is pure C in the driver's non-paged text,
-// HttpHeaderNameEquals exists precisely because RtlEqualString is not
+// HttpTokenEquals exists precisely because RtlEqualString is not
 // DISPATCH-safe, buffer growth is NonPagedPoolNx, and socket pool
 // release is a spinlock. The work that does require PASSIVE_LEVEL --
 // flatcc deserialization and the dir/file-info completion callbacks --
@@ -2492,6 +2732,7 @@ static NTSTATUS HttpParseHeaders(HTTP_CONTEXT* Ctx)
 
     Ctx->ContentLength = contentLength;
     Ctx->BodyEndOffset = bodyEndOffset;
+    Ctx->NoStore = HttpForbidsStoring(Ctx->Headers, Ctx->HeaderCount);
 
     return STATUS_SUCCESS;
 }
@@ -2554,6 +2795,20 @@ static VOID HttpDispatchInline(HTTP_CONTEXT* Ctx)
 
         Ctx->Completion.FileRead.Routine(STATUS_SUCCESS, &fileBuffer, Ctx->CallerContext);
         Ctx->Completion.FileRead.Routine = NULL;
+
+        break;
+    }
+
+    case HttpOpChanges:
+    {
+        PCHANGE_BATCH batch = NULL;
+        result = HttpDeserializeChangeBatch(Ctx, &batch);
+
+        if (NT_SUCCESS(result))
+        {
+            Ctx->Completion.Changes.Routine(STATUS_SUCCESS, batch, Ctx->CallerContext);
+            Ctx->Completion.Changes.Routine = NULL;
+        }
 
         break;
     }
@@ -2745,7 +3000,7 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
             C_CAST(BOOLEAN, HttpConnectionFresh != Ctx->ConnectionSource));
     }
 
-    if (statsBlock && HttpOpFileRead != Ctx->Operation)
+    if (statsBlock && (HttpOpDirInfo == Ctx->Operation || HttpOpFileInfo == Ctx->Operation))
     {
         ULONG64* latencySum = (HttpOpDirInfo == Ctx->Operation)
             ? &statsBlock->DirInfoLatencySumUs
@@ -2804,6 +3059,15 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 
                 break;
             }
+            case HttpOpChanges:
+            {
+                if (Ctx->Completion.Changes.Routine)
+                {
+                    Ctx->Completion.Changes.Routine(Status, NULL, Ctx->CallerContext);
+                }
+
+                break;
+            }
         }
 
         if (Ctx->Socket)
@@ -2839,6 +3103,11 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 // budget, and global.RemoteHostAnsi (bounded by
 // BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES, Driver.h).
 //
+// A NULL Path means the caller has already put the request target's query
+// in Ctx->EncodedPathBuffer, from pool, for a request that names no path
+// (BlorgHttpGetChanges); it is consumed and freed exactly as an encoded
+// path would be.
+//
 
 //
 // Bounds RtlStringCbLengthA's scan of a caller-supplied FormatString
@@ -2857,7 +3126,7 @@ static NTSTATUS HttpBuildRequest(
     HTTP_CONTEXT* Ctx
 )
 {
-    NTSTATUS result = UrlEncodePathToAnsi(Path, &Ctx->EncodedPathBuffer);
+    NTSTATUS result = Path ? UrlEncodePathToAnsi(Path, &Ctx->EncodedPathBuffer) : STATUS_SUCCESS;
 
     if (!NT_SUCCESS(result))
     {
@@ -3086,6 +3355,87 @@ NTSTATUS BlorgHttpGetFileInformation(
 }
 
 //
+// Room for the change-feed query, "epoch=E&since=G" with both at their
+// widest (twenty digits each), and its terminator.
+//
+#define HTTP_CHANGES_QUERY_MAX_BYTES 64
+
+//
+// Issues the change-feed long-poll; CompletionRoutine is invoked exactly
+// once, with a batch it owns on success. The request names no path, so its
+// query is formatted here into the buffer HttpBuildRequest would otherwise
+// fill with an encoded path. See BlorgHttpGetDirectoryInfo for the
+// HttpBuildRequest failure cleanup rationale.
+//
+NTSTATUS BlorgHttpGetChanges(
+    ULONG64 Epoch,
+    ULONG64 Since,
+    PBLORG_CHANGES_COMPLETION CompletionRoutine,
+    PVOID CallerContext
+)
+{
+    if (!CompletionRoutine)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpChanges, 200, HTTP_INITIAL_RECV_CAPACITY);
+
+    if (!ctx)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    ctx->Completion.Changes.Routine = CompletionRoutine;
+    ctx->CallerContext = CallerContext;
+
+    ctx->EncodedPathBuffer.Buffer = ExAllocatePoolZero(NonPagedPoolNx, HTTP_CHANGES_QUERY_MAX_BYTES, HTTP_TAG);
+
+    if (!ctx->EncodedPathBuffer.Buffer)
+    {
+        ctx->FinalStatus = STATUS_INSUFFICIENT_RESOURCES;
+        HttpFreeContext(ctx);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    size_t queryLength = 0;
+    NTSTATUS result = RtlStringCbPrintfA(ctx->EncodedPathBuffer.Buffer, HTTP_CHANGES_QUERY_MAX_BYTES, "epoch=%I64u&since=%I64u", Epoch, Since);
+
+    if (NT_SUCCESS(result))
+    {
+        result = RtlStringCbLengthA(ctx->EncodedPathBuffer.Buffer, HTTP_CHANGES_QUERY_MAX_BYTES, &queryLength);
+    }
+
+    if (!NT_SUCCESS(result))
+    {
+        ctx->FinalStatus = result;
+        HttpFreeContext(ctx);
+        return result;
+    }
+
+    ctx->EncodedPathBuffer.Length = C_CAST(USHORT, queryLength);
+    ctx->EncodedPathBuffer.MaximumLength = HTTP_CHANGES_QUERY_MAX_BYTES;
+
+    static const char requestFormat[] =
+        "GET /get_changes?%hs HTTP/1.1\r\n"
+        "Host: %hs\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+
+    result = HttpBuildRequest(NULL, requestFormat, 0, 0, 0, FALSE, ctx);
+
+    if (!NT_SUCCESS(result))
+    {
+        ctx->FinalStatus = result;
+        HttpFreeContext(ctx);
+        return result;
+    }
+
+    HttpKick(ctx);
+    return STATUS_PENDING;
+}
+
+//
 // Shared implementation behind BlorgHttpGetFile/BlorgHttpGetFileMdl: issues
 // an async ranged GET for file content, into Buffer (TargetMdl NULL) or
 // directly into the caller's locked MDL (zero-copy). endOffsetExclusive is
@@ -3224,6 +3574,15 @@ VOID BlorgFreeHttpFile(PFILE_BUFFER FileBuffer)
     if (FileBuffer && FileBuffer->BaseAddress)
     {
         ExFreePool(FileBuffer->BaseAddress);
+    }
+}
+
+// Frees a batch BlorgHttpGetChanges delivered; one allocation, see HttpDeserializeChangeBatch.
+VOID BlorgFreeChangeBatch(PCHANGE_BATCH Batch)
+{
+    if (Batch)
+    {
+        ExFreePool(Batch);
     }
 }
 

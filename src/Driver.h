@@ -156,6 +156,7 @@
 #include "Structs.h"
 #include "Util.h"
 #include "Client.h"
+#include "ChangeFeed.h"
 #include "Statistics.h"
 #include "CacheManager.h"
 #include "FspWorkQueue.h"
@@ -359,6 +360,24 @@ extern struct GLOBAL
     // value; zero never holds. Defaults to READ_FAIR_BUDGET.
     //
     ULONG ReadFairBudget;
+
+    //
+    // Whether to follow the server's change feed at all (ChangeFeed.c),
+    // from the ChangeFeed registry value; on by default. Off, the metadata
+    // caches expire on their short TTL as they did before the feed, which
+    // is the comparison arm for measuring it.
+    //
+    BOOLEAN ChangeFeed;
+
+    //
+    // Nonzero while the change feed is live: every change the server sees
+    // is being reported and invalidated, so PathCache.c trusts an entry for
+    // its long lifetime instead of the short TTL. Written only through
+    // BlorgPathCacheFollowFeed, which orders it against the flush that
+    // going live needs; read with acquire semantics. A LONG for
+    // ReadAcquire/WriteRelease.
+    //
+    LONG ChangeFeedLive;
 
     //
     //  A single self-relative security descriptor handed out (in the

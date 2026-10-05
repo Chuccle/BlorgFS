@@ -135,6 +135,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="CacheManager.c" />
+    <ClCompile Include="ChangeFeed.c" />
     <ClCompile Include="Cleanup.c" />
     <ClCompile Include="Client.c" />
     <ClCompile Include="Close.c" />
@@ -164,6 +165,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CacheManager.h" />
+    <ClInclude Include="ChangeFeed.h" />
     <ClInclude Include="Client.h" />
     <ClInclude Include="Driver.h" />
     <ClInclude Include="flatbuffers_common_reader.h" />

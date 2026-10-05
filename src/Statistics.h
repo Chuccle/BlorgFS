@@ -398,6 +398,13 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ListingCacheMisses;          // fetched in the foreground
     ULONG64 ListingRefreshes;            // background refetches issued
 
+    // --- change feed (ChangeFeed.c) ------------------------------------------
+    ULONG64 ChangeFeedPolls;             // long-polls issued
+    ULONG64 ChangeFeedFailures;          // polls that failed, taking the feed down
+    ULONG64 ChangeFeedResets;            // resets acted on: the feed came up, or the server lost track
+    ULONG64 ChangeFeedPaths;             // changed paths reported
+    ULONG64 ChangeFeedFlushes;           // batches too large to invalidate path by path, flushed wholesale
+
     // --- connections -----------------------------------------------------
     ULONG64 ConnectionsPooled;           // acquire satisfied from the keep-alive pool
     ULONG64 ConnectionsFresh;            // acquire needed a new TCP connect
@@ -518,8 +525,15 @@ typedef struct _BLORGFS_STATISTICS
 //
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
+//
+// Set while the change feed is live (ChangeFeed.c), so the metadata caches
+// are on their long lifetime. A cache hit rate read without it is ambiguous:
+// the same workload hits far more often with the feed than without.
+//
+#define BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE 0x00000002
 
-#define BLORGFS_STATISTICS_VERSION 16
+
+#define BLORGFS_STATISTICS_VERSION 17
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

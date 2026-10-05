@@ -626,6 +626,11 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
         t.PathCacheHits, t.PathCacheMisses);
     printf("    listings hit/stale/miss %10llu / %llu / %llu  (%llu refreshed behind)\n",
         t.ListingCacheHits, t.ListingCacheStaleHits, t.ListingCacheMisses, t.ListingRefreshes);
+    printf("    change feed           %12s  (%llu polls, %llu failed, %llu resets)\n",
+        (stats.Flags & BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE) ? "live" : "down",
+        t.ChangeFeedPolls, t.ChangeFeedFailures, t.ChangeFeedResets);
+    printf("    changes invalidated   %12llu  (%llu batches flushed whole)\n",
+        t.ChangeFeedPaths, t.ChangeFeedFlushes);
 
     const unsigned long long acquires = t.ConnectionsPooled + t.ConnectionsFresh;
 
@@ -2770,6 +2775,12 @@ static bool WriteReport(
     fprintf(f, "ListingCacheStaleHits=%llu\n", t.ListingCacheStaleHits);
     fprintf(f, "ListingCacheMisses=%llu\n", t.ListingCacheMisses);
     fprintf(f, "ListingRefreshes=%llu\n", t.ListingRefreshes);
+    fprintf(f, "ChangeFeedLive=%u\n", (stats.Flags & BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE) ? 1u : 0u);
+    fprintf(f, "ChangeFeedPolls=%llu\n", t.ChangeFeedPolls);
+    fprintf(f, "ChangeFeedFailures=%llu\n", t.ChangeFeedFailures);
+    fprintf(f, "ChangeFeedResets=%llu\n", t.ChangeFeedResets);
+    fprintf(f, "ChangeFeedPaths=%llu\n", t.ChangeFeedPaths);
+    fprintf(f, "ChangeFeedFlushes=%llu\n", t.ChangeFeedFlushes);
 
     fprintf(f, "ConnectionsPooled=%llu\n", t.ConnectionsPooled);
     fprintf(f, "ConnectionsFresh=%llu\n", t.ConnectionsFresh);
