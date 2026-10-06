@@ -1908,6 +1908,27 @@ RAM.
 - **Teardown** clears `Live`, then waits for a busy count of reads, fills
   and the fill worker to drain before closing the file (`DriverUnload`).
 
+### Where it is tested
+
+`DiskCacheIndexTest.cpp` covers the index on its own -- admission, pinning,
+the split into fetches, the clock. `DiskCacheTest.cpp` covers this file
+with a file system under it: `DiskCacheModel.c` answers the cache's own
+read and write IRPs out of a buffer, so a test can hold a completion back,
+fail the next one, or hand the store a different owner, and the real
+`DiskCache.c` is compiled into `DispatchSandbox` rather than stubbed out.
+
+Two things the model checks on every IRP the driver sends it, because a
+real file system would refuse them in a way that reads as the store being
+lost rather than as a bug: that a non-buffered write is sector aligned and
+its MDL describes what it asks for, and that the completion routine keeps
+the IRP (`STATUS_MORE_PROCESSING_REQUIRED`).
+
+A read is only eligible for the cache when its buffer is page aligned and
+its MDL starts on a page (`BlorgDiskCacheRead`), so a test handing it a
+`std::vector`'s own pointer gets every read fetched -- which looks exactly
+like a cache holding nothing. `DiskCacheTest.cpp` aligns its buffers for
+this reason.
+
 ### Not done yet
 
 - A persistent index, and the per-block MAC it needs.

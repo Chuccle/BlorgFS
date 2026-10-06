@@ -73,6 +73,12 @@ extern "C" {
 #ifndef STATUS_OBJECT_PATH_NOT_FOUND
 #define STATUS_OBJECT_PATH_NOT_FOUND     ((NTSTATUS)0xC000003AL)
 #endif
+#ifndef STATUS_OBJECT_PATH_INVALID
+#define STATUS_OBJECT_PATH_INVALID       ((NTSTATUS)0xC0000039L)
+#endif
+#ifndef STATUS_UNEXPECTED_IO_ERROR
+#define STATUS_UNEXPECTED_IO_ERROR       ((NTSTATUS)0xC00000E9L)
+#endif
 #ifndef STATUS_SHARING_VIOLATION
 #define STATUS_SHARING_VIOLATION         ((NTSTATUS)0xC0000043L)
 #endif
@@ -304,11 +310,14 @@ struct _IO_STACK_LOCATION
 
 //
 // The driver's stack location, as the kernel hands it over. The model
-// stores one per IRP rather than the kernel's stack of them: nothing in
-// BlorgFS calls down to a lower driver, so the next-lower location is
-// never used and modelling it would be surface without behaviour.
+// stores one per IRP rather than the kernel's stack of them: the only IRPs
+// BlorgFS sends down are the disk cache's, which it allocates itself, so
+// the next location of one is the only location it has and the lower
+// driver's current one (IoCallDriver, DiskCacheModel.c).
 //
 PIO_STACK_LOCATION IoGetCurrentIrpStackLocation(PIRP Irp);
+PIO_STACK_LOCATION IoGetNextIrpStackLocation(PIRP Irp);
+NTSTATUS IoCallDriver(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 typedef enum _WAIT_TYPE { WaitAll, WaitAny } WAIT_TYPE;
 

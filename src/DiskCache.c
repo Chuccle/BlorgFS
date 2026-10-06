@@ -105,12 +105,6 @@
 #define DISK_CACHE_FILL_BACKLOG (32ull * 1024 * 1024)
 
 //
-// Most blocks one read may cover: 4 MB, far beyond any paging read Cc or
-// MM issues. A larger read is fetched.
-//
-#define DISK_CACHE_MAX_READ_BLOCKS 64
-
-//
 // One block on its way into the cache: a copy of what a fetch received,
 // and the slot reserved for it.
 //
