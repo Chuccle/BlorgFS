@@ -740,15 +740,13 @@ TEST_F(TlsHandshakeKernelTest, HandshakeAcceptsAMaximallySizedFlightRecord)
 TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnCertificatePinMismatch)
 {
     //
-    // Mirrors TlsHandshake.c's private STATUS_BLORGFS_CERT_PIN_MISMATCH
-    // (0xE0080001) -- not exported via TlsHandshake.h since nothing outside
-    // that file needs to distinguish it from any other handshake failure.
-    // Duplicated here deliberately, the same way SocketKernelTest.cpp
-    // duplicates Socket.c's timeout constants: if this value ever changes,
-    // this assertion failing is what should make someone come re-read it.
+    // The pin-specific status is STATUS_TRUST_FAILURE. It used to be a
+    // customer-defined code (0xE0080001), which the I/O manager has no Win32
+    // mapping for, so a reader on a mounted volume saw "Unknown error" rather
+    // than anything naming a trust failure -- found by mounting over TLS in
+    // the test guest with a wrong pin. Asserting the exact system status is
+    // what keeps a private code from coming back.
     //
-    const NTSTATUS kCertPinMismatch = C_CAST(NTSTATUS, 0xE0080001L);
-
     FakeTlsServer server;
     ASSERT_TRUE(server.GenerateKeys());
 
@@ -767,7 +765,7 @@ TEST_F(TlsHandshakeKernelTest, HandshakeFailsOnCertificatePinMismatch)
     DeliverServerResponse(response, responseLen);
 
     EXPECT_EQ(1, Result.Calls);
-    EXPECT_EQ(kCertPinMismatch, Result.Status)
+    EXPECT_EQ(STATUS_TRUST_FAILURE, Result.Status)
         << "a certificate that doesn't match the configured pin must be rejected with "
            "the pin-specific status, not laundered through a generic parse failure";
     EXPECT_EQ(TlsHandshakeFailed, socket->Tls.State)
