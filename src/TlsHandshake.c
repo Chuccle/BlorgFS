@@ -36,13 +36,6 @@
 //
 #define TLS_CHAIN_STEP(Status, Expression) ((Status) = NT_SUCCESS(Status) ? (Expression) : (Status))
 //
-// Customer-defined NTSTATUS (bit 29 set) in FACILITY_NTCERT (0x8) for a
-// certificate pin mismatch, distinct from generic parse-failure codes.
-// Severity=Error(3), Customer=1, Facility=FACILITY_NTCERT(0x8), Code=1.
-//
-#define STATUS_BLORGFS_CERT_PIN_MISMATCH ((NTSTATUS)0xE0080001L)
-
-//
 // A received record is capped at TLS_RECORD_CIPHERTEXT_MAX (Tls.h), not at
 // the 2^14 plaintext maximum: RFC 8446 5.1 caps TLSPlaintext.length at
 // 2^14, but 5.2 lets TLSCiphertext.length carry that plus the inner
@@ -803,9 +796,12 @@ static VOID TlsHandshakeOnReceiveServerHello(PTLS_HANDSHAKE_CONTEXT Ctx)
 // duplicate or out-of-order arrival. Any other message type fails the
 // handshake. A pin mismatch on the Certificate message (BlorgTlsCheckPin
 // failing on an otherwise cryptographically well-formed certificate, or
-// no pin configured at all) returns STATUS_BLORGFS_CERT_PIN_MISMATCH, a
-// status distinct from the generic STATUS_INVALID_PARAMETER every other
-// parse failure here uses.
+// no pin configured at all) returns STATUS_TRUST_FAILURE, distinct from
+// the generic STATUS_INVALID_PARAMETER every other parse failure here uses.
+// It is a system status so it reaches the application as a Win32 error
+// with a message, ERROR_TRUST_FAILURE, which is also what
+// RtlNtStatusToDosError gives Schannel's SEC_E_UNTRUSTED_ROOT; a
+// customer-defined one surfaces as "Unknown error".
 //
 // SECURITY NOTE: this verifies the server's CertificateVerify signature
 // (proof it holds the private key for the certificate it presented), the
@@ -872,7 +868,7 @@ static NTSTATUS TlsHandshakeProcessFlightMessages(PTLS_HANDSHAKE_CONTEXT Ctx, BO
             if (NT_SUCCESS(status) && !BlorgTlsCheckPin(spki, spkiLen))
             {
                 BLORGFS_PRINT("TlsHandshakeProcessFlightMessages: certificate pin mismatch, rejecting\n");
-                status = STATUS_BLORGFS_CERT_PIN_MISMATCH;
+                status = STATUS_TRUST_FAILURE;
             }
 
             TLS_CHAIN_STEP(status, BlorgTlsDecodeP256SubjectPublicKeyInfo(spki, spkiLen, Ctx->ServerLongTermKey));
