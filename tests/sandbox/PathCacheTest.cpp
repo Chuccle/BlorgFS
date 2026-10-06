@@ -899,4 +899,38 @@ TEST_F(PathCacheFeedTest, GoingLiveDropsWhatWasReadBeforeIt)
         << "a read ticketed before the feed came up was cached under it";
 }
 
+
+//
+// A ticket held outside the caches (a resident FCB's stamp, Create.c) is
+// judged by the same rule an entry is: any invalidation fails it, and so
+// does age past the lifetime in force when it is asked. A ticket never
+// taken is never current.
+//
+TEST_F(PathCacheFeedTest, TicketStaysCurrentUntilAnInvalidationOrTheLifetime)
+{
+    PATH_CACHE_TICKET never = {};
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&never));
+
+    PATH_CACHE_TICKET ticket;
+    BlorgPathCacheTakeTicket(&ticket);
+    EXPECT_TRUE(BlorgPathCacheTicketCurrent(&ticket));
+
+    UNICODE_STRING elsewhere = RTL_CONSTANT_STRING(L"\\feed\\ticket\\other.bin");
+    BlorgPathCacheInvalidate(&elsewhere);
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&ticket))
+        << "the stamp cannot tell which path changed, so any change must fail it";
+
+    BlorgPathCacheTakeTicket(&ticket);
+    ShimAdvanceInterruptTime(5 * kSecond);
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&ticket)) << "past the short TTL with the feed down";
+
+    BlorgPathCacheFollowFeed(TRUE);
+    BlorgPathCacheTakeTicket(&ticket);
+    ShimAdvanceInterruptTime(60 * kSecond);
+    EXPECT_TRUE(BlorgPathCacheTicketCurrent(&ticket)) << "the feed's lifetime applies while it is live";
+
+    BlorgPathCacheFollowFeed(FALSE);
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&ticket)) << "the feed going down shortens a held stamp at once";
+}
+
 } // namespace

@@ -178,6 +178,7 @@ TEST_F(DispatchStressTest, ManyThreadsOpenAndCloseWithoutLosingCounts)
 
     PCOMMON_CONTEXT node = nullptr;
     ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(root, &path, &meta, volume, &node));
+    BlorgPathCacheTakeTicket(&((PFCB)node)->MetaTicket);
     BlorgNodeTablePublish(node);
 
     StressState state = {};

@@ -401,19 +401,32 @@ VOID BlorgPathCacheTakeTicket(PPATH_CACHE_TICKET Ticket)
 }
 
 //
-// Counts every resolution in MetaDataReads, not every miss: the number
-// means "how many create-time lookups ran", alongside PathCacheHits and
-// PathCacheMisses which split it, and MetaDataDiskReads (Client.c) which
-// counts only the network fetches a miss can lead to. It is deliberately
-// not "metadata I/O" -- a pure cache hit moves no bytes and must not
-// inflate an I/O-shaped number.
+// Whether what was read under Ticket is still as good as a cache entry read
+// then would be: no invalidation has run since, and it is younger than the
+// lifetime. For state kept outside these caches that follows their rule
+// without a lookup, which is a resident FCB's size (Create.c). The sequence
+// test is coarser than a lookup, since an invalidation of any path fails
+// it, and a caller falls back to a lookup rather than trusting less. A zero
+// IssueTime is a ticket never taken.
+//
+BOOLEAN BlorgPathCacheTicketCurrent(const PATH_CACHE_TICKET* Ticket)
+{
+    return (0 != Ticket->IssueTime) &&
+           (Ticket->Sequence == ReadNoFence64(&PathCache.Sequence)) &&
+           (PathCacheAge(Ticket->IssueTime, KeQueryInterruptTime()) < PathCacheLifetime());
+}
+
 //
 // Looks up Path's cached existence result under the owning bucket's shared
 // lock, copying out Meta on a live "exists" hit. Returns a miss for
 // expired/stale-generation entries rather than reclaiming them here --
 // reclamation happens under the exclusive lock in PathCacheInsert instead.
 //
-PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta)
+// On a live "exists" hit, Ticket (when given) is dated from the entry's own
+// issue time: what it vouches for is as old as the read that produced the
+// entry, not as the lookup.
+//
+static PATH_CACHE_RESULT PathCacheFind(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta, _Inout_opt_ PPATH_CACHE_TICKET Ticket)
 {
     if (!PathCache.Ready || !Path || 0 == Path->Length || !Path->Buffer)
     {
@@ -443,6 +456,10 @@ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_EN
                     {
                         *Meta = entry->Meta;
                     }
+                    if (Ticket)
+                    {
+                        Ticket->IssueTime = entry->IssueTime;
+                    }
                     result = PathCacheExists;
                 }
                 else
@@ -457,6 +474,21 @@ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_EN
     ExReleasePushLockShared(&bucket->Lock);
     KeLeaveCriticalRegion();
 
+    return result;
+}
+
+//
+// Counts every resolution in MetaDataReads, not every miss: the number
+// means "how many create-time lookups ran", alongside PathCacheHits and
+// PathCacheMisses which split it, and MetaDataDiskReads (Client.c) which
+// counts only the network fetches a miss can lead to. It is deliberately
+// not "metadata I/O" -- a pure cache hit moves no bytes and must not
+// inflate an I/O-shaped number.
+//
+PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta, _Inout_opt_ PPATH_CACHE_TICKET Ticket)
+{
+    PATH_CACHE_RESULT result = PathCacheFind(Path, Meta, Ticket);
+
     BLORGFS_STAT_INC(MetaDataReads);
 
     if (PathCacheMiss == result)
@@ -469,6 +501,21 @@ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_EN
     }
 
     return result;
+}
+
+PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta)
+{
+    return BlorgPathCacheLookupDated(Path, Meta, NULL);
+}
+
+//
+// A lookup that is not a create-time resolution, so it is not counted: a
+// resident FCB checking its own metadata (Create.c), whose open is counted
+// by the lookup that resolves it if it goes on to resolve.
+//
+PATH_CACHE_RESULT BlorgPathCachePeek(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta)
+{
+    return PathCacheFind(Path, Meta, NULL);
 }
 
 //
