@@ -139,6 +139,20 @@
 //
 #define READ_AHEAD_MAX_GRANULARITY (PAGE_SIZE * 512)
 
+//
+// Bytes of fetches the link may have in flight before read-ahead waits its
+// turn (Read.c, ReadFair), overridable through ReadFairBudgetKb; zero
+// issues everything at once, as before the budget existed.
+//
+// Past the bottleneck's own small queue, bytes in flight only add latency:
+// a fetch's first byte waits behind every byte admitted before it, and a
+// player's throughput is its fetch size over that wait. So the budget is
+// the longest queue a player beside copies should ever sit behind, here
+// about 70 ms of the reference link, while still letting a lone copy keep
+// its next granule-sized fetch in flight behind the current one.
+//
+#define READ_FAIR_BUDGET (PAGE_SIZE * 512)
+
 #include "Structs.h"
 #include "Util.h"
 #include "Client.h"
@@ -219,6 +233,11 @@ BOOLEAN BlorgFastIoRead(
     PVOID Buffer,
     PIO_STATUS_BLOCK IoStatus,
     PDEVICE_OBJECT DeviceObject);
+
+// Initializes the read path's fair-share state (Read.c). DriverEntry,
+// before any read can arrive.
+VOID BlorgReadInit(VOID);
+
 _Dispatch_type_(IRP_MJ_WRITE)                    DRIVER_DISPATCH BlorgWrite;
 _Dispatch_type_(IRP_MJ_QUERY_INFORMATION)        DRIVER_DISPATCH BlorgQueryInformation;
 _Dispatch_type_(IRP_MJ_SET_INFORMATION)          DRIVER_DISPATCH BlorgSetInformation;
@@ -334,6 +353,13 @@ extern struct GLOBAL
     // not of this driver.
     //
     ULONG ReadAheadMaxGranularity;
+
+    //
+    // Bytes of fetches in flight past which read-ahead is held and admitted
+    // in fair order (Read.c, ReadFair), from the ReadFairBudgetKb registry
+    // value; zero never holds. Defaults to READ_FAIR_BUDGET.
+    //
+    ULONG ReadFairBudget;
 
     //
     //  A single self-relative security descriptor handed out (in the

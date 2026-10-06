@@ -16,6 +16,10 @@
 // ShimForceNextCcCopyReadMiss() is armed, which is what makes the
 // posted-on-cache-miss branch reachable at all.
 //
+// The fair-share tests at the end hold one file's read-ahead behind
+// another's fetches. Deferred (non-inline) peer steps keep a fetch in
+// flight across calls, which is what lets them observe a held IRP at all.
+//
 
 #include <gtest/gtest.h>
 
@@ -44,6 +48,9 @@ const ULONGLONG kFileSize = 64ull * 1024 * 1024;
 #define DELIVER(bytes) \
     { SandboxStepDeliver, (const unsigned char*)(bytes), sizeof(bytes) - 1, STATUS_SUCCESS, TRUE }
 
+#define DELIVER_LATER(bytes) \
+    { SandboxStepDeliver, (const unsigned char*)(bytes), sizeof(bytes) - 1, STATUS_SUCCESS, FALSE }
+
 #define CLOSE_STEP \
     { SandboxStepClose, nullptr, 0, STATUS_SUCCESS, TRUE }
 
@@ -53,6 +60,7 @@ protected:
     void SetUp() override
     {
         SandboxInitialize();
+        BlorgReadInit();
 
         Volume = StructsModelCreateVolume();
         ASSERT_NE(nullptr, Volume);
@@ -124,17 +132,17 @@ protected:
     }
 
     //
-    // One real READ IRP the way the I/O manager builds one. FileObject
-    // gets a real (zeroed) SECTION_OBJECT_POINTERS regardless of whether a
-    // given test needs it: BlorgVolumeRead dereferences
-    // FileObject->SectionObjectPointer unconditionally once past the
-    // IRP_PAGING_IO/IRP_NOCACHE flag checks, so a null pointer there would
-    // crash a non-paging NOCACHE test rather than just skip the branch.
+    // One real READ IRP the way the I/O manager builds one. FileObject's
+    // SectionObjectPointer is the FCB's own, as Create.c wires it, whether
+    // or not a given test needs it: BlorgVolumeRead dereferences it
+    // unconditionally once past the IRP_PAGING_IO/IRP_NOCACHE flag checks,
+    // and the fetch scheduler finds the file's nonpaged node through it
+    // (ReadFairNode), so a stand-alone one would have it write past the
+    // end of something that is not a node.
     //
     struct ReadRequest
     {
         FILE_OBJECT FileObject;
-        SECTION_OBJECT_POINTERS SectionObject;
         IO_STACK_LOCATION Stack;
         IRP Irp;
     };
@@ -148,7 +156,7 @@ protected:
 
         req->FileObject.FsContext = fcb;
         req->FileObject.DeviceObject = Volume;
-        req->FileObject.SectionObjectPointer = &req->SectionObject;
+        req->FileObject.SectionObjectPointer = &fcb->NonPaged->SectionObjectPointers;
 
         req->Stack.MajorFunction = IRP_MJ_READ;
         req->Stack.MinorFunction = minorFunction;
@@ -594,6 +602,401 @@ TEST_F(ReadTest, DirectFetchThatFailsToIssueSettlesItsOwnAccounting)
 
     EXPECT_EQ(response.Totals.FetchesIssued, response.Totals.FetchesCompleted + response.Totals.FetchesFailed)
         << "every issued fetch must terminate as completed or failed";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Read-ahead taking fair turns on the link
+///////////////////////////////////////////////////////////////////////////
+
+//
+// Two files, a player's and a copy's, each read by Cc's read-ahead in
+// 4-byte paging reads, with the link's budget set to one read's worth so
+// that a second read in flight is past it. Every read here is identical,
+// so whatever order they reach the network in is the scheduler's alone.
+//
+class ReadFairTest : public ReadTest
+{
+protected:
+    void SetUp() override
+    {
+        ReadTest::SetUp();
+
+        UNICODE_STRING name = Path(L"\\media\\copy.bin");
+        ASSERT_EQ(STATUS_SUCCESS,
+            BlorgCreateFCB(&CopyFcb, (CSHORT)BLORGFS_FCB_SIGNATURE, &name, Volume, kFileSize));
+        InitializeListHead(&CopyFcb->Links);
+
+        global.ReadFairBudget = 4;
+        BlorgStatisticsReset();
+    }
+
+    void TearDown() override
+    {
+        IoSetTopLevelIrp(nullptr);
+        Settle();
+        global.ReadFairBudget = 0;
+        BlorgFreeFileContext(CopyFcb, Volume);
+        ReadTest::TearDown();
+    }
+
+    ReadRequest* ReadAhead(PFCB fcb, unsigned char* buffer)
+    {
+        ReadRequest* req = PrepareRead(fcb, 0, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, buffer);
+
+        IoSetTopLevelIrp(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP));
+        EXPECT_EQ(STATUS_PENDING, BlorgRead(Volume, &req->Irp));
+        IoSetTopLevelIrp(nullptr);
+
+        return req;
+    }
+
+    //
+    // Drain until nothing is left. A released read is issued from a work
+    // item and its deferred peer answers on the next completion drain, so
+    // one pass of Drain() stops half way through.
+    //
+    void Settle()
+    {
+        do
+        {
+            SandboxDrainCompletions();
+        } while (ShimDrainWorkItems() > 0);
+    }
+
+    ULONG64 Held()
+    {
+        BLORGFS_STATISTICS_RESPONSE response;
+        BlorgStatisticsQuery(&response);
+        return response.Totals.ReadsHeld;
+    }
+
+    PFCB CopyFcb = nullptr;
+};
+
+//
+// Past the budget, read-ahead must not reach the network -- no socket for
+// it -- and once the fetch ahead of it completes it must be issued and
+// land like any other read. Asserting on sockets rather than on completion
+// is the point: a held read and an issued read that has not completed yet
+// look the same from the IRP, and only the second one is on the link.
+//
+// The last read defends the accounting. Every admitted byte must be
+// settled, the released read's included; one leaked byte past a budget
+// and every later read-ahead on the volume is held behind a fetch that
+// will never complete. With the budget raised to two reads, a second read
+// on a file that already has one in flight is held only if bytes leaked.
+// It is checked by the held count, not by sockets: the earlier fetches
+// left a pooled connection the reads may reuse.
+//
+TEST_F(ReadFairTest, ReadAheadPastTheBudgetWaitsThenIssues)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char* secondBuffer = NewBuffer(4);
+
+    ReadRequest* first = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* second = ReadAhead(CopyFcb, secondBuffer);
+
+    EXPECT_EQ(1u, SandboxSocketsCreated())
+        << "read-ahead past the budget went to the network";
+    EXPECT_EQ(1ull, Held());
+    EXPECT_EQ(0, second->Irp.CompletionCount);
+
+    Settle();
+
+    EXPECT_EQ(1, first->Irp.CompletionCount);
+    EXPECT_EQ(1, second->Irp.CompletionCount)
+        << "the first fetch's completion never released the held read";
+    EXPECT_EQ(STATUS_SUCCESS, second->Irp.IoStatus.Status);
+    EXPECT_EQ(4u, second->Irp.IoStatus.Information);
+    EXPECT_EQ(0, memcmp(secondBuffer, "WXYZ", 4))
+        << "the released read must fetch the range it was held with";
+
+    global.ReadFairBudget = 8;
+
+    ReadRequest* afterFirst = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* afterSecond = ReadAhead(CopyFcb, NewBuffer(4));
+
+    EXPECT_EQ(1ull, Held())
+        << "bytes were left counted in flight with nothing on the link";
+
+    Settle();
+
+    EXPECT_EQ(1, afterFirst->Irp.CompletionCount);
+    EXPECT_EQ(1, afterSecond->Irp.CompletionCount);
+}
+
+//
+// A read admitted to the fair share that then fails to issue must give its
+// bytes back, or every later read-ahead on the volume is held behind a
+// fetch that will never complete. A paging read with no MDL is refused by
+// the client outright. With the budget at two reads, the second of two
+// reads on another file is held only if the failed read's bytes are still
+// counted.
+//
+TEST_F(ReadFairTest, ReadAheadThatFailsToIssueGivesItsBytesBack)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    global.ReadFairBudget = 8;
+
+    ReadRequest* failed = PrepareRead(CopyFcb, 0, 4, IRP_PAGING_IO | IRP_NOCACHE);
+
+    IoSetTopLevelIrp(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP));
+    EXPECT_NE(STATUS_PENDING, BlorgRead(Volume, &failed->Irp));
+    IoSetTopLevelIrp(nullptr);
+
+    ReadRequest* first = ReadAhead(Fcb, NewBuffer(4));
+    ReadRequest* second = ReadAhead(Fcb, NewBuffer(4));
+
+    EXPECT_EQ(0ull, Held())
+        << "a read that never reached the link was left counted in flight";
+
+    Settle();
+
+    EXPECT_EQ(1, first->Irp.CompletionCount);
+    EXPECT_EQ(1, second->Irp.CompletionCount);
+}
+
+//
+// The same for a held read: it is issued from a work item once released,
+// and if the issue fails there it is completed with the failure and its
+// bytes settled, rather than left pending with them counted.
+//
+TEST_F(ReadFairTest, HeldReadThatFailsToIssueCompletesAndGivesItsBytesBack)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    ReadRequest* first = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* held = ReadAhead(CopyFcb, nullptr);
+
+    ASSERT_EQ(1ull, Held());
+
+    Settle();
+
+    EXPECT_EQ(1, first->Irp.CompletionCount);
+    EXPECT_EQ(1, held->Irp.CompletionCount)
+        << "a released read that failed to issue was never completed";
+    EXPECT_FALSE(NT_SUCCESS(held->Irp.IoStatus.Status));
+
+    global.ReadFairBudget = 8;
+
+    ReadRequest* afterFirst = ReadAhead(Fcb, NewBuffer(4));
+    ReadRequest* afterSecond = ReadAhead(Fcb, NewBuffer(4));
+
+    EXPECT_EQ(1ull, Held())
+        << "the failed read's bytes were left counted in flight";
+
+    Settle();
+
+    EXPECT_EQ(1, afterFirst->Irp.CompletionCount);
+    EXPECT_EQ(1, afterSecond->Irp.CompletionCount);
+}
+
+//
+// The case the mechanism exists for. Beside three copies a 6 MB/s player
+// missed about 29% of its deadlines on the reference link, because each of
+// its fetches queued behind the copies' bytes. With a copy's reads already
+// waiting, a player's read that arrives after them must still go ahead of
+// the copy's later one: its file has fetched less, so its start tag is
+// lower, while each queued copy read is charged for every copy read ahead
+// of it. Arrival order would send both copy reads first, and a player that
+// falls behind would wait behind every copy's backlog.
+//
+// The budget is two reads here, so both files get their first fetch and
+// every later one queues. The first two completions free two slots: one
+// goes to the copy's earlier read, whose tag ties the player's and which
+// arrived first, and the other must go to the player, not to the copy's
+// later read. The peer answers each fetch only on SandboxDrainCompletions,
+// and a released read is issued only on ShimDrainWorkItems, so the steps
+// below decide exactly which reads were released.
+//
+TEST_F(ReadFairTest, AReaderThatHasFetchedLessGoesAheadOfAQueuedCopy)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    global.ReadFairBudget = 8;
+
+    ReadRequest* playerFirst = ReadAhead(Fcb, NewBuffer(4));
+    ReadRequest* copyFirst = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* copySecond = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* copyThird = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* player = ReadAhead(Fcb, NewBuffer(4));
+
+    ASSERT_EQ(2u, SandboxSocketsCreated());
+    ASSERT_EQ(3ull, Held());
+
+    SandboxDrainCompletions();
+    ASSERT_EQ(1, playerFirst->Irp.CompletionCount);
+    ASSERT_EQ(1, copyFirst->Irp.CompletionCount);
+    ShimDrainWorkItems();
+    SandboxDrainCompletions();
+
+    EXPECT_EQ(1, copySecond->Irp.CompletionCount);
+    EXPECT_EQ(1, player->Irp.CompletionCount)
+        << "the copy's queued read went ahead of a player that had fetched less";
+    EXPECT_EQ(0, copyThird->Irp.CompletionCount);
+
+    Settle();
+
+    EXPECT_EQ(1, copyThird->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, copyThird->Irp.IoStatus.Status);
+}
+
+//
+// A file with nothing in flight is never held, however far past the budget
+// the link is. Cc keeps a player to one read-ahead at a time, so holding
+// that one made it wait for someone else's completion before every fetch
+// it ever made; measured, that alone kept it 31% late beside copies after
+// fair order had cut its fetches' wait for a first byte from 97 ms to 6.
+//
+TEST_F(ReadFairTest, AFileWithNothingInFlightIsNeverHeld)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    ReadRequest* copy = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* player = ReadAhead(Fcb, NewBuffer(4));
+
+    EXPECT_EQ(2u, SandboxSocketsCreated())
+        << "the player's only read-ahead waited behind a copy past the budget";
+    EXPECT_EQ(0ull, Held());
+
+    Settle();
+
+    EXPECT_EQ(1, copy->Irp.CompletionCount);
+    EXPECT_EQ(1, player->Irp.CompletionCount);
+}
+
+//
+// Under the budget nothing waits: a lone reader on a quiet link must run
+// exactly as before the budget existed.
+//
+TEST_F(ReadFairTest, ReadAheadUnderTheBudgetIsIssuedAtOnce)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    global.ReadFairBudget = 8;
+
+    ReadRequest* first = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* second = ReadAhead(Fcb, NewBuffer(4));
+
+    EXPECT_EQ(2u, SandboxSocketsCreated());
+    EXPECT_EQ(0ull, Held());
+
+    Settle();
+
+    EXPECT_EQ(1, first->Irp.CompletionCount);
+    EXPECT_EQ(1, second->Irp.CompletionCount);
+}
+
+//
+// A demand fault has an application blocked on it, so however far past the
+// budget the link is, it is issued at once.
+//
+TEST_F(ReadFairTest, DemandFaultIsNeverHeld)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    ReadRequest* readAhead = ReadAhead(CopyFcb, NewBuffer(4));
+
+    ReadRequest* fault = PrepareRead(CopyFcb, 0, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, NewBuffer(4));
+    ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &fault->Irp));
+
+    EXPECT_EQ(2u, SandboxSocketsCreated())
+        << "a fault with an application blocked on it was held behind read-ahead";
+    EXPECT_EQ(0ull, Held());
+
+    Settle();
+
+    EXPECT_EQ(1, readAhead->Irp.CompletionCount);
+    EXPECT_EQ(1, fault->Irp.CompletionCount);
+}
+
+//
+// Demand is never held, so other files faulting can keep the link past the
+// budget for as long as they run, and a release that waits for room then
+// never comes. Beside two copies on the reference link that stranded a
+// player's held read-ahead for 25 s, and the player's next read behind it,
+// while no fetch took more than 417 ms. When a file's last fetch settles,
+// its own held read must go out whatever the budget.
+//
+// The other file's fault stalls so that it is still in flight, and the
+// link still past the budget, when the copy's first fetch completes; a
+// fault that completed in the same drain would make room and release the
+// read on its own. Settling everything would not catch this, so the copy's
+// held read is checked while the fault is still parked.
+//
+TEST_F(ReadFairTest, AFileWhoseLastFetchSettlesGetsItsHeldReadPastTheBudget)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    static const SANDBOX_STEP stalled[] =
+    {
+        { SandboxStepStall, nullptr, 0, STATUS_SUCCESS, FALSE },
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char* heldBuffer = NewBuffer(4);
+
+    ReadRequest* first = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* held = ReadAhead(CopyFcb, heldBuffer);
+
+    ASSERT_EQ(1ull, Held());
+
+    SandboxSetPeerScript(stalled, RTL_NUMBER_OF(stalled));
+
+    ReadRequest* fault = PrepareRead(Fcb, 0, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, NewBuffer(4));
+    ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &fault->Irp));
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    SandboxDrainCompletions();
+    ASSERT_EQ(1, first->Irp.CompletionCount);
+    ShimDrainWorkItems();
+    SandboxDrainCompletions();
+
+    EXPECT_EQ(1, held->Irp.CompletionCount)
+        << "a file with nothing in flight was left held while another file's fault kept the link past the budget";
+    EXPECT_EQ(STATUS_SUCCESS, held->Irp.IoStatus.Status);
+    EXPECT_EQ(0, memcmp(heldBuffer, "WXYZ", 4));
+    EXPECT_EQ(0, fault->Irp.CompletionCount);
+
+    SandboxResumeStalled();
+    Settle();
+
+    EXPECT_EQ(1, fault->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, fault->Irp.IoStatus.Status);
 }
 
 } // namespace

@@ -45,6 +45,14 @@
 //
 #define IRP_CONTEXT_FLAG_SPECULATIVE_READ           0x00008000
 
+//
+//  This read's fetch is counted in the bytes in flight on the link
+//  (Read.c, ReadFair). Set when the fetch is admitted and cleared by
+//  whichever of ReadComplete or a failed issue settles it, so each
+//  admitted fetch is uncounted exactly once.
+//
+#define IRP_CONTEXT_FLAG_FETCH_ADMITTED             0x00010000
+
 #if (NTDDI_VERSION >= NTDDI_WINTHRESHOLD)
 #define IRP_CONTEXT_FLAG_SWAPPED_STACK              0x00100000
 #endif

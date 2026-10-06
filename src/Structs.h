@@ -190,12 +190,26 @@ typedef struct _NON_PAGED_NODE
     FAST_MUTEX HdrFastMutex;         // Header synchronization (FastMutex variant)
     ERESOURCE  HdrResource;          // Header synchronization (Resource variant)
     ERESOURCE  HdrPagingIoResource;  // Serializes paging I/O against the header
+
+    //
+    // This file's place on the shared link (Read.c, ReadFair): the virtual
+    // finish tag of its last fetch admitted, and how many of its fetches
+    // are in flight. Here rather than on the FCB because they are only
+    // touched under ReadFair's spin lock, the count from a fetch
+    // completion at DISPATCH_LEVEL, and the FCB is paged.
+    //
+    ULONG64 ReadFinishTag;
+    ULONG   ReadFetchesInFlight;
+    UCHAR   Reserved[4];             // Pad to 8-byte alignment
 } NON_PAGED_NODE, * PNON_PAGED_NODE;
 
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, SectionObjectPointers, HdrFastMutex);
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, HdrFastMutex, HdrResource);
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, HdrResource, HdrPagingIoResource);
-CHECK_PADDING_END(NON_PAGED_NODE, HdrPagingIoResource);
+CHECK_PADDING_BETWEEN(NON_PAGED_NODE, HdrPagingIoResource, ReadFinishTag);
+CHECK_PADDING_BETWEEN(NON_PAGED_NODE, ReadFinishTag, ReadFetchesInFlight);
+CHECK_PADDING_BETWEEN(NON_PAGED_NODE, ReadFetchesInFlight, Reserved);
+CHECK_PADDING_END(NON_PAGED_NODE, Reserved);
 
 //
 // Fields shared by every file-context node (FCB/DCB); embedded as the first
