@@ -263,9 +263,10 @@ while(0)
 // Tears down and frees an FCB/DCB/VCB/root-DCB/CCB node back to its
 // lookaside list, dispatching on node-type signature since the four
 // common-context kinds share teardown but differ in extra per-type state
-// (file locks, oplocks, cached listing, search pattern). For a CCB,
-// ccb->Entries is a borrowed pointer into the DCB's CachedListing (owned
-// and freed by the DCB), so it is NOT freed here.
+// (file locks, oplocks, search pattern, listing snapshot). For a CCB,
+// ccb->Entries is the handle's own reference to a listing snapshot, dropped
+// here; the snapshot is freed only if nothing else (the listing cache,
+// another handle) still holds it.
 //
 VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject)
 {
@@ -287,7 +288,6 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             PDCB dcb = Context;
             FsRtlUninitializeOplock(&dcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);
-            BlorgFreeHttpDirectoryInfo(dcb->CachedListing);
             ExFreePool(dcb->FullPath.Buffer);
             RemoveEntryList(&(dcb->Links));
             ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
@@ -307,7 +307,6 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             PDCB dcb = Context;
             FsRtlUninitializeOplock(&dcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);
-            BlorgFreeHttpDirectoryInfo(dcb->CachedListing);
             ExFreePool(dcb->FullPath.Buffer);
             ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
             break;
@@ -320,6 +319,7 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
                 RtlFreeUnicodeString(&ccb->SearchPattern);
                 RtlZeroMemory(&ccb->SearchPattern, sizeof(UNICODE_STRING));
             }
+            BlorgReleaseDirectoryInfo(ccb->Entries);
             ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->CcbLookasideList, ccb);
             break;
         }

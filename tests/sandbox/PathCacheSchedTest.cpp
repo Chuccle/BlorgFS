@@ -16,6 +16,15 @@
 // every interleaving the scheduler can construct, rather than the one or
 // two orderings a hand-written test would think to try.
 //
+// The invalidate is the long thread: it takes its path bucket and then the
+// listing buckets of the path and of its parent, three lock pairs to the
+// others' one each. Every acquire and release is a scheduling point, so the
+// space is at most 13!/(3! 3! 7!) = 34320 schedules -- past the 1680 it was
+// before invalidation dropped listings, and past a cap sized for that.
+//
+// The proofs after it cover the two places the listing cache depends on an
+// ordering: the invalidation ticket, and the one-shot refresh claim.
+//
 
 #include <gtest/gtest.h>
 
@@ -23,6 +32,8 @@ extern "C" {
 #include "..\..\src\Driver.h"
 #include "Scheduler.h"
 }
+
+#include "ListingBuilder.h"
 
 namespace
 {
@@ -46,7 +57,7 @@ void InsertThread(void* Parameter)
 {
     PathCacheProof* proof = (PathCacheProof*)Parameter;
 
-    BlorgPathCacheInsertExists(&proof->Inserted, &proof->Meta);
+    BlorgPathCacheInsertExists(&proof->Inserted, &proof->Meta, nullptr);
 
     InterlockedIncrement(&proof->InsertRan);
 }
@@ -108,7 +119,7 @@ void PathCacheProofSetup(void* Parameter)
     // Pre-populate the path the invalidate thread targets, so the race is
     // "invalidate races a concurrent unrelated insert", not "invalidate a
     // path that was never cached to begin with".
-    BlorgPathCacheInsertExists(&proof->Invalidated, &proof->Meta);
+    BlorgPathCacheInsertExists(&proof->Invalidated, &proof->Meta, nullptr);
 
     KmSchedSpawn(InsertThread, proof);
     KmSchedSpawn(InvalidateThread, proof);
@@ -138,23 +149,241 @@ TEST_F(PathCacheSchedTest, NoInterleavingOfCrossShardOpsCorruptsState)
     proof = {};
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PathCacheProofSetup, PathCacheProofTeardown, &proof, 20000);
+        KmExploreInterleavings(PathCacheProofSetup, PathCacheProofTeardown, &proof, 100000);
 
     //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
 
-    EXPECT_LT(result.Schedules, 20000)
+    EXPECT_LT(result.Schedules, 100000)
         << "hit the schedule cap -- sampled, not exhausted";
 
     EXPECT_GT(proof.InsertRan, 0) << "no schedule ever ran the insert";
     EXPECT_GT(proof.InvalidateRan, 0) << "no schedule ever ran the invalidate";
     EXPECT_GT(proof.LookupRan, 0) << "no schedule ever ran the lookup";
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+}
+
+//
+// The ticket protocol (BlorgPathCacheTakeTicket), across every interleaving:
+// a reader takes its ticket, reads, and inserts what it read, while another
+// thread invalidates the same directory. Whatever the order, a result whose
+// ticket predates the invalidation must not be in the cache once both
+// threads finish -- the cache would otherwise serve, for a full TTL, what
+// the server said before the change it was just told about. Both the path
+// cache insert and the listing publish carry the ticket, and both are
+// checked: the listing is the one a re-list serves, the path entry the one
+// an open does.
+//
+// Checked after the threads finish, against a ticket taken then: an entry
+// may be present only if the reader's ticket is as new as the final
+// sequence. A single-threaded test can only show the refusal for one fixed
+// order; the window that matters is the invalidation landing between the
+// ticket and the bucket lock, which only the scheduler reaches reliably.
+//
+struct TicketProof
+{
+    UNICODE_STRING Dir;
+    wchar_t DirBuffer[32];
+
+    UNICODE_STRING Child;
+    wchar_t ChildBuffer[48];
+
+    DIRECTORY_ENTRY_METADATA Meta;
+    PDIRECTORY_INFO Listing;
+    PATH_CACHE_TICKET Ticket;
+
+    volatile long ReaderRan;
+    volatile long InvalidateRan;
+    long Violations;
+};
+
+void TicketReaderThread(void* Parameter)
+{
+    TicketProof* proof = (TicketProof*)Parameter;
+
+    BlorgPathCacheTakeTicket(&proof->Ticket);
+    BlorgPathCacheInsertExists(&proof->Child, &proof->Meta, &proof->Ticket);
+    BlorgPathCachePublishListing(&proof->Dir, proof->Listing, &proof->Ticket);
+    BlorgReleaseDirectoryInfo(proof->Listing);
+
+    InterlockedIncrement(&proof->ReaderRan);
+}
+
+void TicketInvalidateThread(void* Parameter)
+{
+    TicketProof* proof = (TicketProof*)Parameter;
+
+    BlorgPathCacheInvalidate(&proof->Child);
+
+    InterlockedIncrement(&proof->InvalidateRan);
+}
+
+void TicketProofSetup(void* Parameter)
+{
+    TicketProof* proof = (TicketProof*)Parameter;
+
+    ShimReset();
+    BlorgPathCacheInit();
+
+    wcscpy_s(proof->DirBuffer, L"\\media\\tickets");
+    proof->Dir.Buffer = proof->DirBuffer;
+    proof->Dir.Length = (USHORT)(wcslen(proof->DirBuffer) * sizeof(wchar_t));
+    proof->Dir.MaximumLength = proof->Dir.Length;
+
+    wcscpy_s(proof->ChildBuffer, L"\\media\\tickets\\file0.bin");
+    proof->Child.Buffer = proof->ChildBuffer;
+    proof->Child.Length = (USHORT)(wcslen(proof->ChildBuffer) * sizeof(wchar_t));
+    proof->Child.MaximumLength = proof->Child.Length;
+
+    proof->Meta = {};
+    proof->Meta.Size = 1000;
+    proof->Listing = BuildSyntheticListing(1, 0);
+
+    KmSchedSpawn(TicketReaderThread, proof);
+    KmSchedSpawn(TicketInvalidateThread, proof);
+}
+
+void TicketProofTeardown(void* Parameter)
+{
+    TicketProof* proof = (TicketProof*)Parameter;
+
+    PATH_CACHE_TICKET current;
+    BlorgPathCacheTakeTicket(&current);
+
+    const bool readerCurrent = (proof->Ticket.Sequence == current.Sequence);
+
+    PDIRECTORY_INFO listing = BlorgPathCacheLookupListing(&proof->Dir, TRUE, nullptr, nullptr, nullptr);
+
+    if (listing && !readerCurrent)
+    {
+        proof->Violations++;
+    }
+
+    BlorgReleaseDirectoryInfo(listing);
+
+    if ((PathCacheMiss != BlorgPathCacheLookup(&proof->Child, nullptr)) && !readerCurrent)
+    {
+        proof->Violations++;
+    }
+
+    BlorgPathCacheCleanup();
+}
+
+TEST_F(PathCacheSchedTest, NoInterleavingKeepsAResultReadBeforeAnInvalidation)
+{
+    static TicketProof proof;
+
+    proof = {};
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(TicketProofSetup, TicketProofTeardown, &proof, 20000);
+
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ(0, result.Truncated);
+    EXPECT_LT(result.Schedules, 20000) << "hit the schedule cap -- sampled, not exhausted";
+
+    EXPECT_EQ(0, proof.Violations)
+        << "a result read before an invalidation was still cached after it";
+    EXPECT_GT(proof.ReaderRan, 0);
+    EXPECT_GT(proof.InvalidateRan, 0);
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+}
+
+//
+// Every query that finds a listing stale races to claim its one refresh
+// under the shared bucket lock, so the claim itself has to be the arbiter:
+// two lookups holding the lock shared together must not both come away
+// owing it (two requests where one was meant) or both come away not owing
+// it (a stale listing nobody refreshes until it ages out).
+//
+struct RefreshClaimProof
+{
+    UNICODE_STRING Dir;
+    wchar_t DirBuffer[32];
+
+    volatile long Owed;
+    volatile long LookupsRan;
+    long Violations;
+};
+
+void RefreshClaimThread(void* Parameter)
+{
+    RefreshClaimProof* proof = (RefreshClaimProof*)Parameter;
+
+    BOOLEAN stale = FALSE;
+    BOOLEAN owed = FALSE;
+    PDIRECTORY_INFO listing = BlorgPathCacheLookupListing(&proof->Dir, TRUE, &stale, &owed, nullptr);
+
+    if (owed)
+    {
+        InterlockedIncrement(&proof->Owed);
+    }
+
+    BlorgReleaseDirectoryInfo(listing);
+
+    InterlockedIncrement(&proof->LookupsRan);
+}
+
+void RefreshClaimSetup(void* Parameter)
+{
+    RefreshClaimProof* proof = (RefreshClaimProof*)Parameter;
+
+    ShimReset();
+    BlorgPathCacheInit();
+
+    proof->Owed = 0;
+
+    wcscpy_s(proof->DirBuffer, L"\\media\\stale");
+    proof->Dir.Buffer = proof->DirBuffer;
+    proof->Dir.Length = (USHORT)(wcslen(proof->DirBuffer) * sizeof(wchar_t));
+    proof->Dir.MaximumLength = proof->Dir.Length;
+
+    PDIRECTORY_INFO listing = BuildSyntheticListing(1, 0);
+    BlorgPathCachePublishListing(&proof->Dir, listing, nullptr);
+    BlorgReleaseDirectoryInfo(listing);
+
+    // Past the 4-second fresh window, inside the 30-second stale one.
+    ShimAdvanceInterruptTime(5ULL * 10ULL * 1000ULL * 1000ULL);
+
+    KmSchedSpawn(RefreshClaimThread, proof);
+    KmSchedSpawn(RefreshClaimThread, proof);
+}
+
+void RefreshClaimTeardown(void* Parameter)
+{
+    RefreshClaimProof* proof = (RefreshClaimProof*)Parameter;
+
+    if (1 != proof->Owed)
+    {
+        proof->Violations++;
+    }
+
+    BlorgPathCacheCleanup();
+}
+
+TEST_F(PathCacheSchedTest, ConcurrentStaleLookupsOweExactlyOneRefresh)
+{
+    static RefreshClaimProof proof;
+
+    proof = {};
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(RefreshClaimSetup, RefreshClaimTeardown, &proof, 20000);
+
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ(0, result.Truncated);
+    EXPECT_LT(result.Schedules, 20000) << "hit the schedule cap -- sampled, not exhausted";
+
+    EXPECT_EQ(0, proof.Violations) << "a stale listing's refresh was owed zero or two times";
+    EXPECT_GT(proof.LookupsRan, 0);
 
     printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
 }
