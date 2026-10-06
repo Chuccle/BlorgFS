@@ -632,6 +632,7 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    released / pool-full  %12llu / %llu\n",
         t.ConnectionsReleasedToPool, t.ConnectionsClosedPoolFull);
     printf("    keep-alive retries    %12llu\n", t.KeepAliveRetries);
+    printf("    connect retries       %12llu\n", t.ConnectRetries);
     printf("    socket timeouts       %12llu\n", t.SocketTimeouts);
 
     if (t.HandshakesStarted > 0)
@@ -2769,6 +2770,7 @@ static bool WriteReport(
     fprintf(f, "ConnectionsReleasedToPool=%llu\n", t.ConnectionsReleasedToPool);
     fprintf(f, "ConnectionsClosedPoolFull=%llu\n", t.ConnectionsClosedPoolFull);
     fprintf(f, "KeepAliveRetries=%llu\n", t.KeepAliveRetries);
+    fprintf(f, "ConnectRetries=%llu\n", t.ConnectRetries);
     fprintf(f, "SocketTimeouts=%llu\n", t.SocketTimeouts);
 
     fprintf(f, "HandshakesStarted=%llu\n", t.HandshakesStarted);

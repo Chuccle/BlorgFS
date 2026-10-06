@@ -21,6 +21,7 @@ static ULONG SocketsClosed = 0;
 static ULONG SocketsPooled = 0;
 static ULONG SocketsLive = 0;
 static ULONG AcquireFailuresPending = 0;
+static NTSTATUS AcquireFailureStatus = STATUS_CONNECTION_DISCONNECTED;
 
 static SANDBOX_PEER LastPeer;
 
@@ -129,7 +130,13 @@ VOID SandboxSetPeerScript(const SANDBOX_STEP* Steps, SIZE_T StepCount)
 
 VOID SandboxFailNextAcquires(ULONG Count)
 {
+    SandboxFailNextAcquiresWith(Count, STATUS_CONNECTION_DISCONNECTED);
+}
+
+VOID SandboxFailNextAcquiresWith(ULONG Count, NTSTATUS Status)
+{
     AcquireFailuresPending = Count;
+    AcquireFailureStatus = Status;
 }
 
 ULONG SandboxSocketsCreated(VOID) { return SocketsCreated; }
@@ -154,6 +161,7 @@ VOID SandboxSocketsReset(VOID)
     SocketsPooled = 0;
     SocketsLive = 0;
     AcquireFailuresPending = 0;
+    AcquireFailureStatus = STATUS_CONNECTION_DISCONNECTED;
 
     memset(&LastPeer, 0, sizeof(LastPeer));
 
@@ -556,7 +564,7 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
     if (AcquireFailuresPending > 0)
     {
         AcquireFailuresPending--;
-        CompletionRoutine(STATUS_CONNECTION_DISCONNECTED, NULL, FALSE, CompletionContext);
+        CompletionRoutine(AcquireFailureStatus, NULL, FALSE, CompletionContext);
         return STATUS_PENDING;
     }
 

@@ -398,6 +398,7 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ConnectionsReleasedToPool;
     ULONG64 ConnectionsClosedPoolFull;
     ULONG64 KeepAliveRetries;            // reused socket was dead, retried fresh
+    ULONG64 ConnectRetries;              // a connect timed out, retried on a new socket
     ULONG64 SocketTimeouts;              // a per-operation watchdog fired
 
     // --- TLS -------------------------------------------------------------
@@ -512,7 +513,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHECKED_BUILD 0x00000001
 
 
-#define BLORGFS_STATISTICS_VERSION 14
+#define BLORGFS_STATISTICS_VERSION 15
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {
