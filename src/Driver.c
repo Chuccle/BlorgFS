@@ -679,6 +679,17 @@ static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICO
         }
     }
 
+    ULONG fairBudgetKb = 0;
+
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadFairBudgetKb", REG_DWORD, &fairBudgetKb, sizeof(fairBudgetKb), &actualSize)))
+    {
+        if (fairBudgetKb <= MAXULONG / 1024)
+        {
+            global.ReadFairBudget = fairBudgetKb * 1024;
+            BLORGFS_LOG("DriverReadRegistryConfig() - fair-share budget: %lu KB\n", fairBudgetKb);
+        }
+    }
+
     ULONG adaptValue = 0;
 
     if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadAdapt", REG_DWORD, &adaptValue, sizeof(adaptValue), &actualSize)))
@@ -904,6 +915,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     BlorgPathCacheInit();
 
+    BlorgReadInit();
+
     NTSTATUS statisticsInitStatus = BlorgStatisticsInitialize();
     if (!NT_SUCCESS(statisticsInitStatus))
     {
@@ -1026,6 +1039,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     global.ReadAheadSlackGrowth = TRUE;
     global.ReadAheadAdapt = TRUE;
     global.ReadAheadMaxGranularity = READ_AHEAD_MAX_GRANULARITY;
+    global.ReadFairBudget = READ_FAIR_BUDGET;
 
     DriverReadRegistryConfig(RegistryPath, &portString, &hostString);
 
