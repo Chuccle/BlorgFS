@@ -69,7 +69,9 @@
           server       the Linux server-rs on the KVM host answers /healthcheck
                        through the guest's NIC at BackendHost -- the topology
                        the product actually runs in
-          install      driver\Install-BlorgFS.ps1 against that server; B: mounts
+          install      driver\Install-BlorgFS.ps1 against that server, with a
+                       256 MB disk cache so every step below reads through
+                       it; B: mounts
           service      BlorgFS is RUNNING
           listing      the tree on B: matches the corpus: every path, every size
           correctness  tools\Test-BlorgCorrectness.ps1 (size, hash, range,
@@ -78,6 +80,9 @@
                        Win32 error it expects (missing file, missing
                        directory, reading past the end); INFO lines report
                        behaviour that is not settled yet and never fail
+          mapped       a file read through a mapped view, around pages
+                       already resident, matches the server, and so do the
+                       non-cached reads the disk cache then answers
           changes      with -HostChanges: changes made to the served corpus
                        on the host while B: is mounted and its caches are
                        warm reach B: through the server's change feed -- a
@@ -523,7 +528,7 @@ function Invoke-TestStep {
             $driver = Join-Path $package 'driver'
             $code = Invoke-ChildScript $log (Join-Path $driver 'Install-BlorgFS.ps1') @{
                 InfPath = (Join-Path $driver 'BlorgFS.inf'); CertPath = (Join-Path $driver 'BlorgFS.cer')
-                RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive
+                RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive; DiskCacheMb = 256
             }
             if ($code -eq 2) { return 'test signing is off (Install-BlorgFS.ps1 exit 2) -- -Step Prepare and a reboot should have handled this' }
             if ($code -ne 0) { return "Install-BlorgFS.ps1 exited $code" }
@@ -648,6 +653,130 @@ function Invoke-TestStep {
             }
 
             if ($failed.Count) { return "$($failed.Count) failed: $($failed -join '; ')" }
+            $true
+        } | Out-Null
+
+        # A mapped read's fetch is the one whose pages the driver cannot take
+        # at their word: for the pages of a cluster already resident, Mm
+        # puts its one shared dummy page in the MDL, so a copy taken from
+        # those pages after the fetch holds whatever was last written there.
+        # Every 64 KB block of the file is faulted in a page at a time, so
+        # each has missed once already when PrefetchVirtualMemory reads the
+        # rest in large clusters around the resident pages; that second miss
+        # is what the disk cache admits. Non-cached reads, which Mm's pages
+        # cannot answer, then come from the cache.
+        Invoke-Step 'mapped' -NeedsMount {
+            param($log)
+            if (-not ('BlorgMapped' -as [type])) {
+                Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.IO.MemoryMappedFiles;
+using System.Runtime.InteropServices;
+
+public static class BlorgMapped {
+    [StructLayout(LayoutKind.Sequential)]
+    struct MemoryRange { public IntPtr Address; public UIntPtr Bytes; }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool PrefetchVirtualMemory(IntPtr process, UIntPtr count, MemoryRange[] ranges, uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool ReadFile(IntPtr file, IntPtr buffer, uint length, out uint read, IntPtr overlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetFilePointerEx(IntPtr file, long distance, IntPtr newPosition, uint method);
+
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr VirtualAlloc(IntPtr address, UIntPtr size, uint type, uint protect);
+
+    [DllImport("kernel32.dll")]
+    static extern bool VirtualFree(IntPtr address, UIntPtr size, uint type);
+
+    public static byte[] Mapped(string path, int stridePages) {
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (var mmf = MemoryMappedFile.CreateFromFile(fs, null, 0, MemoryMappedFileAccess.Read, null, HandleInheritability.None, false))
+        using (var view = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read)) {
+            long length = fs.Length;
+            var handle = view.SafeMemoryMappedViewHandle;
+            bool added = false;
+            handle.DangerousAddRef(ref added);
+            try {
+                IntPtr basePtr = handle.DangerousGetHandle();
+                for (long o = 0; o < length; o += 4096L * stridePages) {
+                    Marshal.ReadByte(new IntPtr(basePtr.ToInt64() + o));
+                }
+                var ranges = new MemoryRange[] { new MemoryRange { Address = basePtr, Bytes = new UIntPtr((ulong)length) } };
+                if (!PrefetchVirtualMemory(new IntPtr(-1), new UIntPtr(1), ranges, 0)) {
+                    throw new IOException("PrefetchVirtualMemory failed: " + Marshal.GetLastWin32Error());
+                }
+                var copy = new byte[length];
+                Marshal.Copy(basePtr, copy, 0, (int)length);
+                return copy;
+            } finally {
+                if (added) { handle.DangerousRelease(); }
+            }
+        }
+    }
+
+    public static byte[] NonCached(string path, long length) {
+        const uint chunk = 1024 * 1024;
+        IntPtr file = CreateFile(path, 0x80000000, 1, IntPtr.Zero, 3, 0x20000000, IntPtr.Zero);
+        if (file == new IntPtr(-1)) { throw new IOException("CreateFile failed: " + Marshal.GetLastWin32Error()); }
+        IntPtr buffer = VirtualAlloc(IntPtr.Zero, new UIntPtr(chunk), 0x3000, 0x04);
+        try {
+            var result = new byte[length];
+            for (long o = 0; o < length; o += chunk) {
+                uint read;
+                if (!SetFilePointerEx(file, o, IntPtr.Zero, 0) || !ReadFile(file, buffer, chunk, out read, IntPtr.Zero)) {
+                    throw new IOException("non-cached read at " + o + " failed: " + Marshal.GetLastWin32Error());
+                }
+                Marshal.Copy(buffer, result, (int)o, (int)Math.Min(read, length - o));
+            }
+            return result;
+        } finally {
+            VirtualFree(buffer, UIntPtr.Zero, 0x8000);
+            CloseHandle(file);
+        }
+    }
+
+    public static long FirstDifference(byte[] a, byte[] b) {
+        long n = Math.Min(a.LongLength, b.LongLength);
+        for (long i = 0; i < n; i++) { if (a[i] != b[i]) { return i; } }
+        return (a.LongLength == b.LongLength) ? -1 : n;
+    }
+}
+'@
+            }
+
+            $relative = 'large\past-hash-limit.bin'
+            $req = [System.Net.HttpWebRequest]::Create("$backendUrl/get_file?path=/large/past-hash-limit.bin")
+            $req.Timeout = 120000
+            $req.ReadWriteTimeout = 120000
+            $resp = $req.GetResponse()
+            try {
+                $ms = New-Object System.IO.MemoryStream
+                $resp.GetResponseStream().CopyTo($ms)
+                $want = $ms.ToArray()
+            } finally { $resp.Close() }
+
+            $file = "${Drive}:\$relative"
+            $failures = @()
+            $at = [BlorgMapped]::FirstDifference([BlorgMapped]::Mapped($file, 8), $want)
+            "mapped read of $relative ($($want.Length) bytes): first difference $at" | Write-StepLog -Log $log
+            if ($at -ge 0) { $failures += "mapped read differs at $at" }
+            foreach ($pass in 1, 2) {
+                $at = [BlorgMapped]::FirstDifference([BlorgMapped]::NonCached($file, $want.Length), $want)
+                "non-cached pass ${pass}: first difference $at" | Write-StepLog -Log $log
+                if ($at -ge 0) { $failures += "non-cached pass $pass differs at $at" }
+            }
+            if ($failures) { return $failures -join '; ' }
             $true
         } | Out-Null
 
