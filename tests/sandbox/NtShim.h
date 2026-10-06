@@ -559,6 +559,7 @@ PVOID MmGetSystemAddressForMdlSafe(PMDL Mdl, ULONG Priority);
 // sandbox would have to export.
 //
 #define MmGetMdlVirtualAddress(Mdl) ((Mdl)->Base)
+#define MmGetMdlByteOffset(Mdl) ((ULONG)((ULONG_PTR)(Mdl)->Base & (PAGE_SIZE - 1)))
 
 //
 // Describes a slice of SourceMdl's pages without taking a second lock on
@@ -570,6 +571,7 @@ PVOID MmGetSystemAddressForMdlSafe(PMDL Mdl, ULONG Priority);
 VOID IoBuildPartialMdl(PMDL SourceMdl, PMDL TargetMdl, PVOID VirtualAddress, ULONG Length);
 
 VOID ShimFailNextMdlMapping(VOID);
+VOID ShimFailNextMdlAllocation(VOID);
 
 //
 // MDLs built by a test rather than by the driver: the paging-read path
@@ -622,6 +624,13 @@ typedef struct _OBJECT_TYPE OBJECT_TYPE, * POBJECT_TYPE;
 //
 extern POBJECT_TYPE* PsThreadType;
 
+//
+// Unlike PsThreadType this one is distinct from NULL, so
+// ObReferenceObjectByHandle can tell a file handle apart: the cache file's
+// handle is its file object (DiskCacheModel.c).
+//
+extern POBJECT_TYPE* IoFileObjectType;
+
 typedef struct _ETHREAD ETHREAD, * PETHREAD;
 typedef struct _EPROCESS EPROCESS, * PEPROCESS;
 
@@ -654,6 +663,7 @@ struct _DEVICE_OBJECT
     DEVICE_TYPE DeviceType;      // reported through FileFsDeviceInformation
     ULONG Characteristics;       // ditto -- read-only, remote, and so on
     struct _VPB* Vpb;
+    CCHAR StackSize;             // stack locations an IRP sent to it needs (DiskCache.c)
 };
 
 #define MAXIMUM_VOLUME_LABEL_LENGTH (32 * sizeof(WCHAR))
@@ -783,6 +793,8 @@ typedef struct _DRIVER_OBJECT
 #define IRP_SYNCHRONOUS_API  0x00000004
 #define IRP_BUFFERED_IO      0x00000010
 #define IRP_INPUT_OPERATION  0x00000040
+#define IRP_WRITE_OPERATION  0x00000400
+#define IRP_READ_OPERATION   0x00000800
 
 typedef NTSTATUS IO_COMPLETION_ROUTINE(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context);
 typedef IO_COMPLETION_ROUTINE* PIO_COMPLETION_ROUTINE;
@@ -855,8 +867,11 @@ struct _IRP
     KPROCESSOR_MODE RequestorMode;
 
     //
-    // One stack location, not a stack of them: BlorgFS never calls down to
-    // a lower driver, so the next-lower location is never used.
+    // One stack location, not a stack of them. An IRP the I/O manager hands
+    // BlorgFS uses it as the current location; one BlorgFS allocates and
+    // sends to the disk cache's file (DiskCache.c) fills it as the next
+    // location, and the model's lower driver reads it as its current one.
+    // Either way only one level is ever looked at.
     //
     struct _IO_STACK_LOCATION* StackLocation;
 
@@ -884,10 +899,15 @@ struct _IRP
 
             PVOID Thread;
             PIRP  CurrentStackLocation;
+            PFILE_OBJECT OriginalFileObject;
         } Overlay;
     } Tail;
 };
 
+//
+// The IRP comes with its one stack location, as the kernel's comes with
+// StackSize of them.
+//
 PIRP IoAllocateIrp(CCHAR StackSize, BOOLEAN ChargeQuota);
 VOID IoFreeIrp(PIRP Irp);
 VOID IoSetCompletionRoutine(PIRP Irp, PIO_COMPLETION_ROUTINE Routine, PVOID Context, BOOLEAN Success, BOOLEAN Error, BOOLEAN Cancel);
