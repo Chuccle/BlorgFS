@@ -46,6 +46,39 @@ BOOLEAN CcUninitializeCacheMap(PFILE_OBJECT F, PLARGE_INTEGER T, PVOID E)
 }
 
 VOID CcSetReadAheadGranularity(PFILE_OBJECT F, ULONG G) { (void)F; (void)G; }
+
+//
+// A purge fails in the kernel while a mapped view or an image section
+// still holds the pages, and CreateFcbRefresh's answer to that -- keep the
+// old copy -- is otherwise unreachable here.
+//
+static volatile LONG CachePurges = 0;
+static volatile LONG CachePurgeRefused = 0;
+
+LONG ShimCachePurges(VOID)
+{
+    return InterlockedCompareExchange(&CachePurges, 0, 0);
+}
+
+VOID ShimRefuseNextCachePurge(VOID)
+{
+    InterlockedExchange(&CachePurgeRefused, 1);
+}
+
+BOOLEAN CcPurgeCacheSection(PSECTION_OBJECT_POINTERS Sections, PLARGE_INTEGER O, ULONG L, ULONG Flags)
+{
+    (void)Sections; (void)O; (void)L; (void)Flags;
+    InterlockedIncrement(&CachePurges);
+    return !InterlockedCompareExchange(&CachePurgeRefused, 0, 1);
+}
+
+VOID CcSetFileSizes(PFILE_OBJECT F, PCC_FILE_SIZES S) { (void)F; (void)S; }
+
+BOOLEAN MmFlushImageSection(PSECTION_OBJECT_POINTERS Sections, MMFLUSH_TYPE FlushType)
+{
+    (void)Sections; (void)FlushType;
+    return TRUE;
+}
 VOID CcSetAdditionalCacheAttributes(PFILE_OBJECT F, BOOLEAN NoRa, BOOLEAN NoWb) { (void)F; (void)NoRa; (void)NoWb; }
 
 //

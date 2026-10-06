@@ -6,7 +6,9 @@
 // FILES through BlorgCreate; a directory open takes a structurally
 // different branch in BlorgVolumeCreate (FILE_NON_DIRECTORY_FILE checks,
 // OpenExistingDcb's CCB allocation, the root-path shortcut) that a
-// file-only opener never touches.
+// file-only opener never touches. The same plumbing drives the reopen of
+// a resident file after the server's copy changed (FcbReopenTest, at the
+// end), the one file-open branch those targets do not reach.
 //
 // CheckFileAccess and CheckDirectoryAccess are `static inline` in
 // Create.c, unreachable from any other translation unit -- the same
@@ -28,12 +30,13 @@
 // CreateComplete (the async BlorgHttpGetFileInformation completion)
 // is also still 0%: reaching it means scripting a real HTTP round trip
 // through the real Client.c and SandboxSocket peer, which is follow-on
-// work, not done here. What IS covered without a network round trip is
-// the OTHER way BlorgVolumeCreate resolves a cold path: a fresh listing of
-// the parent in the listing cache, which is exactly how a warm directory's
-// children resolve once DirCtrlComplete has published its listing. That
-// path exercises SplitPathLeaf and both of FindEntryByName's loops for
-// free.
+// work, not done here; the re-drive that consumes what it stashes is
+// driven directly (FcbReopenTest). What IS covered without a network
+// round trip is the OTHER way BlorgVolumeCreate resolves a cold path: a
+// fresh listing of the parent in the listing cache, which is exactly how
+// a warm directory's children resolve once DirCtrlComplete has published
+// its listing. That path exercises SplitPathLeaf and both of
+// FindEntryByName's loops for free.
 //
 // DispatchSandbox.vcxproj lists this TU BEFORE DispatchSchedTest.cpp, not
 // alphabetically or by habit: KmExploreInterleavings (Scheduler.c) turns
@@ -55,6 +58,8 @@
 
 extern "C" {
 #include "..\..\src\Driver.h"
+
+NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject);
 }
 
 #include "ListingBuilder.h"
@@ -176,7 +181,8 @@ protected:
 
     //
     // A node built and published the way a completed cold open leaves one
-    // (see BlorgInsertByPath/BlorgNodeTablePublish in Create.c).
+    // (see BlorgInsertByPath/BlorgNodeTablePublish in Create.c), a file
+    // stamped as just read so the warm path trusts it (CreateFcbIsCurrent).
     //
     PCOMMON_CONTEXT MakePublishedNode(const wchar_t* path, BOOLEAN IsDirectory)
     {
@@ -191,6 +197,11 @@ protected:
 
         if (node)
         {
+            if (!IsDirectory)
+            {
+                BlorgPathCacheTakeTicket(&C_CAST(PFCB, node)->MetaTicket);
+            }
+
             BlorgNodeTablePublish(node);
         }
 
@@ -938,6 +949,307 @@ TEST_F(CreateDirectoryTest, FailedColdOpenDefersItsInsertedNodeForReap)
 
     EXPECT_EQ(nullptr, stranded)
         << "the resolved node was never reaped after its open failed";
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+// Reopening a resident file -- CreateFcbIsCurrent / CreateFcbRefresh
+///////////////////////////////////////////////////////////////////////////
+
+//
+// A file read and closed stays resident while Cc holds its file object:
+// cleaned up, its close still owed. These drive the next open of it after
+// the server's copy changed, which is what the warm path used to answer
+// with the old size. The change arrives the way the change feed delivers
+// one: the path is invalidated, then the path cache learns the new answer.
+//
+class FcbReopenTest : public CreateDirectoryTest
+{
+protected:
+    void SetUp() override
+    {
+        CreateDirectoryTest::SetUp();
+
+        ASSERT_NE(nullptr, MakePublishedNode(L"\\media", TRUE));
+        File = C_CAST(PFCB, MakePublishedNode(L"\\media\\clip.bin", FALSE));
+        ASSERT_NE(nullptr, File);
+
+        Stats = BlorgStatisticsForCurrentProcessor();
+        ASSERT_NE(nullptr, Stats);
+    }
+
+    NTSTATUS Open(CreateOpener* opener)
+    {
+        PrepareOpener(opener, Path(L"\\media\\clip.bin"), FILE_READ_DATA, kShareAll, 0);
+        BlorgCreate(Volume, &opener->CreateIrp);
+        return opener->CreateIrp.IoStatus.Status;
+    }
+
+    static void ServerChanged(ULONG64 size, ULONG64 lastModified)
+    {
+        UNICODE_STRING path = Path(L"\\media\\clip.bin");
+        BlorgPathCacheInvalidate(&path);
+
+        DIRECTORY_ENTRY_METADATA meta = {};
+        meta.Size = size;
+        meta.LastModifiedTime = lastModified;
+        BlorgPathCacheInsertExists(&path, &meta, nullptr);
+    }
+
+    //
+    // The pass CreateComplete re-queues once the network answered: the
+    // result stashed on the IRP the way it leaves it, consumed at the top
+    // of BlorgVolumeCreate on the FSP thread.
+    //
+    NTSTATUS Redrive(CreateOpener* opener, const wchar_t* path, const PATH_CACHE_TICKET& ticket, BOOLEAN noStore)
+    {
+        PCREATE_NET_RESULT stash = C_CAST(PCREATE_NET_RESULT,
+            ExAllocatePoolZero(NonPagedPoolNx, sizeof(CREATE_NET_RESULT), 'CRET'));
+        EXPECT_NE(nullptr, stash);
+        stash->Ticket = ticket;
+        stash->Meta.Size = 4096;
+        stash->Meta.NoStore = noStore;
+
+        PrepareOpener(opener, Path(path), FILE_READ_DATA, kShareAll, 0);
+        opener->CreateIrp.Tail.Overlay.DriverContext[0] =
+            C_CAST(PVOID, C_CAST(ULONG_PTR, IRP_CONTEXT_FLAG_WAIT | IRP_CONTEXT_FLAG_IN_FSP | IRP_CONTEXT_FLAG_NET_DONE));
+        opener->CreateIrp.Tail.Overlay.DriverContext[1] = stash;
+
+        return BlorgVolumeCreate(&opener->CreateIrp, &opener->CreateStack, Volume);
+    }
+
+    PFCB File = nullptr;
+    PBLORGFS_STATISTICS Stats = nullptr;
+};
+
+TEST_F(FcbReopenTest, ReopenAfterTheServerChangedTheFileTakesTheNewSize)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    ServerChanged(5096, 7);
+
+    const LONG purgesBefore = ShimCachePurges();
+    const ULONG64 refreshesBefore = Stats->FcbRefreshes;
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    EXPECT_EQ(File, second.FileObject.FsContext)
+        << "the resident FCB is refreshed in place, not replaced by a second one for the same file";
+    EXPECT_EQ(5096, File->Header.FileSize.QuadPart);
+    EXPECT_EQ(5096, File->Header.AllocationSize.QuadPart);
+    EXPECT_EQ(7u, File->LastModifiedTime);
+    EXPECT_EQ(purgesBefore + 1, ShimCachePurges()) << "the old pages must go before the new size is taken";
+    EXPECT_EQ(refreshesBefore + 1, Stats->FcbRefreshes);
+
+    CloseOpener(&second);
+    BlorgClose(Volume, &first.CloseIrp);
+}
+
+//
+// The stamp is as old as the read behind the path-cache entry that answered
+// the open, not as the open: an FCB refreshed from an entry near the end of
+// its lifetime is trusted only for what is left of it.
+//
+TEST_F(FcbReopenTest, RefreshFromTheCacheIsStampedWithTheEntrysAge)
+{
+    constexpr ULONG64 kSecond = 10ULL * 1000ULL * 1000ULL;
+
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    ServerChanged(5096, 7);
+    ShimAdvanceInterruptTime(3 * kSecond);
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+    ASSERT_EQ(5096, File->Header.FileSize.QuadPart);
+    EXPECT_TRUE(BlorgPathCacheTicketCurrent(&File->MetaTicket));
+
+    ShimAdvanceInterruptTime(2 * kSecond);
+
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&File->MetaTicket))
+        << "the size came from a read five seconds old, past the four the cache trusts";
+
+    CloseOpener(&second);
+    BlorgClose(Volume, &first.CloseIrp);
+}
+
+//
+// A file first resolved from the network is stamped with the ticket its
+// lookup was issued under, so its next reopen inside the lifetime is
+// answered warm. An answer the server marked no-store vouches for nothing.
+//
+TEST_F(FcbReopenTest, FileResolvedFromTheNetworkIsStampedWithItsRead)
+{
+    constexpr ULONG64 kSecond = 10ULL * 1000ULL * 1000ULL;
+
+    PATH_CACHE_TICKET read;
+    BlorgPathCacheTakeTicket(&read);
+    ShimAdvanceInterruptTime(kSecond);
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_SUCCESS, Redrive(&opener, L"\\media\\fresh.bin", read, FALSE));
+
+    PFCB fresh = C_CAST(PFCB, opener.FileObject.FsContext);
+    ASSERT_NE(nullptr, fresh);
+    EXPECT_EQ(read.IssueTime, fresh->MetaTicket.IssueTime);
+    EXPECT_TRUE(BlorgPathCacheTicketCurrent(&fresh->MetaTicket));
+
+    CloseOpener(&opener);
+}
+
+TEST_F(FcbReopenTest, FileResolvedFromACachedListingIsStampedWithTheListingsAge)
+{
+    constexpr ULONG64 kSecond = 10ULL * 1000ULL * 1000ULL;
+
+    PDIRECTORY_INFO listing = BuildSyntheticListingNamed(L"fresh.bin", L"sub");
+    ASSERT_NE(nullptr, listing);
+    UNICODE_STRING media = Path(L"\\media");
+    EXPECT_TRUE(BlorgPathCachePublishListing(&media, listing, nullptr));
+    BlorgReleaseDirectoryInfo(listing);
+
+    ShimAdvanceInterruptTime(3 * kSecond);
+
+    CreateOpener opener;
+    PrepareOpener(&opener, Path(L"\\media\\fresh.bin"), FILE_READ_DATA, kShareAll, 0);
+    BlorgCreate(Volume, &opener.CreateIrp);
+    ASSERT_EQ(STATUS_SUCCESS, opener.CreateIrp.IoStatus.Status);
+
+    PFCB fresh = C_CAST(PFCB, opener.FileObject.FsContext);
+    ASSERT_NE(nullptr, fresh);
+    EXPECT_TRUE(BlorgPathCacheTicketCurrent(&fresh->MetaTicket));
+
+    ShimAdvanceInterruptTime(2 * kSecond);
+
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&fresh->MetaTicket))
+        << "the size came from a listing fetched five seconds ago";
+
+    CloseOpener(&opener);
+}
+
+TEST_F(FcbReopenTest, FileResolvedFromANoStoreAnswerIsNotStamped)
+{
+    PATH_CACHE_TICKET read;
+    BlorgPathCacheTakeTicket(&read);
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_SUCCESS, Redrive(&opener, L"\\media\\aliased.bin", read, TRUE));
+
+    PFCB fresh = C_CAST(PFCB, opener.FileObject.FsContext);
+    ASSERT_NE(nullptr, fresh);
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&fresh->MetaTicket));
+
+    CloseOpener(&opener);
+}
+
+TEST_F(FcbReopenTest, ReopenWhileAHandleIsOpenSharesTheCopyThatHandleHas)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+
+    ServerChanged(5096, 7);
+
+    const LONG purgesBefore = ShimCachePurges();
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    EXPECT_EQ(File, second.FileObject.FsContext);
+    EXPECT_EQ(4096, File->Header.FileSize.QuadPart)
+        << "changing the size under an open handle would tear the view it is reading";
+    EXPECT_EQ(purgesBefore, ShimCachePurges());
+
+    CloseOpener(&second);
+    CloseOpener(&first);
+}
+
+TEST_F(FcbReopenTest, ReopenOfAFileRemovedOnTheServerIsNotFound)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    UNICODE_STRING path = Path(L"\\media\\clip.bin");
+    BlorgPathCacheInvalidate(&path);
+    BlorgPathCacheInsertNotFound(&path, nullptr);
+
+    CreateOpener second;
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, Open(&second))
+        << "a resident FCB must not answer for a file the server no longer has";
+
+    BlorgClose(Volume, &first.CloseIrp);
+}
+
+TEST_F(FcbReopenTest, ReopenOfAnUnchangedFileIsAnsweredWarm)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    ServerChanged(4096, 0);
+
+    const LONG purgesBefore = ShimCachePurges();
+    const ULONG64 refreshesBefore = Stats->FcbRefreshes;
+    const ULONG64 lookupsBefore = Stats->MetaDataReads;
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    EXPECT_EQ(File, second.FileObject.FsContext);
+    EXPECT_EQ(purgesBefore, ShimCachePurges()) << "nothing changed, so nothing cached may be dropped";
+    EXPECT_EQ(refreshesBefore, Stats->FcbRefreshes);
+    EXPECT_EQ(lookupsBefore, Stats->MetaDataReads) << "a warm reopen resolves nothing, so it counts no lookup";
+
+    CloseOpener(&second);
+    BlorgClose(Volume, &first.CloseIrp);
+}
+
+//
+// A user-mapped view outlives its handle and keeps the old pages, which
+// is when the purge fails. The FCB then keeps its old copy whole rather
+// than taking a size its cached pages disagree with. Opens until the next
+// reported change do not retry the purge, and the first after it, with
+// the view gone, takes the new size.
+//
+TEST_F(FcbReopenTest, PurgeRefusedKeepsTheOldCopyUntilTheNextOpen)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    ServerChanged(5096, 7);
+
+    const ULONG64 deferredBefore = Stats->FcbRefreshesDeferred;
+
+    ShimRefuseNextCachePurge();
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+    EXPECT_EQ(4096, File->Header.FileSize.QuadPart);
+    EXPECT_EQ(0u, File->LastModifiedTime);
+    EXPECT_EQ(deferredBefore + 1, Stats->FcbRefreshesDeferred);
+    CloseOpener(&second);
+
+    const LONG purgesBefore = ShimCachePurges();
+
+    CreateOpener third;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&third));
+    EXPECT_EQ(4096, File->Header.FileSize.QuadPart);
+    EXPECT_EQ(purgesBefore, ShimCachePurges()) << "every open retrying a purge the view still blocks";
+    CloseOpener(&third);
+
+    ServerChanged(5096, 7);
+
+    CreateOpener fourth;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&fourth));
+    EXPECT_EQ(5096, File->Header.FileSize.QuadPart);
+    CloseOpener(&fourth);
+
+    BlorgClose(Volume, &first.CloseIrp);
 }
 
 } // namespace

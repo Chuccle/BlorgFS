@@ -406,7 +406,7 @@ TEST_F(FspWorkQueueStressTest, TeardownDrainFreesTheStashOnAnIrpItCancels)
 
     const SIZE_T before = ShimPoolOutstanding();
 
-    PVOID stash = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(DIRECTORY_ENTRY_METADATA), 'CRET');
+    PVOID stash = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(CREATE_NET_RESULT), 'CRET');
     ASSERT_NE(nullptr, stash);
 
     slot.Irp.Tail.Overlay.DriverContext[1] = stash;
