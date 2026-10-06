@@ -122,6 +122,24 @@ typedef struct _SANDBOX_ACQUIRE_DEFERRED
 
 static SANDBOX_ACQUIRE_DEFERRED* AcquireDeferredHead = NULL;
 
+//
+// Receives a Stall step parked, oldest first. Each keeps what it was asked
+// for, so SandboxResumeStalled can answer it from the step after the stall
+// as though the bytes had only now arrived.
+//
+typedef struct _SANDBOX_PARKED
+{
+    PKSOCKET Socket;
+    unsigned char* Destination;
+    ULONG Length;
+    ULONG Flags;
+    PKSOCKET_COMPLETION_ROUTINE Routine;
+    PVOID Context;
+    struct _SANDBOX_PARKED* Next;
+} SANDBOX_PARKED;
+
+static SANDBOX_PARKED* ParkedHead = NULL;
+
 VOID SandboxSetPeerScript(const SANDBOX_STEP* Steps, SIZE_T StepCount)
 {
     ScriptSteps = Steps;
@@ -173,6 +191,13 @@ VOID SandboxSocketsReset(VOID)
     }
 
     DeferredTail = NULL;
+
+    while (ParkedHead)
+    {
+        SANDBOX_PARKED* next = ParkedHead->Next;
+        free(ParkedHead);
+        ParkedHead = next;
+    }
 
     while (AcquireDeferredHead)
     {
@@ -447,6 +472,24 @@ static NTSTATUS SandboxReceiveCommon(
     if (STATUS_PENDING == status)
     {
         // Stalled: nothing completes, the request stays parked.
+        SANDBOX_PARKED* parked = (SANDBOX_PARKED*)calloc(1, sizeof(SANDBOX_PARKED));
+
+        parked->Socket = Socket;
+        parked->Destination = Destination;
+        parked->Length = Length;
+        parked->Flags = Flags;
+        parked->Routine = CompletionRoutine;
+        parked->Context = CompletionContext;
+
+        SANDBOX_PARKED** link = &ParkedHead;
+
+        while (*link)
+        {
+            link = &(*link)->Next;
+        }
+
+        *link = parked;
+
         return STATUS_PENDING;
     }
 
@@ -465,6 +508,23 @@ static NTSTATUS SandboxReceiveCommon(
     }
 
     return STATUS_PENDING;
+}
+
+VOID SandboxResumeStalled(VOID)
+{
+    SANDBOX_PARKED* parked = ParkedHead;
+    ParkedHead = NULL;
+
+    while (parked)
+    {
+        SANDBOX_PARKED* next = parked->Next;
+
+        SocketState(parked->Socket)->Peer->Stalled = FALSE;
+        SandboxReceiveCommon(parked->Socket, parked->Destination, parked->Length, parked->Flags, parked->Routine, parked->Context);
+
+        free(parked);
+        parked = next;
+    }
 }
 
 NTSTATUS BlorgReceiveWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
