@@ -178,8 +178,8 @@ protected:
 
     //
     // A node built and published the way a completed cold open leaves one
-    // (see BlorgInsertByPath/BlorgNodeTablePublish in Create.c), a file
-    // stamped as just read so the warm path trusts it (FcbIsCurrent).
+    // (see BlorgInsertByPath/BlorgNodeTablePublish in Create.c), stamped
+    // as just read so the warm path trusts it (FcbIsCurrent, DcbIsCurrent).
     //
     PCOMMON_CONTEXT MakePublishedNode(const wchar_t* path, BOOLEAN IsDirectory)
     {
@@ -194,7 +194,11 @@ protected:
 
         if (node)
         {
-            if (!IsDirectory)
+            if (IsDirectory)
+            {
+                BlorgPathCacheTakeTicket(&C_CAST(PDCB, node)->MetaTicket);
+            }
+            else
             {
                 BlorgPathCacheTakeTicket(&C_CAST(PFCB, node)->MetaTicket);
             }
