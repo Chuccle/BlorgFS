@@ -865,4 +865,63 @@ TEST_F(ReadFairTest, DemandFaultIsNeverHeld)
     EXPECT_EQ(1, fault->Irp.CompletionCount);
 }
 
+//
+// Demand is never held, so other files faulting can keep the link past the
+// budget for as long as they run, and a release that waits for room then
+// never comes. Beside two copies on the reference link that stranded a
+// player's held read-ahead for 25 s, and the player's next read behind it,
+// while no fetch took more than 417 ms. When a file's last fetch settles,
+// its own held read must go out whatever the budget.
+//
+// The other file's fault stalls so that it is still in flight, and the
+// link still past the budget, when the copy's first fetch completes; a
+// fault that completed in the same drain would make room and release the
+// read on its own. Settling everything would not catch this, so the copy's
+// held read is checked while the fault is still parked.
+//
+TEST_F(ReadFairTest, AFileWhoseLastFetchSettlesGetsItsHeldReadPastTheBudget)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    static const SANDBOX_STEP stalled[] =
+    {
+        { SandboxStepStall, nullptr, 0, STATUS_SUCCESS, FALSE },
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char* heldBuffer = NewBuffer(4);
+
+    ReadRequest* first = ReadAhead(CopyFcb, NewBuffer(4));
+    ReadRequest* held = ReadAhead(CopyFcb, heldBuffer);
+
+    ASSERT_EQ(1ull, Held());
+
+    SandboxSetPeerScript(stalled, RTL_NUMBER_OF(stalled));
+
+    ReadRequest* fault = PrepareRead(Fcb, 0, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, NewBuffer(4));
+    ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &fault->Irp));
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    SandboxDrainCompletions();
+    ASSERT_EQ(1, first->Irp.CompletionCount);
+    ShimDrainWorkItems();
+    SandboxDrainCompletions();
+
+    EXPECT_EQ(1, held->Irp.CompletionCount)
+        << "a file with nothing in flight was left held while another file's fault kept the link past the budget";
+    EXPECT_EQ(STATUS_SUCCESS, held->Irp.IoStatus.Status);
+    EXPECT_EQ(0, memcmp(heldBuffer, "WXYZ", 4));
+    EXPECT_EQ(0, fault->Irp.CompletionCount);
+
+    SandboxResumeStalled();
+    Settle();
+
+    EXPECT_EQ(1, fault->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, fault->Irp.IoStatus.Status);
+}
+
 } // namespace
