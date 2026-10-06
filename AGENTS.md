@@ -1425,8 +1425,23 @@ A listing is an immutable, reference-counted snapshot. Each handle
 enumerates the one it took on its initial query until it restarts the
 scan, so a refresh landing mid-`dir` never moves entries under the
 handle's index; the cache holds its own reference and a 32 MB budget.
-Only directory queries take a stale listing: an open's not-found does not,
-since a stale listing would hide a file the server has gained.
+The budget is enforced within the bucket a listing is published to, and
+expiry is otherwise noticed only in a bucket taking a publish, so a publish
+over budget first reaps every bucket's dead listings
+(`ListingCacheReapDead`); before that, expired listings in quiet buckets
+held the budget and new ones were refused room. Only directory queries take
+a stale listing: an open's not-found does not, since a stale listing would
+hide a file the server has gained.
+
+A published listing seeds the path cache with its children and drops the
+directory's other children. With the feed down it also drops everything
+deeper, since a child directory may have been replaced; with the feed live
+it keeps what is deeper, because the feed reports such a change and drops
+the subtree itself, and dropping it on every listing emptied the path cache
+beneath a directory each time it was re-listed, the whole volume's for the
+root. The cost is a window: entries beneath a child the new listing no
+longer names stay until the feed's report of that child's removal is
+applied, which is the feed's delay, not the long lifetime.
 
 **The rule a change must keep: every result read from the server is
 inserted with the ticket taken before it was read.** Every invalidation
