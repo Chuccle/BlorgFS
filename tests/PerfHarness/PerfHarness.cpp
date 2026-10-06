@@ -624,6 +624,8 @@ static void PrintDriverStatistics(const BLORGFS_STATISTICS_RESPONSE& stats)
     printf("    path cache hit rate   %12.1f%%  (%llu hit, %llu miss)\n",
         SafeRatio(t.PathCacheHits, t.PathCacheHits + t.PathCacheMisses),
         t.PathCacheHits, t.PathCacheMisses);
+    printf("    listings hit/stale/miss %10llu / %llu / %llu  (%llu refreshed behind)\n",
+        t.ListingCacheHits, t.ListingCacheStaleHits, t.ListingCacheMisses, t.ListingRefreshes);
 
     const unsigned long long acquires = t.ConnectionsPooled + t.ConnectionsFresh;
 
@@ -2765,6 +2767,10 @@ static bool WriteReport(
     fprintf(f, "PathCacheHits=%llu\n", t.PathCacheHits);
     fprintf(f, "PathCacheMisses=%llu\n", t.PathCacheMisses);
     fprintf(f, "PathCacheHitRate=%.4f\n", SafeRatio(t.PathCacheHits, t.PathCacheHits + t.PathCacheMisses));
+    fprintf(f, "ListingCacheHits=%llu\n", t.ListingCacheHits);
+    fprintf(f, "ListingCacheStaleHits=%llu\n", t.ListingCacheStaleHits);
+    fprintf(f, "ListingCacheMisses=%llu\n", t.ListingCacheMisses);
+    fprintf(f, "ListingRefreshes=%llu\n", t.ListingRefreshes);
 
     fprintf(f, "ConnectionsPooled=%llu\n", t.ConnectionsPooled);
     fprintf(f, "ConnectionsFresh=%llu\n", t.ConnectionsFresh);

@@ -376,47 +376,68 @@ static NTSTATUS EnumerateDirectoryEntries(
     return found ? STATUS_SUCCESS : STATUS_NO_MORE_FILES;
 }
 
+#define DIRCTRL_FETCH_TAG 'FDLB'
+
 //
-//  Completion for the async directory-listing fetch issued by
-//  BlorgVolumeDirectoryControl. Runs on the WSK completion path at
-//  <= DISPATCH_LEVEL: it takes ownership of the deserialized DIRECTORY_INFO
-//  (NonPagedPoolNx, so reachable here), stores it on the CCB, and re-queues
-//  the IRP with NET_DONE set so the PASSIVE_LEVEL enumeration runs on an FSP
-//  thread. CallerContext is the PIRP.
+// One directory-listing fetch in flight: the query waiting on it, or none
+// for a background refresh, which instead owns a copy of the directory's
+// path because no handle keeps the DCB alive for it. The ticket is taken
+// at issue, so the result is refused by the listing and path caches if an
+// invalidation overtook it on the wire. NonPagedPoolNx throughout: a fetch
+// that fails is completed on the failure path, which frees this context.
 //
-//  DirInfo is published as the DCB's cached listing, shared by every
-//  handle to this directory and freed only when the last handle closes.
-//  The publish is a release write (WritePointerRelease): BlorgVolumeCreate
-//  reads the pointer holding only the VCB resource, not this DCB's, so
-//  the release/acquire pair -- not a common lock -- is what makes the
-//  listing's contents visible before the pointer on weakly-ordered
-//  architectures (ARM64). The pointer is write-once, NULL -> non-NULL,
-//  never replaced until the DCB itself is freed (see DCB.CachedListing).
-//  If a concurrent query on another handle already cached a listing
-//  while the resource was released across this async fetch, the
-//  existing one is kept and this duplicate freed. This runs at
-//  PASSIVE_LEVEL, so the ERESOURCE is legal; it is wrapped in a critical
-//  region since a system worker thread does not disable APCs the way an
-//  FSP thread does.
+typedef struct _DIRCTRL_FETCH
+{
+    PIRP              Irp;    // the query, or NULL for a refresh
+    UNICODE_STRING    Path;   // owned copy, refresh only
+    PATH_CACHE_TICKET Ticket; // taken immediately before the request is issued
+} DIRCTRL_FETCH, * PDIRCTRL_FETCH;
+
+CHECK_PADDING_BETWEEN(DIRCTRL_FETCH, Irp, Path);
+CHECK_PADDING_BETWEEN(DIRCTRL_FETCH, Path, Ticket);
+CHECK_PADDING_END(DIRCTRL_FETCH, Ticket);
+
 //
-//  A freshly fetched listing is authoritative for the directory's direct
-//  children, so on an actual publish (not a duplicate) it is also handed to
-//  the path cache (BlorgPathCacheSeedListing): every child becomes a live
-//  entry with the listing's metadata, replacing any stale not-found, and
-//  deeper entries are dropped. The listing itself is freed with the DCB once
-//  the last handle closes, so the seeded entries are what let the opens that
-//  follow a `dir` resolve without a fileinfo GET each.
+//  Offers a fetched listing to the listing cache and, if it is the current
+//  truth for the directory, seeds the path cache from it: every child
+//  becomes a live entry with the listing's metadata, replacing any stale
+//  not-found, and deeper entries are dropped (BlorgPathCacheSeedListing).
+//  Both refuse it if an invalidation ran after the fetch was issued, and the
+//  listing cache also refuses one older than the snapshot it already holds.
+//  Runs at PASSIVE_LEVEL from a successful fetch's completion.
 //
-//  If BlorgFsdRequeueRequest fails (FSP threads tearing down), the listing
-//  already belongs to the DCB cache (freed at DCB teardown), so the
-//  query is simply failed.
+static VOID DirCtrlPublish(const UNICODE_STRING* Dir, PDIRECTORY_INFO DirInfo, const PATH_CACHE_TICKET* Ticket)
+{
+    if (BlorgPathCachePublishListing(Dir, DirInfo, Ticket))
+    {
+        BlorgPathCacheSeedListing(Dir, DirInfo, Ticket);
+    }
+}
+
+//
+//  Completion for the fetch a directory query issued on a listing-cache
+//  miss. A success runs at PASSIVE_LEVEL (Client.c bounces deserialization
+//  there), so the ERESOURCE is legal; it is wrapped in a critical region
+//  since a system worker thread does not disable APCs the way an FSP thread
+//  does. A failure only completes the IRP and frees nonpaged memory.
+//
+//  The listing becomes this handle's snapshot unless the handle already has
+//  one: a second query on the same handle can race this fetch with its own
+//  (see BlorgVolumeDirectoryControl), and an enumeration that has started on
+//  one snapshot must not have it swapped underneath. The loser's reference
+//  is dropped. The IRP is then re-queued with NET_DONE set so the PASSIVE
+//  enumeration runs on an FSP thread; if BlorgFsdRequeueRequest fails (FSP
+//  threads tearing down), the snapshot already belongs to the CCB and is
+//  released with it, so the query is simply failed.
 //
 static VOID DirCtrlComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID CallerContext)
 {
-    PIRP irp = CallerContext;
+    PDIRCTRL_FETCH fetch = CallerContext;
+    PIRP irp = fetch->Irp;
 
     if (!NT_SUCCESS(Status))
     {
+        ExFreePool(fetch);
         BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
@@ -425,30 +446,22 @@ static VOID DirCtrlComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Call
     PDCB dcb = irpSp->FileObject->FsContext;
     PCCB ccb = irpSp->FileObject->FsContext2;
 
+    DirCtrlPublish(&dcb->FullPath, DirInfo, &fetch->Ticket);
+    ExFreePool(fetch);
+
     KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(dcb->Header.Resource, TRUE);
 
-    BOOLEAN published = FALSE;
-
-    if (!dcb->CachedListing)
+    if (!ccb->Entries)
     {
-        WritePointerRelease(C_CAST(PVOID volatile*, &dcb->CachedListing), DirInfo);
-        published = TRUE;
+        ccb->Entries = DirInfo;
+        DirInfo = NULL;
     }
-    else
-    {
-        BlorgFreeHttpDirectoryInfo(DirInfo);
-    }
-
-    ccb->Entries = dcb->CachedListing;
 
     ExReleaseResourceLite(dcb->Header.Resource);
     KeLeaveCriticalRegion();
 
-    if (published)
-    {
-        BlorgPathCacheSeedListing(&dcb->FullPath, DirInfo);
-    }
+    BlorgReleaseDirectoryInfo(DirInfo);
 
     BlorgSetIrpContextFlag(irp, IRP_CONTEXT_FLAG_NET_DONE);
 
@@ -461,55 +474,163 @@ static VOID DirCtrlComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Call
 }
 
 //
-// Handles IRP_MJ_DIRECTORY_CONTROL for the volume device: QUERY_DIRECTORY
-// (acquire DCB resource per scan-restart/pattern-change rules, fetch the
-// directory listing over HTTP on a cache miss and re-enter via NET_DONE
-// once cached, then enumerate into the caller's FILE_*_DIR_INFORMATION
-// buffer) and NOTIFY_CHANGE_DIRECTORY (register with the FsRtl notify
-// package; this volume is read-only so notifications are never fired,
-// only completed at handle cleanup).
+//  Issues the listing fetch for a query that missed the listing cache.
+//  STATUS_PENDING means DirCtrlComplete owns the IRP and the context; any
+//  other result means the completion never ran, so the context is freed
+//  here and the caller completes the IRP with the result.
 //
-// On the NET_DONE second pass, DirCtrlComplete has already cached the
-// listing on the DCB, so the fetch is skipped and enumeration runs
-// directly; queries on other handles to the same directory reuse that
-// cache too. The CCB is re-checked for a pattern/MATCH_ALL after
-// acquiring the resource exclusive, since it could have been set by
-// another thread in the window before the lock was taken. On a restart
-// scan or initial query, the CCB's search pattern is cleared and
-// regenerated from the query's FileName (or CCB_FLAG_MATCH_ALL if none
+static NTSTATUS DirCtrlFetch(PIRP Irp, const DCB* Dcb)
+{
+    PDIRCTRL_FETCH fetch = ExAllocatePoolZero(NonPagedPoolNx, sizeof(DIRCTRL_FETCH), DIRCTRL_FETCH_TAG);
+
+    if (!fetch)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    fetch->Irp = Irp;
+    BlorgPathCacheTakeTicket(&fetch->Ticket);
+
+    NTSTATUS result = BlorgHttpGetDirectoryInfo(&Dcb->FullPath, DirCtrlComplete, fetch);
+
+    if (STATUS_PENDING != result)
+    {
+        ExFreePool(fetch);
+    }
+
+    return result;
+}
+
+//
+//  Completion for a background refresh: publishes the new snapshot for the
+//  queries that come after, and drops the fetch's own reference. Nothing
+//  waits on it. A failure leaves the stale snapshot to age out (see
+//  BlorgPathCacheLookupListing).
+//
+static VOID DirCtrlRefreshComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID CallerContext)
+{
+    PDIRCTRL_FETCH fetch = CallerContext;
+
+    if (NT_SUCCESS(Status))
+    {
+        DirCtrlPublish(&fetch->Path, DirInfo, &fetch->Ticket);
+        BlorgReleaseDirectoryInfo(DirInfo);
+    }
+
+    ExFreePool(fetch->Path.Buffer);
+    ExFreePool(fetch);
+}
+
+//
+//  Refetches a directory whose cached listing a query was just answered from
+//  stale, so the next query gets a fresh one. Called with no resource held;
+//  a refresh that cannot be issued is dropped, the same as one that fails.
+//
+static VOID DirCtrlRefresh(const UNICODE_STRING* Dir)
+{
+    PDIRCTRL_FETCH fetch = ExAllocatePoolZero(NonPagedPoolNx, sizeof(DIRCTRL_FETCH), DIRCTRL_FETCH_TAG);
+
+    if (!fetch)
+    {
+        return;
+    }
+
+    fetch->Path.Buffer = ExAllocatePoolUninitialized(NonPagedPoolNx, Dir->Length, DIRCTRL_FETCH_TAG);
+
+    if (!fetch->Path.Buffer)
+    {
+        ExFreePool(fetch);
+        return;
+    }
+
+    RtlCopyMemory(fetch->Path.Buffer, Dir->Buffer, Dir->Length);
+    fetch->Path.Length = Dir->Length;
+    fetch->Path.MaximumLength = Dir->Length;
+
+    BLORGFS_STAT_INC(ListingRefreshes);
+    BlorgPathCacheTakeTicket(&fetch->Ticket);
+
+    if (STATUS_PENDING != BlorgHttpGetDirectoryInfo(&fetch->Path, DirCtrlRefreshComplete, fetch))
+    {
+        ExFreePool(fetch->Path.Buffer);
+        ExFreePool(fetch);
+    }
+}
+
+//
+//  Gives a handle the snapshot it will enumerate. On an initial query or a
+//  restart scan (Replace, DCB resource held exclusive) it replaces whatever
+//  the handle had: a restart is a request to read the directory again. On
+//  any other query the handle had none yet, and two queries on the same
+//  handle may both get here under the shared resource, so the install is a
+//  compare-exchange from NULL and the loser drops its reference -- the
+//  pointer must be published exactly once without a lock that both hold.
+//
+static VOID DirCtrlInstallSnapshot(PCCB Ccb, PDIRECTORY_INFO Snapshot, BOOLEAN Replace)
+{
+    if (Replace)
+    {
+        PDIRECTORY_INFO previous = Ccb->Entries;
+        Ccb->Entries = Snapshot;
+        BlorgReleaseDirectoryInfo(previous);
+    }
+    else if (NULL != InterlockedCompareExchangePointer(C_CAST(PVOID volatile*, &Ccb->Entries), Snapshot, NULL))
+    {
+        BlorgReleaseDirectoryInfo(Snapshot);
+    }
+}
+
+//
+// Handles IRP_MJ_DIRECTORY_CONTROL for the volume device: QUERY_DIRECTORY
+// (acquire DCB resource per scan-restart/pattern-change rules, take a
+// listing snapshot from the listing cache or fetch one over HTTP and
+// re-enter via NET_DONE, then enumerate into the caller's
+// FILE_*_DIR_INFORMATION buffer) and NOTIFY_CHANGE_DIRECTORY (register with
+// the FsRtl notify package; nothing reports changes yet, so the IRP is only
+// completed at handle cleanup).
+//
+// Each handle enumerates its own snapshot (CCB.Entries), taken on its
+// initial query and again on every restart scan, and kept unchanged in
+// between: an enumeration in progress never sees entries move under its
+// index, which is what NTFS and SMB give a caller too. A newer listing of
+// the same directory replaces the cached one for the queries that come
+// after, never the one a handle is reading. The CCB is re-checked for a
+// pattern/MATCH_ALL after acquiring the resource exclusive, since it could
+// have been set by another thread in the window before the lock was taken.
+// A restart scan that finds it set keeps the resource exclusive: it is
+// about to replace the handle's snapshot, which a query holding the
+// resource shared may be enumerating.
+// On a restart scan or initial query, the CCB's search pattern is cleared
+// and regenerated from the query's FileName (or CCB_FLAG_MATCH_ALL if none
 // given).
 //
-// The HTTP fetch is only issued on a cache miss (no dcb->CachedListing
-// yet); a listing already cached (by a prior query on any handle to
-// this directory) is reused directly with no round trip and no NET_DONE
-// second pass. The ERESOURCE cannot be held across the async completion
-// (it runs on a different thread), so it is released before issuing;
-// DirCtrlComplete caches the listing on the DCB and re-queues this IRP
-// with NET_DONE set. The fetch depends only on dcb->FullPath, so it is
-// hoisted out of both pattern branches above. ccb->Entries then points
-// at the DCB's shared cached listing (populated by an earlier query on
-// a hit, or by DirCtrlComplete on the NET_DONE pass); if still NULL,
-// there is nothing to enumerate and it is never dereferenced.
+// The listing cache answers fresh snapshots outright, and stale ones too
+// within its bounded window, in which case this query owes one background
+// refresh (DirCtrlRefresh), issued after the resource is released. Only a
+// miss fetches in the foreground: the ERESOURCE cannot be held across the
+// async completion (it runs on a different thread), so it is released
+// before issuing, and a restart scan drops the handle's old snapshot first
+// so the completion installs the new one. DirCtrlComplete publishes the
+// listing and re-queues this IRP with NET_DONE set.
 //
-// The fetch-issuing check below is gated on !dcb->CachedListing alone,
-// not also on (initialQuery || restartScan): a second QUERY_DIRECTORY on
-// the same handle, arriving after the first has set the pattern but
-// before that first fetch has completed, is neither an initial query nor
-// a restart -- ccb->SearchPattern is already set -- so gating on those
-// used to fall through to "no listing, therefore no more files", which
-// is wrong; NULL only ever means "not fetched yet", never "empty" (an
-// empty directory still publishes a real zero-count DIRECTORY_INFO).
-// Issuing a second fetch here in that race is redundant but not unsafe:
-// DirCtrlComplete already discards whichever of two racing fetches
-// loses the publish (see its own comment), the same protection this
-// leans on for two different handles racing the same DCB. That second
-// query also skips the posts in the pattern branches, so it is posted to
-// the FSP here when not already there: the fetch can complete the IRP
-// before it returns, so it is only issued once the IRP is pending.
+// A snapshot is looked for whenever the handle has none, not only on an
+// initial query or a restart: a second QUERY_DIRECTORY on the same handle,
+// arriving after the first has set the pattern but before that first
+// fetch has completed, is neither, and used to fall through to "no
+// listing, therefore no more files", which is wrong; NULL only ever means
+// "not fetched yet", never "empty" (an empty directory still produces a
+// real zero-count DIRECTORY_INFO). That second query may issue a second
+// fetch; whichever completes first becomes the handle's snapshot and the
+// other is released (DirCtrlComplete). It also skips the posts in the
+// pattern branches, so it is posted to the FSP here when not already
+// there: the fetch can complete the IRP before it returns, so it is only
+// issued once the IRP is pending. The NET_DONE pass looks again for the
+// same reason if a racing restart on the handle dropped the snapshot the
+// completion installed.
 //
 // NOTIFY_CHANGE_DIRECTORY registers the watch with the FsRtl notify
 // package, which captures its own copy of the directory name and holds
-// the IRP pending. This volume is read-only and never changes, so
+// the IRP pending. Nothing learns of server-side changes yet, so
 // FsRtlNotifyFullReportChange is never called -- the IRP simply waits
 // until the handle is cleaned up (FsRtlNotifyCleanup in
 // CleanupVolume completes it). The name is only used by the
@@ -585,7 +706,15 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 if (ccb->SearchPattern.Buffer || FlagOn(ccb->Flags, CCB_FLAG_MATCH_ALL))
                 {
                     initialQuery = FALSE;
-                    ExConvertExclusiveToSharedLite(dcb->Header.Resource);
+
+                    if (restartScan)
+                    {
+                        ccb->CurrentIndex = 0;
+                    }
+                    else
+                    {
+                        ExConvertExclusiveToSharedLite(dcb->Header.Resource);
+                    }
                 }
             }
             else if (restartScan)
@@ -662,20 +791,46 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 }
             }
 
-            if (!netDone && !dcb->CachedListing)
-            {
-                ExReleaseResourceLite(dcb->Header.Resource);
+            BOOLEAN freshSnapshot = !netDone && (initialQuery || restartScan);
+            BOOLEAN refreshOwed = FALSE;
 
-                if (!BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_IN_FSP))
+            NT_ASSERT(!freshSnapshot || ExIsResourceAcquiredExclusiveLite(dcb->Header.Resource));
+
+            if (freshSnapshot || !ReadPointerAcquire(C_CAST(PVOID volatile*, &ccb->Entries)))
+            {
+                BOOLEAN stale = FALSE;
+                PDIRECTORY_INFO snapshot = BlorgPathCacheLookupListing(&dcb->FullPath, TRUE, &stale, &refreshOwed, NULL);
+
+                if (!snapshot)
                 {
-                    BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                    return BlorgFsdPostRequest(Irp, IrpSp);
+                    if (freshSnapshot)
+                    {
+                        DirCtrlInstallSnapshot(ccb, NULL, TRUE);
+                    }
+
+                    ExReleaseResourceLite(dcb->Header.Resource);
+
+                    if (!BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_IN_FSP))
+                    {
+                        BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
+                        return BlorgFsdPostRequest(Irp, IrpSp);
+                    }
+
+                    BLORGFS_STAT_INC(ListingCacheMisses);
+                    return DirCtrlFetch(Irp, dcb);
                 }
 
-                return BlorgHttpGetDirectoryInfo(&dcb->FullPath, DirCtrlComplete, Irp);
-            }
+                if (stale)
+                {
+                    BLORGFS_STAT_INC(ListingCacheStaleHits);
+                }
+                else
+                {
+                    BLORGFS_STAT_INC(ListingCacheHits);
+                }
 
-            ccb->Entries = dcb->CachedListing;
+                DirCtrlInstallSnapshot(ccb, snapshot, freshSnapshot);
+            }
 
             if (!ccb->Entries)
             {
@@ -838,11 +993,16 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 result = GetExceptionCode();
             }
 
-            ExReleaseResourceLite(dcb->Header.Resource);
-
             if (updateCcb)
             {
                 ccb->CurrentIndex = index;
+            }
+
+            ExReleaseResourceLite(dcb->Header.Resource);
+
+            if (refreshOwed)
+            {
+                DirCtrlRefresh(&dcb->FullPath);
             }
 
             break;

@@ -372,14 +372,16 @@ static inline NTSTATUS OpenRootDcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCE
 
 typedef struct _CREATE_NET_CONTEXT
 {
-    PIRP           Irp;
-    UNICODE_STRING Path;   // owned copy, NonPagedPoolNx
+    PIRP              Irp;
+    UNICODE_STRING    Path;   // owned copy, NonPagedPoolNx
+    PATH_CACHE_TICKET Ticket; // taken immediately before the lookup is issued
 } CREATE_NET_CONTEXT, * PCREATE_NET_CONTEXT;
 
 //
 //  Async completion for the BlorgHttpGetFileInformation lookup issued from
 //  BlorgVolumeCreate. Memoizes the result in the path cache (only a
-//  definitive not-found, never a transient failure), stashes the metadata
+//  definitive not-found, never a transient failure, and neither if an
+//  invalidation overtook the request -- see PATH_CACHE_TICKET), stashes the metadata
 //  on the IRP, and re-queues it with NET_DONE set so BlorgVolumeCreate
 //  resumes from the top with the result already in hand. If the re-queue
 //  fails (FSP threads tearing down), the stash is freed and the create is
@@ -396,7 +398,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
 
         if (STATUS_OBJECT_NAME_NOT_FOUND == Status)
         {
-            BlorgPathCacheInsertNotFound(&netCtx->Path);
+            BlorgPathCacheInsertNotFound(&netCtx->Path, &netCtx->Ticket);
         }
 
         ExFreePool(netCtx->Path.Buffer);
@@ -407,7 +409,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
 
     BLORGFS_LOG("Create net result OK (dir=%u size=%llu)\n", FileInfo->IsDirectory, FileInfo->Size);
 
-    BlorgPathCacheInsertExists(&netCtx->Path, FileInfo);
+    BlorgPathCacheInsertExists(&netCtx->Path, FileInfo, &netCtx->Ticket);
 
     PDIRECTORY_ENTRY_METADATA stash = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(DIRECTORY_ENTRY_METADATA), 'CRET');
 
@@ -557,12 +559,13 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 //  BlorgNodeUnpin after the open helper returns); the unpin defers the
 //  node to the reap worker when a failed or filtered open leaves it with
 //  no handles. The path cache absorbs the shell's repeated probe storm
-//  the same way it always has; the parent-listing probe pins the parent
-//  DCB by path (the root DCB is used directly -- it is never
-//  table-resident and never reaped) and reads CachedListing with
-//  ReadPointerAcquire, pairing with DirCtrlComplete's release write to
-//  order the listing's contents on weakly-ordered architectures (see
-//  DCB.CachedListing). If neither table nor path cache nor listing
+//  the same way it always has; the parent-listing probe takes a reference
+//  to the parent's snapshot from the listing cache by path -- fresh only,
+//  since a miss in it is answered as not-found outright -- and needs no
+//  node at all, so it also answers for a parent nobody has open. Results
+//  it and the network lookup produce are inserted with the ticket taken
+//  before the read, so neither re-caches what an invalidation in between
+//  removed (PATH_CACHE_TICKET). If neither table nor path cache nor listing
 //  resolves the path, existence is verified on the remote store: on the
 //  first pass the lookup is issued asynchronously and CreateComplete
 //  stashes the result on the IRP and re-queues it with NET_DONE set, so
@@ -851,58 +854,40 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
         if (SplitPathLeaf(&filePath.String, &parentPath, &leaf))
         {
-            PCOMMON_CONTEXT parentNode;
-            BOOLEAN parentPinned;
-
             if (0 == parentPath.Length)
             {
-                parentNode = C_CAST(PCOMMON_CONTEXT, BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb);
-                parentPinned = FALSE;
-            }
-            else
-            {
-                parentNode = BlorgNodeTableLookupPin(&parentPath);
-                parentPinned = (NULL != parentNode);
+                parentPath = BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->RootDcb->FullPath;
             }
 
-            if (parentNode &&
-                ((BLORGFS_DCB_SIGNATURE == GET_NODE_TYPE(parentNode)) ||
-                 (BLORGFS_ROOT_DCB_SIGNATURE == GET_NODE_TYPE(parentNode))))
-            {
-                PDIRECTORY_INFO listing = ReadPointerAcquire(C_CAST(PVOID volatile*, &C_CAST(PDCB, parentNode)->CachedListing));
+            PATH_CACHE_TICKET ticket;
+            BlorgPathCacheTakeTicket(&ticket);
 
-                if (listing)
+            PDIRECTORY_INFO listing = BlorgPathCacheLookupListing(&parentPath, FALSE, NULL, NULL, &ticket);
+
+            if (listing)
+            {
+                BOOLEAN found = FindEntryByName(listing, &leaf, &dirEntInfo);
+                BlorgReleaseDirectoryInfo(listing);
+
+                if (found)
                 {
-                    if (FindEntryByName(listing, &leaf, &dirEntInfo))
-                    {
-                        BLORGFS_STAT_INC(CreateHits);
-                        BLORGFS_LOG("Create listing HIT (exists): %wZ\n", &filePath.String);
-                        BlorgPathCacheInsertExists(&filePath.String, &dirEntInfo);
-                        haveDirEntInfo = TRUE;
-                    }
-                    else
-                    {
-                        BLORGFS_LOG("Create listing HIT (not found): %wZ\n", &filePath.String);
-                        BlorgPathCacheInsertNotFound(&filePath.String);
-
-                        if (parentPinned)
-                        {
-                            BlorgNodeUnpin(parentNode);
-                        }
-
-                        if (filePath.IsAllocated)
-                        {
-                            ExFreePool(filePath.String.Buffer);
-                        }
-
-                        return STATUS_OBJECT_NAME_NOT_FOUND;
-                    }
+                    BLORGFS_STAT_INC(CreateHits);
+                    BLORGFS_LOG("Create listing HIT (exists): %wZ\n", &filePath.String);
+                    BlorgPathCacheInsertExists(&filePath.String, &dirEntInfo, &ticket);
+                    haveDirEntInfo = TRUE;
                 }
-            }
+                else
+                {
+                    BLORGFS_LOG("Create listing HIT (not found): %wZ\n", &filePath.String);
+                    BlorgPathCacheInsertNotFound(&filePath.String, &ticket);
 
-            if (parentPinned)
-            {
-                BlorgNodeUnpin(parentNode);
+                    if (filePath.IsAllocated)
+                    {
+                        ExFreePool(filePath.String.Buffer);
+                    }
+
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+                }
             }
         }
     }
@@ -950,6 +935,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         netCtx->Path.Length = filePath.String.Length;
         netCtx->Path.MaximumLength = filePath.String.Length;
         netCtx->Irp = Irp;
+        BlorgPathCacheTakeTicket(&netCtx->Ticket);
 
         NTSTATUS issueResult = BlorgHttpGetFileInformation(&filePath.String, CreateComplete, netCtx);
 

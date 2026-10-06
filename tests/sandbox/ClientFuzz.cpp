@@ -75,7 +75,7 @@ namespace
 
         if (DirInfo)
         {
-            BlorgFreeHttpDirectoryInfo(DirInfo);
+            BlorgReleaseDirectoryInfo(DirInfo);
         }
     }
 
