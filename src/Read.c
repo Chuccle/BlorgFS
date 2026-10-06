@@ -328,8 +328,15 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
 // built at PASSIVE_LEVEL (HttpBuildRequest), so each held IRP is issued
 // from a work item allocated when it was held.
 //
-// Nothing is held unless something is in flight, so a completion is always
-// coming to release it. Admission and release both decide under the lock:
+// Nothing is held unless its own file has something in flight, so a
+// completion on that file is always coming to release it. The budget
+// alone cannot be what releases it: demand is never held, and other files
+// faulting can keep the link past the budget for as long as they run.
+// Beside two copies on the reference link that stranded a player's
+// read-ahead for 25 s, and its next read with it, on fetches that never
+// took more than 417 ms. So when a file's last fetch settles, its earliest
+// held read goes out whatever the budget, which is the rule admission
+// already keeps. Admission and release both decide under the lock:
 // holding after the last fetch has already settled would strand the IRP.
 // The bytes counted are the IRP's own Parameters.Read.Length, not the
 // trimmed length, so admission and settlement always agree.
@@ -431,7 +438,9 @@ static BOOLEAN ReadFairAdmit(PIRP Irp, BOOLEAN MayHold)
 //
 // Settles an admitted fetch, whether it completed or failed to issue, and
 // admits held reads, lowest start tag first, while the link has room. A
-// read that was never admitted carries no flag and settles nothing.
+// file this leaves with nothing in flight gets its own earliest held read
+// admitted whether or not there is room. A read that was never admitted
+// carries no flag and settles nothing.
 //
 // <= DISPATCH_LEVEL: called from ReadComplete on the WSK completion chain.
 //
@@ -450,11 +459,20 @@ static VOID ReadFairSettle(PIRP Irp)
     KIRQL oldIrql;
     KeAcquireSpinLock(&ReadFair.Lock, &oldIrql);
 
-    ReadFair.InFlightBytes -= IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
-    ReadFairNode(Irp)->ReadFetchesInFlight--;
+    PNON_PAGED_NODE node = ReadFairNode(Irp);
 
-    while (!IsListEmpty(&ReadFair.Held) && ReadFair.InFlightBytes < global.ReadFairBudget)
+    ReadFair.InFlightBytes -= IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
+    node->ReadFetchesInFlight--;
+
+    while (!IsListEmpty(&ReadFair.Held))
     {
+        const BOOLEAN room = ReadFair.InFlightBytes < global.ReadFairBudget;
+
+        if (!room && 0 != node->ReadFetchesInFlight)
+        {
+            break;
+        }
+
         PIRP next = NULL;
         ULONG64 nextStart = MAXULONG64;
 
@@ -463,11 +481,16 @@ static VOID ReadFairSettle(PIRP Irp)
             PIRP held = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
             const ULONG64 start = C_CAST(ULONG64, C_CAST(ULONG_PTR, held->Tail.Overlay.DriverContext[1]));
 
-            if (start < nextStart)
+            if (start < nextStart && (room || ReadFairNode(held) == node))
             {
                 next = held;
                 nextStart = start;
             }
+        }
+
+        if (!next)
+        {
+            break;
         }
 
         RemoveEntryList(&next->Tail.Overlay.ListEntry);
