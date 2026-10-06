@@ -671,6 +671,48 @@ TEST_F(PathCacheListingTest, EveryListingOfADeepTreeStaysCached)
 }
 
 //
+// The byte budget is enforced only within the bucket a listing is published
+// to, and expiry is only noticed in a bucket that takes a publish. So once
+// the budget filled, listings that had expired in quiet buckets went on
+// holding it, and a new listing whose bucket had nothing to give up was
+// refused, until each of those buckets happened to take a publish. A
+// publish over budget now reaps every bucket's dead listings first. The
+// test fills the budget until a listing is refused room, lets everything
+// expire, and publishes once more.
+//
+TEST_F(PathCacheListingTest, DeadListingsDoNotHoldTheByteBudget)
+{
+    int published = 0;
+
+    for (; published < 200; ++published)
+    {
+        wchar_t buf[64];
+        swprintf_s(buf, L"\\budget\\full\\d%03d", published);
+
+        Publish(buf, BuildSyntheticListing(2000, 0), nullptr, TRUE);
+
+        PDIRECTORY_INFO listing = LookupListing(buf, FALSE);
+        const bool kept = (nullptr != listing);
+        BlorgReleaseDirectoryInfo(listing);
+
+        if (!kept)
+        {
+            break;
+        }
+    }
+
+    ASSERT_LT(published, 200) << "the byte budget never filled";
+
+    ShimAdvanceInterruptTime(60 * kSecond);
+
+    Publish(L"\\budget\\after", BuildSyntheticListing(2000, 0), nullptr, TRUE);
+
+    PDIRECTORY_INFO listing = LookupListing(L"\\budget\\after", FALSE);
+    EXPECT_NE(nullptr, listing) << "a listing was refused room held only by expired listings";
+    BlorgReleaseDirectoryInfo(listing);
+}
+
+//
 // A handle enumerates the snapshot it took; the cache dropping its own
 // reference must not free it underneath. ASan turns a regression here into
 // a use-after-free report at the FileCount read.
@@ -1006,6 +1048,34 @@ TEST_F(PathCacheFeedTest, GoingLiveDropsWhatWasReadBeforeIt)
         << "a read ticketed before the feed came up was cached under it";
 }
 
+
+//
+// With the feed live, a listing keeps what is cached below its children:
+// the feed reports a child directory that is replaced or removed and drops
+// its subtree itself. Dropping it on every listing too emptied the path
+// cache beneath a directory each time it was re-listed, the whole volume's
+// when it was the root. Its own children are still replaced by the listing,
+// and one it no longer names is gone. With the feed down the deeper entries
+// go, as KeepsTheDirectoryReplacesStaleChildrenDropsDeeperEntries pins.
+//
+TEST_F(PathCacheFeedTest, LiveFeedListingKeepsEntriesBelowItsChildren)
+{
+    BlorgPathCacheFollowFeed(TRUE);
+
+    UNICODE_STRING grandchild = RTL_CONSTANT_STRING(L"\\feed\\keep\\dir0\\inner.bin");
+    UNICODE_STRING vanished = RTL_CONSTANT_STRING(L"\\feed\\keep\\gone.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(5, FALSE);
+    BlorgPathCacheInsertExists(&grandchild, &meta, nullptr);
+    BlorgPathCacheInsertExists(&vanished, &meta, nullptr);
+
+    Seed(L"\\feed\\keep", BuildSyntheticListing(1, 1));
+
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\feed\\keep\\dir0\\inner.bin"))
+        << "a re-listing with the feed live dropped an entry below one of its children";
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\feed\\keep\\gone.bin"))
+        << "a child the listing no longer names survived it";
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\feed\\keep\\file0.bin"));
+}
 
 //
 // A ticket held outside the caches (a resident FCB's stamp, Create.c) is

@@ -779,15 +779,38 @@ static BOOLEAN PathCacheIsUnder(const UNICODE_STRING* Dir, const UNICODE_STRING*
 }
 
 //
-//  Drop everything beneath a directory, and the directory's own entry too
-//  unless KeepDir. A subtree's paths hash to different buckets, so this
-//  sweeps every bucket -- once per listing publish (BlorgPathCacheSeedListing),
+//  True when Path lies more than one component beneath Dir, which Path
+//  already lies under (PathCacheIsUnder): a separator follows the first
+//  component after Dir's own.
+//
+static BOOLEAN PathCacheIsBelowChild(const UNICODE_STRING* Dir, const UNICODE_STRING* Path)
+{
+    const USHORT dirChars = Dir->Length / sizeof(WCHAR);
+    const USHORT pathChars = Path->Length / sizeof(WCHAR);
+    const BOOLEAN dirEndsWithSeparator = (0 < dirChars) && (L'\\' == Dir->Buffer[dirChars - 1]);
+
+    for (USHORT i = dirEndsWithSeparator ? dirChars : dirChars + 1; i < pathChars; i++)
+    {
+        if (L'\\' == Path->Buffer[i])
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+//
+//  Drop everything beneath a directory, or with ChildrenOnly just its direct
+//  children, and the directory's own entry too unless KeepDir. A subtree's
+//  paths hash to different buckets, so this sweeps every bucket -- once per
+//  listing publish (BlorgPathCacheSeedListing),
 //  which is a network round trip's worth of time apart at the very least,
 //  so 256 uncontended push-lock acquisitions are noise beside it. Each
 //  bucket is taken and released in turn, so no two locks are ever held
 //  together.
 //
-static VOID PathCacheInvalidateUnder(const UNICODE_STRING* Dir, BOOLEAN KeepDir)
+static VOID PathCacheInvalidateUnder(const UNICODE_STRING* Dir, BOOLEAN KeepDir, BOOLEAN ChildrenOnly)
 {
     for (ULONG i = 0; i < PATH_CACHE_BUCKETS; i++)
     {
@@ -804,7 +827,8 @@ static VOID PathCacheInvalidateUnder(const UNICODE_STRING* Dir, BOOLEAN KeepDir)
             PLIST_ENTRY next = e->Flink;
 
             if (PathCacheIsUnder(Dir, &entry->Path) &&
-                !(KeepDir && entry->Path.Length == Dir->Length))
+                !(KeepDir && entry->Path.Length == Dir->Length) &&
+                !(ChildrenOnly && PathCacheIsBelowChild(Dir, &entry->Path)))
             {
                 PathCacheRemoveEntry(bucket, entry);
             }
@@ -862,7 +886,7 @@ VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
     }
 
     PathCacheAdvanceSequence();
-    PathCacheInvalidateUnder(Dir, FALSE);
+    PathCacheInvalidateUnder(Dir, FALSE, FALSE);
     ListingCacheDropUnder(Dir);
     ListingCacheDropParent(Dir);
 }
@@ -910,8 +934,14 @@ static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const 
 //   - Every direct child is inserted as existing, with the listing's
 //     metadata. That also replaces a stale not-found for a child that has
 //     since appeared, which was the reason the publish invalidated at all.
-//   - Everything deeper is still dropped: the listing says nothing about
-//     grandchildren, and a child directory may be gone.
+//   - Every direct child is dropped first, so one the listing no longer
+//     names is gone.
+//   - Everything deeper is dropped too while the change feed is down: the
+//     listing says nothing about grandchildren, and a child directory may be
+//     gone or replaced. While the feed is live it is kept, since the feed
+//     reports such a change and invalidates the subtree itself; dropping it
+//     here as well emptied the path cache beneath a directory on every
+//     re-listing of it, the volume root's included.
 //   - The directory's own entry is kept. A listing that arrived is proof the
 //     directory exists, and evicting it is what made a repeated `dir` pay a
 //     fileinfo GET before its dirinfo GET.
@@ -944,7 +974,7 @@ VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listin
         return;
     }
 
-    PathCacheInvalidateUnder(Dir, TRUE);
+    PathCacheInvalidateUnder(Dir, TRUE, 0 != ReadAcquire(&global.ChangeFeedLive));
 
     if (!Listing || Dir->Length + sizeof(WCHAR) > PATH_CACHE_MAX_PATH_BYTES)
     {
@@ -1088,6 +1118,44 @@ PDIRECTORY_INFO BlorgPathCacheLookupListing(const UNICODE_STRING* Dir, BOOLEAN A
 }
 
 //
+//  Drops every listing past its lifetime and stale grace, or minted under an
+//  older generation, from every listing bucket, one lock at a time. Expiry
+//  is otherwise only noticed in a bucket that takes a publish, so a dead
+//  listing in a quiet bucket stayed charged to the byte budget, and once the
+//  budget filled that way a new listing evicted live neighbours in its own
+//  bucket and could still be refused. Called by a publish that would exceed
+//  the budget, before it takes its own bucket's lock.
+//
+static VOID ListingCacheReapDead(ULONG64 Now, LONG Generation, ULONG64 Lifetime)
+{
+    for (ULONG i = 0; i < LISTING_CACHE_BUCKETS; i++)
+    {
+        PATH_CACHE_BUCKET* bucket = &PathCache.ListingBuckets[i];
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&bucket->Lock);
+
+        PLIST_ENTRY e = bucket->List.Flink;
+
+        while (e != &bucket->List)
+        {
+            PLISTING_CACHE_ENTRY entry = CONTAINING_RECORD(e, LISTING_CACHE_ENTRY, Link);
+            PLIST_ENTRY next = e->Flink;
+
+            if (!ListingCacheEntryLive(entry, Now, Generation, Lifetime))
+            {
+                ListingCacheRemoveEntry(bucket, entry);
+            }
+
+            e = next;
+        }
+
+        ExReleasePushLockExclusive(&bucket->Lock);
+        KeLeaveCriticalRegion();
+    }
+}
+
+//
 //  Offers a freshly fetched listing to the cache. Refused outright when its
 //  ticket has been overtaken by an invalidation, or when the server marked
 //  it no-store; either way it is not current, so nothing is seeded from it
@@ -1105,8 +1173,11 @@ PDIRECTORY_INFO BlorgPathCacheLookupListing(const UNICODE_STRING* Dir, BOOLEAN A
 //  them all would still leave no room, which would lose live listings for
 //  nothing; a listing that does not fit is simply not kept (its caller
 //  still owns its own reference). The budget is soft across buckets -- it
-//  never evicts from a bucket it does not hold -- which keeps every
-//  publish to one lock.
+//  never evicts a live listing from a bucket it does not hold -- which
+//  keeps the publish itself to one lock. A publish that would exceed it
+//  first reaps the dead listings of every bucket (ListingCacheReapDead),
+//  one lock at a time, so the budget is never held by listings nothing can
+//  be served from.
 //
 //  The entry is built outside the lock, as PathCacheInsert's is.
 //
@@ -1146,6 +1217,11 @@ BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO 
         newEntry->Bytes = bytes;
         newEntry->IssueTime = issueTime;
         newEntry->Generation = C_CAST(ULONG, generation);
+    }
+
+    if (newEntry && ReadNoFence64(&PathCache.ListingBytes) + bytes > LISTING_CACHE_MAX_BYTES)
+    {
+        ListingCacheReapDead(now, generation, lifetime);
     }
 
     PATH_CACHE_BUCKET* bucket = ListingCacheBucket(Dir);
