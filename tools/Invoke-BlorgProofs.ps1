@@ -51,6 +51,15 @@ function Get-Cbmc {
 }
 
 function Get-VcVars {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $root = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if ($root) {
+            $found = Join-Path $root 'VC\Auxiliary\Build\vcvars64.bat'
+            if (Test-Path $found) { return $found }
+        }
+    }
+
     $candidates = @(
         'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat',
         'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat',
