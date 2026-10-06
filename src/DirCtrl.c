@@ -630,14 +630,13 @@ static VOID DirCtrlInstallSnapshot(PCCB Ccb, PDIRECTORY_INFO Snapshot, BOOLEAN R
 //
 // NOTIFY_CHANGE_DIRECTORY registers the watch with the FsRtl notify
 // package, which captures its own copy of the directory name and holds
-// the IRP pending. Nothing learns of server-side changes yet, so
-// FsRtlNotifyFullReportChange is never called -- the IRP simply waits
-// until the handle is cleaned up (FsRtlNotifyCleanup in
-// CleanupVolume completes it). The name is only used by the
-// package to match reported changes; since none are ever reported, its
-// exact encoding is immaterial. The package marks the IRP pending
-// itself, so this function returns STATUS_PENDING and must not touch
-// the IRP afterward.
+// the IRP pending until a change is reported under it or the handle is
+// cleaned up (FsRtlNotifyCleanup in CleanupVolume). Changes are reported
+// only from the server's change feed (ChangeFeed.c), and the package
+// matches them against this name, so the name is the DCB's FullPath,
+// spelled as the feed's paths are converted (HttpDeserializeChangeBatch).
+// The package marks the IRP pending itself, so this function returns
+// STATUS_PENDING and must not touch the IRP afterward.
 //
 NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {

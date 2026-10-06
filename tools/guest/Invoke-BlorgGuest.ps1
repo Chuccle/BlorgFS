@@ -78,6 +78,15 @@
                        Win32 error it expects (missing file, missing
                        directory, reading past the end); INFO lines report
                        behaviour that is not settled yet and never fail
+          changes      with -HostChanges: changes made to the served corpus
+                       on the host while B: is mounted and its caches are
+                       warm reach B: through the server's change feed -- a
+                       new file and directory appear, a removed file goes, a
+                       grown file shows its new size -- and are reported to
+                       a FileSystemWatcher on the directory. The guest asks
+                       for each change by creating
+                       C:\blorgfs-ci\changes-<phase>, which blorg guest
+                       test watches for
           survived     BlorgFS still RUNNING afterwards
 
         The driver is not stopped at the end: there is no dismount handler,
@@ -132,6 +141,11 @@
 .PARAMETER Drive
     Test: the drive letter BlorgFS mounts.
 
+.PARAMETER HostChanges
+    Test: the host will change the corpus's feed\ directory when the
+    changes step asks it to (blorg guest test does). Without it that step
+    is skipped, since nothing would ever change.
+
 .PARAMETER NoVerifier
     Prepare: leave Driver Verifier off for BlorgFS.sys (and turn it off if
     set). Benchmark runs must not have it; it skews timings.
@@ -148,6 +162,7 @@ param(
     [string]$BackendHost = '10.0.3.1',
     [int]$Port = 18080,
     [char]$Drive = 'B',
+    [switch]$HostChanges,
     [switch]$NoVerifier,
     [switch]$IncludeKernelDump
 )
@@ -320,6 +335,10 @@ function Invoke-PrepareStep {
     try {
         if (Test-Path $ResultsDir) { Remove-Item -Recurse -Force $ResultsDir }
         New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
+        # A guest kept from an earlier run (--keep, then --booted) still has
+        # its changes step's signals, and the host would act on one before
+        # this run's step asks for it.
+        Remove-Item 'C:\blorgfs-ci\changes-*' -Force -ErrorAction SilentlyContinue
 
         $bcd = bcdedit /enum '{current}' | Out-String
         if ($bcd -notmatch 'testsigning\s+Yes') {
@@ -634,6 +653,86 @@ function Invoke-TestStep {
 
             if ($failed.Count) { return "$($failed.Count) failed: $($failed -join '; ')" }
             $true
+        } | Out-Null
+
+        # The change feed, end to end, in two phases the host makes on its
+        # copy of the corpus when asked (change_corpus in tools/blorg): seed
+        # creates feed\ and must appear, then everything in it is looked at
+        # so the path cache, the listing cache and a not-found are all warm,
+        # and change alters it. With the feed live those entries are trusted
+        # for minutes, so only the feed's invalidations make the change
+        # visible within the deadline, and only the feed reports it to a
+        # watcher: a short TTL would converge too, but silently.
+        #
+        # Contents are never read. An FCB whose file was read lives on after
+        # its last close while the memory manager keeps its pages, and an
+        # open of it is answered from that FCB without asking the cache or
+        # the server; nothing refreshes it yet, feed or not. That is why
+        # feed\ is created here, after the correctness step has read
+        # everything else on the volume.
+        Invoke-Step 'changes' -NeedsMount {
+            param($log)
+            if (-not $HostChanges) { return 'skip' }
+            $dir = "${Drive}:\feed"
+            $signal = 'C:\blorgfs-ci\changes-'
+            Remove-Item "${signal}*" -Force -ErrorAction SilentlyContinue
+
+            function Get-Names { @([System.IO.Directory]::GetFiles($dir) | ForEach-Object { Split-Path $_ -Leaf }) }
+            function Wait-Until([string]$Phase, [scriptblock]$Missing) {
+                New-Item -ItemType File -Force -Path "$signal$Phase" | Out-Null
+                $t0 = Get-Date
+                $left = @("the host did not make the $Phase change")
+                while (((Get-Date) - $t0).TotalSeconds -lt 60) {
+                    $left = @(& $Missing)
+                    if (-not $left) { break }
+                    Start-Sleep -Milliseconds 250
+                }
+                $secs = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+                "${Phase}: ${secs}s, files now: $((Get-Names) -join ', ')" | Write-StepLog -Log $log
+                if ($left) { return "$Phase not visible after ${secs}s: $($left -join '; ')" }
+            }
+
+            $failure = Wait-Until 'seed' {
+                if (-not [System.IO.Directory]::Exists($dir)) { 'feed\ not there'; return }
+                foreach ($n in 'stable.bin', 'doomed.bin', 'grows.bin') {
+                    if (-not [System.IO.File]::Exists("$dir\$n")) { "$n not there" }
+                }
+            }
+            if ($failure) { return $failure }
+
+            $null = Get-Names
+            $null = [System.IO.File]::Exists("$dir\born.bin")
+            $null = [System.IO.Directory]::Exists("$dir\newdir")
+            $null = ([System.IO.FileInfo]::new("$dir\grows.bin")).Length
+
+            $watcher = New-Object System.IO.FileSystemWatcher $dir
+            $watcher.IncludeSubdirectories = $false
+            $watcher.NotifyFilter = [System.IO.NotifyFilters]'FileName, DirectoryName, Size, LastWrite'
+            $seen = [System.Collections.Generic.List[string]]::new()
+            $handler = { $Event.MessageData.Add("$($EventArgs.ChangeType) $($EventArgs.Name)") }
+            $subs = foreach ($kind in 'Created', 'Deleted', 'Changed') {
+                Register-ObjectEvent -InputObject $watcher -EventName $kind -MessageData $seen -Action $handler
+            }
+            $watcher.EnableRaisingEvents = $true
+
+            try {
+                $failure = Wait-Until 'change' {
+                    $names = Get-Names
+                    if (-not ([System.IO.File]::Exists("$dir\born.bin") -and $names -contains 'born.bin')) { 'born.bin not there' }
+                    elseif (([System.IO.FileInfo]::new("$dir\born.bin")).Length -ne 123) { 'born.bin not 123 bytes' }
+                    if ([System.IO.File]::Exists("$dir\doomed.bin") -or $names -contains 'doomed.bin') { 'doomed.bin still there' }
+                    if (([System.IO.FileInfo]::new("$dir\grows.bin")).Length -ne 5096) { 'grows.bin not 5096 bytes' }
+                    if (-not [System.IO.File]::Exists("$dir\newdir\inner.bin")) { 'newdir\inner.bin not there' }
+                    if ($seen.Count -eq 0) { 'no directory-change notification' }
+                }
+                "watcher: $($seen -join '; ')" | Write-StepLog -Log $log
+                if ($failure) { return $failure }
+                $true
+            } finally {
+                $watcher.EnableRaisingEvents = $false
+                $subs | ForEach-Object { Unregister-Event -SourceIdentifier $_.Name -ErrorAction SilentlyContinue }
+                $watcher.Dispose()
+            }
         } | Out-Null
 
         Invoke-Step 'survived' $serviceRunning | Out-Null

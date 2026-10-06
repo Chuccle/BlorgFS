@@ -372,6 +372,11 @@ VOID BlorgStatisticsQuery(PBLORGFS_STATISTICS_RESPONSE Out)
     Out->Flags = 0;
 #endif
 
+    if (ReadAcquire(&global.ChangeFeedLive))
+    {
+        Out->Flags |= BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE;
+    }
+
     Out->SizeOfStruct = C_CAST(ULONG, sizeof(BLORGFS_STATISTICS_RESPONSE));
     Out->ProcessorCount = BlorgStatisticsProcessorCount;
     Out->QpcFrequency = StatisticsQpcFrequency;

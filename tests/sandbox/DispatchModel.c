@@ -251,6 +251,47 @@ VOID FsRtlNotifyFullChangeDirectory(
 }
 
 //
+// Reports are recorded rather than matched against registered IRPs: which
+// directory a change lands in is decided by the name and offset the driver
+// passes, and that is what the change feed's tests assert on. Reports past
+// the array's end are counted but not kept.
+//
+#define SHIM_NOTIFY_REPORTS_KEPT 64u
+
+static SHIM_NOTIFY_REPORT ShimNotifyReports[SHIM_NOTIFY_REPORTS_KEPT];
+static ULONG ShimNotifyReportsCount;
+
+VOID FsRtlNotifyFullReportChange(
+    PNOTIFY_SYNC S, PLIST_ENTRY L, PSTRING Name, USHORT Offset,
+    PSTRING Stream, PSTRING Parent, ULONG Filter, ULONG Action, PVOID Target)
+{
+    (void)S; (void)L; (void)Stream; (void)Parent; (void)Target;
+
+    if (ShimNotifyReportsCount < SHIM_NOTIFY_REPORTS_KEPT)
+    {
+        SHIM_NOTIFY_REPORT* report = &ShimNotifyReports[ShimNotifyReportsCount];
+        USHORT bytes = (Name->Length < sizeof(report->Path)) ? Name->Length : (USHORT)sizeof(report->Path);
+
+        memcpy(report->Path, Name->Buffer, bytes);
+        report->PathLength = bytes;
+        report->NameOffset = Offset;
+        report->Filter = Filter;
+        report->Action = Action;
+    }
+
+    ShimNotifyReportsCount++;
+}
+
+ULONG ShimNotifyReportCount(VOID) { return ShimNotifyReportsCount; }
+
+const SHIM_NOTIFY_REPORT* ShimNotifyReport(ULONG Index)
+{
+    return (Index < ShimNotifyReportsCount && Index < SHIM_NOTIFY_REPORTS_KEPT) ? &ShimNotifyReports[Index] : NULL;
+}
+
+VOID ShimNotifyReportsReset(VOID) { ShimNotifyReportsCount = 0; }
+
+//
 // Name matching is real: BlorgFS passes the caller's wildcard straight
 // through, so a directory query test that could not distinguish "*.mkv"
 // from "*" would not be testing the filter at all. This handles the
@@ -392,9 +433,13 @@ NTSTATUS ObReferenceObjectByHandle(HANDLE H, ACCESS_MASK A, POBJECT_TYPE T, KPRO
 
 NTSTATUS ZwClose(HANDLE H) { (void)H; return STATUS_SUCCESS; }
 
-NTSTATUS PsCreateSystemThread(PHANDLE T, ULONG A, PVOID Ob, HANDLE P, PVOID C, PVOID S, PVOID Ctx)
+ULONG ShimSystemThreadAttributes;
+
+NTSTATUS PsCreateSystemThread(PHANDLE T, ULONG A, POBJECT_ATTRIBUTES Ob, HANDLE P, PVOID C, PVOID S, PVOID Ctx)
 {
-    (void)A; (void)Ob; (void)P; (void)C; (void)S; (void)Ctx;
+    (void)A; (void)P; (void)C; (void)S; (void)Ctx;
+
+    ShimSystemThreadAttributes = Ob ? Ob->Attributes : 0;
 
     if (T)
     {

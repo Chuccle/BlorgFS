@@ -647,9 +647,12 @@ NTSTATUS BlorgCreateWorkQueue(VOID)
 
     FspQueue.ThreadCount = threadCount;
 
+    OBJECT_ATTRIBUTES attributes;
+    InitializeObjectAttributes(&attributes, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
     for (ULONG i = 0; i < threadCount; ++i)
     {
-        result = PsCreateSystemThread(&FspQueue.ThreadHandle[i], DELETE | SYNCHRONIZE, NULL, NULL, NULL, BlorgFspDispatch, NULL);
+        result = PsCreateSystemThread(&FspQueue.ThreadHandle[i], DELETE | SYNCHRONIZE, &attributes, NULL, NULL, BlorgFspDispatch, NULL);
 
         if (!NT_SUCCESS(result))
         {

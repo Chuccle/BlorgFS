@@ -34,7 +34,7 @@ occasionally, not every session.
 | [Deploying to a VM](#deploying-to-a-vm) | The deploy pipeline and its quirks |
 | [Debugging the VM: what's real and what's noise](#debugging-the-vm-whats-real-and-whats-noise) | Decision tree for VM/debugger flakiness |
 | [Measuring performance](#measuring-performance) | How to benchmark correctly |
-| [Metadata caching: current state](#metadata-caching-current-state) | The path and listing caches, and the rule any new invalidation or insert must keep |
+| [Metadata caching: current state](#metadata-caching-current-state) | The path and listing caches, the change feed that keeps them, and the rule any new invalidation or insert must keep |
 | [Read-ahead policy: current state](#read-ahead-policy-current-state) | What the driver does today, and why, in one place |
 | [Evidence trail: the playback-stutter investigation](#evidence-trail-the-playback-stutter-investigation) | Conclusions and reusable measurement lessons from the investigation behind that policy; full round-by-round history is in git log |
 | [Future work: on-disk hot cache (not implemented)](#future-work-on-disk-hot-cache-not-implemented) | Design for a not-yet-started project — nothing in it exists in the codebase |
@@ -512,7 +512,10 @@ the guest; `Install-BlorgFS.ps1` installs and `B:` mounts; the tree on `B:`
 matches the corpus path for path and size for size;
 `Test-BlorgCorrectness.ps1` passes; server errors reach a program as the
 Win32 error it expects (a missing file is `FileNotFound`, a missing
-directory `DirectoryNotFound`, reading past the end returns 0 bytes); the
+directory `DirectoryNotFound`, reading past the end returns 0 bytes);
+files the host creates, removes and grows under the mounted volume show up
+on `B:` through the change feed and are reported to a `FileSystemWatcher`
+(`changes`, driven from the host by `change_corpus` in `tools/blorg`); the
 service is still RUNNING. A bugcheck or unexplained reboot anywhere
 fails the run, and the minidumps come back in `diag/dumps`. CI then
 analyses them on `windows-latest` with the driver's PDB from the same
@@ -1411,10 +1414,10 @@ small it is, so the levers left on metadata are how many requests a
 workload makes, not how fast each one is. Two caches in `PathCache.c`
 remove them; both are in-memory only and both are lost on unload.
 
-| Cache | Answers | Kept for |
-|---|---|---|
-| Path cache | An open's exists/not-found and metadata, without a fileinfo GET | 4 s (`PATH_CACHE_TTL_100NS`) |
-| Listing cache | A directory query, without a dirinfo GET; an open's not-found from its parent's listing | Fresh 4 s, then served stale up to 30 s while one background refetch replaces it |
+| Cache | Answers | Kept for, feed down | Kept for, feed live |
+|---|---|---|---|
+| Path cache | An open's exists/not-found and metadata, without a fileinfo GET | 4 s (`PATH_CACHE_TTL_100NS`) | 5 min (`PATH_CACHE_FEED_TTL_100NS`); a not-found stays 4 s, since the feed reports a create behind a symlink by the target's path |
+| Listing cache | A directory query, without a dirinfo GET; an open's not-found from its parent's listing | Fresh 4 s, then served stale 26 s more while one background refetch replaces it | Fresh 5 min, then the same 26 s of stale |
 
 A listing is an immutable, reference-counted snapshot. Each handle
 enumerates the one it took on its initial query until it restarts the
@@ -1433,12 +1436,55 @@ TTL. Two fetches of one directory resolve the other way round: the
 later-issued one wins whichever completes first. `PathCacheSchedTest`
 proves the first across every interleaving, and
 `PathCacheListingTest.LaterIssuedFetchWinsWhicheverCompletesFirst` the
-second in both completion orders. A future change feed or write path
-invalidates through the same calls and inherits the guarantee; anything
-that inserts without a ticket does not.
+second in both completion orders. The change feed below invalidates
+through the same calls and inherits the guarantee, as a write path will;
+anything that inserts without a ticket does not.
 
 `PerfHarness stats` reports `listings hit/stale/miss` and the background
 refreshes issued.
+
+### The change feed
+
+server-rs numbers every debounced batch its filesystem watcher reports and
+answers `GET /get_changes?epoch=E&since=G` with what changed after
+generation `G` as a `ChangeBatch` (the `schemas` table), holding the
+request up to 20 s when nothing has. `ChangeFeed.c` follows it: one system
+thread per volume, one poll in flight, started when the volume is created
+and stopped before it is torn down. A modified path invalidates itself and
+its parent's listing; a created or removed one everything beneath it too;
+more than 64 structural paths in one batch flush the whole cache. Every
+change is also reported through `FsRtlNotifyFullReportChange`, so an
+Explorer window on the directory refreshes.
+
+**What makes the long lifetime correct is a contract on both sides.** The
+server bumps the generation before it invalidates its own cache, publishes
+after, and marks any answer whose load a bump overtook (or that went
+through a symlink) `Cache-Control: no-store`; the driver never caches
+those (`NoStore` on the metadata and the listing). So an answer read after
+the driver applied generation `G` reflects every change up to `G`, and
+every later change arrives as an invalidation, which the ticket rule above
+makes win over a read racing it. The lifetime is applied when an entry is
+read, not when it is written: the feed going down shortens everything
+already cached at once. Going live flushes first, because nothing cached
+before then was covered by any feed (`BlorgPathCacheFollowFeed` has the
+ordering argument).
+
+The feed is live from the first reset the server answers until the first
+poll that fails (a 503 while the server's watcher is down, a 404 from a
+server that predates the feed, a timeout); a failure backs off 1 s doubling
+to 30 s. A reset, or a batch from another server process (`epoch`), flushes
+everything. The 5-minute bound stays because the feed only reports what the
+server's watcher sees. `ChangeFeed=0` under `Parameters` turns the follower
+off; `PerfHarness stats` reports whether it is live and its polls, failures,
+resets, paths and flushes.
+
+**Not covered, and not new:** an open of a file whose FCB is still resident
+is answered from the FCB (`BlorgNodeTableLookupPin` in `Create.c`) without
+consulting either cache, and nothing refreshes an FCB's size or times. An
+FCB outlives its last handle for as long as the memory manager holds the
+file's pages, so a file that was read keeps its old size on reopen however
+it changed on the server, feed or not. The guest's `changes` check creates
+its files after everything else has been read for exactly this reason.
 
 **Index a path-keyed table by the top bits of `BlorgHashPath`, never by
 masking `RtlHashUnicodeString` directly.** Its default is x65599, and 65599
