@@ -667,6 +667,48 @@ TEST_F(PathCacheListingTest, InvalidatingAChildDropsTheParentsListing)
 }
 
 //
+// A repeat `dir /s` answers every directory from the listing cache, which
+// holds only if sibling paths spread across its buckets. The kernel's path
+// hash does not spread them on its own (see BlorgHashPath): this tree, the
+// shape of the guest measurement, packed up to 12 listings into one bucket
+// of 8, and two thirds of a repeat walk went back to the server. The shim
+// hashes with the kernel's algorithm so the clustering is real here.
+//
+TEST_F(PathCacheListingTest, EveryListingOfADeepTreeStaysCached)
+{
+    std::vector<std::wstring> dirs = { L"\\prof\\r1\\tree" };
+
+    for (int i = 0; i < 40; ++i)
+    {
+        wchar_t buf[64];
+        swprintf_s(buf, L"\\prof\\r1\\tree\\d%02d", i);
+        dirs.push_back(buf);
+
+        for (int k = 0; k < 2; ++k)
+        {
+            swprintf_s(buf, L"\\prof\\r1\\tree\\d%02d\\s%d", i, k);
+            dirs.push_back(buf);
+        }
+    }
+
+    for (const auto& dir : dirs)
+    {
+        Publish(dir, BuildSyntheticListing(5, 0), nullptr, TRUE);
+    }
+
+    int missing = 0;
+
+    for (const auto& dir : dirs)
+    {
+        PDIRECTORY_INFO listing = LookupListing(dir, FALSE);
+        missing += (listing == nullptr);
+        BlorgReleaseDirectoryInfo(listing);
+    }
+
+    EXPECT_EQ(0, missing) << "of " << dirs.size() << " listings published back to back";
+}
+
+//
 // A handle enumerates the snapshot it took; the cache dropping its own
 // reference must not free it underneath. ASan turns a regression here into
 // a use-after-free report at the FileCount read.
