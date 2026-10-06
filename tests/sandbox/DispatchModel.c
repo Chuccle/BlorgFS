@@ -28,6 +28,7 @@
 #define BLORGFS_SHIM_INTERNAL
 
 #include "..\..\src\Driver.h"
+#include "Scheduler.h"
 
 ///////////////////////////////////////////////////////////////////////////
 // Cache manager
@@ -339,8 +340,27 @@ NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT D, PDEVICE_OBJECT* V)
     return STATUS_NOT_IMPLEMENTED;
 }
 
-BOOLEAN ExIsResourceAcquiredExclusiveLite(PERESOURCE R) { (void)R; return TRUE; }
-VOID ExConvertExclusiveToSharedLite(PERESOURCE R) { (void)R; }
+BOOLEAN ExIsResourceAcquiredExclusiveLite(PERESOURCE R) { return (BOOLEAN)(R->ExclusiveOwner == KmSchedThreadId()); }
+
+//
+// Exclusive becomes shared with no window between, as in the kernel. Under
+// the scheduler the shared holders it lets in are real, so a path that
+// converts and then still needs the resource exclusive fails the check
+// above. Outside it the SRW lock cannot convert, and the resource stays
+// exclusive, which only serialises.
+//
+VOID ExConvertExclusiveToSharedLite(PERESOURCE R)
+{
+    if (!KmSchedActive())
+    {
+        return;
+    }
+
+    R->ExclusiveOwner = 0;
+    R->SchedState = 1;
+    KmSchedNoteRelease(R);
+    KmSchedYield();
+}
 
 VOID ObReferenceObject(PVOID O) { (void)O; }
 VOID ObDereferenceObject(PVOID O) { (void)O; }

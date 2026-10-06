@@ -46,7 +46,8 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
     PVOID CallerContext
 );
 
-VOID BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo);
+VOID BlorgReferenceDirectoryInfo(PDIRECTORY_INFO DirInfo);
+VOID BlorgReleaseDirectoryInfo(PDIRECTORY_INFO DirInfo);
 
 NTSTATUS BlorgHttpGetFileInformation(
     const UNICODE_STRING* Path,

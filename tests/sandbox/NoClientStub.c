@@ -1,7 +1,7 @@
 //
 // The Client.c entry points needed by targets that do not compile Client.c.
 //
-// Structs.c calls BlorgFreeHttpDirectoryInfo from node teardown, so it must
+// Structs.c calls BlorgReleaseDirectoryInfo from node teardown, so it must
 // resolve everywhere; but ClientSandbox links the real Client.c and must
 // not also link a stub of it. Keeping the stub in its own translation unit
 // lets each target pick exactly one, the same split NoStatisticsStub.c
@@ -16,9 +16,9 @@
 
 #include "..\..\src\Driver.h"
 
-void BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
+void BlorgReleaseDirectoryInfo(PDIRECTORY_INFO DirInfo)
 {
-    if (DirInfo)
+    if (DirInfo && 0 == InterlockedDecrement(&DirInfo->RefCount))
     {
         ExFreePool(DirInfo);
     }

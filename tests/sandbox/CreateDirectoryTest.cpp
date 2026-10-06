@@ -29,9 +29,9 @@
 // is also still 0%: reaching it means scripting a real HTTP round trip
 // through the real Client.c and SandboxSocket peer, which is follow-on
 // work, not done here. What IS covered without a network round trip is
-// the OTHER way BlorgVolumeCreate resolves a cold path: a pre-populated
-// parent DCB->CachedListing, which is exactly how a warm directory's
-// children resolve once DirCtrlComplete has cached its listing. That
+// the OTHER way BlorgVolumeCreate resolves a cold path: a fresh listing of
+// the parent in the listing cache, which is exactly how a warm directory's
+// children resolve once DirCtrlComplete has published its listing. That
 // path exercises SplitPathLeaf and both of FindEntryByName's loops for
 // free.
 //
@@ -198,16 +198,21 @@ protected:
     }
 
     //
-    // A synthetic parent-directory listing with one file and one
-    // subdirectory entry, built the way DirCtrlComplete would have cached
-    // one -- so BlorgVolumeCreate's listing-hit branch (FindEntryByName,
+    // Publishes a synthetic listing of Dir with one file and one
+    // subdirectory entry into the listing cache, the way DirCtrlComplete
+    // would have -- so BlorgVolumeCreate's listing-hit branch (FindEntryByName,
     // reached without any network round trip) can be driven directly. The
     // layout arithmetic lives in ListingBuilder.h, shared with
     // DirCtrlTest.cpp rather than copied.
     //
-    static PDIRECTORY_INFO BuildListing(const wchar_t* fileName, const wchar_t* subdirName)
+    static void PublishListing(const wchar_t* dir, const wchar_t* fileName, const wchar_t* subdirName)
     {
-        return BuildSyntheticListingNamed(fileName, subdirName);
+        UNICODE_STRING dirName = Path(dir);
+        PDIRECTORY_INFO listing = BuildSyntheticListingNamed(fileName, subdirName);
+
+        ASSERT_NE(nullptr, listing);
+        EXPECT_TRUE(BlorgPathCachePublishListing(&dirName, listing, nullptr));
+        BlorgReleaseDirectoryInfo(listing);
     }
 
     static UNICODE_STRING Path(const wchar_t* path)
@@ -599,8 +604,7 @@ TEST_F(CreateDirectoryTest, NewSubdirectoryResolvedThroughCachedParentListingIsO
     PCOMMON_CONTEXT parent = MakePublishedNode(L"\\media", TRUE);
     ASSERT_NE(nullptr, parent);
 
-    PDCB parentDcb = C_CAST(PDCB, parent);
-    parentDcb->CachedListing = BuildListing(L"clip.bin", L"movies");
+    PublishListing(L"\\media", L"clip.bin", L"movies");
 
     CreateOpener dirOpener;
     PrepareOpener(&dirOpener, Path(L"\\media\\movies"), FILE_LIST_DIRECTORY, kShareAll, 0);
@@ -633,8 +637,7 @@ TEST_F(CreateDirectoryTest, LeafNotInCachedParentListingReturnsObjectNameNotFoun
     PCOMMON_CONTEXT parent = MakePublishedNode(L"\\media", TRUE);
     ASSERT_NE(nullptr, parent);
 
-    PDCB parentDcb = C_CAST(PDCB, parent);
-    parentDcb->CachedListing = BuildListing(L"clip.bin", L"movies");
+    PublishListing(L"\\media", L"clip.bin", L"movies");
 
     CreateOpener opener;
     PrepareOpener(&opener, Path(L"\\media\\ghost"), FILE_LIST_DIRECTORY, kShareAll, 0);
@@ -643,6 +646,34 @@ TEST_F(CreateDirectoryTest, LeafNotInCachedParentListingReturnsObjectNameNotFoun
     EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, opener.CreateIrp.IoStatus.Status)
         << "a leaf absent from both loops of a resolved listing must fail "
            "without falling through to a network lookup";
+}
+
+//
+// An open answered from a cached listing caches its answer as old as the
+// fetch behind the listing, not as the open: it goes when the listing
+// would have, rather than a lifetime after the listing's last use.
+//
+TEST_F(CreateDirectoryTest, EntrySeededFromACachedListingIsAsOldAsTheListing)
+{
+    constexpr ULONG64 kSecond = 10ULL * 1000ULL * 1000ULL;
+
+    PCOMMON_CONTEXT parent = MakePublishedNode(L"\\media", TRUE);
+    ASSERT_NE(nullptr, parent);
+
+    PublishListing(L"\\media", L"clip.bin", L"movies");
+    ShimAdvanceInterruptTime(3 * kSecond);
+
+    CreateOpener opener;
+    PrepareOpener(&opener, Path(L"\\media\\movies"), FILE_LIST_DIRECTORY, kShareAll, 0);
+    BlorgCreate(Volume, &opener.CreateIrp);
+    ASSERT_EQ(STATUS_SUCCESS, opener.CreateIrp.IoStatus.Status);
+    CloseOpener(&opener);
+
+    ShimAdvanceInterruptTime(2 * kSecond);
+
+    UNICODE_STRING movies = Path(L"\\media\\movies");
+    EXPECT_EQ(PathCacheMiss, BlorgPathCacheLookup(&movies, nullptr))
+        << "the listing was fetched five seconds ago, past the four the cache trusts";
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -877,7 +908,7 @@ TEST_F(CreateDirectoryTest, FailedColdOpenDefersItsInsertedNodeForReap)
     ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &clipPath, &meta, Volume, &node));
     ASSERT_NE(nullptr, node);
 
-    Root->CachedListing = BuildListing(L"clip.bin", L"movies");
+    PublishListing(L"\\", L"clip.bin", L"movies");
 
     CreateOpener opener;
     PrepareOpener(&opener, clipPath,
@@ -893,9 +924,10 @@ TEST_F(CreateDirectoryTest, FailedColdOpenDefersItsInsertedNodeForReap)
     ShimDrainWorkItems();
 
     //
-    // The listing hit seeded the path cache (production frees it via TTL
-    // or invalidation); the test owns neither, so drop it before teardown's
-    // quiescence floor.
+    // The open's path-cache entry and the root's listing are both cache
+    // state this test created (production frees them via TTL or
+    // invalidation), so drop them before teardown's quiescence floor;
+    // invalidating a path also drops its parent's listing.
     //
     UNICODE_STRING clipSeed = Path(L"\\clip.bin");
     BlorgPathCacheInvalidate(&clipSeed);

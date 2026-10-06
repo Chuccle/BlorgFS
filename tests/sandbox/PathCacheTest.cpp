@@ -2,7 +2,7 @@
 // Functional tests for PathCache.c: the sharded full-path resolution
 // cache wired into the create path (via BlorgPathCacheLookup/InsertExists/
 // InsertNotFound) and into DirCtrlComplete (via BlorgPathCacheSeedListing
-// on a listing publish). Exercised here through its own public API rather
+// on a listing publish), and the listing cache beside it. Exercised here through its own public API rather
 // than through IRP dispatch -- the cache's state machine (TTL, targeted/
 // prefix invalidation, per-bucket FIFO eviction) is what OpenCppCoverage
 // showed as never exercised at all, compile-only.
@@ -74,7 +74,7 @@ TEST_F(PathCacheTest, InsertExistsThenLookupHitsWithMetadataWithinTtl)
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\media\\movies\\alpha.mkv");
     DIRECTORY_ENTRY_METADATA meta = MakeMeta(123456789ULL, FALSE);
 
-    BlorgPathCacheInsertExists(&path, &meta);
+    BlorgPathCacheInsertExists(&path, &meta, nullptr);
 
     DIRECTORY_ENTRY_METADATA out = {};
     EXPECT_EQ(PathCacheExists, BlorgPathCacheLookup(&path, &out));
@@ -89,7 +89,7 @@ TEST_F(PathCacheTest, InsertNotFoundThenLookupReturnsNotFoundWithinTtl)
 {
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\media\\movies\\missing.mkv");
 
-    BlorgPathCacheInsertNotFound(&path);
+    BlorgPathCacheInsertNotFound(&path, nullptr);
 
     EXPECT_EQ(PathCacheNotFound, BlorgPathCacheLookup(&path, nullptr));
 }
@@ -112,8 +112,8 @@ TEST_F(PathCacheTest, ReinsertingACachedPathRefreshesItInPlace)
     DIRECTORY_ENTRY_METADATA first = MakeMeta(111, FALSE);
     DIRECTORY_ENTRY_METADATA second = MakeMeta(222, TRUE);
 
-    BlorgPathCacheInsertExists(&path, &first);
-    BlorgPathCacheInsertExists(&path, &second);
+    BlorgPathCacheInsertExists(&path, &first, nullptr);
+    BlorgPathCacheInsertExists(&path, &second, nullptr);
 
     DIRECTORY_ENTRY_METADATA out = {};
     EXPECT_EQ(PathCacheExists, BlorgPathCacheLookup(&path, &out));
@@ -132,7 +132,7 @@ TEST_F(PathCacheTest, LookupAfterTtlExpiryMisses)
     UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\media\\movies\\beta.mkv");
     DIRECTORY_ENTRY_METADATA meta = MakeMeta(42, FALSE);
 
-    BlorgPathCacheInsertExists(&path, &meta);
+    BlorgPathCacheInsertExists(&path, &meta, nullptr);
     ASSERT_EQ(PathCacheExists, BlorgPathCacheLookup(&path, nullptr))
         << "sanity: the entry must be live before it can prove expiry";
 
@@ -148,8 +148,8 @@ TEST_F(PathCacheTest, TargetedInvalidationRemovesExactlyThatPath)
     UNICODE_STRING bystander = RTL_CONSTANT_STRING(L"\\media\\movies\\delta.mkv");
     DIRECTORY_ENTRY_METADATA meta = MakeMeta(7, FALSE);
 
-    BlorgPathCacheInsertExists(&victim, &meta);
-    BlorgPathCacheInsertExists(&bystander, &meta);
+    BlorgPathCacheInsertExists(&victim, &meta, nullptr);
+    BlorgPathCacheInsertExists(&bystander, &meta, nullptr);
 
     BlorgPathCacheInvalidate(&victim);
 
@@ -184,11 +184,11 @@ TEST_F(PathCacheTest, PrefixInvalidationRemovesSubtreeButNotSiblings)
     DIRECTORY_ENTRY_METADATA meta = MakeMeta(9, FALSE);
     DIRECTORY_ENTRY_METADATA dirMeta = MakeMeta(0, TRUE);
 
-    BlorgPathCacheInsertExists(&inDirA, &meta);
-    BlorgPathCacheInsertExists(&inDirB, &meta);
-    BlorgPathCacheInsertExists(&dirItself, &dirMeta);
-    BlorgPathCacheInsertExists(&sibling, &meta);
-    BlorgPathCacheInsertExists(&unrelated, &meta);
+    BlorgPathCacheInsertExists(&inDirA, &meta, nullptr);
+    BlorgPathCacheInsertExists(&inDirB, &meta, nullptr);
+    BlorgPathCacheInsertExists(&dirItself, &dirMeta, nullptr);
+    BlorgPathCacheInsertExists(&sibling, &meta, nullptr);
+    BlorgPathCacheInsertExists(&unrelated, &meta, nullptr);
 
     BlorgPathCacheInvalidatePrefix(&dir);
 
@@ -234,8 +234,8 @@ TEST_F(PathCacheTest, RootPrefixInvalidationRemovesItsChildren)
     UNICODE_STRING rootChild = RTL_CONSTANT_STRING(L"\\rootlevel.bin");
     UNICODE_STRING deeperChild = RTL_CONSTANT_STRING(L"\\media\\nested.bin");
 
-    BlorgPathCacheInsertNotFound(&rootChild);
-    BlorgPathCacheInsertNotFound(&deeperChild);
+    BlorgPathCacheInsertNotFound(&rootChild, nullptr);
+    BlorgPathCacheInsertNotFound(&deeperChild, nullptr);
 
     ASSERT_EQ(PathCacheNotFound, BlorgPathCacheLookup(&rootChild, nullptr))
         << "sanity: the negative entry must be live before invalidation can prove anything";
@@ -261,7 +261,7 @@ TEST_F(PathCacheTest, NonRootPrefixInvalidationRemovesItsChildren)
     UNICODE_STRING dir = RTL_CONSTANT_STRING(L"\\media");
     UNICODE_STRING child = RTL_CONSTANT_STRING(L"\\media\\controlcase.bin");
 
-    BlorgPathCacheInsertNotFound(&child);
+    BlorgPathCacheInsertNotFound(&child, nullptr);
     ASSERT_EQ(PathCacheNotFound, BlorgPathCacheLookup(&child, nullptr));
 
     BlorgPathCacheInvalidatePrefix(&dir);
@@ -295,7 +295,7 @@ TEST_F(PathCacheTest, InsertUnderPressureEvictsRatherThanGrowingUnbounded)
 
     for (int i = 0; i < kPaths; ++i)
     {
-        BlorgPathCacheInsertExists(&paths[i], &meta);
+        BlorgPathCacheInsertExists(&paths[i], &meta, nullptr);
     }
 
     EXPECT_EQ(PathCacheExists, BlorgPathCacheLookup(&paths[kPaths - 1], nullptr))
@@ -340,8 +340,8 @@ protected:
     static void Seed(const std::wstring& Dir, PDIRECTORY_INFO Listing)
     {
         UNICODE_STRING dir = Path(Dir);
-        BlorgPathCacheSeedListing(&dir, Listing);
-        BlorgFreeHttpDirectoryInfo(Listing);
+        BlorgPathCacheSeedListing(&dir, Listing, nullptr);
+        BlorgReleaseDirectoryInfo(Listing);
     }
 
     static PATH_CACHE_RESULT Lookup(const std::wstring& Text, DIRECTORY_ENTRY_METADATA* Meta = nullptr)
@@ -381,9 +381,9 @@ TEST_F(PathCacheSeedTest, KeepsTheDirectoryReplacesStaleChildrenDropsDeeperEntri
     UNICODE_STRING grandchild = RTL_CONSTANT_STRING(L"\\seed\\keep\\dir0\\inner.bin");
     DIRECTORY_ENTRY_METADATA dirMeta = MakeMeta(0, TRUE);
 
-    BlorgPathCacheInsertExists(&dir, &dirMeta);
-    BlorgPathCacheInsertNotFound(&staleChild);
-    BlorgPathCacheInsertNotFound(&grandchild);
+    BlorgPathCacheInsertExists(&dir, &dirMeta, nullptr);
+    BlorgPathCacheInsertNotFound(&staleChild, nullptr);
+    BlorgPathCacheInsertNotFound(&grandchild, nullptr);
 
     Seed(L"\\seed\\keep", BuildSyntheticListing(1, 1));
 
@@ -453,6 +453,289 @@ TEST_F(PathCacheSeedTest, VeryLargeListingSeedsOnlyItsFirstEntries)
     EXPECT_EQ(PathCacheExists, Lookup(L"\\seed\\huge\\file0.bin"));
     EXPECT_EQ(PathCacheMiss, Lookup(L"\\seed\\huge\\file1999.bin"))
         << "a 2000-entry listing was seeded in full, flushing the rest of the cache";
+}
+
+//
+// The listing cache (BlorgPathCacheLookupListing/PublishListing): what lets a
+// re-list skip its dirinfo GET, and the ticket protocol that keeps a listing
+// fetched before a change from being served after it. DirCtrlTest.cpp drives
+// it through real queries; the time windows and the races are pinned here,
+// where the clock can be jumped and each verdict read directly.
+//
+class PathCacheListingTest : public PathCacheSeedTest
+{
+protected:
+    static void Publish(const std::wstring& Dir, PDIRECTORY_INFO Listing, const PATH_CACHE_TICKET* Ticket, BOOLEAN ExpectCurrent)
+    {
+        UNICODE_STRING dir = Path(Dir);
+
+        ASSERT_NE(nullptr, Listing);
+        EXPECT_EQ(ExpectCurrent, BlorgPathCachePublishListing(&dir, Listing, Ticket));
+        BlorgReleaseDirectoryInfo(Listing);
+    }
+
+    static PDIRECTORY_INFO LookupListing(const std::wstring& Dir, BOOLEAN AllowStale, BOOLEAN* Stale = nullptr, BOOLEAN* RefreshOwed = nullptr)
+    {
+        UNICODE_STRING dir = Path(Dir);
+        return BlorgPathCacheLookupListing(&dir, AllowStale, Stale, RefreshOwed, nullptr);
+    }
+
+    static std::wstring FirstFileName(const DIRECTORY_INFO* Listing)
+    {
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(const_cast<PDIRECTORY_INFO>(Listing), 0);
+        return std::wstring(file->Name, file->NameLength);
+    }
+
+    static constexpr ULONG64 kSecond = 10ULL * 1000ULL * 1000ULL;
+};
+
+TEST_F(PathCacheListingTest, FreshListingIsServedWithoutOwingARefresh)
+{
+    Publish(L"\\lst\\fresh", BuildSyntheticListing(2, 0), nullptr, TRUE);
+
+    BOOLEAN stale = TRUE;
+    BOOLEAN owed = TRUE;
+    PDIRECTORY_INFO listing = LookupListing(L"\\lst\\fresh", FALSE, &stale, &owed);
+
+    ASSERT_NE(nullptr, listing) << "a listing within the TTL must answer a re-list";
+    EXPECT_EQ(2u, listing->FileCount);
+    EXPECT_FALSE(stale);
+    EXPECT_FALSE(owed);
+
+    BlorgReleaseDirectoryInfo(listing);
+}
+
+//
+// Past the TTL a listing still answers a directory query (AllowStale) and
+// never an open's not-found (Create.c passes FALSE), and of every query that
+// sees it stale exactly one is told to refetch. A refresh per query would
+// put the request back on every re-list of a busy directory, which is what
+// the cache exists to remove.
+//
+TEST_F(PathCacheListingTest, StaleListingAnswersOnlyQueriesAndOwesOneRefresh)
+{
+    Publish(L"\\lst\\stale", BuildSyntheticListing(1, 0), nullptr, TRUE);
+    ShimAdvanceInterruptTime(5 * kSecond);
+
+    EXPECT_EQ(nullptr, LookupListing(L"\\lst\\stale", FALSE))
+        << "a stale listing must not answer an open's not-found";
+
+    BOOLEAN stale = FALSE;
+    BOOLEAN owed = FALSE;
+    PDIRECTORY_INFO first = LookupListing(L"\\lst\\stale", TRUE, &stale, &owed);
+    ASSERT_NE(nullptr, first);
+    EXPECT_TRUE(stale);
+    EXPECT_TRUE(owed) << "the first stale query owes the refresh";
+
+    PDIRECTORY_INFO second = LookupListing(L"\\lst\\stale", TRUE, &stale, &owed);
+    ASSERT_NE(nullptr, second);
+    EXPECT_TRUE(stale);
+    EXPECT_FALSE(owed) << "the refresh is owed once per snapshot, not once per query";
+
+    BlorgReleaseDirectoryInfo(first);
+    BlorgReleaseDirectoryInfo(second);
+}
+
+//
+// The stale window is bounded: a directory nobody has listed for a while is
+// fetched in the foreground rather than shown as it was long ago.
+//
+TEST_F(PathCacheListingTest, ListingPastTheStaleWindowIsGone)
+{
+    Publish(L"\\lst\\old", BuildSyntheticListing(1, 0), nullptr, TRUE);
+    ShimAdvanceInterruptTime(31 * kSecond);
+
+    EXPECT_EQ(nullptr, LookupListing(L"\\lst\\old", TRUE));
+}
+
+//
+// Two fetches of one directory can complete in either order. The one issued
+// later saw the newer directory, so an earlier-issued listing completing
+// after it must neither replace it nor seed the path cache (the FALSE
+// verdict). Without the IssueTime check the slower, older response would
+// win and roll the listing back.
+//
+TEST_F(PathCacheListingTest, LaterIssuedFetchWinsWhicheverCompletesFirst)
+{
+    PATH_CACHE_TICKET older;
+    PATH_CACHE_TICKET newer;
+
+    BlorgPathCacheTakeTicket(&older);
+    ShimAdvanceInterruptTime(1);
+    BlorgPathCacheTakeTicket(&newer);
+
+    Publish(L"\\lst\\order", BuildSyntheticListingNamed(L"newer.bin", L"d"), &newer, TRUE);
+    Publish(L"\\lst\\order", BuildSyntheticListingNamed(L"older.bin", L"d"), &older, FALSE);
+
+    PDIRECTORY_INFO listing = LookupListing(L"\\lst\\order", FALSE);
+    ASSERT_NE(nullptr, listing);
+    EXPECT_EQ(L"newer.bin", FirstFileName(listing));
+    BlorgReleaseDirectoryInfo(listing);
+}
+
+//
+// A result read before an invalidation must not be cached after it. The
+// invalidation here is of a different path than the one inserted, which is
+// the conservative side of the protocol (see BlorgPathCacheTakeTicket): an
+// insert cannot know which invalidations covered what it read, so it yields
+// to any.
+//
+TEST_F(PathCacheListingTest, TicketTakenBeforeAnInvalidationIsRefused)
+{
+    PATH_CACHE_TICKET ticket;
+    BlorgPathCacheTakeTicket(&ticket);
+
+    UNICODE_STRING changed = RTL_CONSTANT_STRING(L"\\lst\\raced\\gone.bin");
+    BlorgPathCacheInvalidate(&changed);
+
+    Publish(L"\\lst\\raced", BuildSyntheticListing(1, 0), &ticket, FALSE);
+    EXPECT_EQ(nullptr, LookupListing(L"\\lst\\raced", TRUE));
+
+    UNICODE_STRING file = RTL_CONSTANT_STRING(L"\\lst\\raced\\file0.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(1, FALSE);
+    BlorgPathCacheInsertExists(&file, &meta, &ticket);
+    BlorgPathCacheInsertNotFound(&changed, &ticket);
+
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\lst\\raced\\file0.bin"));
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\lst\\raced\\gone.bin"));
+
+    PATH_CACHE_TICKET after;
+    BlorgPathCacheTakeTicket(&after);
+    Publish(L"\\lst\\raced", BuildSyntheticListing(1, 0), &after, TRUE);
+    EXPECT_NE(nullptr, LookupListing(L"\\lst\\raced", FALSE));
+}
+
+//
+// An open resolved from a cached listing inserts what the listing says, so
+// it must insert under the listing's own ticket, not one taken at the
+// lookup. An invalidation advances the sequence before it sweeps, and the
+// listing can still be cached in between; a fresh ticket would then pass
+// for newer than the invalidation and its insert would never be swept.
+// Here the invalidation is of another path and has finished, which is the
+// conservative side of the same rule: the insert cannot tell which paths
+// the invalidations since the listing's fetch covered, so it yields to any.
+//
+TEST_F(PathCacheListingTest, AnEntryReadFromACachedListingCarriesItsFetchTicket)
+{
+    PATH_CACHE_TICKET fetched;
+    BlorgPathCacheTakeTicket(&fetched);
+    Publish(L"\\lst\\provenance", BuildSyntheticListing(1, 0), &fetched, TRUE);
+
+    UNICODE_STRING elsewhere = RTL_CONSTANT_STRING(L"\\lst\\elsewhere\\gone.bin");
+    BlorgPathCacheInvalidate(&elsewhere);
+
+    UNICODE_STRING dir = RTL_CONSTANT_STRING(L"\\lst\\provenance");
+    PATH_CACHE_TICKET ticket;
+    BlorgPathCacheTakeTicket(&ticket);
+
+    PDIRECTORY_INFO listing = BlorgPathCacheLookupListing(&dir, FALSE, nullptr, nullptr, &ticket);
+    ASSERT_NE(nullptr, listing);
+    BlorgReleaseDirectoryInfo(listing);
+
+    EXPECT_EQ(fetched.Sequence, ticket.Sequence);
+    EXPECT_EQ(fetched.IssueTime, ticket.IssueTime);
+
+    UNICODE_STRING file = RTL_CONSTANT_STRING(L"\\lst\\provenance\\file0.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(1000, FALSE);
+    BlorgPathCacheInsertExists(&file, &meta, &ticket);
+
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\lst\\provenance\\file0.bin"))
+        << "an entry from a listing older than an invalidation was cached under a newer ticket";
+}
+
+//
+// A change to a path is a change to the listing of the directory it sits
+// in, so invalidating the path must drop that listing too; otherwise a
+// re-list would keep showing a file that was just found to be gone.
+//
+TEST_F(PathCacheListingTest, InvalidatingAChildDropsTheParentsListing)
+{
+    Publish(L"\\lst\\parent", BuildSyntheticListing(1, 0), nullptr, TRUE);
+    Publish(L"\\lst\\parent\\dir0", BuildSyntheticListing(1, 0), nullptr, TRUE);
+    Publish(L"\\lst\\sibling", BuildSyntheticListing(1, 0), nullptr, TRUE);
+
+    UNICODE_STRING child = RTL_CONSTANT_STRING(L"\\lst\\parent\\dir0");
+    BlorgPathCacheInvalidate(&child);
+
+    EXPECT_EQ(nullptr, LookupListing(L"\\lst\\parent", TRUE));
+    EXPECT_EQ(nullptr, LookupListing(L"\\lst\\parent\\dir0", TRUE))
+        << "a directory's own listing goes with it";
+
+    PDIRECTORY_INFO sibling = LookupListing(L"\\lst\\sibling", FALSE);
+    EXPECT_NE(nullptr, sibling) << "an unrelated listing must survive";
+    BlorgReleaseDirectoryInfo(sibling);
+}
+
+//
+// A handle enumerates the snapshot it took; the cache dropping its own
+// reference must not free it underneath. ASan turns a regression here into
+// a use-after-free report at the FileCount read.
+//
+TEST_F(PathCacheListingTest, SnapshotOutlivesItsCacheEntry)
+{
+    Publish(L"\\lst\\held", BuildSyntheticListing(3, 0), nullptr, TRUE);
+
+    PDIRECTORY_INFO held = LookupListing(L"\\lst\\held", FALSE);
+    ASSERT_NE(nullptr, held);
+
+    UNICODE_STRING dir = RTL_CONSTANT_STRING(L"\\lst\\held");
+    BlorgPathCacheInvalidatePrefix(&dir);
+
+    EXPECT_EQ(nullptr, LookupListing(L"\\lst\\held", TRUE));
+    EXPECT_EQ(3u, held->FileCount);
+    EXPECT_EQ(L"file0.bin", FirstFileName(held));
+
+    BlorgReleaseDirectoryInfo(held);
+}
+
+//
+// A listing larger than the whole byte budget can never be kept, and
+// evicting its bucket's live listings to try only loses them. A thousand
+// small listings leave nearly every bucket holding some; whichever were
+// kept must all still be there after the large one is refused.
+//
+TEST_F(PathCacheListingTest, AListingTheBudgetCannotHoldEvictsNothing)
+{
+    std::vector<std::wstring> kept;
+
+    for (int i = 0; i < 1000; ++i)
+    {
+        wchar_t buf[64];
+        swprintf_s(buf, L"\\budget\\small\\d%03d", i);
+        Publish(buf, BuildSyntheticListing(1, 0), nullptr, TRUE);
+    }
+
+    for (int i = 0; i < 1000; ++i)
+    {
+        wchar_t buf[64];
+        swprintf_s(buf, L"\\budget\\small\\d%03d", i);
+
+        PDIRECTORY_INFO listing = LookupListing(buf, FALSE);
+
+        if (listing)
+        {
+            kept.push_back(buf);
+        }
+
+        BlorgReleaseDirectoryInfo(listing);
+    }
+
+    Publish(L"\\budget\\huge", BuildSyntheticListing(70000, 0), nullptr, TRUE);
+
+    PDIRECTORY_INFO huge = LookupListing(L"\\budget\\huge", FALSE);
+    EXPECT_EQ(nullptr, huge);
+    BlorgReleaseDirectoryInfo(huge);
+
+    int missing = 0;
+
+    for (const auto& dir : kept)
+    {
+        PDIRECTORY_INFO listing = LookupListing(dir, FALSE);
+        missing += (nullptr == listing);
+        BlorgReleaseDirectoryInfo(listing);
+    }
+
+    EXPECT_EQ(0, missing) << "of " << kept.size() << " listings kept before the large one";
 }
 
 } // namespace

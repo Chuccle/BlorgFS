@@ -880,6 +880,7 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
     dirInfo->SubDirsOffset = headerSize + filesEntryArraySize;
     dirInfo->FileCount = filesCount;
     dirInfo->SubDirCount = subdirCount;
+    dirInfo->RefCount = 1;
 
     PDIRECTORY_FILE_METADATA fileEntries = BlorgGetFileEntry(dirInfo, 0);
 
@@ -2501,7 +2502,7 @@ static NTSTATUS HttpParseHeaders(HTTP_CONTEXT* Ctx)
 // Deserializes the response body per Ctx->Operation and fires the caller's
 // completion callback on success, clearing Completion.*.Routine so
 // HttpComplete does not invoke it a second time (dirInfo ownership
-// transfers to the caller, who frees it with BlorgFreeHttpDirectoryInfo). Must
+// transfers to the caller with one reference, dropped with BlorgReleaseDirectoryInfo). Must
 // run at PASSIVE (see HttpDispatch/HttpMustBounceToPassive) since flatcc
 // and the callbacks require it. For HttpOpFileRead in zero-copy mode, the
 // body is already in the caller's MDL, so there is nothing to hand over --
@@ -3195,12 +3196,22 @@ NTSTATUS BlorgHttpGetFileMdl(
 }
 
 //
-// Frees a PDIRECTORY_INFO returned via BlorgHttpGetDirectoryInfo's
-// completion callback.
+// Takes one more reference on a listing snapshot. The caller must already
+// hold one, or hold the lock that keeps the holder's alive (the listing
+// cache's bucket lock).
 //
-VOID BlorgFreeHttpDirectoryInfo(PDIRECTORY_INFO DirInfo)
+VOID BlorgReferenceDirectoryInfo(PDIRECTORY_INFO DirInfo)
 {
-    if (DirInfo)
+    InterlockedIncrement(&DirInfo->RefCount);
+}
+
+//
+// Drops one reference to a listing snapshot from BlorgHttpGetDirectoryInfo's
+// completion, freeing it with the last. NULL is a no-op.
+//
+VOID BlorgReleaseDirectoryInfo(PDIRECTORY_INFO DirInfo)
+{
+    if (DirInfo && 0 == InterlockedDecrement(&DirInfo->RefCount))
     {
         ExFreePool(DirInfo);
     }
