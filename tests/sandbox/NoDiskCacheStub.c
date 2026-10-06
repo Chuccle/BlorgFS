@@ -35,11 +35,15 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, PNON_PAGED_NODE Node, ULONG64 Offset, ULONG
     return FALSE;
 }
 
-VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length, PMDL Mdl)
+BOOLEAN BlorgDiskCacheLive(VOID)
+{
+    return FALSE;
+}
+
+VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length)
 {
     UNREFERENCED_PARAMETER(Node);
     UNREFERENCED_PARAMETER(FileBuffer);
     UNREFERENCED_PARAMETER(Offset);
     UNREFERENCED_PARAMETER(Length);
-    UNREFERENCED_PARAMETER(Mdl);
 }

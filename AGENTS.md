@@ -1855,6 +1855,15 @@ RAM.
   failed read or write turns the cache off for the rest of the load
   (`DiskCacheLost`); the read it failed is fetched instead, so a reader
   never sees the loss. It comes back, empty, at the next driver load.
+- **A block is kept from bytes the driver owns.** While the cache is live a
+  fetch of up to 4 MB lands in the client's own buffer and is copied into
+  the IRP's pages (`ReadIssueFetch`, `ReadComplete`), and the cache copies
+  from that buffer. The IRP's pages cannot be trusted afterwards: a mapped
+  read's MDL holds Mm's one shared dummy page wherever the cluster spans a
+  page already resident, so several slots alias one page, and a user
+  buffer can be changed by its own application mid-read. Copying from the
+  MDL served wrong bytes to mapped readers; the guest's `mapped` step is
+  the regression check.
 - **Teardown** clears `Live`, then waits for a busy count of reads, fills
   and the fill worker to drain before closing the file (`DriverUnload`).
 

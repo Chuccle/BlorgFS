@@ -177,12 +177,22 @@ typedef DISK_CACHE_READ_COMPLETION* PDISK_CACHE_READ_COMPLETION;
 BOOLEAN BlorgDiskCacheRead(PIRP Irp, PNON_PAGED_NODE Node, ULONG64 Offset, ULONG Length, ULONG Valid, PDISK_CACHE_READ_COMPLETION Completion);
 
 //
-// Offers what a fetch just put in Mdl to the cache: Length bytes of Node's
-// file at Offset, belonging to the version FileBuffer's entity tag names.
-// Every whole block in it -- or the last block of the file, if the fetch
-// reached end of file -- is copied and queued to be written, if admitted.
-// Nothing is kept unless that version is the one Node's reads are for.
-// <= DISPATCH_LEVEL, from a fetch completion, before the IRP owning Mdl is
-// completed.
+// Whether the cache is taking fills. A fetch made while it is lands in a
+// buffer of the driver's own (BlorgHttpGetFile) rather than straight in
+// the reader's pages: those may hold Mm's dummy page, which a mapped
+// read's cluster puts in place of pages already resident, or a user
+// buffer the application changes under the read, and the cache must keep
+// the bytes the server sent, not what those pages hold afterwards.
 //
-VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length, PMDL Mdl);
+BOOLEAN BlorgDiskCacheLive(VOID);
+
+//
+// Offers what a fetch just received into FileBuffer's body to the cache:
+// Length bytes of Node's file at Offset, belonging to the version
+// FileBuffer's entity tag names. Every whole block in it -- or the last
+// block of the file, if the fetch reached end of file -- is copied and
+// queued to be written, if admitted. Nothing is kept unless that version
+// is the one Node's reads are for, nor from a fetch received straight into
+// the reader's pages. <= DISPATCH_LEVEL, from a fetch completion.
+//
+VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length);

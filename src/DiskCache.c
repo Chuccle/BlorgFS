@@ -863,11 +863,17 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, PNON_PAGED_NODE Node, ULONG64 Offset, ULONG
     return TRUE;
 }
 
-VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length, PMDL Mdl)
+BOOLEAN BlorgDiskCacheLive(VOID)
+{
+    return 0 != ReadNoFence(&DiskCache.Live);
+}
+
+VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length)
 {
     DISK_CACHE_KEY key;
+    const UCHAR* source = C_CAST(const UCHAR*, FileBuffer->BodyBuffer);
 
-    if (!ReadNoFence(&DiskCache.Live) || !Mdl || 0 == Length || !DiskCacheKeyOf(Node, &key))
+    if (!ReadNoFence(&DiskCache.Live) || !source || 0 == Length || !DiskCacheKeyOf(Node, &key))
     {
         return;
     }
@@ -879,7 +885,6 @@ VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, UL
     }
 
     const ULONG64 end = Offset + Length;
-    PUCHAR source = NULL;
 
     if (end > key.Size)
     {
@@ -925,12 +930,7 @@ VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, UL
             continue;
         }
 
-        if (!source)
-        {
-            source = MmGetSystemAddressForMdlSafe(Mdl, NormalPagePriority | MdlMappingNoExecute);
-        }
-
-        PDISK_CACHE_FILL fill = source ? ExAllocatePoolZero(NonPagedPoolNx, sizeof(DISK_CACHE_FILL), DISK_CACHE_TAG) : NULL;
+        PDISK_CACHE_FILL fill = ExAllocatePoolZero(NonPagedPoolNx, sizeof(DISK_CACHE_FILL), DISK_CACHE_TAG);
         PVOID buffer = fill ? ExAllocatePoolUninitialized(NonPagedPoolNx, DISK_CACHE_BLOCK_SIZE, DISK_CACHE_TAG) : NULL;
         PMDL mdl = buffer ? IoAllocateMdl(buffer, DISK_CACHE_BLOCK_SIZE, FALSE, FALSE, NULL) : NULL;
 

@@ -190,6 +190,14 @@ static ULONG64 ReadCurrentStreak(const FCB* Fcb)
 #define READ_AHEAD_ADAPT_GREEDY_IDLE_PERCENT 25
 
 //
+// Largest fetch received into a buffer of the client's while the disk cache
+// is live (ReadIssueFetch). A larger one, which only a non-cached read asks
+// for, goes straight into the IRP's pages and is not offered to the cache,
+// rather than make the client find that much nonpaged pool at once.
+//
+#define READ_BUFFERED_FETCH_MAX (4ul * 1024ul * 1024ul)
+
+//
 // Fetches in flight below which a greedy consumer is taken to be alone on
 // the transport, and above which slack is not consulted at all.
 //
@@ -832,11 +840,13 @@ static VOID ReadSucceeded(PIRP Irp, LONG64 ArrivedQpc)
 //  Irp->MdlAddress by BlorgPrePostIrp when the IRP was posted to the FSP queue.
 //  CallerContext is the PIRP.
 //
-//  This is a zero-copy read (BlorgHttpGetFileMdl): the body was received
+//  Usually a zero-copy read (BlorgHttpGetFileMdl): the body was received
 //  directly into Irp->MdlAddress by the client, so there is nothing to
 //  map, copy, or free here -- FileBuffer carries only the byte count
 //  (the client validated it against the requested range length, so it
-//  never exceeds the locked user buffer).
+//  never exceeds the locked user buffer). While the disk cache is live the
+//  body arrives in a buffer of its own instead (ReadIssueFetch), and is
+//  copied into the IRP's pages here, after the cache has taken its copy.
 //
 //  Two spans are closed here, and they are not the same span.
 //  DriverContext[2] carries the fetch issue stamp set at the direct-fetch
@@ -867,6 +877,22 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
         ReadRecordUserLatency(NULL, arrivedQpc);
         BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
+    }
+
+    if (FileBuffer->BodyBuffer)
+    {
+        PVOID target = MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
+
+        if (!target)
+        {
+            BlorgFreeHttpFile(FileBuffer);
+            BLORGFS_STAT_INC(FetchesFailed);
+            ReadRecordUserLatency(NULL, arrivedQpc);
+            BlorgCompleteRequest(irp, STATUS_INSUFFICIENT_RESOURCES, IO_DISK_INCREMENT);
+            return;
+        }
+
+        RtlCopyMemory(target, FileBuffer->BodyBuffer, FileBuffer->BodyBufferSize);
     }
 
     irp->IoStatus.Information = FileBuffer->BodyBufferSize;
@@ -906,8 +932,9 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
         ReadFairNode(irp),
         FileBuffer,
         C_CAST(ULONG64, irpSp->Parameters.Read.ByteOffset.QuadPart),
-        C_CAST(ULONG, FileBuffer->BodyBufferSize),
-        irp->MdlAddress);
+        C_CAST(ULONG, FileBuffer->BodyBufferSize));
+
+    BlorgFreeHttpFile(FileBuffer);
 
     ReadSucceeded(irp, arrivedQpc);
 }
@@ -1012,6 +1039,11 @@ static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG B
 // read is counted when it actually reaches the network rather than when it
 // arrived.
 //
+// While the disk cache is live a fetch of up to READ_BUFFERED_FETCH_MAX is
+// received into a buffer of the client's rather than the IRP's pages, for
+// the reason BlorgDiskCacheLive gives; ReadComplete copies it across. The
+// copy is memory bandwidth against a network transfer of the same bytes.
+//
 // PASSIVE_LEVEL: HttpBuildRequest is. A return other than STATUS_PENDING
 // means ReadComplete never ran and the IRP is still the caller's.
 //
@@ -1024,13 +1056,20 @@ static NTSTATUS ReadIssueFetch(PIRP Irp, PFCB Fcb, LONGLONG StartingByte, ULONG 
     BLORGFS_STAT_INC(UserDiskReads);
     BLORGFS_STAT_INC(NonCachedDiskReads);
 
-    NTSTATUS fetchStatus = BlorgHttpGetFileMdl(
-        &Fcb->FullPath,
-        StartingByte,
-        Length,
-        Irp->MdlAddress,
-        ReadComplete,
-        Irp);
+    NTSTATUS fetchStatus = ((Length <= READ_BUFFERED_FETCH_MAX) && BlorgDiskCacheLive()) ?
+        BlorgHttpGetFile(
+            &Fcb->FullPath,
+            StartingByte,
+            Length,
+            ReadComplete,
+            Irp) :
+        BlorgHttpGetFileMdl(
+            &Fcb->FullPath,
+            StartingByte,
+            Length,
+            Irp->MdlAddress,
+            ReadComplete,
+            Irp);
 
     if (STATUS_PENDING != fetchStatus)
     {

@@ -3752,7 +3752,8 @@ NTSTATUS BlorgHttpGetChanges(
 // already excluded by the 0 == Length check above, but kept explicit
 // rather than relying on that exclusion alone. Zero-copy requests never
 // put body bytes in Buffer, so headers-only sizing suffices; buffer mode
-// sizes for a full read-ahead chunk so the body fits without a regrow. On
+// sizes for the headers and the whole body, and at least a read-ahead
+// chunk, so the body lands without a regrow. On
 // a HttpBuildRequest failure, see BlorgHttpGetDirectoryInfo for the
 // HttpFreeContext/FinalStatus cleanup rationale.
 //
@@ -3777,10 +3778,19 @@ static NTSTATUS HttpGetFileCommon(
         return STATUS_INVALID_PARAMETER;
     }
 
-    HTTP_CONTEXT* ctx = HttpAllocateContext(
-        HttpOpFileRead,
-        206,
-        TargetMdl ? HTTP_MDL_INITIAL_RECV_CAPACITY : HTTP_FILE_INITIAL_RECV_CAPACITY);
+    SIZE_T capacity = HTTP_MDL_INITIAL_RECV_CAPACITY;
+
+    if (!TargetMdl && !HttpCheckedAddSizeT(Length, HTTP_MDL_INITIAL_RECV_CAPACITY, &capacity))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!TargetMdl && (capacity < HTTP_FILE_INITIAL_RECV_CAPACITY))
+    {
+        capacity = HTTP_FILE_INITIAL_RECV_CAPACITY;
+    }
+
+    HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpFileRead, 206, capacity);
 
     if (!ctx)
     {
