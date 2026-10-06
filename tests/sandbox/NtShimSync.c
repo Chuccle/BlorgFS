@@ -485,11 +485,15 @@ WCHAR RtlUpcaseUnicodeChar(WCHAR Source)
 
 //
 // The driver hashes case-insensitively and falls back to its own loop if
-// this fails, so the exact algorithm does not matter -- only that equal
-// strings hash equally under the same case folding the comparison uses.
-// A hash that disagreed with the compare would put a node in a bucket
-// where lookup never finds it, so the two are kept deliberately
-// consistent.
+// this fails. Equal strings must hash equally under the same case folding
+// the comparison uses: a hash that disagreed with the compare would put a
+// node in a bucket where lookup never finds it, so the two are kept
+// deliberately consistent.
+//
+// The algorithm is the kernel's default, x65599, rather than any decent
+// hash, because its distribution is what BlorgHashPath has to repair: with
+// a gentler stand-in here, a test of how paths spread across buckets
+// passes against a hash the real driver never sees.
 //
 NTSTATUS RtlHashUnicodeString(const UNICODE_STRING* String, BOOLEAN CaseInSensitive, ULONG Algorithm, PULONG Value)
 {
@@ -511,7 +515,7 @@ NTSTATUS RtlHashUnicodeString(const UNICODE_STRING* String, BOOLEAN CaseInSensit
             c = RtlUpcaseUnicodeChar(c);
         }
 
-        hash = (hash * 131u) + c;
+        hash = (hash * 65599u) + c;
     }
 
     *Value = hash;
