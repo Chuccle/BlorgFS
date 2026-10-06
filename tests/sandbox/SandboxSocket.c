@@ -527,6 +527,18 @@ VOID SandboxResumeStalled(VOID)
     }
 }
 
+ULONG SandboxSocketsParked(VOID)
+{
+    ULONG count = 0;
+
+    for (SANDBOX_PARKED* parked = ParkedHead; parked; parked = parked->Next)
+    {
+        count++;
+    }
+
+    return count;
+}
+
 NTSTATUS BlorgReceiveWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG Flags, PKSOCKET_COMPLETION_ROUTINE CompletionRoutine, PVOID CompletionContext)
 {
     return SandboxReceiveCommon(Socket, (unsigned char*)Buffer, Length, Flags, CompletionRoutine, CompletionContext);

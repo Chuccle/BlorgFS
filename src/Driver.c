@@ -160,7 +160,9 @@ static VOID DriverDeleteDiskDeviceObject(PDEVICE_OBJECT DiskDeviceObject)
 // device, initializes its lookaside lists, root DCB, VCB, work queue, and
 // directory-notify package, unwinding each already-initialized piece in
 // reverse order if a later step fails so no resource leaks on a partial
-// mount failure. The notify IRPs registered against the directory-notify
+// mount failure. The change feed starts last, once the notify package it
+// reports into exists, and cannot fail the mount: without it the caches
+// keep their short TTL. The notify IRPs registered against the directory-notify
 // package are completed in DriverDeleteVolumeDeviceObject (via
 // FsRtlNotifyUninitializeSync) and at handle cleanup (FsRtlNotifyCleanup).
 // FsRtlNotifyInitializeSync raises on allocation failure, which is
@@ -258,6 +260,8 @@ NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
     FsRtlNotifyInitializeSync(&devExt->NotifySync);
     InitializeListHead(&devExt->NotifyList);
 
+    BlorgChangeFeedStart(volumeDeviceObject);
+
     ClearFlag(volumeDeviceObject->Flags, DO_DEVICE_INITIALIZING);
 
     *VolumeDeviceObject = volumeDeviceObject;
@@ -290,7 +294,8 @@ static VOID FreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
 }
 
 //
-// Tears down the volume device object: completes/frees the notify sync
+// Tears down the volume device object: stops the change feed, which
+// reports into the notify package, completes/frees the notify sync
 // object, destroys the work queue, retires the node table and its reap
 // worker (before the tree walk, so no work item can race the frees),
 // releases the VCB, the remaining node tree, and the root DCB, deletes
@@ -315,6 +320,7 @@ static VOID DriverDeleteVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
     {
         PBLORGFS_VDO_DEVICE_EXTENSION pDevExt = BlorgGetVolumeDeviceExtension(VolumeDeviceObject);
 
+        BlorgChangeFeedStop();
         FsRtlNotifyUninitializeSync(&pDevExt->NotifySync);
 
         BlorgDestroyWorkQueue();
@@ -697,6 +703,14 @@ static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICO
         global.ReadAheadAdapt = (0 != adaptValue);
     }
 
+    ULONG changeFeedValue = 0;
+
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ChangeFeed", REG_DWORD, &changeFeedValue, sizeof(changeFeedValue), &actualSize)))
+    {
+        global.ChangeFeed = (0 != changeFeedValue);
+        BLORGFS_LOG("DriverReadRegistryConfig() - change feed: %lu\n", changeFeedValue);
+    }
+
     ULONG slackGrowthValue = 0;
 
     if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadSlackGrowth", REG_DWORD, &slackGrowthValue, sizeof(slackGrowthValue), &actualSize)))
@@ -1040,6 +1054,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     global.ReadAheadAdapt = TRUE;
     global.ReadAheadMaxGranularity = READ_AHEAD_MAX_GRANULARITY;
     global.ReadFairBudget = READ_FAIR_BUDGET;
+    global.ChangeFeed = TRUE;
 
     DriverReadRegistryConfig(RegistryPath, &portString, &hostString);
 

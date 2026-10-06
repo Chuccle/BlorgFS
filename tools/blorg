@@ -974,6 +974,32 @@ PS1
     note "golden image ready: $GUEST_GOLDEN ($(du -h "$GUEST_GOLDEN" | cut -f1))"
 )
 
+# The host's half of the guest's changes step (Invoke-BlorgGuest.ps1): the
+# guest creates C:/blorgfs-ci/changes-<phase> when it is ready for a phase,
+# and this makes that phase's change to feed/ in the served corpus. "seed"
+# creates the files the guest then warms its caches with; "change" makes
+# one of each kind of change the server's feed reports. feed/ is created
+# here rather than in the corpus so nothing earlier in the run reads its
+# contents (see the step for why that matters).
+change_corpus() {
+    local feed="$1/feed"
+    case "$2" in
+        seed)
+            mkdir -p "$feed" &&
+                head -c 100 /dev/urandom >"$feed/stable.bin" &&
+                head -c 200 /dev/urandom >"$feed/doomed.bin" &&
+                head -c 4096 /dev/urandom >"$feed/grows.bin"
+            ;;
+        change)
+            head -c 123 /dev/urandom >"$feed/born.bin" &&
+                rm -f "$feed/doomed.bin" &&
+                head -c 1000 /dev/urandom >>"$feed/grows.bin" &&
+                mkdir -p "$feed/newdir" &&
+                head -c 77 /dev/urandom >"$feed/newdir/inner.bin"
+            ;;
+    esac
+}
+
 # ------------------------------------------------------------ guest test
 #
 # One runtime test run, end to end, on a KVM host: boot a fresh guest from
@@ -1125,8 +1151,20 @@ guest_test() (
 
     step "Running the tests in the guest"
     boot_before="$("$BLORG" guest boot-id)"
-    test_args="-BackendHost $(guest_backend_host) -Port $SERVER_PORT"
-    "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Test $test_args; exit \$LASTEXITCODE"
+    test_args="-BackendHost $(guest_backend_host) -Port $SERVER_PORT -HostChanges"
+    "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Test $test_args; exit \$LASTEXITCODE" &
+    test_pid=$!
+    # The changes step asks for the corpus to change under the mounted
+    # volume, one phase at a time; see change_corpus.
+    phases=(seed change)
+    while kill -0 "$test_pid" 2>/dev/null; do
+        if (( ${#phases[@]} )) && "$BLORG" guest ssh "if (Test-Path C:/blorgfs-ci/changes-${phases[0]}) { exit 0 } else { exit 1 }" >/dev/null 2>&1; then
+            change_corpus "$work/corpus" "${phases[0]}" && echo "blorg guest test: changes step: ${phases[0]} done on the host"
+            phases=("${phases[@]:1}")
+        fi
+        sleep 1
+    done
+    wait "$test_pid"
     test_rc=$?
     endstep
 

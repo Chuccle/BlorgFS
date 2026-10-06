@@ -742,4 +742,161 @@ TEST_F(PathCacheListingTest, AListingTheBudgetCannotHoldEvictsNothing)
     EXPECT_EQ(0, missing) << "of " << kept.size() << " listings kept before the large one";
 }
 
+//
+// What the server marked no-store (Client.c's HttpForbidsStoring) is refused
+// by both caches. The server sends it for an answer it could not vouch for
+// against its own change feed -- a load an invalidation overtook, or a path
+// reached through a link -- so caching it could outlive a change the feed
+// has already reported, and nothing would ever invalidate it again.
+//
+TEST_F(PathCacheListingTest, NoStoreResultsAreNeverCached)
+{
+    UNICODE_STRING file = RTL_CONSTANT_STRING(L"\\lst\\nostore\\file0.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(1, FALSE);
+    meta.NoStore = TRUE;
+
+    BlorgPathCacheInsertExists(&file, &meta, nullptr);
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\lst\\nostore\\file0.bin"));
+
+    PDIRECTORY_INFO listing = BuildSyntheticListing(1, 0);
+    ASSERT_NE(nullptr, listing);
+    listing->NoStore = TRUE;
+
+    Publish(L"\\lst\\nostore", listing, nullptr, FALSE);
+    EXPECT_EQ(nullptr, LookupListing(L"\\lst\\nostore", TRUE));
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\lst\\nostore\\file0.bin"))
+        << "a refused listing must not seed its children either";
+}
+
+//
+// BlorgPathCacheFollowFeed: what the change feed changes about how long an
+// entry is trusted. Each test leaves the feed down, so the short TTL every
+// other test assumes is back for the next one.
+//
+class PathCacheFeedTest : public PathCacheListingTest
+{
+protected:
+    void TearDown() override
+    {
+        BlorgPathCacheFollowFeed(FALSE);
+    }
+};
+
+//
+// With the feed live, every change is invalidated as it is reported, so an
+// entry outlives the short TTL. Inserted after the feed came up, as the
+// ordering in BlorgPathCacheFollowFeed requires.
+//
+TEST_F(PathCacheFeedTest, LiveFeedKeepsEntriesPastTheShortTtl)
+{
+    BlorgPathCacheFollowFeed(TRUE);
+
+    UNICODE_STRING file = RTL_CONSTANT_STRING(L"\\feed\\long\\file.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(5, FALSE);
+    BlorgPathCacheInsertExists(&file, &meta, nullptr);
+    Publish(L"\\feed\\long", BuildSyntheticListing(1, 0), nullptr, TRUE);
+
+    ShimAdvanceInterruptTime(60 * kSecond);
+
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\feed\\long\\file.bin"));
+
+    BOOLEAN stale = TRUE;
+    PDIRECTORY_INFO listing = LookupListing(L"\\feed\\long", FALSE, &stale);
+    ASSERT_NE(nullptr, listing);
+    EXPECT_FALSE(stale) << "a minute is well inside the feed's lifetime";
+    BlorgReleaseDirectoryInfo(listing);
+}
+
+//
+// The feed's lifetime is still a bound: a change the server's watcher never
+// sees is never reported, and only expiry would ever correct it.
+//
+TEST_F(PathCacheFeedTest, LiveFeedLifetimeIsStillBounded)
+{
+    BlorgPathCacheFollowFeed(TRUE);
+
+    UNICODE_STRING file = RTL_CONSTANT_STRING(L"\\feed\\bounded\\file.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(5, FALSE);
+    BlorgPathCacheInsertExists(&file, &meta, nullptr);
+
+    ShimAdvanceInterruptTime(6 * 60 * kSecond);
+
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\feed\\bounded\\file.bin"));
+}
+
+//
+// A not-found keeps the short TTL with the feed live: a 404 reached through a
+// symlink is not marked no-store, and a create behind the link is reported by
+// the target's path, so nothing would ever invalidate it.
+//
+TEST_F(PathCacheFeedTest, LiveFeedKeepsANotFoundOnlyForTheShortTtl)
+{
+    BlorgPathCacheFollowFeed(TRUE);
+
+    UNICODE_STRING missing = RTL_CONSTANT_STRING(L"\\feed\\link\\missing.bin");
+    UNICODE_STRING file = RTL_CONSTANT_STRING(L"\\feed\\link\\file.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(5, FALSE);
+    BlorgPathCacheInsertNotFound(&missing, nullptr);
+    BlorgPathCacheInsertExists(&file, &meta, nullptr);
+
+    ShimAdvanceInterruptTime(5 * kSecond);
+
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\feed\\link\\missing.bin"));
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\feed\\link\\file.bin"));
+}
+
+//
+// Lifetime is applied when an entry is read, so the feed going down shortens
+// every entry already held at once. Fixing expiry at insert instead would
+// leave entries trusted for minutes with nothing reporting changes to them.
+//
+TEST_F(PathCacheFeedTest, FeedGoingDownShortensEntriesAlreadyHeld)
+{
+    BlorgPathCacheFollowFeed(TRUE);
+
+    UNICODE_STRING file = RTL_CONSTANT_STRING(L"\\feed\\down\\file.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(5, FALSE);
+    BlorgPathCacheInsertExists(&file, &meta, nullptr);
+    Publish(L"\\feed\\down", BuildSyntheticListing(1, 0), nullptr, TRUE);
+
+    ShimAdvanceInterruptTime(10 * kSecond);
+    ASSERT_EQ(PathCacheExists, Lookup(L"\\feed\\down\\file.bin"));
+
+    BlorgPathCacheFollowFeed(FALSE);
+
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\feed\\down\\file.bin"));
+
+    BOOLEAN stale = FALSE;
+    PDIRECTORY_INFO listing = LookupListing(L"\\feed\\down", TRUE, &stale);
+    ASSERT_NE(nullptr, listing) << "ten seconds is still inside the stale grace";
+    EXPECT_TRUE(stale);
+    BlorgReleaseDirectoryInfo(listing);
+}
+
+//
+// Going live drops everything held before: those entries were read when no
+// feed covered them, and the long lifetime must not apply to them. A ticket
+// taken before the flush is refused for the same reason.
+//
+TEST_F(PathCacheFeedTest, GoingLiveDropsWhatWasReadBeforeIt)
+{
+    UNICODE_STRING file = RTL_CONSTANT_STRING(L"\\feed\\before\\file.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(5, FALSE);
+    BlorgPathCacheInsertExists(&file, &meta, nullptr);
+    Publish(L"\\feed\\before", BuildSyntheticListing(1, 0), nullptr, TRUE);
+
+    PATH_CACHE_TICKET ticket;
+    BlorgPathCacheTakeTicket(&ticket);
+
+    BlorgPathCacheFollowFeed(TRUE);
+
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\feed\\before\\file.bin"));
+    EXPECT_EQ(nullptr, LookupListing(L"\\feed\\before", TRUE));
+
+    UNICODE_STRING late = RTL_CONSTANT_STRING(L"\\feed\\before\\late.bin");
+    BlorgPathCacheInsertExists(&late, &meta, &ticket);
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\feed\\before\\late.bin"))
+        << "a read ticketed before the feed came up was cached under it";
+}
+
 } // namespace

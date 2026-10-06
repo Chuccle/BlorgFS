@@ -21,6 +21,18 @@
 //  elsewhere is inserted with the ticket taken before the read, and refused
 //  if an invalidation ran in between; see BlorgPathCacheTakeTicket.
 //
+//  How long an entry is trusted depends on whether the server's change feed
+//  is live (ChangeFeed.c). Without it, the short TTL is all that bounds how
+//  stale an answer can be. With it, every change the server sees is
+//  invalidated here as it is reported, and an entry lives for
+//  PATH_CACHE_FEED_TTL_100NS instead; see BlorgPathCacheFollowFeed. The
+//  lifetime is applied when an entry is read, not fixed when it is written,
+//  so the feed going down shortens every entry already held at once.
+//
+//  A result the server marked no-store (NoStore on the listing or the
+//  metadata) is never inserted: the server could not vouch that it reflects
+//  every change its feed has reported, so keeping it could outlive one.
+//
 
 #define PATH_CACHE_BUCKET_BITS     8u
 #define PATH_CACHE_BUCKETS         (1u << PATH_CACHE_BUCKET_BITS)
@@ -30,6 +42,14 @@
 
 // 4 seconds, in 100ns units (KeQueryInterruptTime).
 #define PATH_CACHE_TTL_100NS       (4LL * 10LL * 1000LL * 1000LL)
+
+//
+// 5 minutes: how long an entry is trusted while the change feed is live. A
+// bound rather than forever, because the feed can only report what the
+// server's watcher sees, and a change that reaches the share some other way
+// -- a filesystem whose watcher misses it -- would otherwise never expire.
+//
+#define PATH_CACHE_FEED_TTL_100NS  (5LL * 60LL * 10LL * 1000LL * 1000LL)
 
 // Most entries one listing may seed: a quarter of the cache's capacity (see
 // BlorgPathCacheSeedListing).
@@ -42,16 +62,16 @@
 #define LISTING_CACHE_TAG          'CLHT'
 
 //
-// A listing answers without a request for the path cache's own TTL, the
-// staleness the driver already accepts for every open. Past that, a
-// directory query is still answered from it at once, and one background
-// refetch replaces it (BlorgPathCacheLookupListing's RefreshOwed): a re-list
-// never waits on the wire, and what it shows is at most one refresh behind.
-// The stale window is bounded so a directory nobody has listed for a while
-// is fetched in the foreground rather than shown from long ago.
+// A listing answers without a request for the path cache's own lifetime,
+// the staleness the driver already accepts for every open. For a further
+// LISTING_STALE_GRACE_100NS, a directory query is still answered from it at
+// once, and one background refetch replaces it
+// (BlorgPathCacheLookupListing's RefreshOwed): a re-list never waits on the
+// wire, and what it shows is at most one refresh behind. The stale window
+// is bounded so a directory nobody has listed for a while is fetched in the
+// foreground rather than shown from long ago.
 //
-#define LISTING_FRESH_100NS        PATH_CACHE_TTL_100NS
-#define LISTING_STALE_MAX_100NS    (30LL * 10LL * 1000LL * 1000LL)
+#define LISTING_STALE_GRACE_100NS  (26LL * 10LL * 1000LL * 1000LL)
 
 //
 // One cached path-lookup result (exists+metadata, or not-found).
@@ -61,7 +81,7 @@ typedef struct _PATH_CACHE_ENTRY
 {
     LIST_ENTRY               Link;        // bucket list linkage
     UNICODE_STRING           Path;        // owned copy, PagedPool (all access <= APC_LEVEL under push locks)
-    ULONG64                  ExpiryTime;  // KeQueryInterruptTime units
+    ULONG64                  IssueTime;   // when the read behind this result was issued (KeQueryInterruptTime)
     DIRECTORY_ENTRY_METADATA Meta;        // valid only when Exists
     ULONG                    Generation;  // snapshot of PathCache.Generation at insert
     BOOLEAN                  Exists;      // whether the path resolved
@@ -69,8 +89,8 @@ typedef struct _PATH_CACHE_ENTRY
 } PATH_CACHE_ENTRY, * PPATH_CACHE_ENTRY;
 
 CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, Link, Path);
-CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, Path, ExpiryTime);
-CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, ExpiryTime, Meta);
+CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, Path, IssueTime);
+CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, IssueTime, Meta);
 CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, Meta, Generation);
 CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, Generation, Exists);
 CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, Exists, Reserved);
@@ -219,24 +239,38 @@ static VOID ListingCacheRemoveEntry(PATH_CACHE_BUCKET* Bucket, PLISTING_CACHE_EN
 }
 
 //
-// How long ago the fetch behind Entry was issued. Now is read before the
-// bucket lock, so an entry published meanwhile by a later-issued fetch can be
+// How long ago a read issued at IssueTime was. Now is read before the
+// bucket lock, so an entry published meanwhile by a later-issued read can be
 // younger than Now; that counts as age zero, not as an unsigned wrap that
-// would make the newest listing look the oldest.
+// would make the newest entry look the oldest.
 //
-static ULONG64 ListingCacheAge(const LISTING_CACHE_ENTRY* Entry, ULONG64 Now)
+static ULONG64 PathCacheAge(ULONG64 IssueTime, ULONG64 Now)
 {
-    return (Now > Entry->IssueTime) ? (Now - Entry->IssueTime) : 0;
+    return (Now > IssueTime) ? (Now - IssueTime) : 0;
+}
+
+//
+// How long an entry is trusted from the moment its read was issued: the
+// short TTL, or the long one while the change feed is live. Read once per
+// lookup or insert, with acquire semantics, so an entry read after the feed
+// went down is judged by the short TTL; see BlorgPathCacheFollowFeed for
+// the other direction.
+//
+static ULONG64 PathCacheLifetime(VOID)
+{
+    return ReadAcquire(&global.ChangeFeedLive)
+        ? C_CAST(ULONG64, PATH_CACHE_FEED_TTL_100NS)
+        : C_CAST(ULONG64, PATH_CACHE_TTL_100NS);
 }
 
 //
 // Live means minted under the current generation and young enough to be
 // served at all, stale or not.
 //
-static BOOLEAN ListingCacheEntryLive(const LISTING_CACHE_ENTRY* Entry, ULONG64 Now, LONG Generation)
+static BOOLEAN ListingCacheEntryLive(const LISTING_CACHE_ENTRY* Entry, ULONG64 Now, LONG Generation, ULONG64 Lifetime)
 {
     return (Entry->Generation == C_CAST(ULONG, Generation)) &&
-           (ListingCacheAge(Entry, Now) < C_CAST(ULONG64, LISTING_STALE_MAX_100NS));
+           (PathCacheAge(Entry->IssueTime, Now) < Lifetime + C_CAST(ULONG64, LISTING_STALE_GRACE_100NS));
 }
 
 //
@@ -268,9 +302,17 @@ static VOID PathCacheRemoveEntry(PATH_CACHE_BUCKET* Bucket, PPATH_CACHE_ENTRY En
 //  An entry is honoured only while unexpired AND minted under the current
 //  generation. Both a stale TTL and a stale generation make it a miss.
 //
-static BOOLEAN PathCacheEntryLive(const PATH_CACHE_ENTRY* Entry, ULONG64 Now, LONG Generation)
+//  A not-found keeps the short TTL even while the feed is live. The server
+//  marks an answer no-store when it was reached through a symlink, but a
+//  404 names nothing it could resolve, so it goes out unmarked; and when
+//  the missing file is then created behind the link, the feed reports the
+//  target's path, never the one the 404 was cached under.
+//
+static BOOLEAN PathCacheEntryLive(const PATH_CACHE_ENTRY* Entry, ULONG64 Now, LONG Generation, ULONG64 Lifetime)
 {
-    return (Now < Entry->ExpiryTime) && (Entry->Generation == C_CAST(ULONG, Generation));
+    const ULONG64 lifetime = Entry->Exists ? Lifetime : C_CAST(ULONG64, PATH_CACHE_TTL_100NS);
+
+    return (PathCacheAge(Entry->IssueTime, Now) < lifetime) && (Entry->Generation == C_CAST(ULONG, Generation));
 }
 
 //
@@ -380,6 +422,7 @@ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_EN
 
     PATH_CACHE_BUCKET* bucket = PathCacheBucket(Path);
     ULONG64 now = KeQueryInterruptTime();
+    ULONG64 lifetime = PathCacheLifetime();
     LONG generation = ReadNoFence(&PathCache.Generation);
     PATH_CACHE_RESULT result = PathCacheMiss;
 
@@ -392,7 +435,7 @@ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_EN
 
         if (RtlEqualUnicodeString(&entry->Path, Path, TRUE))
         {
-            if (PathCacheEntryLive(entry, now, generation))
+            if (PathCacheEntryLive(entry, now, generation, lifetime))
             {
                 if (entry->Exists)
                 {
@@ -436,14 +479,18 @@ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_EN
 // the bucket is at capacity. If an existing entry is refreshed in place
 // instead, the prebuilt entry's ownership was never transferred to the
 // bucket, so it is freed before returning. A ticket an invalidation has
-// overtaken inserts nothing (see BlorgPathCacheTakeTicket).
+// overtaken inserts nothing (see BlorgPathCacheTakeTicket), and neither does
+// metadata the server marked no-store.
+//
+// The entry's age is counted from its ticket's issue time, when there is
+// one: the result is as old as the read that produced it, not as the insert.
 //
 static VOID PathCacheInsert(const UNICODE_STRING* Path, BOOLEAN Exists, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket)
 {
     BOOLEAN hasMeta = Exists && Meta;
 
     if (!PathCache.Ready || !Path || 0 == Path->Length || !Path->Buffer ||
-        Path->Length > PATH_CACHE_MAX_PATH_BYTES)
+        Path->Length > PATH_CACHE_MAX_PATH_BYTES || (hasMeta && Meta->NoStore))
     {
         return;
     }
@@ -474,9 +521,10 @@ static VOID PathCacheInsert(const UNICODE_STRING* Path, BOOLEAN Exists, const DI
     }
 
     ULONG64 now = KeQueryInterruptTime();
+    ULONG64 lifetime = PathCacheLifetime();
     LONG generation = ReadNoFence(&PathCache.Generation);
     newEntry->Generation = C_CAST(ULONG, generation);
-    newEntry->ExpiryTime = now + PATH_CACHE_TTL_100NS;
+    newEntry->IssueTime = Ticket ? Ticket->IssueTime : now;
 
     PATH_CACHE_BUCKET* bucket = PathCacheBucket(Path);
 
@@ -500,12 +548,12 @@ static VOID PathCacheInsert(const UNICODE_STRING* Path, BOOLEAN Exists, const DI
                 entry->Meta = *Meta;
             }
             entry->Generation = newEntry->Generation;
-            entry->ExpiryTime = newEntry->ExpiryTime;
+            entry->IssueTime = newEntry->IssueTime;
             inserted = TRUE;
             break;
         }
 
-        if (!PathCacheEntryLive(entry, now, generation))
+        if (!PathCacheEntryLive(entry, now, generation, lifetime))
         {
             PathCacheRemoveEntry(bucket, entry);
         }
@@ -914,7 +962,7 @@ VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listin
 
 //
 //  Returns a referenced snapshot of Dir's listing, or NULL. Fresh within the
-//  path cache's TTL; with AllowStale, also within LISTING_STALE_MAX_100NS,
+//  path cache's lifetime; with AllowStale, also LISTING_STALE_GRACE_100NS past it,
 //  reported through *Stale, and the first lookup to see a given snapshot
 //  stale is told through *RefreshOwed that it owes the one background
 //  refetch. That claim is an interlocked flag on the entry rather than an
@@ -939,6 +987,7 @@ PDIRECTORY_INFO BlorgPathCacheLookupListing(const UNICODE_STRING* Dir, BOOLEAN A
     {
         PATH_CACHE_BUCKET* bucket = ListingCacheBucket(Dir);
         ULONG64 now = KeQueryInterruptTime();
+        ULONG64 lifetime = PathCacheLifetime();
         LONG generation = ReadNoFence(&PathCache.Generation);
 
         KeEnterCriticalRegion();
@@ -953,9 +1002,9 @@ PDIRECTORY_INFO BlorgPathCacheLookupListing(const UNICODE_STRING* Dir, BOOLEAN A
                 continue;
             }
 
-            if (ListingCacheEntryLive(entry, now, generation))
+            if (ListingCacheEntryLive(entry, now, generation, lifetime))
             {
-                stale = (ListingCacheAge(entry, now) >= C_CAST(ULONG64, LISTING_FRESH_100NS));
+                stale = (PathCacheAge(entry->IssueTime, now) >= lifetime);
 
                 if (!stale || AllowStale)
                 {
@@ -993,7 +1042,9 @@ PDIRECTORY_INFO BlorgPathCacheLookupListing(const UNICODE_STRING* Dir, BOOLEAN A
 
 //
 //  Offers a freshly fetched listing to the cache. Refused outright when its
-//  ticket has been overtaken by an invalidation. Otherwise it replaces the
+//  ticket has been overtaken by an invalidation, or when the server marked
+//  it no-store; either way it is not current, so nothing is seeded from it
+//  either. Otherwise it replaces the
 //  cached snapshot of the same directory unless that one came from a fetch
 //  issued later -- two fetches of one directory can complete in either
 //  order, and the later-issued one is the newer truth. The returned
@@ -1015,7 +1066,7 @@ PDIRECTORY_INFO BlorgPathCacheLookupListing(const UNICODE_STRING* Dir, BOOLEAN A
 BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing, _In_opt_ const PATH_CACHE_TICKET* Ticket)
 {
     if (!PathCache.Ready || !Dir || 0 == Dir->Length || !Dir->Buffer ||
-        Dir->Length > PATH_CACHE_MAX_PATH_BYTES || !Listing)
+        Dir->Length > PATH_CACHE_MAX_PATH_BYTES || !Listing || Listing->NoStore)
     {
         return FALSE;
     }
@@ -1034,6 +1085,7 @@ BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO 
     }
 
     ULONG64 now = KeQueryInterruptTime();
+    ULONG64 lifetime = PathCacheLifetime();
     ULONG64 issueTime = Ticket ? Ticket->IssueTime : now;
     LONG generation = ReadNoFence(&PathCache.Generation);
     LONG64 bytes = ListingCacheSizeOf(Listing);
@@ -1063,7 +1115,7 @@ BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO 
         PLISTING_CACHE_ENTRY entry = CONTAINING_RECORD(e, LISTING_CACHE_ENTRY, Link);
         PLIST_ENTRY next = e->Flink;
 
-        if (!ListingCacheEntryLive(entry, now, generation))
+        if (!ListingCacheEntryLive(entry, now, generation, lifetime))
         {
             ListingCacheRemoveEntry(bucket, entry);
         }
@@ -1147,4 +1199,32 @@ VOID BlorgPathCacheInvalidateAll(VOID)
     {
         ListingCacheDropUnder(NULL);
     }
+}
+
+//
+//  Switches the lifetime every entry is judged by (PathCacheLifetime) as the
+//  change feed comes up and goes down.
+//
+//  Going live drops everything first, and the order is the whole argument.
+//  An entry read before the flush was not covered by any feed: it is minted
+//  under the old generation and is dead. An insert ticketed before the
+//  flush and landing after it is refused by its ticket. So every entry the
+//  long lifetime can apply to was read after the flush, and so after the
+//  feed answered with the generation this driver now follows; anything that
+//  changes it later is reported, and invalidated, as it happens. Setting
+//  the flag before the flush would leave a window in which an entry read
+//  before the feed existed is trusted for the long lifetime.
+//
+//  Going down needs no flush. Lifetime is applied when an entry is read, so
+//  from the moment the flag clears every entry is judged by the short TTL
+//  again, which is exactly the staleness the driver accepts without a feed.
+//
+VOID BlorgPathCacheFollowFeed(BOOLEAN Live)
+{
+    if (Live)
+    {
+        BlorgPathCacheInvalidateAll();
+    }
+
+    WriteRelease(&global.ChangeFeedLive, Live ? 1 : 0);
 }

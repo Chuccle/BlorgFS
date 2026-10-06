@@ -61,8 +61,36 @@ NTSTATUS KeWaitForMultipleObjects(
     ULONG Count, PVOID Object[], WAIT_TYPE WaitType, KWAIT_REASON WaitReason,
     KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 
-NTSTATUS PsCreateSystemThread(PHANDLE ThreadHandle, ULONG Access, PVOID ObjectAttributes,
+#define OBJ_KERNEL_HANDLE    0x00000200L
+
+typedef struct _OBJECT_ATTRIBUTES
+{
+    ULONG Length;
+    HANDLE RootDirectory;
+    PUNICODE_STRING ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, * POBJECT_ATTRIBUTES;
+
+#define InitializeObjectAttributes(p, n, a, r, s) \
+    { \
+        (p)->Length = sizeof(OBJECT_ATTRIBUTES); \
+        (p)->RootDirectory = (r); \
+        (p)->Attributes = (a); \
+        (p)->ObjectName = (n); \
+        (p)->SecurityDescriptor = (s); \
+        (p)->SecurityQualityOfService = NULL; \
+    }
+
+//
+// Starts nothing; the thread handle comes back NULL. ShimSystemThreadAttributes
+// keeps the attributes of the last call, 0 for none, so a test can check a
+// thread's handle was asked for as a kernel handle.
+//
+NTSTATUS PsCreateSystemThread(PHANDLE ThreadHandle, ULONG Access, POBJECT_ATTRIBUTES ObjectAttributes,
     HANDLE ProcessHandle, PVOID ClientId, PVOID StartRoutine, PVOID StartContext);
+extern ULONG ShimSystemThreadAttributes;
 NTSTATUS PsTerminateSystemThread(NTSTATUS ExitStatus);
 
 NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, ACCESS_MASK Access, POBJECT_TYPE Type,
@@ -93,7 +121,29 @@ VOID FsRtlNotifyFullChangeDirectory(
     PNOTIFY_SYNC Sync, PLIST_ENTRY List, PVOID Context, PSTRING FullName,
     BOOLEAN WatchTree, BOOLEAN IgnoreBuffer, ULONG Filter, PIRP Irp,
     PVOID TraverseCallback, PVOID SubjectContext);
+VOID FsRtlNotifyFullReportChange(
+    PNOTIFY_SYNC Sync, PLIST_ENTRY List, PSTRING FullTargetName, USHORT TargetNameOffset,
+    PSTRING StreamName, PSTRING NormalizedParentName, ULONG FilterMatch, ULONG Action,
+    PVOID TargetContext);
 BOOLEAN FsRtlIsNameInExpression(PUNICODE_STRING Expression, PUNICODE_STRING Name, BOOLEAN IgnoreCase, PWCH Upcase);
+
+//
+// What FsRtlNotifyFullReportChange was asked to report, oldest first, so a
+// test can assert on the directory a change was reported into and how. The
+// path is copied; ShimNotifyReportsReset forgets them all.
+//
+typedef struct _SHIM_NOTIFY_REPORT
+{
+    WCHAR  Path[260];
+    USHORT PathLength;
+    USHORT NameOffset;
+    ULONG  Filter;
+    ULONG  Action;
+} SHIM_NOTIFY_REPORT;
+
+ULONG ShimNotifyReportCount(VOID);
+const SHIM_NOTIFY_REPORT* ShimNotifyReport(ULONG Index);
+VOID ShimNotifyReportsReset(VOID);
 BOOLEAN FsRtlAreNamesEqual(PCUNICODE_STRING A, PCUNICODE_STRING B, BOOLEAN IgnoreCase, PCWCH Upcase);
 
 VOID CcInitializeCacheMap(PFILE_OBJECT F, PCC_FILE_SIZES Sizes, BOOLEAN PinAccess, PCACHE_MANAGER_CALLBACKS Callbacks, PVOID Context);

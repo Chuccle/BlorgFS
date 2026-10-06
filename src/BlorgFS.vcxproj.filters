@@ -109,6 +109,9 @@
     <ClCompile Include="PathCache.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ChangeFeed.c">
+      <Filter>Source Files\Networking</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Structs.h">
@@ -143,6 +146,9 @@
     </ClInclude>
     <ClInclude Include="FspWorkQueue.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ChangeFeed.h">
+      <Filter>Header Files\Networking</Filter>
     </ClInclude>
     <ClInclude Include="Tls.h">
       <Filter>Header Files</Filter>
