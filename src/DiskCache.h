@@ -55,6 +55,12 @@
 #define DISK_CACHE_MAX_READ_FETCHES 4
 
 //
+// Most blocks one read may cover: 4 MB, far beyond any paging read Cc or
+// Mm issues. A larger read is fetched.
+//
+#define DISK_CACHE_MAX_READ_BLOCKS 64
+
+//
 // Where the cache file lives unless the DiskCachePath registry value says
 // otherwise. ProgramData is on the system volume and always exists; the
 // BlorgFS directory under it is created with the file.

@@ -441,11 +441,15 @@ VOID ObDereferenceObject(PVOID O) { (void)O; }
 
 NTSTATUS ObReferenceObjectByHandle(HANDLE H, ACCESS_MASK A, POBJECT_TYPE T, KPROCESSOR_MODE M, PVOID* O, PVOID I)
 {
-    (void)A; (void)T; (void)M; (void)I;
+    (void)A; (void)M; (void)I;
 
+    //
+    // A file handle is its file object's address (DiskCacheModel.c);
+    // anything else has no object behind it.
+    //
     if (O)
     {
-        *O = NULL;
+        *O = (T == *IoFileObjectType) ? (PVOID)H : NULL;
     }
 
     //
