@@ -528,7 +528,7 @@ function Invoke-TestStep {
             $driver = Join-Path $package 'driver'
             $code = Invoke-ChildScript $log (Join-Path $driver 'Install-BlorgFS.ps1') @{
                 InfPath = (Join-Path $driver 'BlorgFS.inf'); CertPath = (Join-Path $driver 'BlorgFS.cer')
-                RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive; DiskCacheMb = 256
+                RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive; DiskCacheMb = 0
             }
             if ($code -eq 2) { return 'test signing is off (Install-BlorgFS.ps1 exit 2) -- -Step Prepare and a reboot should have handled this' }
             if ($code -ne 0) { return "Install-BlorgFS.ps1 exited $code" }
