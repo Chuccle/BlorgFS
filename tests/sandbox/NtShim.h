@@ -479,6 +479,7 @@ VOID RtlFreeUnicodeString(PUNICODE_STRING String);
 
 
 #define ReadAcquire(p)        (*(volatile LONG*)(p))
+#define WriteRelease(p, v)    (*(volatile LONG*)(p) = (v))
 #define ReadPointerNoFence(p) (*(PVOID volatile*)(p))
 
 ///////////////////////////////////////////////////////////////////////////
@@ -511,6 +512,7 @@ typedef enum _KPROCESSOR_MODE { KernelMode = 0, UserMode = 1 } KPROCESSOR_MODE;
 
 VOID KeInitializeEvent(PKEVENT Event, EVENT_TYPE Type, BOOLEAN State);
 LONG KeSetEvent(PKEVENT Event, LONG Increment, BOOLEAN Wait);
+VOID KeClearEvent(PKEVENT Event);
 NTSTATUS KeWaitForSingleObject(PVOID Object, KWAIT_REASON Reason, KPROCESSOR_MODE Mode, BOOLEAN Alertable, PVOID Timeout);
 
 //

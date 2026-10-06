@@ -49,17 +49,40 @@ struct FileInfoResult
 {
     int Calls = 0;
     NTSTATUS Status = STATUS_SUCCESS;
+    DIRECTORY_ENTRY_METADATA Meta = {};
 };
 
 FileInfoResult LastFileInfo;
 
 void OnFileInfo(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* FileInfo, PVOID CallerContext)
 {
-    (void)FileInfo;
     (void)CallerContext;
 
     LastFileInfo.Calls++;
     LastFileInfo.Status = Status;
+
+    if (FileInfo)
+    {
+        LastFileInfo.Meta = *FileInfo;
+    }
+}
+
+struct ChangesResult
+{
+    int Calls = 0;
+    NTSTATUS Status = STATUS_SUCCESS;
+    PCHANGE_BATCH Batch = nullptr;
+};
+
+ChangesResult LastChanges;
+
+void OnChanges(NTSTATUS Status, PCHANGE_BATCH Batch, PVOID CallerContext)
+{
+    (void)CallerContext;
+
+    LastChanges.Calls++;
+    LastChanges.Status = Status;
+    LastChanges.Batch = Batch;
 }
 
 UNICODE_STRING MakePath(wchar_t* literal)
@@ -85,6 +108,7 @@ protected:
         SandboxInitialize();
         LastRead = {};
         LastFileInfo = {};
+        LastChanges = {};
     }
 
     //
@@ -98,6 +122,7 @@ protected:
         SandboxDrainCompletions();
         ShimDrainWorkItems();
         BlorgCleanupWskClient();
+        BlorgFreeChangeBatch(LastChanges.Batch);
 
         EXPECT_EQ(0u, ShimPoolOutstanding()) << "pool allocation(s) leaked";
     }
@@ -125,6 +150,23 @@ protected:
         return BlorgHttpGetFileMdl(&pathString, offset, length, Mdl, OnFileRead, nullptr);
     }
 
+    //
+    // Scripts a peer that answers with Headers and then Length bytes of
+    // Body, delivered in one burst. Content-Length is the caller's to write,
+    // so a test can lie in it. The response is kept on the fixture because
+    // the script refers to it until the test drains.
+    //
+    void Respond(const char* Headers, const void* Body, SIZE_T Length)
+    {
+        SIZE_T headerLength = strlen(Headers);
+
+        Response.assign(Headers, Headers + headerLength);
+        Response.insert(Response.end(), C_CAST(const unsigned char*, Body), C_CAST(const unsigned char*, Body) + Length);
+
+        Step = { SandboxStepDeliver, Response.data(), Response.size(), STATUS_SUCCESS, TRUE };
+        SandboxSetPeerScript(&Step, 1);
+    }
+
     void FreeMdl()
     {
         if (Mdl)
@@ -135,6 +177,8 @@ protected:
     }
 
     PMDL Mdl = nullptr;
+    std::vector<unsigned char> Response;
+    SANDBOX_STEP Step = {};
 };
 
 ///////////////////////////////////////////////////////////////////////////
@@ -892,6 +936,240 @@ TEST_F(HttpClientTest, OverSentMetadataBodyMustNotSlidePastTheReceiveBuffer)
     EXPECT_FALSE(NT_SUCCESS(LastFileInfo.Status))
         << "a body longer than the declared Content-Length must be rejected";
 }
+
+///////////////////////////////////////////////////////////////////////////
+// The change feed and no-store
+///////////////////////////////////////////////////////////////////////////
+
+//
+// A ChangeBatch as server-rs encodes one (bytes produced by its schema with
+// the reference flatbuffers builder): epoch 7, generation 42, modified
+// "media/a.bin" and "" (the root), created "media/new dir" and "m\u00E9dia",
+// removed "old.bin". Paths are the server's keys -- relative, '/'-separated
+// UTF-8 -- which is what the conversion below is checked against.
+//
+static const char kChangeBatch[] =
+    "\x18\x00\x00\x00\x00\x00\x00\x00\x10\x00\x24\x00\x18\x00\x10\x00"
+    "\x00\x00\x0c\x00\x08\x00\x04\x00\x10\x00\x00\x00\x20\x00\x00\x00"
+    "\x30\x00\x00\x00\x58\x00\x00\x00\x2a\x00\x00\x00\x00\x00\x00\x00"
+    "\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00"
+    "\x04\x00\x00\x00\x07\x00\x00\x00\x6f\x6c\x64\x2e\x62\x69\x6e\x00"
+    "\x02\x00\x00\x00\x14\x00\x00\x00\x04\x00\x00\x00\x06\x00\x00\x00"
+    "\x6d\xc3\xa9\x64\x69\x61\x00\x00\x0d\x00\x00\x00\x6d\x65\x64\x69"
+    "\x61\x2f\x6e\x65\x77\x20\x64\x69\x72\x00\x00\x00\x02\x00\x00\x00"
+    "\x10\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    "\x0b\x00\x00\x00\x6d\x65\x64\x69\x61\x2f\x61\x2e\x62\x69\x6e\x00";
+
+//
+// A reset (epoch 9, generation 3) that also lists a path, which a reset
+// never needs: the driver drops everything on one anyway.
+//
+static const char kResetBatch[] =
+    "\x14\x00\x00\x00\x10\x00\x24\x00\x1c\x00\x14\x00\x13\x00\x0c\x00"
+    "\x08\x00\x04\x00\x10\x00\x00\x00\x20\x00\x00\x00\x20\x00\x00\x00"
+    "\x20\x00\x00\x00\x00\x00\x00\x01\x03\x00\x00\x00\x00\x00\x00\x00"
+    "\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    "\x01\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x78\x00\x00\x00";
+
+//
+// A DirectoryEntryMetadata for a 4096-byte file, encoded the same way.
+//
+static const char kFileInfo[] =
+    "\x14\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x24\x00\x1c\x00\x14\x00"
+    "\x0c\x00\x04\x00\x0c\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00"
+    "\x02\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x10\x00\x00\x00\x00\x00\x00";
+
+std::wstring EntryPath(const CHANGE_ENTRY& Entry)
+{
+    return std::wstring(Entry.Path.Buffer, Entry.Path.Length / sizeof(WCHAR));
+}
+
+//
+// The poll's request line carries where the follower is, and the answer
+// comes back as this volume spells paths: a leading backslash, backslashes
+// between components, UTF-16 from the server's UTF-8, and the root as a
+// lone backslash. Spelled any other way a change would invalidate a key no
+// cache entry has, and be silently lost.
+//
+TEST_F(HttpClientTest, ChangeBatchArrivesInTheVolumesOwnSpelling)
+{
+    char headers[128];
+    sprintf_s(headers, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", sizeof(kChangeBatch) - 1);
+    Respond(headers, kChangeBatch, sizeof(kChangeBatch) - 1);
+
+    ASSERT_EQ(STATUS_PENDING, BlorgHttpGetChanges(7, 41, OnChanges, nullptr));
+
+    Drain();
+
+    SIZE_T sentLength = 0;
+    const char* text = (const char*)SandboxLastRequest(&sentLength);
+    ASSERT_GT(sentLength, 0u);
+    EXPECT_NE(nullptr, strstr(text, "GET /get_changes?epoch=7&since=41 HTTP/1.1\r\n"));
+
+    ASSERT_EQ(1, LastChanges.Calls);
+    ASSERT_EQ(STATUS_SUCCESS, LastChanges.Status);
+    ASSERT_NE(nullptr, LastChanges.Batch);
+
+    const CHANGE_BATCH* batch = LastChanges.Batch;
+    EXPECT_EQ(7u, batch->Epoch);
+    EXPECT_EQ(42u, batch->Generation);
+    EXPECT_FALSE(batch->Reset);
+    ASSERT_EQ(5u, batch->Count);
+
+    EXPECT_EQ(L"\\media\\a.bin", EntryPath(batch->Entries[0]));
+    EXPECT_EQ(ChangeModified, batch->Entries[0].Kind);
+    EXPECT_EQ(L"\\", EntryPath(batch->Entries[1]));
+    EXPECT_EQ(ChangeModified, batch->Entries[1].Kind);
+    EXPECT_EQ(L"\\media\\new dir", EntryPath(batch->Entries[2]));
+    EXPECT_EQ(ChangeCreated, batch->Entries[2].Kind);
+    EXPECT_EQ(L"\\m\u00E9dia", EntryPath(batch->Entries[3]));
+    EXPECT_EQ(ChangeCreated, batch->Entries[3].Kind);
+    EXPECT_EQ(L"\\old.bin", EntryPath(batch->Entries[4]));
+    EXPECT_EQ(ChangeRemoved, batch->Entries[4].Kind);
+}
+
+//
+// A reset is acted on wholesale, so whatever paths it lists are not
+// delivered: the follower would only spend time invalidating entries the
+// reset drops anyway.
+//
+TEST_F(HttpClientTest, ResetBatchCarriesNoEntries)
+{
+    char headers[128];
+    sprintf_s(headers, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", sizeof(kResetBatch) - 1);
+    Respond(headers, kResetBatch, sizeof(kResetBatch) - 1);
+
+    ASSERT_EQ(STATUS_PENDING, BlorgHttpGetChanges(0, 0, OnChanges, nullptr));
+
+    Drain();
+
+    ASSERT_EQ(STATUS_SUCCESS, LastChanges.Status);
+    ASSERT_NE(nullptr, LastChanges.Batch);
+    EXPECT_TRUE(LastChanges.Batch->Reset);
+    EXPECT_EQ(9u, LastChanges.Batch->Epoch);
+    EXPECT_EQ(3u, LastChanges.Batch->Generation);
+    EXPECT_EQ(0u, LastChanges.Batch->Count);
+}
+
+//
+// A batch past CHANGE_BATCH_MAX_ENTRIES is delivered as a reset rather than
+// allocated in full or failed. Failing it would take the feed down and leave
+// the caches on their short TTL until the server answered something smaller,
+// which a burst that large never makes it do.
+//
+// The buffer is built by hand because no literal of that size is worth
+// embedding: one vector of CHANGE_BATCH_MAX_ENTRIES + 1 offsets that all
+// name the same empty string, which the format allows and the verifier
+// accepts.
+//
+TEST_F(HttpClientTest, BatchPastTheEntryCapArrivesAsAReset)
+{
+    const ULONG count = CHANGE_BATCH_MAX_ENTRIES + 1;
+    const SIZE_T vectorAt = 24;
+    const SIZE_T stringAt = vectorAt + 4 + (4 * C_CAST(SIZE_T, count));
+    std::vector<unsigned char> body(stringAt + 8);
+
+    auto put16 = [&body](SIZE_T At, USHORT Value) { memcpy(&body[At], &Value, sizeof(Value)); };
+    auto put32 = [&body](SIZE_T At, ULONG Value) { memcpy(&body[At], &Value, sizeof(Value)); };
+
+    put32(0, 16);
+    put16(4, 12);
+    put16(6, 8);
+    put16(14, 4);
+    put32(16, 12);
+    put32(20, C_CAST(ULONG, vectorAt - 20));
+    put32(vectorAt, count);
+
+    for (ULONG i = 0; i < count; ++i)
+    {
+        SIZE_T at = vectorAt + 4 + (4 * C_CAST(SIZE_T, i));
+        put32(at, C_CAST(ULONG, stringAt - at));
+    }
+
+    char headers[128];
+    sprintf_s(headers, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", body.size());
+    Respond(headers, body.data(), body.size());
+
+    ASSERT_EQ(STATUS_PENDING, BlorgHttpGetChanges(7, 1, OnChanges, nullptr));
+
+    Drain();
+
+    ASSERT_EQ(STATUS_SUCCESS, LastChanges.Status);
+    ASSERT_NE(nullptr, LastChanges.Batch);
+    EXPECT_TRUE(LastChanges.Batch->Reset);
+    EXPECT_EQ(0u, LastChanges.Batch->Count);
+}
+
+//
+// A feed that is not live answers 503, which must reach the follower as a
+// failure so it takes the feed down rather than trusting the caches.
+//
+TEST_F(HttpClientTest, FeedThatIsNotLiveFailsThePoll)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    ASSERT_EQ(STATUS_PENDING, BlorgHttpGetChanges(7, 1, OnChanges, nullptr));
+
+    Drain();
+
+    ASSERT_EQ(1, LastChanges.Calls);
+    EXPECT_FALSE(NT_SUCCESS(LastChanges.Status));
+    EXPECT_EQ(nullptr, LastChanges.Batch);
+}
+
+//
+// Cache-Control: no-store is what the server sends for an answer it could
+// not vouch for against its own feed, and NoStore is how the path cache
+// learns not to keep it. The directive is found case-insensitively among
+// others, on any Cache-Control header, and not mistaken for a longer token
+// that merely starts with it. One fixture per case, because a pooled
+// connection keeps its place in the script it was acquired under.
+//
+struct NoStoreCase
+{
+    const char* Header;
+    BOOLEAN NoStore;
+};
+
+class HttpClientNoStoreTest : public HttpClientTest,
+                              public ::testing::WithParamInterface<NoStoreCase>
+{
+};
+
+TEST_P(HttpClientNoStoreTest, DirectiveMarksTheAnswer)
+{
+    char headers[256];
+    sprintf_s(headers, "HTTP/1.1 200 OK\r\n%sContent-Length: %zu\r\n\r\n", GetParam().Header, sizeof(kFileInfo) - 1);
+    Respond(headers, kFileInfo, sizeof(kFileInfo) - 1);
+
+    wchar_t path[] = L"/media/file.bin";
+    UNICODE_STRING pathString = MakePath(path);
+
+    ASSERT_EQ(STATUS_PENDING, BlorgHttpGetFileInformation(&pathString, OnFileInfo, nullptr));
+
+    Drain();
+
+    ASSERT_EQ(1, LastFileInfo.Calls);
+    ASSERT_EQ(STATUS_SUCCESS, LastFileInfo.Status);
+    EXPECT_EQ(4096u, LastFileInfo.Meta.Size);
+    EXPECT_EQ(GetParam().NoStore, LastFileInfo.Meta.NoStore);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CacheControlSpellings,
+    HttpClientNoStoreTest,
+    ::testing::Values(
+        NoStoreCase{ "", FALSE },
+        NoStoreCase{ "Cache-Control: no-store\r\n", TRUE },
+        NoStoreCase{ "cache-control: max-age=0, No-Store\r\n", TRUE },
+        NoStoreCase{ "Cache-Control: private\r\nCache-Control: no-store\r\n", TRUE },
+        NoStoreCase{ "Cache-Control: no-store-later, no-cache\r\n", FALSE }));
 
 ///////////////////////////////////////////////////////////////////////////
 // Resource exhaustion

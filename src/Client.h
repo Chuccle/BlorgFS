@@ -2,8 +2,8 @@
 
 //
 // HTTP client interface: address resolution and the directory-info /
-// file-info / file-read request calls, each with an async completion
-// callback. Backs the filesystem's network-facing operations.
+// file-info / file-read / change-feed request calls, each with an async
+// completion callback. Backs the filesystem's network-facing operations.
 //
 
 //
@@ -29,16 +29,21 @@ VOID BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo);
 //    not block, touch paged memory/code, or take push locks /
 //    KeEnterCriticalRegion.
 //
-//  - DIRINFO / FILEINFO callbacks always run at PASSIVE_LEVEL (success
-//    and failure alike; the client bounces to a work item first). They
-//    may take push locks, enter critical regions, and touch paged data
-//    -- CreateComplete/DirCtrlComplete rely on this for the
+//  - DIRINFO / FILEINFO / CHANGES callbacks always run at PASSIVE_LEVEL
+//    (success and failure alike; the client bounces to a work item
+//    first). They may take push locks, enter critical regions, and touch
+//    paged data -- CreateComplete/DirCtrlComplete rely on this for the
 //    PathCache and DCB listing cache.
+//
+//  A DIRINFO or FILEINFO result the server marked Cache-Control: no-store
+//  arrives with NoStore set, and the path cache refuses it: the server
+//  could not vouch that it reflects every change its feed has reported.
 //
 
 typedef VOID(*PBLORG_DIRINFO_COMPLETION)(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID CallerContext);
 typedef VOID(*PBLORG_FILEINFO_COMPLETION)(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* FileInfo, PVOID CallerContext);
 typedef VOID(*PBLORG_FILEREAD_COMPLETION)(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext);
+typedef VOID(*PBLORG_CHANGES_COMPLETION)(NTSTATUS Status, PCHANGE_BATCH Batch, PVOID CallerContext);
 
 NTSTATUS BlorgHttpGetDirectoryInfo(
     const UNICODE_STRING* Path,
@@ -82,3 +87,20 @@ NTSTATUS BlorgHttpGetFileMdl(
 );
 
 VOID BlorgFreeHttpFile(PFILE_BUFFER FileBuffer);
+
+//
+// Long-polls the server's change feed for what changed after generation
+// Since of server process Epoch (both zero for a client with neither yet,
+// which is answered at once with a reset). The server holds the request
+// until something changes or its hold time passes, well inside the
+// receive timeout. On success the batch belongs to CompletionRoutine,
+// which frees it with BlorgFreeChangeBatch.
+//
+NTSTATUS BlorgHttpGetChanges(
+    ULONG64 Epoch,
+    ULONG64 Since,
+    PBLORG_CHANGES_COMPLETION CompletionRoutine,
+    PVOID CallerContext
+);
+
+VOID BlorgFreeChangeBatch(PCHANGE_BATCH Batch);

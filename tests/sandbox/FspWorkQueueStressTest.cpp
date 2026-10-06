@@ -457,6 +457,21 @@ TEST_F(FspWorkQueueStressTest, OplockReleaseAfterTeardownCompletesTheIrpRatherTh
 }
 
 //
+// Each worker's handle is waited on and closed at teardown, so it is a
+// kernel handle, out of reach of whatever process the driver was loaded in.
+//
+TEST_F(FspWorkQueueStressTest, WorkersAreStartedWithKernelHandles)
+{
+    ShimSystemThreadAttributes = 0;
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
+
+    EXPECT_NE(0u, ShimSystemThreadAttributes & OBJ_KERNEL_HANDLE);
+
+    BlorgDestroyWorkQueue();
+}
+
+//
 // The same callback while the queue is alive must still re-queue: the gate
 // above is a teardown check, not a new policy for oplock breaks.
 //

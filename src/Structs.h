@@ -40,14 +40,16 @@ typedef struct _DIRECTORY_ENTRY_METADATA
     ULONG64 LastAccessedTime;  // Last access time, NT FILETIME
     ULONG64 LastModifiedTime;  // Last write time, NT FILETIME
     BOOLEAN IsDirectory;       // Nonzero if this entry is a directory
-    UCHAR   Reserved[7];       // Pad to 8-byte alignment
+    BOOLEAN NoStore;           // Server marked the answer Cache-Control: no-store; never cached
+    UCHAR   Reserved[6];       // Pad to 8-byte alignment
 } DIRECTORY_ENTRY_METADATA, * PDIRECTORY_ENTRY_METADATA;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, Size, CreationTime);
 CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, CreationTime, LastAccessedTime);
 CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, LastAccessedTime, LastModifiedTime);
 CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, LastModifiedTime, IsDirectory);
-CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, IsDirectory, Reserved);
+CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, IsDirectory, NoStore);
+CHECK_PADDING_BETWEEN(DIRECTORY_ENTRY_METADATA, NoStore, Reserved);
 CHECK_PADDING_END(DIRECTORY_ENTRY_METADATA, Reserved);
 
 ///////////////////////////////////////////////////////////
@@ -108,14 +110,16 @@ typedef struct _DIRECTORY_INFO
     SIZE_T FileCount;     // Number of DIRECTORY_FILE_METADATA entries
     SIZE_T SubDirCount;   // Number of DIRECTORY_SUBDIR_METADATA entries
     LONG   RefCount;      // Interlocked: holders on different threads release independently
-    UCHAR  Reserved[4];   // explicit tail padding
+    BOOLEAN NoStore;      // Server marked the answer Cache-Control: no-store; never cached
+    UCHAR  Reserved[3];   // explicit tail padding
 } DIRECTORY_INFO, * PDIRECTORY_INFO;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FilesOffset, SubDirsOffset);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirsOffset, FileCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FileCount, SubDirCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirCount, RefCount);
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, Reserved);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, NoStore);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, NoStore, Reserved);
 CHECK_PADDING_END(DIRECTORY_INFO, Reserved);
 
 //
@@ -172,6 +176,76 @@ typedef struct _FILE_BUFFER
 CHECK_PADDING_BETWEEN(FILE_BUFFER, BodyBuffer, BodyBufferSize);
 CHECK_PADDING_BETWEEN(FILE_BUFFER, BodyBufferSize, BaseAddress);
 CHECK_PADDING_END(FILE_BUFFER, BaseAddress);
+
+/////////////////////////////////////////////
+////// Structures for the change feed ///////
+/////////////////////////////////////////////
+
+//
+// What happened to one path, as the server's change feed reports it:
+// changed in place, or came into or went out of existence. A rename is
+// reported as its old path removed and its new one created.
+//
+typedef enum _CHANGE_KIND
+{
+    ChangeModified = 0,
+    ChangeCreated,
+    ChangeRemoved
+} CHANGE_KIND;
+
+// One changed path, spelled the way the volume names it ("\dir\file").
+typedef struct _CHANGE_ENTRY
+{
+    UNICODE_STRING Path;        // points into the owning batch's allocation
+    CHANGE_KIND    Kind;        // what happened to Path
+    UCHAR          Reserved[4]; // explicit tail padding
+} CHANGE_ENTRY, * PCHANGE_ENTRY;
+
+CHECK_PADDING_BETWEEN(CHANGE_ENTRY, Path, Kind);
+CHECK_PADDING_BETWEEN(CHANGE_ENTRY, Kind, Reserved);
+CHECK_PADDING_END(CHANGE_ENTRY, Reserved);
+
+//
+// Most entries one batch is delivered with. A batch naming more arrives as
+// a reset with none: past this many, dropping the whole cache costs less
+// than dropping each path.
+//
+#define CHANGE_BATCH_MAX_ENTRIES 4096u
+
+//
+// Most path text, in UTF-8 bytes across every entry, one batch is
+// delivered with; past it, likewise a reset. Bounds the allocation a batch
+// can cost to about twice this, where the response size alone would allow
+// a hundred times more.
+//
+#define CHANGE_BATCH_MAX_PATH_BYTES (1024u * 1024u)
+
+//
+// One answer from the change feed (Client.c, BlorgHttpGetChanges). One
+// PagedPool allocation holding this header, Entries and every path's
+// characters; freed with BlorgFreeChangeBatch.
+//
+// Reset means the server could not say precisely what changed since the
+// generation asked about -- it restarted, the client fell behind what it
+// retains, or its watcher lost events -- and the client must drop
+// everything it caches. Generation is what to ask from next either way.
+//
+typedef struct _CHANGE_BATCH
+{
+    ULONG64       Epoch;       // the server process that answered
+    ULONG64       Generation;  // the generation this batch brings the client up to
+    PCHANGE_ENTRY Entries;     // Count entries, inside this allocation
+    SIZE_T        Count;       // entries in Entries
+    BOOLEAN       Reset;       // drop everything; Entries is empty
+    UCHAR         Reserved[7]; // explicit tail padding
+} CHANGE_BATCH, * PCHANGE_BATCH;
+
+CHECK_PADDING_BETWEEN(CHANGE_BATCH, Epoch, Generation);
+CHECK_PADDING_BETWEEN(CHANGE_BATCH, Generation, Entries);
+CHECK_PADDING_BETWEEN(CHANGE_BATCH, Entries, Count);
+CHECK_PADDING_BETWEEN(CHANGE_BATCH, Count, Reset);
+CHECK_PADDING_BETWEEN(CHANGE_BATCH, Reset, Reserved);
+CHECK_PADDING_END(CHANGE_BATCH, Reserved);
 
 /////////////////////////////////////////////
 ///////FILE CONTEXT SECTION//////////////////
@@ -655,21 +729,28 @@ BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO 
 
 //
 //  Invalidation. TTL keeps us eventually-consistent with the backing store
-//  changing out of band; these drop entries early when we learn of a change
-//  ourselves. Each one advances the invalidation sequence before it sweeps,
-//  so an insert ticketed before it is refused (see PATH_CACHE_TICKET).
+//  changing out of band; these drop entries early when we learn of a change.
+//  Each one advances the invalidation sequence before it sweeps, so an
+//  insert ticketed before it is refused (see PATH_CACHE_TICKET).
 //  Invalidate and InvalidatePrefix also drop the listing of the path's
-//  parent, whose contents the change alters; wire them to rename/delete once
-//  mutating SetInformation lands, and to server change notifications.
-//  SeedListing is the directory-listing refresh (DirCtrlComplete): it drops
-//  the directory's subtree and re-seeds its children from the listing; it
-//  is not an invalidation and does not advance the sequence. InvalidateAll
-//  is the O(1) wholesale flush for backend reconnect / remount.
+//  parent, whose contents the change alters; the change feed
+//  (ChangeFeed.c) calls them for what the server reports, and a write path
+//  calls them for its own renames and deletes once it lands. SeedListing is
+//  the directory-listing refresh (DirCtrlComplete): it drops the
+//  directory's subtree and re-seeds its children from the listing; it is
+//  not an invalidation and does not advance the sequence. InvalidateAll is
+//  the O(1) wholesale flush for a feed reset or reconnect.
+//
+//  FollowFeed tells the cache whether the change feed is live, which is
+//  what decides how long an entry is trusted: the short TTL without it, a
+//  long one with it, since every change is then invalidated as it is
+//  reported. Going live drops everything first.
 //
 VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path);
 VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir);
 VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing, _In_opt_ const PATH_CACHE_TICKET* Ticket);
 VOID BlorgPathCacheInvalidateAll(VOID);
+VOID BlorgPathCacheFollowFeed(BOOLEAN Live);
 
 /////////////////////////////////////////////
 ///////DEVICE EXTENSION SECTION//////////////
