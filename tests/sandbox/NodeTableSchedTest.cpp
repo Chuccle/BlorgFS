@@ -1027,16 +1027,27 @@ TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
         << "an interleaving exists in which a revived node was freed under its opener";
 
     //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes linked under the root";
 
     EXPECT_GT(proof.RevivalsObserved, 0);
     EXPECT_GT(proof.RetiresObserved, 0);
-    EXPECT_GT(proof.RevivedWhileQueued, 0)
-        << "no schedule revived a node that was already claimed for reap";
+
+    //
+    // Gated on exhaustion, as in NoInterleavingFreesARevivedNode and for
+    // the same reason: a depth-first walk that hits the cap has varied only
+    // its late choices, and the reap claim is taken early, so a sampled run
+    // can miss the revived-while-queued schedule without that saying
+    // anything about whether it exists.
+    //
+    if (result.Schedules < 2000000)
+    {
+        EXPECT_GT(proof.RevivedWhileQueued, 0)
+            << "no schedule revived a node that was already claimed for reap";
+    }
 
     printf("[  sched   ] atomic revival soak: %d interleavings, max depth %d, "
            "%ld revivals (%ld while queued), %ld retires, exhausted=%s\n",
