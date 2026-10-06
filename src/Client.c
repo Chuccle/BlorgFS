@@ -1916,7 +1916,7 @@ static VOID HttpFail(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 }
 
 //
-// A send/receive failure on a pooled keep-alive socket, before any
+// A send, receive or handshake failure on a pooled socket, before any
 // response byte has been seen, is the expected idle-close race: closes
 // the dead socket and re-issues the (idempotent GET) request once on a
 // guaranteed-fresh connection. Returns TRUE if a retry was launched (caller
@@ -1984,11 +1984,14 @@ static VOID HttpFailOrRetryReusedConnection(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 // disabled by default, so this is a no-op until explicitly turned on. When
 // enabled, a pooled socket that already completed a handshake (State ==
 // TlsHandshakeComplete) skips straight to sending the request; anything
-// else (always true for a fresh connection) runs the handshake first. A
-// handshake failure is always a hard error here, never the idle-close
-// retry case, since a reused socket by construction already has a
-// completed handshake, so this stage is only ever reached for fresh
-// connections. No separate pool-release guard is needed on that failure:
+// else (always true for a fresh connection) runs the handshake first. That
+// includes a pooled socket that never had one: pre-warmed connections
+// (Socket.c) enter the pool straight from the connect, and a server that
+// drops a client which stays silent (the guest's TLS terminator does after
+// 15 s) has already closed one that waited there. A handshake failure on a
+// reused socket is therefore the idle-close case and is retried once on a
+// fresh connection, as a failed send or receive is.
+// No separate pool-release guard is needed on a failure:
 // HttpComplete's failure path already closes rather than pools any socket
 // still held on failure, and the only success path that pools a socket
 // (HttpReadResponse, after a full response is read) is unreachable unless
@@ -2064,8 +2067,8 @@ static VOID HttpAcquireSocketWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 
 //
 // Completion for BlorgTlsStartHandshakeAsync: advances to sending the request
-// on success, otherwise fails the request (never the idle-close retry
-// case -- see the comment in HttpOnSocket).
+// on success; a failure on a reused (pre-warmed) socket is retried once on a
+// fresh connection, any other fails the request (see HttpOnSocket).
 //
 static VOID HttpOnTlsHandshakeComplete(NTSTATUS Status, PVOID CallerContext)
 {
@@ -2073,7 +2076,7 @@ static VOID HttpOnTlsHandshakeComplete(NTSTATUS Status, PVOID CallerContext)
 
     if (!NT_SUCCESS(Status))
     {
-        HttpFail(ctx, Status);
+        HttpFailOrRetryReusedConnection(ctx, Status);
         return;
     }
 

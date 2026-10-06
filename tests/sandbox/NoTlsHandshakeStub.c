@@ -12,9 +12,7 @@
 //
 #define BLORGFS_SHIM_INTERNAL
 
-#include "..\..\src\Driver.h"
-#include "..\..\src\Socket.h"
-#include "..\..\src\TlsHandshake.h"
+#include "SandboxSocket.h"
 
 //
 // These scenarios drive the plaintext client (SandboxInitialize leaves
@@ -25,13 +23,31 @@
 // covered against RFC 8448 vectors by TlsHandshakeTest, which drives
 // TlsHandshake.c directly. A scenario that set TlsEnabled would be testing
 // this stub, so nothing here should grow until the peer script can speak
-// records.
+// records -- except a failure, which is all a scenario needs to drive what
+// Client.c does when a handshake does not complete.
 //
+static ULONG FailHandshakesRemaining;
+static NTSTATUS FailHandshakesStatus;
+
+VOID SandboxFailNextHandshakesWith(ULONG Count, NTSTATUS Status)
+{
+    FailHandshakesRemaining = Count;
+    FailHandshakesStatus = Status;
+}
+
 VOID BlorgTlsStartHandshakeAsync(
     PKSOCKET Socket,
     PBLORG_TLS_HANDSHAKE_COMPLETION CompletionRoutine,
     PVOID CallerContext)
 {
+    if (0 < FailHandshakesRemaining)
+    {
+        FailHandshakesRemaining--;
+        Socket->Tls.State = TlsHandshakeFailed;
+        CompletionRoutine(FailHandshakesStatus, CallerContext);
+        return;
+    }
+
     Socket->Tls.State = TlsHandshakeComplete;
 
     CompletionRoutine(STATUS_SUCCESS, CallerContext);

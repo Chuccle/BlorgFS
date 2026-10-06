@@ -94,9 +94,16 @@
                        test watches for
           survived     BlorgFS still RUNNING afterwards
 
+        With -TlsPort, the driver is installed with TlsEnabled and -TlsPin
+        and reaches the server through a TLS 1.3 terminator on that port;
+        server also checks the terminator accepts connections, and
+        correctness keeps the plaintext port as its reference, so the bytes
+        read through TLS are checked against bytes that never were.
+
         The driver is not stopped at the end: there is no dismount handler,
         so `sc stop` wedges in STOP_PENDING. Runs end by discarding the
-        guest's disk instead.
+        guest's disk instead, and a second run (plaintext then TLS) needs a
+        reboot between them.
 
         Exit code 0 only when the verdict is "pass".
 
@@ -143,6 +150,14 @@
 .PARAMETER Port
     Test: server-rs's port.
 
+.PARAMETER TlsPort
+    Test: the TLS terminator's port on BackendHost, for the driver to
+    connect through. 0 (the default) installs it plaintext, on Port.
+
+.PARAMETER TlsPin
+    Test, with TlsPort: the SHA-256 of the terminator certificate's
+    SubjectPublicKeyInfo, 64 hex characters; installed as TlsPin.
+
 .PARAMETER Drive
     Test: the drive letter BlorgFS mounts.
 
@@ -166,6 +181,8 @@ param(
     [string]$ResultsDir = 'C:\blorgfs-ci\results',
     [string]$BackendHost = '10.0.3.1',
     [int]$Port = 18080,
+    [int]$TlsPort = 0,
+    [string]$TlsPin,
     [char]$Drive = 'B',
     [switch]$HostChanges,
     [switch]$NoVerifier,
@@ -521,8 +538,16 @@ function Invoke-TestStep {
             try {
                 $r = Invoke-WebRequest -UseBasicParsing -Uri "$backendUrl/healthcheck" -TimeoutSec 15
                 "server at $backendUrl answered $($r.StatusCode)" | Write-StepLog -Log $log
-                $r.StatusCode -eq 200
-            } catch { "server at $backendUrl unreachable from the guest: $($_.Exception.Message)" }
+                if ($r.StatusCode -ne 200) { return $false }
+            } catch { return "server at $backendUrl unreachable from the guest: $($_.Exception.Message)" }
+            if (-not $TlsPort) { return $true }
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            try {
+                $tcp.Connect($BackendHost, $TlsPort)
+                "TLS terminator at ${BackendHost}:$TlsPort accepted a connection" | Write-StepLog -Log $log
+                $true
+            } catch { "TLS terminator at ${BackendHost}:$TlsPort unreachable from the guest: $($_.Exception.Message)" }
+            finally { $tcp.Dispose() }
         } | Out-Null
 
         Invoke-Step 'install' {
@@ -530,10 +555,14 @@ function Invoke-TestStep {
             # Paths passed explicitly: under `powershell -File`, Windows
             # PowerShell 5.1 leaves $PSScriptRoot empty in param() defaults.
             $driver = Join-Path $package 'driver'
-            $code = Invoke-ChildScript $log (Join-Path $driver 'Install-BlorgFS.ps1') @{
+            $installArgs = @{
                 InfPath = (Join-Path $driver 'BlorgFS.inf'); CertPath = (Join-Path $driver 'BlorgFS.cer')
                 RemoteHost = $BackendHost; RemotePort = "$Port"; DriveLetter = $Drive; DiskCacheMb = 256
             }
+            if ($TlsPort) {
+                $installArgs.TlsEnabled = $true; $installArgs.RemotePort = "$TlsPort"; $installArgs.TlsPinHex = $TlsPin
+            }
+            $code = Invoke-ChildScript $log (Join-Path $driver 'Install-BlorgFS.ps1') $installArgs
             if ($code -eq 2) { return 'test signing is off (Install-BlorgFS.ps1 exit 2) -- -Step Prepare and a reboot should have handled this' }
             if ($code -ne 0) { return "Install-BlorgFS.ps1 exited $code" }
             $script:Mounted = Test-Path "${Drive}:\"
@@ -567,7 +596,9 @@ function Invoke-TestStep {
                 elseif ($haveFiles[$f.path] -ne [long]$f.size) { $bad += "size $($f.path): volume $($haveFiles[$f.path]) != $($f.size)" }
                 $haveFiles.Remove($f.path)
             }
-            foreach ($extra in $haveFiles.Keys) { $bad += "unexpected file $extra" }
+            # feed\ is the changes step's, made by the host after the corpus
+            # manifest was written; a TLS pass finds it left by the first.
+            foreach ($extra in $haveFiles.Keys) { if (-not ($TlsPort -and $extra.StartsWith('feed\'))) { $bad += "unexpected file $extra" } }
             foreach ($d in $want.directories) {
                 if (-not $haveDirs.ContainsKey($d)) { $bad += "missing directory $d" }
             }
