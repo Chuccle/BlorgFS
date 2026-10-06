@@ -38,6 +38,14 @@ VOID KdBreakPoint(VOID);
 VOID ShimForceNextOplockCheck(NTSTATUS Status);
 VOID ShimForceNextCcCopyReadMiss(VOID);
 
+//
+// What a reopened FCB's refresh asked of Cc and Mm (Create.c FcbRefresh):
+// how many purges were attempted, and a switch that makes the next one
+// fail the way a user-mapped view makes the real one fail.
+//
+LONG ShimCachePurges(VOID);
+VOID ShimRefuseNextCachePurge(VOID);
+
 BOOLEAN ExIsResourceAcquiredExclusiveLite(PERESOURCE Resource);
 VOID ExConvertExclusiveToSharedLite(PERESOURCE Resource);
 
@@ -149,6 +157,9 @@ BOOLEAN FsRtlAreNamesEqual(PCUNICODE_STRING A, PCUNICODE_STRING B, BOOLEAN Ignor
 VOID CcInitializeCacheMap(PFILE_OBJECT F, PCC_FILE_SIZES Sizes, BOOLEAN PinAccess, PCACHE_MANAGER_CALLBACKS Callbacks, PVOID Context);
 BOOLEAN CcUninitializeCacheMap(PFILE_OBJECT F, PLARGE_INTEGER TruncateSize, PVOID Event);
 VOID CcSetReadAheadGranularity(PFILE_OBJECT F, ULONG Granularity);
+BOOLEAN CcPurgeCacheSection(PSECTION_OBJECT_POINTERS Sections, PLARGE_INTEGER Offset, ULONG Length, ULONG Flags);
+VOID CcSetFileSizes(PFILE_OBJECT F, PCC_FILE_SIZES Sizes);
+BOOLEAN MmFlushImageSection(PSECTION_OBJECT_POINTERS Sections, MMFLUSH_TYPE FlushType);
 
 VOID CcSetAdditionalCacheAttributes(PFILE_OBJECT F, BOOLEAN DisableReadAhead, BOOLEAN DisableWriteBehind);
 BOOLEAN CcCopyReadEx(PFILE_OBJECT F, PLARGE_INTEGER Offset, ULONG Length, BOOLEAN Wait, PVOID Buffer, PIO_STATUS_BLOCK Status, PETHREAD Thread);

@@ -229,13 +229,15 @@ void DispatchProofSetup(void* Parameter)
     // Published, idle, zero handles: the file exists and is warm-findable
     // before either opener runs, which is what makes this a race between
     // two opens rather than a race with the cold-open path (already a
-    // different, and already node-table-proven, concern).
+    // different, and already node-table-proven, concern). Stamped as just
+    // read, so the warm path trusts it without a lookup (FcbIsCurrent).
     //
     DIRECTORY_ENTRY_METADATA meta = {};
     meta.Size = 4096;
 
     PCOMMON_CONTEXT node = nullptr;
     BlorgInsertByPath(proof->Root, &proof->Path, &meta, proof->Volume, &node);
+    BlorgPathCacheTakeTicket(&((PFCB)node)->MetaTicket);
     BlorgNodeTablePublish(node);
     proof->Node = node;
 

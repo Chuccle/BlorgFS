@@ -1478,13 +1478,20 @@ server's watcher sees. `ChangeFeed=0` under `Parameters` turns the follower
 off; `PerfHarness stats` reports whether it is live and its polls, failures,
 resets, paths and flushes.
 
-**Not covered, and not new:** an open of a file whose FCB is still resident
-is answered from the FCB (`BlorgNodeTableLookupPin` in `Create.c`) without
-consulting either cache, and nothing refreshes an FCB's size or times. An
-FCB outlives its last handle for as long as the memory manager holds the
-file's pages, so a file that was read keeps its old size on reopen however
-it changed on the server, feed or not. The guest's `changes` check creates
-its files after everything else has been read for exactly this reason.
+**A resident FCB is refreshed on reopen, not while it is open.** An FCB
+outlives its last handle while the cache manager holds the file's pages.
+The warm open path (`FcbIsCurrent` in `Create.c`) trusts it only while its
+metadata stamp passes the path cache's own rule (`BlorgPathCacheTicketCurrent`:
+no invalidation since, younger than the lifetime), or the path cache holds the
+same size and write time. Otherwise the open resolves cold and `FcbRefresh`
+purges the old pages and takes the new size, so a file that changed on the
+server reopens as it is now: NFS's close-to-open rule. While any handle is
+open the FCB is left alone, since its readers share one cache, and a purge
+refused by a mapped view or a running image keeps the old copy until the
+next reported change or the cache's lifetime, so opens in between do not
+retry it (`FcbRefreshesDeferred`). Directories' own times are not
+refreshed this way; their listings are cached separately. The guest's
+`changes` check reads `grows.bin` before it grows and again after.
 
 **Index a path-keyed table by the top bits of `BlorgHashPath`, never by
 masking `RtlHashUnicodeString` directly.** Its default is x65599, and 65599
