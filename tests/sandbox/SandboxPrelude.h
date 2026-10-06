@@ -33,6 +33,8 @@
 //   FsRtlShim.h     The handful of FsRtl/MM types that must be
 //                   substituted because they belong to the kernel.
 //   WskModel.h      A scriptable WSK provider, so the real Socket.c runs.
+//   DiskCacheModel.h The file system under the disk cache's file, so the
+//                   real DiskCache.c runs.
 //
 
 //
@@ -62,6 +64,7 @@
 #include "IoShim.h"
 #include "FileInfoShim.h"
 #include "DispatchModel.h"
+#include "DiskCacheModel.h"
 #include "WskModel.h"
 
 //

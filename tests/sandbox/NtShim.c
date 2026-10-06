@@ -585,10 +585,11 @@ PIRP IoAllocateIrp(CCHAR StackSize, BOOLEAN ChargeQuota)
     (void)StackSize;
     (void)ChargeQuota;
 
-    PIRP irp = (PIRP)calloc(1, sizeof(IRP));
+    PIRP irp = (PIRP)calloc(1, sizeof(IRP) + sizeof(IO_STACK_LOCATION));
 
     if (irp)
     {
+        irp->StackLocation = (PIO_STACK_LOCATION)(irp + 1);
         KmObjectCreated(KmObjectIrp);
     }
 
@@ -1260,6 +1261,9 @@ PIO_STACK_LOCATION IoGetCurrentIrpStackLocation(PIRP Irp)
 static OBJECT_TYPE* PsThreadTypeObject = NULL;
 POBJECT_TYPE* PsThreadType = &PsThreadTypeObject;
 
+static OBJECT_TYPE* IoFileObjectTypeObject = (OBJECT_TYPE*)&IoFileObjectTypeObject;
+POBJECT_TYPE* IoFileObjectType = &IoFileObjectTypeObject;
+
 //
 // A monotonic counter with a fixed frequency. Statistics.c divides by the
 // frequency, so it must never be zero.
@@ -1342,4 +1346,28 @@ BOOLEAN FsRtlFastCheckLockForWrite(
     return TRUE;
 }
 
-PSE_EXPORTS SeExports = NULL;
+//
+// The well-known SIDs the driver names, laid out as the kernel's are, so
+// the Win32 security calls DiskCacheModel.c builds on take them as real
+// ones. Room for two subauthorities, which BUILTIN\Administrators needs.
+//
+typedef struct _SHIM_SID
+{
+    UCHAR Revision;
+    UCHAR SubAuthorityCount;
+    SID_IDENTIFIER_AUTHORITY IdentifierAuthority;
+    ULONG SubAuthority[2];
+} SHIM_SID;
+
+static SHIM_SID ShimLocalSystemSid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_LOCAL_SYSTEM_RID } };
+static SHIM_SID ShimAliasAdminsSid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS } };
+static SHIM_SID ShimAliasUsersSid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_USERS } };
+
+static SE_EXPORTS ShimSeExports =
+{
+    .SeLocalSystemSid = &ShimLocalSystemSid,
+    .SeAliasAdminsSid = &ShimAliasAdminsSid,
+    .SeAliasUsersSid = &ShimAliasUsersSid,
+};
+
+PSE_EXPORTS SeExports = &ShimSeExports;
