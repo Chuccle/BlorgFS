@@ -399,12 +399,13 @@ static NTSTATUS EnumerateDirectoryEntries(
 //  region since a system worker thread does not disable APCs the way an
 //  FSP thread does.
 //
-//  A freshly fetched listing is authoritative for its subtree, so on an
-//  actual publish (not a duplicate) the path cache beneath dcb->FullPath
-//  is invalidated: a stale not-found memoized before the file appeared
-//  on the backend would otherwise shadow the new listing until its TTL
-//  lapses, since Create consults the path cache before the listing.
-//  Re-resolution re-seeds it locally with no network I/O.
+//  A freshly fetched listing is authoritative for the directory's direct
+//  children, so on an actual publish (not a duplicate) it is also handed to
+//  the path cache (BlorgPathCacheSeedListing): every child becomes a live
+//  entry with the listing's metadata, replacing any stale not-found, and
+//  deeper entries are dropped. The listing itself is freed with the DCB once
+//  the last handle closes, so the seeded entries are what let the opens that
+//  follow a `dir` resolve without a fileinfo GET each.
 //
 //  If BlorgFsdRequeueRequest fails (FSP threads tearing down), the listing
 //  already belongs to the DCB cache (freed at DCB teardown), so the
@@ -446,7 +447,7 @@ static VOID DirCtrlComplete(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID Call
 
     if (published)
     {
-        BlorgPathCacheInvalidatePrefix(&dcb->FullPath);
+        BlorgPathCacheSeedListing(&dcb->FullPath, DirInfo);
     }
 
     BlorgSetIrpContextFlag(irp, IRP_CONTEXT_FLAG_NET_DONE);
