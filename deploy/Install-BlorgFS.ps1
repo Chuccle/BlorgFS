@@ -14,9 +14,9 @@
       3. Runs BlorgFS.inf's DefaultInstall section (rundll32 setupapi.dll,InstallHinfSection),
          which copies BlorgFS.sys to System32\drivers and registers the service, including
          the INF's seeded Parameters\RemoteHost default (see BlorgFS.inf).
-      4. Optionally overrides TlsEnabled / TlsPin / RemotePort / RemoteHost under the
-         service's Parameters key (see Driver.c's ReadBlorgfsRegistryConfig) on top of
-         whatever the INF seeded.
+      4. Optionally overrides TlsEnabled / TlsPin / RemotePort / RemoteHost / DiskCacheMb
+         under the service's Parameters key (see Driver.c's ReadBlorgfsRegistryConfig) on
+         top of whatever the INF seeded.
       5. Starts the service and polls for the B: drive to come up (the driver
          self-mounts at load; there is no separate "mount" step).
 
@@ -50,6 +50,11 @@
     Required for -TlsEnabled to actually complete a handshake -- without it every TLS
     connection fails closed at the Certificate message (see Driver.h's TlsEnabled comment).
 
+.PARAMETER DiskCacheMb
+    If passed, writes DiskCacheMb (REG_DWORD) to the service Parameters key: the size of
+    the local disk cache in MB (0 = off, the driver's default; capped at 16384). Read at
+    driver load, so it takes effect with the start below.
+
 .EXAMPLE
     .\Install-BlorgFS.ps1
     Installs against the plaintext default (port 8080, no TLS, RemoteHost from the INF).
@@ -67,6 +72,7 @@ param(
     [switch]$TlsEnabled,
     [string]$RemotePort,
     [string]$TlsPinHex,
+    [int]$DiskCacheMb = -1,
     [char]$DriveLetter = 'B',
     [int]$MountTimeoutSeconds = 20
 )
@@ -148,7 +154,7 @@ if ($installed -match "1060") {
     throw "INF install did not register the '$ServiceName' service. Check %windir%\inf\setupapi.dev.log for the setupapi-side error."
 }
 
-if ($RemoteHost -or $TlsEnabled -or $RemotePort -or $TlsPinHex) {
+if ($RemoteHost -or $TlsEnabled -or $RemotePort -or $TlsPinHex -or ($DiskCacheMb -ge 0)) {
     Write-Step "Applying registry Parameters overrides"
     $paramsKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters"
     New-Item -Path $paramsKey -Force | Out-Null
@@ -168,6 +174,9 @@ if ($RemoteHost -or $TlsEnabled -or $RemotePort -or $TlsPinHex) {
         }
         $bytes = [byte[]]($TlsPinHex -split '(?<=\G.{2})(?!$)' | ForEach-Object { [Convert]::ToByte($_, 16) })
         New-ItemProperty -Path $paramsKey -Name "TlsPin" -PropertyType Binary -Value $bytes -Force | Out-Null
+    }
+    if ($DiskCacheMb -ge 0) {
+        New-ItemProperty -Path $paramsKey -Name "DiskCacheMb" -PropertyType DWord -Value $DiskCacheMb -Force | Out-Null
     }
 }
 
