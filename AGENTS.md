@@ -1502,6 +1502,25 @@ refetched two thirds of them from evictions alone. The sandbox shim hashes
 with x65599 so a test sees the real spread
 (`PathCacheListingTest.EveryListingOfADeepTreeStaysCached`).
 
+### Subtree listings
+
+A directory query that misses the listing cache asks for the listings
+beneath the directory too: `get_dir_info?subtree=N` (`SubtreeEntries`,
+default 2048, 0 off). server-rs walks breadth first and stops before the
+first listing that would take the answer past `N` entries, each listing
+counting its entries plus one, so what arrives is always every directory
+nearer the top than what does not. Each descendant names its directory by
+position, the `subdirectory`-th entry of its `parent` listing, so the
+driver builds every path from names a listing already carried and no path
+string crosses the wire. `HttpDecodeDescendants` keeps the decodable
+prefix and never fails the answer over them; `DirCtrlPublish` takes them
+off the listing before it is shared and publishes each to the listing
+cache under the fetch's one ticket, so an invalidation that overtook the
+fetch refuses them all. They do not seed the path cache: an open beneath
+resolves from its parent's cached listing (`Create.c`), and the path cache
+holds 4096 entries. Background refreshes stay single listings.
+`PerfHarness stats` reports `listings prefetched`.
+
 ## Read-ahead policy: current state
 
 This is the driver's read-ahead behaviour as it stands today, stated
