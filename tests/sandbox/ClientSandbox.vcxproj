@@ -140,6 +140,7 @@
     <ClCompile Include="..\..\third_party\googletest\googlemock\src\gmock_main.cc" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="SubtreeResponse.h" />
     <ClInclude Include="SandboxSocket.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

@@ -406,11 +406,27 @@ CHECK_PADDING_END(DIRCTRL_FETCH, Ticket);
 //  listing cache also refuses one older than the snapshot it already holds.
 //  Runs at PASSIVE_LEVEL from a successful fetch's completion.
 //
+//  A subtree answer's descendants are taken off the listing first, so the
+//  snapshot the cache and the handle share never holds them, and are then
+//  published as listings of their own. The seed only touches the path
+//  cache, which they do not seed, so the two may run in either order.
+//
 static VOID DirCtrlPublish(const UNICODE_STRING* Dir, PDIRECTORY_INFO DirInfo, const PATH_CACHE_TICKET* Ticket)
 {
+    SIZE_T count = 0;
+    PDIRECTORY_DESCENDANT descendants = BlorgTakeDescendants(DirInfo, &count);
+
     if (BlorgPathCachePublishListing(Dir, DirInfo, Ticket))
     {
         BlorgPathCacheSeedListing(Dir, DirInfo, Ticket);
+    }
+
+    if (descendants)
+    {
+        const SIZE_T published = BlorgPathCachePublishDescendants(Dir, DirInfo, descendants, count, Ticket);
+
+        BLORGFS_STAT_ADD(ListingsPrefetched, published);
+        BlorgReleaseDescendants(descendants, count);
     }
 }
 
@@ -491,7 +507,7 @@ static NTSTATUS DirCtrlFetch(PIRP Irp, const DCB* Dcb)
     fetch->Irp = Irp;
     BlorgPathCacheTakeTicket(&fetch->Ticket);
 
-    NTSTATUS result = BlorgHttpGetDirectoryInfo(&Dcb->FullPath, DirCtrlComplete, fetch);
+    NTSTATUS result = BlorgHttpGetDirectoryInfo(&Dcb->FullPath, global.SubtreeEntries, DirCtrlComplete, fetch);
 
     if (STATUS_PENDING != result)
     {
@@ -550,7 +566,7 @@ static VOID DirCtrlRefresh(const UNICODE_STRING* Dir)
     BLORGFS_STAT_INC(ListingRefreshes);
     BlorgPathCacheTakeTicket(&fetch->Ticket);
 
-    if (STATUS_PENDING != BlorgHttpGetDirectoryInfo(&fetch->Path, DirCtrlRefreshComplete, fetch))
+    if (STATUS_PENDING != BlorgHttpGetDirectoryInfo(&fetch->Path, 0, DirCtrlRefreshComplete, fetch))
     {
         ExFreePool(fetch->Path.Buffer);
         ExFreePool(fetch);

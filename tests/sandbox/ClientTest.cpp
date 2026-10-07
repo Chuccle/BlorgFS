@@ -12,6 +12,8 @@
 // produces -- which is exactly why they had never been exercised.
 //
 
+#include "SubtreeResponse.h"
+
 #include <gtest/gtest.h>
 
 #include <cstring>
@@ -76,6 +78,24 @@ struct ChangesResult
 
 ChangesResult LastChanges;
 
+struct DirInfoResult
+{
+    int Calls = 0;
+    NTSTATUS Status = STATUS_SUCCESS;
+    PDIRECTORY_INFO DirInfo = nullptr;
+};
+
+DirInfoResult LastDirInfo;
+
+void OnDirInfo(NTSTATUS Status, PDIRECTORY_INFO DirInfo, PVOID CallerContext)
+{
+    (void)CallerContext;
+
+    LastDirInfo.Calls++;
+    LastDirInfo.Status = Status;
+    LastDirInfo.DirInfo = DirInfo;
+}
+
 void OnChanges(NTSTATUS Status, PCHANGE_BATCH Batch, PVOID CallerContext)
 {
     (void)CallerContext;
@@ -109,6 +129,7 @@ protected:
         LastRead = {};
         LastFileInfo = {};
         LastChanges = {};
+        LastDirInfo = {};
     }
 
     //
@@ -123,6 +144,7 @@ protected:
         ShimDrainWorkItems();
         BlorgCleanupWskClient();
         BlorgFreeChangeBatch(LastChanges.Batch);
+        BlorgReleaseDirectoryInfo(LastDirInfo.DirInfo);
 
         EXPECT_EQ(0u, ShimPoolOutstanding()) << "pool allocation(s) leaked";
     }
@@ -1170,6 +1192,142 @@ INSTANTIATE_TEST_SUITE_P(
         NoStoreCase{ "cache-control: max-age=0, No-Store\r\n", TRUE },
         NoStoreCase{ "Cache-Control: private\r\nCache-Control: no-store\r\n", TRUE },
         NoStoreCase{ "Cache-Control: no-store-later, no-cache\r\n", FALSE }));
+
+///////////////////////////////////////////////////////////////////////////
+// Subtree answers
+///////////////////////////////////////////////////////////////////////////
+
+//
+// kSubtreeOutOfOrder with a fourth that names subdirectory 1 of a, which has
+// only one.
+//
+static const char kSubtreeOutOfRange[] =
+    "\x04\x00\x00\x00\x82\xff\xff\xff\x0c\x00\x00\x00\x28\x00\x00\x00"
+    "\x18\x00\x00\x00\x04\x00\x00\x00\x40\x01\x00\x00\xf4\x00\x00\x00"
+    "\xb0\x00\x00\x00\x68\x00\x00\x00\x02\x00\x00\x00\x20\x00\x00\x00"
+    "\x0c\x00\x00\x00\x01\x00\x00\x00\x2c\x00\x00\x00\xb6\xfe\xff\xff"
+    "\x04\x00\x00\x00\x01\x00\x00\x00\x62\x00\x00\x00\xc6\xfe\xff\xff"
+    "\x04\x00\x00\x00\x01\x00\x00\x00\x61\x00\x00\x00\x08\x00\x14\x00"
+    "\x10\x00\x04\x00\x08\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00"
+    "\x00\x00\x00\x00\x04\x00\x00\x00\x05\x00\x00\x00\x72\x2e\x62\x69"
+    "\x6e\x00\x0a\x00\x10\x00\x0c\x00\x08\x00\x04\x00\x0a\x00\x00\x00"
+    "\x0c\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x80\xff\xff\xff"
+    "\x04\x00\x00\x00\x01\x00\x00\x00\x04\x00\x00\x00\x10\xff\xff\xff"
+    "\x00\x10\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x05\x00\x00\x00"
+    "\x64\x2e\x62\x69\x6e\x00\x0a\x00\x0c\x00\x08\x00\x00\x00\x04\x00"
+    "\x0a\x00\x00\x00\x08\x00\x00\x00\x01\x00\x00\x00\xc0\xff\xff\xff"
+    "\x04\x00\x00\x00\x01\x00\x00\x00\x04\x00\x00\x00\x50\xff\xff\xff"
+    "\x00\x10\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x05\x00\x00\x00"
+    "\x63\x2e\x62\x69\x6e\x00\x0a\x00\x0c\x00\x00\x00\x08\x00\x04\x00"
+    "\x0a\x00\x00\x00\x10\x00\x00\x00\x01\x00\x00\x00\x08\x00\x08\x00"
+    "\x00\x00\x04\x00\x08\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00"
+    "\x04\x00\x00\x00\x98\xff\xff\xff\x00\x10\x00\x00\x00\x00\x00\x00"
+    "\x04\x00\x00\x00\x05\x00\x00\x00\x62\x2e\x62\x69\x6e\x00\x0a\x00"
+    "\x08\x00\x00\x00\x00\x00\x04\x00\x0a\x00\x00\x00\x0c\x00\x00\x00"
+    "\x08\x00\x0c\x00\x08\x00\x04\x00\x08\x00\x00\x00\x10\x00\x00\x00"
+    "\x04\x00\x00\x00\x01\x00\x00\x00\x14\x00\x00\x00\x01\x00\x00\x00"
+    "\x24\x00\x00\x00\x00\x00\x06\x00\x08\x00\x04\x00\x06\x00\x00\x00"
+    "\x04\x00\x00\x00\x01\x00\x00\x00\x63\x00\x00\x00\x08\x00\x10\x00"
+    "\x0c\x00\x04\x00\x08\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00"
+    "\x04\x00\x00\x00\x05\x00\x00\x00\x61\x2e\x62\x69\x6e\x00\x00\x00";
+
+class HttpClientSubtreeTest : public HttpClientTest
+{
+protected:
+    //
+    // Asks for /r's listing with SubtreeEntries and answers with Body.
+    // Returns the listing, which the fixture releases.
+    //
+    PDIRECTORY_INFO List(ULONG SubtreeEntries, const char* Body, SIZE_T Length)
+    {
+        char headers[128];
+        sprintf_s(headers, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", Length);
+        Respond(headers, Body, Length);
+
+        wchar_t path[] = L"/r";
+        UNICODE_STRING pathString = MakePath(path);
+
+        EXPECT_EQ(STATUS_PENDING, BlorgHttpGetDirectoryInfo(&pathString, SubtreeEntries, OnDirInfo, nullptr));
+
+        Drain();
+
+        EXPECT_EQ(1, LastDirInfo.Calls);
+        EXPECT_EQ(STATUS_SUCCESS, LastDirInfo.Status);
+        return LastDirInfo.DirInfo;
+    }
+};
+
+//
+// Each listing is attached in the answer's order with the parent and
+// subdirectory it names, and decoding stops at the first descendant whose
+// parent is not yet decoded: what came before is still every listing
+// nearer the root than the rest.
+//
+TEST_F(HttpClientSubtreeTest, ListingsArriveInOrderUpToAParentNotYetDecoded)
+{
+    PDIRECTORY_INFO root = List(64, kSubtreeOutOfOrder, sizeof(kSubtreeOutOfOrder) - 1);
+    ASSERT_NE(nullptr, root);
+
+    SIZE_T sentLength = 0;
+    const char* text = (const char*)SandboxLastRequest(&sentLength);
+    ASSERT_GT(sentLength, 0u);
+    EXPECT_NE(nullptr, strstr(text, "&subtree=64 HTTP/1.1\r\n"));
+
+    ASSERT_EQ(2u, root->SubDirCount);
+    ASSERT_EQ(3u, root->DescendantCount);
+
+    const DIRECTORY_DESCENDANT* descendants = root->Descendants;
+    EXPECT_EQ(0u, descendants[0].Parent);
+    EXPECT_EQ(0u, descendants[0].SubDir);
+    EXPECT_EQ(0u, descendants[1].Parent);
+    EXPECT_EQ(1u, descendants[1].SubDir);
+    EXPECT_EQ(1u, descendants[2].Parent);
+    EXPECT_EQ(0u, descendants[2].SubDir);
+
+    PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(descendants[2].Listing, 0);
+    EXPECT_EQ(L"c.bin", std::wstring(file->Name, file->NameLength));
+    EXPECT_EQ(nullptr, descendants[2].Listing->Descendants);
+}
+
+TEST_F(HttpClientSubtreeTest, ADescendantNamingASubdirectoryItsParentLacksEndsTheDecode)
+{
+    PDIRECTORY_INFO root = List(64, kSubtreeOutOfRange, sizeof(kSubtreeOutOfRange) - 1);
+    ASSERT_NE(nullptr, root);
+
+    EXPECT_EQ(3u, root->DescendantCount);
+}
+
+//
+// SubtreeEntries bounds what is decoded as well as what is asked for: a
+// listing that would take the total past it is not attached. a's two
+// entries and b's one fit in three; c's would make four.
+//
+TEST_F(HttpClientSubtreeTest, ListingsPastTheEntriesAskedForAreNotDecoded)
+{
+    PDIRECTORY_INFO root = List(3, kSubtreeOutOfOrder, sizeof(kSubtreeOutOfOrder) - 1);
+    ASSERT_NE(nullptr, root);
+
+    EXPECT_EQ(2u, root->DescendantCount);
+}
+
+//
+// A listing asked for without its subtree (a refresh) keeps none the
+// server sent anyway.
+//
+TEST_F(HttpClientSubtreeTest, ARequestThatAskedForNoSubtreeDecodesNone)
+{
+    PDIRECTORY_INFO root = List(0, kSubtreeOutOfOrder, sizeof(kSubtreeOutOfOrder) - 1);
+    ASSERT_NE(nullptr, root);
+
+    SIZE_T sentLength = 0;
+    const char* text = (const char*)SandboxLastRequest(&sentLength);
+    ASSERT_GT(sentLength, 0u);
+    EXPECT_EQ(nullptr, strstr(text, "subtree="));
+
+    EXPECT_EQ(2u, root->SubDirCount);
+    EXPECT_EQ(0u, root->DescendantCount);
+    EXPECT_EQ(nullptr, root->Descendants);
+}
 
 ///////////////////////////////////////////////////////////////////////////
 // Resource exhaustion

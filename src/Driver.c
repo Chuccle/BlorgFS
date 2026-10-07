@@ -709,6 +709,13 @@ static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICO
         global.ChangeFeed = (0 != changeFeedValue);
     }
 
+    ULONG subtreeEntries = 0;
+
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"SubtreeEntries", REG_DWORD, &subtreeEntries, sizeof(subtreeEntries), &actualSize)))
+    {
+        global.SubtreeEntries = subtreeEntries;
+    }
+
     ULONG slackGrowthValue = 0;
 
     if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadSlackGrowth", REG_DWORD, &slackGrowthValue, sizeof(slackGrowthValue), &actualSize)))
@@ -1053,6 +1060,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     global.ReadAheadMaxGranularity = READ_AHEAD_MAX_GRANULARITY;
     global.ReadFairBudget = READ_FAIR_BUDGET;
     global.ChangeFeed = TRUE;
+    global.SubtreeEntries = SUBTREE_ENTRIES;
 
     DriverReadRegistryConfig(RegistryPath, &portString, &hostString);
 
