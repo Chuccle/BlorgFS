@@ -444,6 +444,7 @@ typedef struct _HTTP_CONTEXT
     ULONG Capacity;
     ULONG Length;
     ULONG ConnectTimeouts; // connects that hit SOCKET_CONNECT_TIMEOUT_MS; see HttpOnSocket
+    ULONG SubtreeEntries;  // a listing's subtree=, which also bounds what its answer may decode
 
     //
     // The response carried Cache-Control: no-store (HttpForbidsStoring).
@@ -870,8 +871,10 @@ static PCHAR HttpAlignBodyInPlace(PCHAR Body, SIZE_T BodyLen)
 }
 
 //
-// Verifies and decodes a FlatBuffer Directory response body into a newly
-// allocated PDIRECTORY_INFO (header + inline file/subdir arrays). PASSIVE
+// Decodes one verified Directory table into a newly allocated
+// PDIRECTORY_INFO (header + inline file/subdir arrays): the listing a
+// response answers, or one a subtree answer carries beneath it. BodyLen is
+// the whole response body's, which bounds the entry counts. PASSIVE
 // only (RtlUTF8ToUnicodeN), per the stage-machine gating above. The
 // listing is PagedPool: every producer and consumer (this deserialize,
 // the create path's serve-from-listing, directory enumeration, and the
@@ -887,6 +890,242 @@ static PCHAR HttpAlignBodyInPlace(PCHAR Body, SIZE_T BodyLen)
 // EnumerateDirectoryEntries reads Name as null-terminated). A name too
 // long for the field fails its conversion outright and rejects the
 // listing, the same policy the old explicit length check enforced.
+//
+static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZE_T BodyLen, BOOLEAN NoStore, PDIRECTORY_INFO* OutDirInfo)
+{
+    size_t headerSize = sizeof(DIRECTORY_INFO);
+
+    BlorgMetaFlat_SubdirectoryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(Directory);
+    SIZE_T subdirCount = (flatSubdirEntries) ? BlorgMetaFlat_SubdirectoryMetadata_vec_len(flatSubdirEntries) : 0;
+
+    BlorgMetaFlat_FileEntryMetadata_vec_t flatFileEntries = BlorgMetaFlat_Directory_files(Directory);
+    SIZE_T filesCount = (flatFileEntries) ? BlorgMetaFlat_FileEntryMetadata_vec_len(flatFileEntries) : 0;
+
+    if (!HttpListingCountsAreCredible(subdirCount, filesCount, BodyLen))
+    {
+        BLORGFS_PRINT("HttpDecodeListing() - implausible entry counts for a %Iu byte body\n", BodyLen);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    SIZE_T filesEntryArraySize = filesCount * sizeof(DIRECTORY_FILE_METADATA);
+    SIZE_T subDirArraySize = subdirCount * sizeof(DIRECTORY_SUBDIR_METADATA);
+
+    SIZE_T entriesSize = 0;
+    SIZE_T allocationSize = 0;
+
+    if (!HttpCheckedAddSizeT(filesEntryArraySize, subDirArraySize, &entriesSize) ||
+        !HttpCheckedAddSizeT(headerSize, entriesSize, &allocationSize))
+    {
+        BLORGFS_PRINT("HttpDecodeListing() - listing size overflowed\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    PDIRECTORY_INFO dirInfo = ExAllocatePoolZero(PagedPool, allocationSize, 'DBLR');
+
+    if (!dirInfo)
+    {
+        BLORGFS_PRINT("HttpDecodeListing() - failed entries alloc\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    dirInfo->FilesOffset = headerSize;
+    dirInfo->SubDirsOffset = headerSize + filesEntryArraySize;
+    dirInfo->FileCount = filesCount;
+    dirInfo->SubDirCount = subdirCount;
+    dirInfo->RefCount = 1;
+
+    PDIRECTORY_FILE_METADATA fileEntries = BlorgGetFileEntry(dirInfo, 0);
+
+    for (size_t i = 0; i < filesCount; ++i)
+    {
+        BlorgMetaFlat_FileEntryMetadata_table_t flatFileEntry = BlorgMetaFlat_FileEntryMetadata_vec_at(flatFileEntries, i);
+
+        if (!flatFileEntry)
+        {
+            BLORGFS_PRINT("HttpDecodeListing() - failed\n");
+            ExFreePool(dirInfo);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        flatbuffers_string_t name = BlorgMetaFlat_FileEntryMetadata_name(flatFileEntry);
+
+        if (!name || flatbuffers_string_len(name) == 0)
+        {
+            BLORGFS_PRINT("HttpDecodeListing() - failed\n");
+            ExFreePool(dirInfo);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        ULONG nameBytes = 0;
+        NTSTATUS status = RtlUTF8ToUnicodeN(
+            fileEntries[i].Name,
+            (MAX_NAME_LEN - 1) * sizeof(WCHAR),
+            &nameBytes,
+            name,
+            C_CAST(ULONG, flatbuffers_string_len(name)));
+
+        if (!NT_SUCCESS(status))
+        {
+            BLORGFS_PRINT("HttpDecodeListing() - file name conversion failed: %8lx\n", status);
+            ExFreePool(dirInfo);
+            return status;
+        }
+
+        fileEntries[i].NameLength = nameBytes / sizeof(WCHAR);
+
+        fileEntries[i].Size = BlorgMetaFlat_FileEntryMetadata_size(flatFileEntry);
+        fileEntries[i].CreationTime = BlorgMetaFlat_FileEntryMetadata_created(flatFileEntry);
+        fileEntries[i].LastAccessedTime = BlorgMetaFlat_FileEntryMetadata_accessed(flatFileEntry);
+        fileEntries[i].LastModifiedTime = BlorgMetaFlat_FileEntryMetadata_modified(flatFileEntry);
+    }
+
+    PDIRECTORY_SUBDIR_METADATA subdirEntries = BlorgGetSubDirEntry(dirInfo, 0);
+
+    for (size_t i = 0; i < subdirCount; ++i)
+    {
+        BlorgMetaFlat_SubdirectoryMetadata_table_t flatSubdirEntry = BlorgMetaFlat_SubdirectoryMetadata_vec_at(flatSubdirEntries, i);
+
+        if (!flatSubdirEntry)
+        {
+            BLORGFS_PRINT("HttpDecodeListing() - failed\n");
+            ExFreePool(dirInfo);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        flatbuffers_string_t name = BlorgMetaFlat_SubdirectoryMetadata_name(flatSubdirEntry);
+
+        if (!name || flatbuffers_string_len(name) == 0)
+        {
+            BLORGFS_PRINT("HttpDecodeListing() - failed\n");
+            ExFreePool(dirInfo);
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        ULONG nameBytes = 0;
+        NTSTATUS status = RtlUTF8ToUnicodeN(
+            subdirEntries[i].Name,
+            (MAX_NAME_LEN - 1) * sizeof(WCHAR),
+            &nameBytes,
+            name,
+            C_CAST(ULONG, flatbuffers_string_len(name)));
+
+        if (!NT_SUCCESS(status))
+        {
+            BLORGFS_PRINT("HttpDecodeListing() - subdir name conversion failed: %8lx\n", status);
+            ExFreePool(dirInfo);
+            return status;
+        }
+
+        subdirEntries[i].NameLength = nameBytes / sizeof(WCHAR);
+
+        subdirEntries[i].CreationTime = BlorgMetaFlat_SubdirectoryMetadata_created(flatSubdirEntry);
+        subdirEntries[i].LastAccessedTime = BlorgMetaFlat_SubdirectoryMetadata_accessed(flatSubdirEntry);
+        subdirEntries[i].LastModifiedTime = BlorgMetaFlat_SubdirectoryMetadata_modified(flatSubdirEntry);
+    }
+
+    dirInfo->NoStore = NoStore;
+
+    *OutDirInfo = dirInfo;
+    return STATUS_SUCCESS;
+}
+
+//
+// Most entries the listings beneath a subtree answer may hold between them,
+// the most the server will send (get_dir_info?subtree=). Each listing's own
+// counts are checked against the body, but several descendants can point at
+// the same table, so the total needs a bound of its own: what was asked
+// for, and never past this.
+//
+#define HTTP_SUBTREE_MAX_ENTRIES 65536u
+
+//
+// Attaches the listings a subtree answer carries beneath Root, in the
+// answer's order (DIRECTORY_DESCENDANT). Decoding stops at the first
+// descendant that names a parent not yet decoded or a subdirectory its
+// parent does not have, fails to decode, or would take the total past
+// MaxEntries, the subtree= asked for; what came before is kept, and since
+// the answer is breadth first it is still every listing nearer the root
+// than the rest. An answer to a request that asked for none decodes none.
+// A descendant's own descendants are ignored. Nothing here fails the
+// answer: Root is the listing asked for, and the rest is a prefetch.
+//
+static VOID HttpDecodeDescendants(BlorgMetaFlat_Directory_table_t Directory, SIZE_T BodyLen, ULONG MaxEntries, PDIRECTORY_INFO Root)
+{
+    BlorgMetaFlat_Descendant_vec_t flatDescendants = BlorgMetaFlat_Directory_descendants(Directory);
+    SIZE_T count = flatDescendants ? BlorgMetaFlat_Descendant_vec_len(flatDescendants) : 0;
+    const SIZE_T cap = min(MaxEntries, HTTP_SUBTREE_MAX_ENTRIES);
+
+    count = min(count, cap);
+
+    if (0 == count)
+    {
+        return;
+    }
+
+    PDIRECTORY_DESCENDANT descendants = ExAllocatePoolZero(PagedPool, count * sizeof(DIRECTORY_DESCENDANT), 'DBLR');
+
+    if (!descendants)
+    {
+        return;
+    }
+
+    SIZE_T decoded = 0;
+    SIZE_T entries = 0;
+
+    for (; decoded < count; ++decoded)
+    {
+        BlorgMetaFlat_Descendant_table_t flatDescendant = BlorgMetaFlat_Descendant_vec_at(flatDescendants, decoded);
+        BlorgMetaFlat_Directory_table_t flatListing = flatDescendant ? BlorgMetaFlat_Descendant_listing(flatDescendant) : NULL;
+
+        if (!flatListing)
+        {
+            break;
+        }
+
+        ULONG parent = BlorgMetaFlat_Descendant_parent(flatDescendant);
+        ULONG subDir = BlorgMetaFlat_Descendant_subdirectory(flatDescendant);
+
+        PDIRECTORY_INFO parentListing = (0 == parent) ? Root :
+            (parent <= decoded) ? descendants[parent - 1].Listing : NULL;
+
+        if (!parentListing || subDir >= parentListing->SubDirCount)
+        {
+            break;
+        }
+
+        PDIRECTORY_INFO listing = NULL;
+
+        if (!NT_SUCCESS(HttpDecodeListing(flatListing, BodyLen, Root->NoStore, &listing)))
+        {
+            break;
+        }
+
+        entries += listing->FileCount + listing->SubDirCount;
+
+        if (entries > cap)
+        {
+            BlorgReleaseDirectoryInfo(listing);
+            break;
+        }
+
+        descendants[decoded].Listing = listing;
+        descendants[decoded].Parent = parent;
+        descendants[decoded].SubDir = subDir;
+    }
+
+    if (0 == decoded)
+    {
+        ExFreePool(descendants);
+        return;
+    }
+
+    Root->Descendants = descendants;
+    Root->DescendantCount = decoded;
+}
+
+//
+// Verifies a FlatBuffer Directory response body and decodes the listing it
+// answers, with any listings beneath it attached (HttpDecodeDescendants).
 //
 static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO* OutDirInfo)
 {
@@ -917,137 +1156,15 @@ static NTSTATUS HttpDeserializeDirectoryInfo(HTTP_CONTEXT* Ctx, PDIRECTORY_INFO*
         return STATUS_INVALID_PARAMETER;
     }
 
-    size_t headerSize = sizeof(DIRECTORY_INFO);
+    PDIRECTORY_INFO dirInfo = NULL;
+    NTSTATUS status = HttpDecodeListing(directory, bodyLen, Ctx->NoStore, &dirInfo);
 
-    BlorgMetaFlat_SubdirectoryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(directory);
-    SIZE_T subdirCount = (flatSubdirEntries) ? BlorgMetaFlat_SubdirectoryMetadata_vec_len(flatSubdirEntries) : 0;
-
-    BlorgMetaFlat_FileEntryMetadata_vec_t flatFileEntries = BlorgMetaFlat_Directory_files(directory);
-    SIZE_T filesCount = (flatFileEntries) ? BlorgMetaFlat_FileEntryMetadata_vec_len(flatFileEntries) : 0;
-
-    if (!HttpListingCountsAreCredible(subdirCount, filesCount, bodyLen))
+    if (!NT_SUCCESS(status))
     {
-        BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - implausible entry counts for a %Iu byte body\n", bodyLen);
-        return STATUS_INVALID_PARAMETER;
+        return status;
     }
 
-    SIZE_T filesEntryArraySize = filesCount * sizeof(DIRECTORY_FILE_METADATA);
-    SIZE_T subDirArraySize = subdirCount * sizeof(DIRECTORY_SUBDIR_METADATA);
-
-    SIZE_T entriesSize = 0;
-    SIZE_T allocationSize = 0;
-
-    if (!HttpCheckedAddSizeT(filesEntryArraySize, subDirArraySize, &entriesSize) ||
-        !HttpCheckedAddSizeT(headerSize, entriesSize, &allocationSize))
-    {
-        BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - listing size overflowed\n");
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    PDIRECTORY_INFO dirInfo = ExAllocatePoolZero(PagedPool, allocationSize, 'DBLR');
-
-    if (!dirInfo)
-    {
-        BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - failed entries alloc\n");
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    dirInfo->FilesOffset = headerSize;
-    dirInfo->SubDirsOffset = headerSize + filesEntryArraySize;
-    dirInfo->FileCount = filesCount;
-    dirInfo->SubDirCount = subdirCount;
-    dirInfo->RefCount = 1;
-
-    PDIRECTORY_FILE_METADATA fileEntries = BlorgGetFileEntry(dirInfo, 0);
-
-    for (size_t i = 0; i < filesCount; ++i)
-    {
-        BlorgMetaFlat_FileEntryMetadata_table_t flatFileEntry = BlorgMetaFlat_FileEntryMetadata_vec_at(flatFileEntries, i);
-
-        if (!flatFileEntry)
-        {
-            BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        flatbuffers_string_t name = BlorgMetaFlat_FileEntryMetadata_name(flatFileEntry);
-
-        if (!name || flatbuffers_string_len(name) == 0)
-        {
-            BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        ULONG nameBytes = 0;
-        NTSTATUS status = RtlUTF8ToUnicodeN(
-            fileEntries[i].Name,
-            (MAX_NAME_LEN - 1) * sizeof(WCHAR),
-            &nameBytes,
-            name,
-            C_CAST(ULONG, flatbuffers_string_len(name)));
-
-        if (!NT_SUCCESS(status))
-        {
-            BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - file name conversion failed: %8lx\n", status);
-            ExFreePool(dirInfo);
-            return status;
-        }
-
-        fileEntries[i].NameLength = nameBytes / sizeof(WCHAR);
-
-        fileEntries[i].Size = BlorgMetaFlat_FileEntryMetadata_size(flatFileEntry);
-        fileEntries[i].CreationTime = BlorgMetaFlat_FileEntryMetadata_created(flatFileEntry);
-        fileEntries[i].LastAccessedTime = BlorgMetaFlat_FileEntryMetadata_accessed(flatFileEntry);
-        fileEntries[i].LastModifiedTime = BlorgMetaFlat_FileEntryMetadata_modified(flatFileEntry);
-    }
-
-    PDIRECTORY_SUBDIR_METADATA subdirEntries = BlorgGetSubDirEntry(dirInfo, 0);
-
-    for (size_t i = 0; i < subdirCount; ++i)
-    {
-        BlorgMetaFlat_SubdirectoryMetadata_table_t flatSubdirEntry = BlorgMetaFlat_SubdirectoryMetadata_vec_at(flatSubdirEntries, i);
-
-        if (!flatSubdirEntry)
-        {
-            BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        flatbuffers_string_t name = BlorgMetaFlat_SubdirectoryMetadata_name(flatSubdirEntry);
-
-        if (!name || flatbuffers_string_len(name) == 0)
-        {
-            BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        ULONG nameBytes = 0;
-        NTSTATUS status = RtlUTF8ToUnicodeN(
-            subdirEntries[i].Name,
-            (MAX_NAME_LEN - 1) * sizeof(WCHAR),
-            &nameBytes,
-            name,
-            C_CAST(ULONG, flatbuffers_string_len(name)));
-
-        if (!NT_SUCCESS(status))
-        {
-            BLORGFS_PRINT("HttpDeserializeDirectoryInfo() - subdir name conversion failed: %8lx\n", status);
-            ExFreePool(dirInfo);
-            return status;
-        }
-
-        subdirEntries[i].NameLength = nameBytes / sizeof(WCHAR);
-
-        subdirEntries[i].CreationTime = BlorgMetaFlat_SubdirectoryMetadata_created(flatSubdirEntry);
-        subdirEntries[i].LastAccessedTime = BlorgMetaFlat_SubdirectoryMetadata_accessed(flatSubdirEntry);
-        subdirEntries[i].LastModifiedTime = BlorgMetaFlat_SubdirectoryMetadata_modified(flatSubdirEntry);
-    }
-
-    dirInfo->NoStore = Ctx->NoStore;
+    HttpDecodeDescendants(directory, bodyLen, Ctx->SubtreeEntries, dirInfo);
 
     *OutDirInfo = dirInfo;
     return STATUS_SUCCESS;
@@ -3217,6 +3334,66 @@ static NTSTATUS HttpBuildRequest(
 }
 
 //
+// Room for "&subtree=" and a ULONG's digits after the encoded path.
+//
+#define HTTP_SUBTREE_QUERY_SUFFIX_BYTES 24
+
+//
+// Builds a listing request whose query asks for the subtree too: the
+// encoded path with "&subtree=<Entries>" after it, handed to
+// HttpBuildRequest as a prepared query (a NULL Path) so the format stays
+// the plain listing's. On failure the caller frees Ctx, which frees a
+// prepared query with it.
+//
+static NTSTATUS HttpBuildSubtreeRequest(const UNICODE_STRING* Path, ULONG Entries, const char* FormatString, HTTP_CONTEXT* Ctx)
+{
+    ANSI_STRING encoded;
+    NTSTATUS result = UrlEncodePathToAnsi(Path, &encoded);
+
+    if (!NT_SUCCESS(result))
+    {
+        return result;
+    }
+
+    const SIZE_T size = C_CAST(SIZE_T, encoded.Length) + HTTP_SUBTREE_QUERY_SUFFIX_BYTES;
+
+    if (size > MAXUSHORT)
+    {
+        ExFreePool(encoded.Buffer);
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    Ctx->EncodedPathBuffer.Buffer = ExAllocatePoolZero(NonPagedPoolNx, size, HTTP_TAG);
+
+    if (!Ctx->EncodedPathBuffer.Buffer)
+    {
+        ExFreePool(encoded.Buffer);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    Ctx->EncodedPathBuffer.MaximumLength = C_CAST(USHORT, size);
+
+    size_t queryLength = 0;
+    result = RtlStringCbPrintfA(Ctx->EncodedPathBuffer.Buffer, size, "%hs&subtree=%lu", encoded.Buffer, Entries);
+
+    ExFreePool(encoded.Buffer);
+
+    if (NT_SUCCESS(result))
+    {
+        result = RtlStringCbLengthA(Ctx->EncodedPathBuffer.Buffer, size, &queryLength);
+    }
+
+    if (!NT_SUCCESS(result))
+    {
+        return result;
+    }
+
+    Ctx->EncodedPathBuffer.Length = C_CAST(USHORT, queryLength);
+
+    return HttpBuildRequest(NULL, FormatString, 0, 0, 0, FALSE, Ctx);
+}
+
+//
 // Allocates and initializes an HTTP_CONTEXT: the context struct, its
 // initial receive buffer, and a preallocated work item (so later PASSIVE
 // bounces can never fail for lack of one -- see the WorkItem field
@@ -3281,6 +3458,7 @@ static HTTP_CONTEXT* HttpAllocateContext(HTTP_OPERATION Operation, int ExpectedS
 //
 NTSTATUS BlorgHttpGetDirectoryInfo(
     const UNICODE_STRING* Path,
+    ULONG SubtreeEntries,
     PBLORG_DIRINFO_COMPLETION CompletionRoutine,
     PVOID CallerContext
 )
@@ -3299,6 +3477,7 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
 
     ctx->Completion.DirInfo.Routine = CompletionRoutine;
     ctx->CallerContext = CallerContext;
+    ctx->SubtreeEntries = SubtreeEntries;
 
     BLORGFS_STAT_INC(DirInfoRequests);
     BLORGFS_STAT_INC(MetaDataDiskReads);
@@ -3309,7 +3488,9 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
         "Connection: keep-alive\r\n"
         "\r\n";
 
-    NTSTATUS result = HttpBuildRequest(Path, requestFormat, 0, 0, 0, FALSE, ctx);
+    NTSTATUS result = (0 == SubtreeEntries) ?
+        HttpBuildRequest(Path, requestFormat, 0, 0, 0, FALSE, ctx) :
+        HttpBuildSubtreeRequest(Path, SubtreeEntries, requestFormat, ctx);
 
     if (!NT_SUCCESS(result))
     {
@@ -3572,14 +3753,47 @@ VOID BlorgReferenceDirectoryInfo(PDIRECTORY_INFO DirInfo)
 
 //
 // Drops one reference to a listing snapshot from BlorgHttpGetDirectoryInfo's
-// completion, freeing it with the last. NULL is a no-op.
+// completion, freeing it with the last, and any descendants still attached
+// to it. NULL is a no-op.
 //
 VOID BlorgReleaseDirectoryInfo(PDIRECTORY_INFO DirInfo)
 {
     if (DirInfo && 0 == InterlockedDecrement(&DirInfo->RefCount))
     {
+        BlorgReleaseDescendants(DirInfo->Descendants, DirInfo->DescendantCount);
         ExFreePool(DirInfo);
     }
+}
+
+//
+// Detaches the listings a subtree answer carried beneath DirInfo, which the
+// caller now owns. Only for a listing not yet shared with anything.
+//
+PDIRECTORY_DESCENDANT BlorgTakeDescendants(PDIRECTORY_INFO DirInfo, PSIZE_T Count)
+{
+    PDIRECTORY_DESCENDANT descendants = DirInfo->Descendants;
+
+    *Count = DirInfo->DescendantCount;
+    DirInfo->Descendants = NULL;
+    DirInfo->DescendantCount = 0;
+
+    return descendants;
+}
+
+// Drops each descendant's reference and frees the array. NULL is a no-op.
+VOID BlorgReleaseDescendants(PDIRECTORY_DESCENDANT Descendants, SIZE_T Count)
+{
+    if (!Descendants)
+    {
+        return;
+    }
+
+    for (SIZE_T i = 0; i < Count; ++i)
+    {
+        BlorgReleaseDirectoryInfo(Descendants[i].Listing);
+    }
+
+    ExFreePool(Descendants);
 }
 
 //

@@ -140,12 +140,18 @@ CHECK_PADDING_END(DIRECTORY_SUBDIR_METADATA, Name);
 // of the same directory is a new snapshot, so an enumeration in progress
 // keeps the one it started with.
 //
+// The one field set after deserialization is Descendants, and only before
+// the snapshot is shared: a subtree answer arrives with the listings beneath
+// it attached, and DirCtrlPublish takes them off before publishing any.
+//
 typedef struct _DIRECTORY_INFO
 {
     SIZE_T FilesOffset;   // Offset from start of this struct to first file entry
     SIZE_T SubDirsOffset; // Offset from start of this struct to first subdir entry
     SIZE_T FileCount;     // Number of DIRECTORY_FILE_METADATA entries
     SIZE_T SubDirCount;   // Number of DIRECTORY_SUBDIR_METADATA entries
+    struct _DIRECTORY_DESCENDANT* Descendants; // Subtree answer only, until DirCtrlPublish takes it
+    SIZE_T DescendantCount; // Number of entries in Descendants
     LONG   RefCount;      // Interlocked: holders on different threads release independently
     BOOLEAN NoStore;      // Server marked the answer Cache-Control: no-store; never cached
     UCHAR  Reserved[3];   // explicit tail padding
@@ -154,10 +160,29 @@ typedef struct _DIRECTORY_INFO
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FilesOffset, SubDirsOffset);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirsOffset, FileCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FileCount, SubDirCount);
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirCount, RefCount);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirCount, Descendants);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, Descendants, DescendantCount);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, DescendantCount, RefCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, NoStore);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, NoStore, Reserved);
 CHECK_PADDING_END(DIRECTORY_INFO, Reserved);
+
+//
+// One listing beneath the directory a subtree answer was asked for: the
+// listing of subdirectory SubDir of listing Parent, where 0 is the listing
+// asked for and k is the k'th descendant (metadata_flatbuffer.fbs,
+// Descendant). Parent always precedes its children.
+//
+typedef struct _DIRECTORY_DESCENDANT
+{
+    PDIRECTORY_INFO Listing; // one reference, owned by the array
+    ULONG Parent;
+    ULONG SubDir;
+} DIRECTORY_DESCENDANT, * PDIRECTORY_DESCENDANT;
+
+CHECK_PADDING_BETWEEN(DIRECTORY_DESCENDANT, Listing, Parent);
+CHECK_PADDING_BETWEEN(DIRECTORY_DESCENDANT, Parent, SubDir);
+CHECK_PADDING_END(DIRECTORY_DESCENDANT, SubDir);
 
 //
 // Returns a pointer to the Index'th subdirectory entry packed after this
@@ -752,10 +777,12 @@ VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path, _In_opt_ const PAT
 //  reference when it retains the listing, and returns whether the listing
 //  is current -- neither superseded by a newer fetch nor issued before an
 //  invalidation -- which is the condition for seeding the path cache from
-//  it.
+//  it. PublishDescendants offers each listing a subtree answer carried
+//  beneath Dir the same way, and seeds nothing.
 //
 PDIRECTORY_INFO BlorgPathCacheLookupListing(const UNICODE_STRING* Dir, BOOLEAN AllowStale, _Out_opt_ PBOOLEAN Stale, _Out_opt_ PBOOLEAN RefreshOwed, _Inout_opt_ PPATH_CACHE_TICKET Ticket);
 BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing, _In_opt_ const PATH_CACHE_TICKET* Ticket);
+SIZE_T BlorgPathCachePublishDescendants(const UNICODE_STRING* Dir, PDIRECTORY_INFO Root, const DIRECTORY_DESCENDANT* Descendants, SIZE_T Count, _In_opt_ const PATH_CACHE_TICKET* Ticket);
 
 //
 //  Invalidation. TTL keeps us eventually-consistent with the backing store
