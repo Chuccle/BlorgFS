@@ -25,14 +25,17 @@ VOID BlorgDiskCacheNoteFile(PNON_PAGED_NODE Node, const UNICODE_STRING* Path, UL
     RtlZeroMemory(Key, sizeof(*Key));
 }
 
-BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, ULONG64 Offset, ULONG Length, ULONG Valid, PDISK_CACHE_READ_COMPLETION Completion)
+BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, const UNICODE_STRING* Path, ULONG64 Offset, ULONG Length, ULONG Valid, PULONG Fetches, PDISK_CACHE_READ_COMPLETION Completion)
 {
     UNREFERENCED_PARAMETER(Irp);
     UNREFERENCED_PARAMETER(Key);
+    UNREFERENCED_PARAMETER(Path);
     UNREFERENCED_PARAMETER(Offset);
     UNREFERENCED_PARAMETER(Length);
     UNREFERENCED_PARAMETER(Valid);
     UNREFERENCED_PARAMETER(Completion);
+
+    *Fetches = 0;
 
     return FALSE;
 }
