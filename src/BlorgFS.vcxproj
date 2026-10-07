@@ -142,6 +142,8 @@
     <ClCompile Include="Create.c" />
     <ClCompile Include="DevIoCtrl.c" />
     <ClCompile Include="DirCtrl.c" />
+    <ClCompile Include="DiskCache.c" />
+    <ClCompile Include="DiskCacheIndex.c" />
     <ClCompile Include="Driver.c" />
     <ClCompile Include="..\third_party\flatcc\src\runtime\verifier.c" />
     <ClCompile Include="FlushBuffers.c" />
@@ -167,6 +169,7 @@
     <ClInclude Include="CacheManager.h" />
     <ClInclude Include="ChangeFeed.h" />
     <ClInclude Include="Client.h" />
+    <ClInclude Include="DiskCache.h" />
     <ClInclude Include="Driver.h" />
     <ClInclude Include="flatbuffers_common_reader.h" />
     <ClInclude Include="Socket.h" />

@@ -34,6 +34,9 @@ struct ReadResult
     int Calls = 0;
     NTSTATUS Status = STATUS_SUCCESS;
     SIZE_T Bytes = 0;
+    BOOLEAN HasVersion = FALSE;
+    ULONG64 VersionSize = 0;
+    ULONG64 VersionTime = 0;
 };
 
 ReadResult LastRead;
@@ -45,6 +48,9 @@ void OnFileRead(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
     LastRead.Calls++;
     LastRead.Status = Status;
     LastRead.Bytes = FileBuffer ? FileBuffer->BodyBufferSize : 0;
+    LastRead.HasVersion = FileBuffer ? FileBuffer->HasVersion : FALSE;
+    LastRead.VersionSize = FileBuffer ? FileBuffer->VersionSize : 0;
+    LastRead.VersionTime = FileBuffer ? FileBuffer->VersionTime : 0;
 }
 
 struct FileInfoResult
@@ -229,6 +235,71 @@ TEST_F(HttpClientTest, RangedReadSucceeds)
     EXPECT_EQ(1, LastRead.Calls);
 
     FreeMdl();
+}
+
+//
+// The disk cache keeps a fetched block only under the version the
+// response's entity tag names, so the tag has to come back as the same
+// size and 100-ns time since 1601 a listing reports: 0x5f5e1000 seconds
+// since 1970 is 1600000000, and 0x3e8 nanoseconds is 10 ticks.
+//
+TEST_F(HttpClientTest, AFileReadCarriesTheVersionItsEntityTagNames)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nETag: \"5f5e1000.000003e8-2a\"\r\nContent-Length: 8\r\n\r\nABCDEFGH")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    unsigned char target[8] = {};
+
+    ASSERT_EQ(STATUS_PENDING, Read(target, sizeof(target)));
+
+    Drain();
+
+    EXPECT_TRUE(NT_SUCCESS(LastRead.Status));
+    EXPECT_TRUE(LastRead.HasVersion);
+    EXPECT_EQ(0x2Aull, LastRead.VersionSize);
+    EXPECT_EQ(1600000000ull * 10000000 + 116444736000000000ull + 10, LastRead.VersionTime);
+
+    FreeMdl();
+}
+
+//
+// Weak, out of range, missing a part, or another server's spelling
+// entirely: none names a version, and the read itself still succeeds. One
+// pooled connection answers all four in turn.
+//
+TEST_F(HttpClientTest, AWeakOrForeignEntityTagNamesNoVersion)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nETag: W/\"5f5e1000.000003e8-2a\"\r\nContent-Length: 8\r\n\r\nABCDEFGH"),
+        DELIVER("HTTP/1.1 206 Partial Content\r\nETag: \"5f5e1000.3b9aca00-2a\"\r\nContent-Length: 8\r\n\r\nABCDEFGH"),
+        DELIVER("HTTP/1.1 206 Partial Content\r\nETag: \"5f5e1000-2a\"\r\nContent-Length: 8\r\n\r\nABCDEFGH"),
+        DELIVER("HTTP/1.1 206 Partial Content\r\nETag: \"d41d8cd98f00b204e9800998ecf8427e\"\r\nContent-Length: 8\r\n\r\nABCDEFGH")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    for (SIZE_T i = 0; i < RTL_NUMBER_OF(script); ++i)
+    {
+        unsigned char target[8] = {};
+
+        LastRead = {};
+
+        ASSERT_EQ(STATUS_PENDING, Read(target, sizeof(target)));
+
+        Drain();
+
+        EXPECT_TRUE(NT_SUCCESS(LastRead.Status)) << "response " << i;
+        EXPECT_FALSE(LastRead.HasVersion) << "response " << i;
+
+        FreeMdl();
+    }
+
+    EXPECT_EQ(1u, SandboxSocketsCreated()) << "every response should have come over the one pooled connection";
 }
 
 //

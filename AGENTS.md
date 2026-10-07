@@ -17,7 +17,7 @@ settings, and the top footguns, each linking to the full section for
 detail and evidence. The rest of the document is organized rules-first,
 reference-second: operating rules and conventions come early because they
 apply to every task; the two large evidence sections (the read-ahead
-investigation and the disk-cache design) are last because they are read
+investigation and the disk cache) are last because they are read
 occasionally, not every session.
 
 | Section | What it's for |
@@ -37,7 +37,7 @@ occasionally, not every session.
 | [Metadata caching: current state](#metadata-caching-current-state) | The path and listing caches, the change feed that keeps them, and the rule any new invalidation or insert must keep |
 | [Read-ahead policy: current state](#read-ahead-policy-current-state) | What the driver does today, and why, in one place |
 | [Evidence trail: the playback-stutter investigation](#evidence-trail-the-playback-stutter-investigation) | Conclusions and reusable measurement lessons from the investigation behind that policy; full round-by-round history is in git log |
-| [Future work: on-disk hot cache (not implemented)](#future-work-on-disk-hot-cache-not-implemented) | Design for a not-yet-started project — nothing in it exists in the codebase |
+| [Disk cache: current state](#disk-cache-current-state) | The local block store behind non-cached reads: what it keeps, when it serves, and why it is safe |
 
 ## Quick reference
 
@@ -109,12 +109,14 @@ Full derivation in [Read-ahead policy: current state](#read-ahead-policy-current
 | Adaptive feedback loop | on | `ReadAheadAdapt=0` pins the granule |
 | Slack-based growth | on | `ReadAheadSlackGrowth=0` disables it |
 
-### Not implemented — don't assume it exists
+### Disk cache: current settings
 
-The **on-disk hot cache is an unstarted future project** ([design
-doc](#future-work-on-disk-hot-cache-not-implemented)). There is no
-`DiskCache.c`/`.h` in the tree yet; nothing described there is live driver
-behaviour.
+Full detail in [Disk cache: current state](#disk-cache-current-state).
+
+| Setting | Value | Registry override |
+|---|---|---|
+| Size | off | `DiskCacheMb` (capped at 16384) |
+| Location | `C:\ProgramData\BlorgFS\BlockCache.bin` | `DiskCachePath` (an NT path) |
 
 ## What is expected of you here
 
@@ -1541,7 +1543,7 @@ exist specifically because a simpler version of them measurably failed.
 **Lookahead is entirely Cc's built-in read-ahead**, sized per file object
 via `CcSetReadAheadGranularity`. The driver's own prefetcher and chunk
 budget are gone (git history only) and are not coming back as-is — see
-"Future work: on-disk hot cache" for the replacement direction.
+"Disk cache: current state" for what replaced them.
 
 | Rule | Detail |
 |---|---|
@@ -1551,7 +1553,7 @@ budget are gone (git history only) and are not coming back as-is — see
 | Growth ceiling | **2 MB** (`ReadAheadMaxGranularityKb`), chosen because Cc itself caps around ~1.1 MB on this rig and going further bought nothing. |
 | Feedback loop | On by default; `ReadAheadAdapt=0` pins the granule (useful for A/B measurement). |
 | Slack-based growth | On by default; `ReadAheadSlackGrowth=0` disables it. |
-| Fair share | Past `ReadFairBudgetKb` (default **2 MB**) of fetches in flight, read-ahead from a file that already has a fetch in flight is **held** and admitted on each completion in start-time fair order, by bytes per file (`ReadFair` in `Read.c`): a file that has fetched less recently goes first, and every backlogged file gets the same bytes whatever its fetch size. A file with nothing in flight is never held (Cc keeps a player to one read-ahead at a time), nor are demand faults and uncached reads; and when a file's last fetch settles, its earliest held read is admitted whatever the budget, because other files' demand can keep the link past it for as long as they run (that stranded a player for 25 s beside two copies). Under the budget, which is everything a lone reader on a quiet link does, nothing waits. Counted as `ReadsHeld`; `ReadFairBudgetKb=0` never holds. |
+| Fair share | Past `ReadFairBudgetKb` (default **2 MB**) of fetches in flight, read-ahead from a file that already has a fetch in flight is **held** and admitted on each completion in start-time fair order, by bytes per file (`ReadFair` in `Read.c`): a file that has fetched less recently goes first, and every backlogged file gets the same bytes whatever its fetch size. A file with nothing in flight is never held (Cc keeps a player to one read-ahead at a time), nor are demand faults and uncached reads; and when a file's last fetch settles, its earliest held read is admitted whatever the budget, because other files' demand can keep the link past it for as long as they run (that stranded a player for 25 s beside two copies). Under the budget, which is everything a lone reader on a quiet link does, nothing waits. Counted as `ReadsHeld`; `ReadFairBudgetKb=0` never holds. Separately, at most `READ_FAIR_MAX_FETCHES` (32) fetches are in flight at once, demand included, and demand waiting for that goes first: a mapped read faulting a page at a time once issued 10,100 4 KB fetches together, overran the server's accept queue and failed `PrefetchVirtualMemory`. Whether a fetch waits is decided under the lock only; one that must wait and cannot get the work item that would release it fails with `STATUS_INSUFFICIENT_RESOURCES` rather than going out past the limit. |
 | **Removed**: "loaded transport grows the granule" | Was in the tree, measured to be up to **12x worse** on paced/deadline workloads, deleted outright. Growth today is slack-only. |
 
 **What this gets right, measured:** a greedy sequential reader (file copy)
@@ -1775,27 +1777,14 @@ absolute count of reads over a frame ranks the longest run worst.
 multiplying it again yields impossible values above 100% and, worse,
 preserves the ordering while destroying the magnitude.
 
-## Future work: on-disk hot cache (not implemented)
+## Disk cache: current state
 
-> **Not implemented. This is a future project, not current driver
-> behaviour.** There is no `DiskCache.c`/`DiskCache.h` in the tree, no
-> registry keys for it, and nothing described below exists yet. Don't
-> reference this section as if the code is present, and don't be surprised
-> the symbols below don't grep-hit anywhere else in the repo — that's
-> expected until the project starts.
-
-The prefetch ring was removed rather than replaced. What follows is the
-design for its replacement, which is **not an in-memory prefetcher** -- that
-experiment is finished and its evidence is in git history.
-
-**It lives in the driver, as a module.** A usermode helper owning the store
-was the other candidate, on the argument that it removed a re-entrancy
-problem by construction. That argument was weaker than it looked: keeping
-the store off this volume removes the recursion just as completely, since
-nothing in NTFS's completion path calls back into this driver. What is left
-is deadlock through the memory manager, which is a discipline problem the
-helper would not have solved either -- it is the same problem every
-filesystem has when it touches another one.
+`src/DiskCache.c` (the file and its I/O) and `src/DiskCacheIndex.c` (which
+slot holds which block). Off unless `DiskCacheMb` is set. It keeps 64 KB
+blocks of file data that non-cached reads fetched, in one preallocated file
+on a local volume, and serves later non-cached reads of the same blocks
+from it instead of the network. Both files open with a header comment
+that carries the reasoning in full; this section is the map.
 
 ### Why this, and not more lookahead
 
@@ -1817,209 +1806,94 @@ set stopped fitting and a re-read fell from 6677 MB/s to 131 MB/s. Local
 disk is ~20x the network on write, ~140x on read, with ~100x the capacity of
 RAM.
 
-### Architecture: a driver module
+### What it does
 
-`src/DiskCache.c` / `DiskCache.h`, owning a block store in **one ordinary
-file on an ordinary live volume**. Location and maximum size configurable
-through the registry alongside `RemoteHost`/`RemotePort` in `Parameters`.
+- **Fills.** `ReadComplete` offers each fetch to `BlorgDiskCacheAdmit`
+  before completing the IRP, while its pages are still the read's. Each
+  whole block (or the last block of the file) inside the fetch that the
+  index admits is copied into nonpaged pool there, at `DISPATCH_LEVEL`, and
+  written from a work item. Copies waiting for their write are capped at
+  32 MB; past it, or when an allocation fails, the rest of the fetch is
+  dropped rather than queued, and each block of it counted as dropped.
+- **Reads.** The non-cached path in `BlorgVolumeRead` asks
+  `BlorgDiskCacheRead` first. A page-aligned read of at most 64 blocks
+  whose every block is held is pinned and served by the driver's own
+  non-cached IRPs to the cache file's device, one per run of consecutive
+  slots, each into a partial MDL of the read's own buffer, completed by a
+  completion routine. Nothing waits on the calling thread, which may be a
+  paging read with APCs disabled. Anything else is fetched as before. A
+  read the cache fails part-way is fetched through `ReadFairWorker`.
+- **Versions.** Blocks are keyed by two hashes of the path plus the size
+  and last-write time the FCB names, read together under the paging
+  resource that a refresh changes them under (`ReadSnapshotFile`); the
+  same snapshot trims the read, and the cache refuses a read whose valid
+  bytes run past the size its key names. A fill is kept only if the
+  response's entity tag names that same version (`HttpParseFileVersion`;
+  server-rs spells it `"<secs>.<nanos>-<size>"` in hex for resident and
+  streamed files alike). Once the change feed or a reopen refreshes the FCB
+  to a new version, its old blocks stop matching and age out; there is no
+  explicit invalidation. This holds once the volume is writable too, as
+  long as a write changes the version the FCB names.
+- **Admission and replacement.** A block is written on its second miss
+  only, through a four-way ghost table of tags (a direct-mapped one lost
+  about a fifth of a re-read file to blocks evicting each other's tag).
+  Replacement is a CLOCK over the slots, with a per-slot pin count so a
+  slot is never reused while a read or write is in flight on it. CLOCK
+  and second-miss admission cover what segmented LRU would: a scan read
+  once never gets in, and a block served since the hand last passed
+  survives a turn.
 
-The module boundary is deliberately narrow, and every entry point is either
-pure memory or explicitly asynchronous:
+### Why it is safe
 
-```
-BlorgDiskCacheInitialize / BlorgDiskCacheDrain   startup, unload
-BlorgDiskCacheLookup(FileId, BlockIndex)         IN MEMORY ONLY, no I/O
-BlorgDiskCacheReadAsync(Slot, Mdl, Completion)   serves a hit
-BlorgDiskCacheAdmitAsync(FileId, Block, Mdl)     fire-and-forget write-behind
-BlorgDiskCacheInvalidate(FileId)                 validator changed
-```
+- **The store is never trusted across loads.** The index lives only in
+  memory and starts empty, so a block is served only after this load wrote
+  it, and the file is opened without sharing, so nothing else can change
+  it in between. That is why there is no per-block MAC yet: offline
+  tampering cannot reach a reader. **A persistent index needs one**, keyed
+  from the service's registry key.
+- **The file and its directory are opened without following reparse
+  points (`OBJ_DONT_REPARSE`) and refused unless SYSTEM or Administrators
+  own them.** Any user can create a directory under ProgramData, so the
+  configured path may already hold a link or a file with a DACL the user
+  chose; following it would have this driver write as SYSTEM wherever the
+  user pointed. Refused, not repaired. A new file or directory gets a
+  protected DACL admitting only SYSTEM and Administrators.
+- **A store on this volume is refused** (`FileObject->DeviceObject` is the
+  disk device), so its I/O cannot come back into this driver.
+- **Non-buffered, preallocated.** `FILE_NO_INTERMEDIATE_BUFFERING` keeps
+  the store out of the Windows cache it stands behind and off the memory
+  pressure a paging read may already be under. Slots are first handed out
+  in file order, so early fills extend NTFS's valid data length in order
+  rather than making it zero a gap ahead of each.
+- **Deleting the store while mounted.** It is opened without
+  `FILE_SHARE_DELETE`, so deleting or renaming it, or renaming or deleting
+  its directory, fails with a sharing violation while the driver holds it.
+  If its volume goes anyway (a pulled disk, a forced dismount), the first
+  failed read or write turns the cache off for the rest of the load
+  (`DiskCacheLost`); the read it failed is fetched instead, so a reader
+  never sees the loss. It comes back, empty, at the next driver load.
+- **A block is kept from bytes the driver owns.** While the cache is live a
+  fetch of up to 4 MB lands in the client's own buffer and is copied into
+  the IRP's pages (`ReadIssueFetch`, `ReadComplete`), and the cache copies
+  from that buffer. The IRP's pages cannot be trusted afterwards: a mapped
+  read's MDL holds Mm's one shared dummy page wherever the cluster spans a
+  page already resident, so several slots alias one page, and a user
+  buffer can be changed by its own application mid-read. Copying from the
+  MDL served wrong bytes to mapped readers; the guest's `mapped` step is
+  the regression check.
+- **Teardown** clears `Live`, then waits for a busy count of reads, fills
+  and the fill worker to drain before closing the file (`DriverUnload`).
 
-`BlorgDiskCacheLookup` touching no I/O is what makes the rest safe: the read
-dispatch path can ask "is this cached?" while holding whatever it holds, and
-only then decide which asynchronous path to take.
+### Not done yet
 
-**The read path keeps the shape it already has.** A paging read today
-returns `STATUS_PENDING` and is completed later from a network completion
-(`Read.c`). A cache hit is the same shape with a different source:
+- A persistent index, and the per-block MAC it needs.
+- Using the FCB's sequential streak to prefer streamed blocks.
+- Blocks for reads Cc serves from its own cache never reach the store;
+  only non-cached reads (Cc's own paging reads included) fill it.
 
-1. `BlorgDiskCacheLookup` — in-memory index, no I/O, no blocking.
-2. **Hit**: queue a cache read; a worker fills `Irp->MdlAddress` and
-   completes the IRP.
-3. **Miss**: issue the HTTP fetch exactly as now. On completion, complete the
-   IRP *first*, then queue the write-behind from the buffer already in hand.
-
-The reader never waits on the cache in either direction. A miss costs
-nothing it did not already cost, and a write-behind failure is invisible.
-
-### What the store being off-volume does, and does not, buy
-
-**The store must not live on this volume**, checked at open by comparing the
-target's volume device object with ours. That single rule is what removes
-*recursion*: with the store on NTFS, nothing in the completion path of a
-`ZwReadFile` calls back into BlorgFS. There is no cycle in the call graph,
-and the usermode-helper alternative bought nothing here that this check does
-not.
-
-What is left is not recursion, and calling it that obscures the actual
-risks. Two remain, both mediated by memory manager:
-
-- **Deadlock through MM, not a nested call.** If a thread holds an FCB
-  resource and, inside a cache read, memory pressure makes MM trim that
-  file's pages, MM calls this driver's `AcquireForLazyWrite` and blocks on
-  the resource the thread is still holding. So: **never hold an FCB resource
-  across a cache call.** Enqueue, release, return pending.
-- **The paging path is the dangerous one.** A paging read can originate from
-  MM while it is already short of memory. Dependent I/O issued from that
-  thread can wait on the reclaim that is waiting on us. So: **no cache I/O
-  on the calling thread** -- all `ZwReadFile`/`ZwWriteFile` happen on the
-  module's own PASSIVE workers, and the dispatch path only ever enqueues.
-
-That second rule costs nothing the design was not already paying. The IRP is
-completed asynchronously either way, so moving the I/O to a worker changes
-which thread finishes it and nothing else.
-
-**IRQL** is a hard constraint rather than a judgement call: `ZwReadFile` and
-`ZwWriteFile` are PASSIVE-only, while network completions run at
-`<= DISPATCH`, so an admit queued from a completion reaches PASSIVE through
-a work item. That is the same rule the removed prefetcher lived by, and the
-one thing from it worth keeping.
-
-**Open the store `FILE_NO_INTERMEDIATE_BUFFERING`**, for two reasons that
-are worth stating accurately. It avoids double-caching bytes Cc already
-holds for this volume, and it keeps the store from adding cache-manager
-memory pressure at exactly the moment the driver is serving a paging read.
-The cost is sector alignment, which a fixed-block store gives for free.
-
-An earlier draft of this section justified the flag by claiming that
-cache-manager pressure from our own store could re-enter this driver through
-its own cache callbacks. That is not true for a store on another volume, and
-the flag is worth setting anyway for the two reasons above.
-
-### Store layout, index and recovery
-
-Fixed-size blocks, each preceded by its own header: magic, file-identity
-hash, block index, backend validator, byte length, and the MAC below. Slots
-are addressed by index, never by cluster or LCN, so fragmentation, extension
-and defragmentation are all transparent.
-
-**The index is rebuilt from the block headers at startup, not persisted.**
-A separate index file is faster to load and introduces a whole failure class
-this does not need — an index that disagrees with the store, torn across a
-crash, and confidently wrong. Header scan cannot desync because the headers
-*are* the store. At 512 KB blocks a 30 GB store is ~61k headers; reading
-only the header of each is a few hundred MB against a local disk measured at
-4.3 GB/s, so a second or so of startup, off the mount path.
-
-Persisting an index is a later optimisation, and only worth it if that
-startup cost ever shows up as a complaint.
-
-### Concurrency
-
-- Slot allocation from a free list under a leaf lock; nothing else is
-  acquired under it.
-- Per-slot reference count so eviction cannot reclaim a slot with a read in
-  flight -- the same protocol the node table already uses, and the one the
-  systematic scheduler is set up to explore.
-- A per-block "fetch in flight" marker so two readers missing the same block
-  do not both fetch it and both write it.
-
-### Cluster pinning: not worth it
-
-`FSCTL_MARK_HANDLE` with `MARK_HANDLE_PROTECT_CLUSTERS` marks a file so the
-defragmenter will not move it. **The conclusion is not to use it.** The
-intuition that this is over-engineering is right, and for reasons stronger
-than "SSDs do not care about seeks":
-
-- It solves a problem this design does not have. Protection matters when
-  something maps a file by LCN and needs that mapping to stay valid --
-  hibernation files, page files, block-level VM disks. This store is
-  addressed through the filesystem by offset, so a moved extent is
-  transparent.
-- It is NTFS-only and volume-specific, and the cache is meant to live
-  wherever the user points it.
-- Marking a large file unmovable is antisocial: it permanently constrains the
-  volume's own defragmenter on behalf of a cache that is by definition
-  disposable.
-- The cost it avoids is seek cost, which on SSD is near zero and on spinning
-  media is still small against the ~30 ms network fetch it is competing with.
-
-Revisit only if profiling ever shows extent-map lookup -- not seek time --
-dominating cache reads, which would be a surprise.
-
-### Security model
-
-**Cache integrity is a security boundary.** A process that can write the
-store can inject bytes this filesystem then serves as authoritative file
-content: a straightforward data-poisoning primitive against every reader of
-the share.
-
-- **ACL the store to SYSTEM and Administrators only**, deny everyone else,
-  and create it with an explicit security descriptor rather than inheriting
-  the parent directory's. A cache under a user-writable path with inherited
-  ACLs is the default-insecure outcome to avoid.
-- **Refuse a store whose ownership or ACL is not what was expected**, at
-  open, rather than repairing it -- repairing races the attacker.
-- **ACLs alone are not sufficient.** They do not cover an offline attack
-  (booting another OS, mounting the volume elsewhere), an administrator-level
-  compromise, or ordinary corruption. Blocks must carry their own integrity
-  check.
-- **Per-block keyed integrity, verified before use.** Each block records a
-  MAC over (file identity, block index, backend validator, contents). A
-  mismatch discards the block and falls back to the network. A plain
-  checksum detects corruption but not tampering, and the threat here is
-  tampering.
-
-  The key has to persist for the cache to survive a reboot, and it has to
-  live somewhere the store does not -- otherwise an attacker who can rewrite
-  blocks can recompute the tags and the MAC proves nothing. The service's
-  own registry key is the natural home: same trust boundary as the driver's
-  configuration, already SYSTEM-only, and already what `TlsPin` uses
-  (`Driver.c`). Generate it on first use, never log it, and treat a missing
-  key as an empty cache rather than an error.
-
-  Running in kernel does not change the threat model here. The attacker of
-  interest is a process that can write the file, not one that can call the
-  driver -- and MAC verification happens on the module's worker before any
-  cached byte reaches an IRP, so a forged block is discarded on the same
-  path that would have discarded a corrupt one.
-- **Bind blocks to a backend validator.** `server-rs` returns `etag` and
-  `last_modified`; a block whose validator does not match the current
-  response is stale and must not be served. Without this the cache serves
-  yesterday's bytes for a file that changed.
-- **Tampering, truncation or wholesale replacement** must be
-  indistinguishable in effect from a cold cache: verification fails, blocks
-  are discarded, reads go to the network.
-
-The bar is explicit: **the cached path must not be weaker than the uncached
-path.** A design step that cannot meet that does not ship.
-
-### Admission and eviction: start small
-
-The literature is consistent that the largest wins come from **admission**
-control rather than clever eviction, and that the specific thing to avoid is
-caching one-hit-wonders -- for a disk-backed store that is wasted write
-bandwidth and, on SSD, wasted endurance.
-
-- **Admit on second miss, not first.** This is the CDN answer to one-hit
-  wonders, costs a few bytes of state per candidate, and is the single
-  highest-value policy decision available.
-- **Prefer sequential streams.** The `READ_STREAM_TRACKER` array on the FCB
-  (`Structs.h`) already carries the streak -- it survived the prefetch
-  removal partly for this. A streaked reader is exactly the case where the
-  following blocks are worth having.
-- **Evict with segmented LRU.** Cheap, well understood, and resistant to one
-  large scan flushing the whole store.
-- **Do not start with TinyLFU/W-TinyLFU or ARC.** W-TinyLFU is the strongest
-  general result in the literature and is the right thing to *grow into* if
-  measurement justifies it; its frequency sketch costs about a page. But it
-  earns its keep on skewed, high-cardinality, small-object workloads -- CDN
-  edges, key-value caches -- and this workload is a handful of very large,
-  sequentially-read files. Second-hit admission plus SLRU captures most of
-  the benefit at a fraction of the complexity, and the counters will show
-  whether anything more is warranted.
-
-Measure hit rate, bytes served from cache, and write amplification before
-tuning any of it.
+Counters: `PerfHarness stats` prints `DiskCacheHits`, `HitBytes`,
+`ReadFailures`, `FirstMisses`, `Fills`, `FillFailures`, `Dropped` and
+`Stale` (a fetch whose tag named another version than the FCB).
 
 Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),
 [size-aware admission for CDN memory caches (CMU)](http://reports-archive.adm.cs.cmu.edu/anon/2016/CMU-CS-16-120.pdf),

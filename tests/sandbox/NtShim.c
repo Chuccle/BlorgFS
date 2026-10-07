@@ -419,6 +419,7 @@ NTSTATUS KeWaitForSingleObject(PVOID Object, KWAIT_REASON Reason, KPROCESSOR_MOD
 ///////////////////////////////////////////////////////////////////////////
 
 static volatile LONG MdlMappingFailPending = 0;
+static volatile LONG WorkItemFailPending = 0;
 
 VOID ShimFailNextMdlMapping(VOID)
 {
@@ -911,6 +912,7 @@ VOID ShimReset(VOID)
     ShimPoolFailAt(-1);
     ShimWatchFree(NULL, NULL);
     InterlockedExchange(&MdlMappingFailPending, 0);
+    InterlockedExchange(&WorkItemFailPending, 0);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -952,8 +954,18 @@ static void EnsureWorkItemCs(void)
     }
 }
 
+VOID ShimFailNextWorkItem(VOID)
+{
+    InterlockedExchange(&WorkItemFailPending, 1);
+}
+
 PIO_WORKITEM IoAllocateWorkItem(PDEVICE_OBJECT DeviceObject)
 {
+    if (InterlockedExchange(&WorkItemFailPending, 0))
+    {
+        return NULL;
+    }
+
     PIO_WORKITEM item = (PIO_WORKITEM)calloc(1, sizeof(IO_WORKITEM));
 
     if (item)
