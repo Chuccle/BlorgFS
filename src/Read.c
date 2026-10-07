@@ -372,6 +372,7 @@ VOID BlorgReadInit(VOID)
 }
 
 static IO_WORKITEM_ROUTINE ReadFairWorker;
+static IO_WORKITEM_ROUTINE ReadRefetchWorker;
 
 //
 // The nonpaged node of the file a read is for. A file object's
@@ -482,36 +483,15 @@ static NTSTATUS ReadFairAdmit(PIRP Irp, BOOLEAN MayHold)
 }
 
 //
-// Settles an admitted fetch, whether it completed or failed to issue, and
-// admits held reads while fewer than READ_FAIR_MAX_FETCHES are in flight:
+// Admits held reads while fewer than READ_FAIR_MAX_FETCHES are in flight:
 // waiting demand first, in arrival order, then read-ahead, lowest start
 // tag first, while the link has room. A file with nothing in flight gets
-// its earliest held read admitted whether or not there is room. A read
-// that was never admitted carries no flag and settles nothing.
+// its earliest held read admitted whether or not there is room. Called
+// under the lock; what it admits is moved to Released, for
+// ReadFairIssueHeld once the lock is dropped.
 //
-// <= DISPATCH_LEVEL: called from ReadComplete on the WSK completion chain.
-//
-static VOID ReadFairSettle(PIRP Irp)
+static VOID ReadFairAdmitHeld(PLIST_ENTRY Released)
 {
-    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_FETCH_ADMITTED))
-    {
-        return;
-    }
-
-    BlorgClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
-
-    LIST_ENTRY released;
-    InitializeListHead(&released);
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&ReadFair.Lock, &oldIrql);
-
-    PNON_PAGED_NODE node = ReadFairNode(Irp);
-
-    ReadFair.InFlightBytes -= IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
-    ReadFair.InFlightFetches--;
-    node->ReadFetchesInFlight--;
-
     while (ReadFair.InFlightFetches < READ_FAIR_MAX_FETCHES)
     {
         PIRP next = NULL;
@@ -555,17 +535,99 @@ static VOID ReadFairSettle(PIRP Irp)
         ReadFairNode(next)->ReadFetchesInFlight++;
         BlorgSetIrpContextFlag(next, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
 
-        InsertTailList(&released, &next->Tail.Overlay.ListEntry);
+        InsertTailList(Released, &next->Tail.Overlay.ListEntry);
     }
+}
 
-    KeReleaseSpinLock(&ReadFair.Lock, oldIrql);
-
-    while (!IsListEmpty(&released))
+static VOID ReadFairIssueHeld(PLIST_ENTRY Released)
+{
+    while (!IsListEmpty(Released))
     {
-        PIRP held = CONTAINING_RECORD(RemoveHeadList(&released), IRP, Tail.Overlay.ListEntry);
+        PIRP held = CONTAINING_RECORD(RemoveHeadList(Released), IRP, Tail.Overlay.ListEntry);
 
         IoQueueWorkItem(C_CAST(PIO_WORKITEM, held->Tail.Overlay.DriverContext[2]), ReadFairWorker, DelayedWorkQueue, held);
     }
+}
+
+//
+// Settles an admitted fetch, whether it completed or failed to issue, and
+// admits held reads into the room it leaves (ReadFairAdmitHeld). A read
+// that was never admitted carries no flag and settles nothing.
+//
+// <= DISPATCH_LEVEL: called from ReadComplete on the WSK completion chain.
+//
+static VOID ReadFairSettle(PIRP Irp)
+{
+    if (!BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_FETCH_ADMITTED))
+    {
+        return;
+    }
+
+    BlorgClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
+
+    LIST_ENTRY released;
+    InitializeListHead(&released);
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&ReadFair.Lock, &oldIrql);
+
+    PNON_PAGED_NODE node = ReadFairNode(Irp);
+
+    ReadFair.InFlightBytes -= IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
+    ReadFair.InFlightFetches--;
+    node->ReadFetchesInFlight--;
+
+    ReadFairAdmitHeld(&released);
+
+    KeReleaseSpinLock(&ReadFair.Lock, oldIrql);
+
+    ReadFairIssueHeld(&released);
+}
+
+//
+// Reserves up to Fetches more fetches beside an admitted read's own, as
+// far as READ_FAIR_MAX_FETCHES leaves room, and returns how many. A read
+// the disk cache serves in part fetches each run it lacks with a request
+// of its own (ReadFromDiskCache), and every request counts against the
+// limit. The read's bytes were already charged with its admission, so the
+// budget plays no part. Whatever is reserved goes back through
+// ReadFairGiveBack. <= DISPATCH_LEVEL.
+//
+static ULONG ReadFairReserve(ULONG Fetches)
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&ReadFair.Lock, &oldIrql);
+
+    const ULONG room = (ReadFair.InFlightFetches < READ_FAIR_MAX_FETCHES) ? READ_FAIR_MAX_FETCHES - ReadFair.InFlightFetches : 0;
+    const ULONG reserved = min(Fetches, room);
+
+    ReadFair.InFlightFetches += reserved;
+
+    KeReleaseSpinLock(&ReadFair.Lock, oldIrql);
+
+    return reserved;
+}
+
+static VOID ReadFairGiveBack(ULONG Fetches)
+{
+    if (0 == Fetches)
+    {
+        return;
+    }
+
+    LIST_ENTRY released;
+    InitializeListHead(&released);
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&ReadFair.Lock, &oldIrql);
+
+    ReadFair.InFlightFetches -= Fetches;
+
+    ReadFairAdmitHeld(&released);
+
+    KeReleaseSpinLock(&ReadFair.Lock, oldIrql);
+
+    ReadFairIssueHeld(&released);
 }
 
 //
@@ -1015,34 +1077,45 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
 }
 
 //
-//  Completion for a read the disk cache served (BlorgDiskCacheRead), at
-//  <= DISPATCH_LEVEL like ReadComplete. Valid is the trimmed length the
-//  read was offered with. One the cache could not finish is fetched
-//  instead: a fetch can only be built at PASSIVE_LEVEL, so it goes through
-//  ReadFairWorker, which trims and issues it as it would a held read.
+//  Completion for a read the disk cache served (BlorgDiskCacheRead), wholly
+//  or with the blocks it lacked fetched, at <= DISPATCH_LEVEL like
+//  ReadComplete. Valid is the trimmed length the read was offered with. One
+//  the cache could not finish is fetched whole instead, when Refetch says
+//  to: a fetch can only be built at PASSIVE_LEVEL, so it goes through
+//  ReadRefetchWorker, which trims and issues it as it would a held read. A
+//  fetch of the read's that failed fails it, as it would a read not served
+//  from the cache. A partly held read was admitted to the fair share
+//  before its fetches began (ReadFromDiskCache), and the Fetches it made
+//  beyond the first are given back here; the admission itself is settled
+//  here too, unless the read is fetched whole, which settles it as any
+//  fetch does.
 //
-static VOID ReadDiskComplete(PIRP Irp, NTSTATUS Status, ULONG Valid)
+static VOID ReadDiskComplete(PIRP Irp, NTSTATUS Status, ULONG Valid, ULONG Fetches, BOOLEAN Refetch)
 {
     const LONG64 arrivedQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[3]));
 
+    ReadFairGiveBack((Fetches > 1) ? Fetches - 1 : 0);
+
     if (NT_SUCCESS(Status))
     {
+        ReadFairSettle(Irp);
         Irp->IoStatus.Information = Valid;
         ReadSucceeded(Irp, arrivedQpc);
         return;
     }
 
-    PIO_WORKITEM workItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
+    PIO_WORKITEM workItem = Refetch ? IoAllocateWorkItem(global.FileSystemDeviceObject) : NULL;
 
     if (!workItem)
     {
+        ReadFairSettle(Irp);
         ReadRecordUserLatency(NULL, arrivedQpc);
         BlorgCompleteRequest(Irp, Status, IO_DISK_INCREMENT);
         return;
     }
 
     Irp->Tail.Overlay.DriverContext[2] = workItem;
-    IoQueueWorkItem(workItem, ReadFairWorker, DelayedWorkQueue, Irp);
+    IoQueueWorkItem(workItem, ReadRefetchWorker, DelayedWorkQueue, Irp);
 }
 
 //
@@ -1141,7 +1214,7 @@ static NTSTATUS ReadTrimToFileSize(LARGE_INTEGER FileSize, LARGE_INTEGER Startin
 //
 // Issues the direct fetch for a non-cached read whose IRP is already marked
 // pending, and does the issue-time accounting BlorgVolumeRead's header
-// describes. Shared by the inline path and by ReadFairWorker, so a held
+// describes. Shared by the inline path and by ReadIssueReleased, so a held
 // read is counted when it actually reaches the network rather than when it
 // arrived.
 //
@@ -1186,46 +1259,125 @@ static NTSTATUS ReadIssueFetch(PIRP Irp, PFCB Fcb, LONGLONG StartingByte, ULONG 
 }
 
 //
+// Offers an admitted read the disk cache holds part of to the cache, which
+// serves the blocks it holds and fetches the rest in Runs runs, as the
+// cache counted them, or in as many as the fetch limit has room for: the
+// first is the read's own admission, the others are reserved here, and
+// those it did not issue are given back once it has started. One that
+// fetched is counted as a read that left the cache, once, as a whole fetch
+// is (ReadIssueFetch). The read may complete before the cache returns, so
+// nothing of it is touched after. TRUE means the cache took the read.
+// PASSIVE_LEVEL, as BlorgDiskCacheRead is.
+//
+static BOOLEAN ReadFromDiskCache(PIRP Irp, PFCB Fcb, const DISK_CACHE_KEY* Key, ULONG64 Offset, ULONG Length, ULONG Valid, ULONG Runs)
+{
+    const ULONG reserved = ReadFairReserve(Runs - 1);
+    ULONG fetches = 1 + reserved;
+
+    const BOOLEAN started = BlorgDiskCacheRead(Irp, Key, &Fcb->FullPath, Offset, Length, Valid, &fetches, ReadDiskComplete);
+
+    if (started && (0 != fetches))
+    {
+        BLORGFS_STAT_INC(UserDiskReads);
+        BLORGFS_STAT_INC(NonCachedDiskReads);
+    }
+
+    ReadFairGiveBack(started ? reserved - ((fetches > 1) ? fetches - 1 : 0) : reserved);
+
+    return started;
+}
+
+//
+// Offers a read ReadFairAdmit held to the disk cache once it is admitted,
+// as BlorgVolumeRead would have had it not been held: whole, or in part
+// through ReadFromDiskCache. Its key is taken from Version, the snapshot
+// its length was trimmed by, as the read's own (BlorgDiskCacheNoteFile).
+// TRUE means the cache took the read. PASSIVE_LEVEL.
+//
+static BOOLEAN ReadFromDiskCacheReleased(PIRP Irp, PFCB Fcb, const READ_FILE_VERSION* Version, ULONG Valid)
+{
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    const ULONG64 offset = C_CAST(ULONG64, irpSp->Parameters.Read.ByteOffset.QuadPart);
+    DISK_CACHE_KEY key;
+    ULONG runs = 0;
+
+    BlorgDiskCacheNoteFile(Fcb->NonPaged, &Fcb->FullPath, C_CAST(ULONG64, Version->Size.QuadPart), Version->ModifiedTime, &key);
+
+    return BlorgDiskCacheRead(Irp, &key, &Fcb->FullPath, offset, irpSp->Parameters.Read.Length, Valid, &runs, ReadDiskComplete) ||
+        ((0 != runs) && ReadFromDiskCache(Irp, Fcb, &key, offset, irpSp->Parameters.Read.Length, Valid, runs));
+}
+
+//
 // Issues a read ReadFairAdmit held, at PASSIVE_LEVEL, once ReadFairSettle
 // has admitted it, or one the disk cache could not finish
-// (ReadDiskComplete), which was never admitted and settles nothing. The
-// length is trimmed again rather than carried, from a snapshot of its own:
-// a refresh may have moved a closed FCB to a new version while the read
-// waited, and the IRP has no free slot to carry the old one in.
+// (ReadDiskComplete). The length is trimmed again rather than carried, from
+// a snapshot of its own: a refresh may have moved a closed FCB to a new
+// version while the read waited, and the IRP has no free slot to carry the
+// old one in. A held read is offered to the disk cache first, as it would have
+// been had it not been held, so the blocks the cache holds of it are not
+// fetched again; one the cache could not finish is fetched whole. A read
+// the cache was to serve whole was never admitted, and is admitted now,
+// before it fetches, which may hold it in turn.
 //
 // Nothing else will complete this IRP: BlorgVolumeRead already returned
 // STATUS_PENDING for it. A failed issue settles its admission first, as
 // ReadComplete would have.
 //
-static VOID ReadFairWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+static VOID ReadIssueReleased(PIRP Irp, BOOLEAN FromDiskCache)
 {
-    UNREFERENCED_PARAMETER(DeviceObject);
-
-    PIRP irp = Context;
-
-    NT_ASSERT(NULL != irp);
-
-    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     PFCB fcb = irpSp->FileObject->FsContext;
 
-    IoFreeWorkItem(C_CAST(PIO_WORKITEM, irp->Tail.Overlay.DriverContext[2]));
+    IoFreeWorkItem(C_CAST(PIO_WORKITEM, Irp->Tail.Overlay.DriverContext[2]));
 
     ULONG realLength = 0;
     const READ_FILE_VERSION version = ReadSnapshotFile(fcb);
 
     NTSTATUS status = ReadTrimToFileSize(
-        version.Size, irpSp->Parameters.Read.ByteOffset, irpSp->Parameters.Read.Length, irp, &realLength);
+        version.Size, irpSp->Parameters.Read.ByteOffset, irpSp->Parameters.Read.Length, Irp, &realLength);
+
+    if (NT_SUCCESS(status) &&
+        !BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_FETCH_ADMITTED))
+    {
+        status = ReadFairAdmit(Irp, FALSE);
+
+        if (STATUS_PENDING == status)
+        {
+            return;
+        }
+    }
 
     if (NT_SUCCESS(status))
     {
-        status = ReadIssueFetch(irp, fcb, irpSp->Parameters.Read.ByteOffset.QuadPart, realLength);
+        if (FromDiskCache && ReadFromDiskCacheReleased(Irp, fcb, &version, realLength))
+        {
+            return;
+        }
+
+        status = ReadIssueFetch(Irp, fcb, irpSp->Parameters.Read.ByteOffset.QuadPart, realLength);
     }
 
     if (STATUS_PENDING != status)
     {
-        ReadFairSettle(irp);
-        BlorgCompleteRequest(irp, status, IO_DISK_INCREMENT);
+        ReadFairSettle(Irp);
+        BlorgCompleteRequest(Irp, status, IO_DISK_INCREMENT);
     }
+}
+
+static VOID ReadFairWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    NT_ASSERT(NULL != Context);
+
+    ReadIssueReleased(Context, TRUE);
+}
+
+static VOID ReadRefetchWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    NT_ASSERT(NULL != Context);
+
+    ReadIssueReleased(Context, FALSE);
 }
 
 //
@@ -1370,6 +1522,11 @@ static VOID ReadFairWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // raised then, by ReadIssueFetch, so a held read is not in flight until it
 // is. Every fetch is counted in flight from its admission to ReadComplete
 // or a failed issue.
+//
+// A read the disk cache holds whole never reaches the link, so it is
+// served before the fair share sees it. One it holds only part of still
+// fetches the rest, so it is admitted first, charged as a fetch of its
+// whole length; a held one is offered to the cache again when released.
 //
 NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
@@ -1537,7 +1694,9 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         IoMarkIrpPending(Irp);
 
-        if (BlorgDiskCacheRead(Irp, &cacheKey, C_CAST(ULONG64, startingByte.QuadPart), bytesLength, realLength, ReadDiskComplete))
+        ULONG runs = 0;
+
+        if (BlorgDiskCacheRead(Irp, &cacheKey, &fcb->FullPath, C_CAST(ULONG64, startingByte.QuadPart), bytesLength, realLength, &runs, ReadDiskComplete))
         {
             return STATUS_PENDING;
         }
@@ -1547,6 +1706,11 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         if (STATUS_SUCCESS != admitStatus)
         {
             return admitStatus;
+        }
+
+        if (0 != runs && ReadFromDiskCache(Irp, fcb, &cacheKey, C_CAST(ULONG64, startingByte.QuadPart), bytesLength, realLength, runs))
+        {
+            return STATUS_PENDING;
         }
 
         NTSTATUS fetchStatus = ReadIssueFetch(Irp, fcb, startingByte.QuadPart, realLength);
