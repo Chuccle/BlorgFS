@@ -109,6 +109,12 @@
     <ClCompile Include="PathCache.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="DiskCache.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DiskCacheIndex.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ChangeFeed.c">
       <Filter>Source Files\Networking</Filter>
     </ClCompile>
@@ -128,6 +134,9 @@
     </ClInclude>
     <ClInclude Include="Client.h">
       <Filter>Header Files\Networking</Filter>
+    </ClInclude>
+    <ClInclude Include="DiskCache.h">
+      <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Driver.h">
       <Filter>Header Files</Filter>

@@ -455,6 +455,15 @@ typedef struct _HTTP_CONTEXT
     BOOLEAN NoStore;
 
     //
+    // The version a file read's entity tag names (HttpParseFileVersion),
+    // decided in HttpParseHeaders like NoStore and copied onto the
+    // FILE_BUFFER at dispatch. HasVersion is FALSE for any other operation.
+    //
+    BOOLEAN HasVersion;
+    ULONG64 VersionSize;
+    ULONG64 VersionTime;
+
+    //
     // QPC stamp taken when the request is built, so HttpComplete can fold
     // metadata requests into their latency counters (Statistics.h). File
     // reads are timed at their own issue sites instead -- the direct-fetch
@@ -718,6 +727,124 @@ static BOOLEAN HttpForbidsStoring(const struct phr_header* Headers, SIZE_T Heade
     }
 
     return FALSE;
+}
+
+//
+// Parses Length hex digits at Text into Value. No digits, a non-digit, or
+// more than fit in 64 bits fail.
+//
+static BOOLEAN HttpParseHex64(const char* Text, SIZE_T Length, PULONG64 Value)
+{
+    if (0 == Length || Length > 16)
+    {
+        return FALSE;
+    }
+
+    ULONG64 value = 0;
+
+    for (SIZE_T i = 0; i < Length; ++i)
+    {
+        const CHAR c = Text[i];
+        ULONG digit;
+
+        if (c >= '0' && c <= '9')
+        {
+            digit = C_CAST(ULONG, c - '0');
+        }
+        else if (c >= 'a' && c <= 'f')
+        {
+            digit = C_CAST(ULONG, c - 'a') + 10;
+        }
+        else if (c >= 'A' && c <= 'F')
+        {
+            digit = C_CAST(ULONG, c - 'A') + 10;
+        }
+        else
+        {
+            return FALSE;
+        }
+
+        value = (value << 4) | digit;
+    }
+
+    *Value = value;
+
+    return TRUE;
+}
+
+//
+// Reads the version a file response's entity tag names. The server spells
+// it "<seconds>.<nanoseconds>-<size>" in hex, the modification time as
+// seconds and nanoseconds since 1970, the way tower-http's file service
+// spells its own, for resident and streamed files alike. The time comes
+// back in the 100-ns ticks since 1601 that a listing reports, truncated
+// as the server truncates it there, so the two compare directly. FALSE
+// for no tag, more than one, a weak one, or any other spelling: a version
+// that cannot be read is one nothing may be kept under.
+//
+static BOOLEAN HttpParseFileVersion(const struct phr_header* Headers, SIZE_T HeaderCount, PULONG64 Size, PULONG64 ModifiedTime)
+{
+    static const char etagName[] = "etag";
+    const ULONG64 ticksPerSecond = 10000000;
+    const ULONG64 epochTicks = 116444736000000000ull;
+
+    const struct phr_header* tag = NULL;
+
+    for (SIZE_T i = 0; i < HeaderCount; ++i)
+    {
+        if (HttpTokenEquals(Headers[i].name, Headers[i].name_len, etagName, sizeof(etagName) - 1))
+        {
+            if (tag)
+            {
+                return FALSE;
+            }
+
+            tag = &Headers[i];
+        }
+    }
+
+    if (!tag || tag->value_len < 2 || '"' != tag->value[0] || '"' != tag->value[tag->value_len - 1])
+    {
+        return FALSE;
+    }
+
+    const char* text = tag->value + 1;
+    const SIZE_T length = tag->value_len - 2;
+    SIZE_T dot = 0;
+
+    while (dot < length && '.' != text[dot])
+    {
+        dot++;
+    }
+
+    SIZE_T dash = dot;
+
+    while (dash < length && '-' != text[dash])
+    {
+        dash++;
+    }
+
+    ULONG64 seconds;
+    ULONG64 nanoseconds;
+    ULONG64 size;
+
+    if (dash >= length ||
+        !HttpParseHex64(text, dot, &seconds) ||
+        !HttpParseHex64(text + dot + 1, dash - dot - 1, &nanoseconds) ||
+        !HttpParseHex64(text + dash + 1, length - dash - 1, &size))
+    {
+        return FALSE;
+    }
+
+    if (nanoseconds >= 1000000000 || seconds > (MAXULONG64 - epochTicks) / ticksPerSecond - 1)
+    {
+        return FALSE;
+    }
+
+    *Size = size;
+    *ModifiedTime = (seconds * ticksPerSecond) + (nanoseconds / 100) + epochTicks;
+
+    return TRUE;
 }
 
 #define HEX_TO_CHAR(x) ((x) < 10 ? '0' + (x) : 'A' + (x) - 10)
@@ -2849,6 +2976,8 @@ static NTSTATUS HttpParseHeaders(HTTP_CONTEXT* Ctx)
     Ctx->BodyEndOffset = bodyEndOffset;
     Ctx->NoStore = (HttpOpDirInfo == Ctx->Operation || HttpOpFileInfo == Ctx->Operation) &&
         HttpForbidsStoring(Ctx->Headers, Ctx->HeaderCount);
+    Ctx->HasVersion = (HttpOpFileRead == Ctx->Operation) &&
+        HttpParseFileVersion(Ctx->Headers, Ctx->HeaderCount, &Ctx->VersionSize, &Ctx->VersionTime);
 
     return STATUS_SUCCESS;
 }
@@ -2906,7 +3035,10 @@ static VOID HttpDispatchInline(HTTP_CONTEXT* Ctx)
         {
             .BodyBuffer = Ctx->TargetMdl ? NULL : Ctx->Buffer + Ctx->BodyOffset,
             .BodyBufferSize = Ctx->ContentLength,
-            .BaseAddress = Ctx->TargetMdl ? NULL : Ctx->Buffer
+            .BaseAddress = Ctx->TargetMdl ? NULL : Ctx->Buffer,
+            .VersionSize = Ctx->VersionSize,
+            .VersionTime = Ctx->VersionTime,
+            .HasVersion = Ctx->HasVersion
         };
 
         Ctx->Completion.FileRead.Routine(STATUS_SUCCESS, &fileBuffer, Ctx->CallerContext);
@@ -3644,7 +3776,8 @@ NTSTATUS BlorgHttpGetChanges(
 // already excluded by the 0 == Length check above, but kept explicit
 // rather than relying on that exclusion alone. Zero-copy requests never
 // put body bytes in Buffer, so headers-only sizing suffices; buffer mode
-// sizes for a full read-ahead chunk so the body fits without a regrow. On
+// sizes for the headers and the whole body, and at least a read-ahead
+// chunk, so the body lands without a regrow. On
 // a HttpBuildRequest failure, see BlorgHttpGetDirectoryInfo for the
 // HttpFreeContext/FinalStatus cleanup rationale.
 //
@@ -3669,10 +3802,19 @@ static NTSTATUS HttpGetFileCommon(
         return STATUS_INVALID_PARAMETER;
     }
 
-    HTTP_CONTEXT* ctx = HttpAllocateContext(
-        HttpOpFileRead,
-        206,
-        TargetMdl ? HTTP_MDL_INITIAL_RECV_CAPACITY : HTTP_FILE_INITIAL_RECV_CAPACITY);
+    SIZE_T capacity = HTTP_MDL_INITIAL_RECV_CAPACITY;
+
+    if (!TargetMdl && !HttpCheckedAddSizeT(Length, HTTP_MDL_INITIAL_RECV_CAPACITY, &capacity))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!TargetMdl && (capacity < HTTP_FILE_INITIAL_RECV_CAPACITY))
+    {
+        capacity = HTTP_FILE_INITIAL_RECV_CAPACITY;
+    }
+
+    HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpFileRead, 206, capacity);
 
     if (!ctx)
     {

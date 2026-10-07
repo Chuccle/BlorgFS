@@ -930,6 +930,9 @@ PIO_WORKITEM IoAllocateWorkItem(PDEVICE_OBJECT DeviceObject);
 VOID IoFreeWorkItem(PIO_WORKITEM IoWorkItem);
 VOID IoQueueWorkItem(PIO_WORKITEM IoWorkItem, PIO_WORKITEM_ROUTINE Routine, WORK_QUEUE_TYPE QueueType, PVOID Context);
 
+// Fails the next IoAllocateWorkItem, wherever it comes from.
+VOID ShimFailNextWorkItem(VOID);
+
 // Runs every queued work item, including any they queue in turn.
 ULONG ShimDrainWorkItems(VOID);
 ULONG ShimPendingWorkItems(VOID);

@@ -999,4 +999,144 @@ TEST_F(ReadFairTest, AFileWhoseLastFetchSettlesGetsItsHeldReadPastTheBudget)
     EXPECT_EQ(STATUS_SUCCESS, fault->Irp.IoStatus.Status);
 }
 
+//
+// Nothing else bounds demand, so the fetch limit has to. A mapped read
+// faulting a page at a time issued 10,100 fetches at once in the guest,
+// one connection each, and the connects that overran the server's accept
+// queue timed out and failed the reads. Past READ_FAIR_MAX_FETCHES a fault
+// must not reach the network until a fetch settles, and must then be
+// issued and land like any other.
+//
+TEST_F(ReadFairTest, DemandPastTheFetchLimitWaitsForAFetchToSettle)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    std::vector<ReadRequest*> faults;
+
+    for (ULONG i = 0; i <= READ_FAIR_MAX_FETCHES; i++)
+    {
+        ReadRequest* fault = PrepareRead(Fcb, i * 4ull, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, NewBuffer(4));
+        ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &fault->Irp));
+        faults.push_back(fault);
+    }
+
+    EXPECT_EQ(C_CAST(ULONG, READ_FAIR_MAX_FETCHES), SandboxSocketsCreated())
+        << "a fault past the fetch limit went to the network";
+    EXPECT_EQ(0ull, Held())
+        << "a fault waiting for the fetch limit was counted as held read-ahead";
+
+    Settle();
+
+    for (ReadRequest* fault : faults)
+    {
+        EXPECT_EQ(1, fault->Irp.CompletionCount);
+        EXPECT_EQ(STATUS_SUCCESS, fault->Irp.IoStatus.Status);
+        EXPECT_EQ(4u, fault->Irp.IoStatus.Information);
+    }
+}
+
+//
+// A fault past the fetch limit is released from a work item, so one that
+// cannot have a work item cannot wait. It fails, with nothing sent, rather
+// than going out past the limit. Admission used to allocate the work item
+// only when an unlocked look at the link said a wait was coming, and went
+// ahead without one whenever the locked look disagreed.
+//
+TEST_F(ReadFairTest, DemandPastTheFetchLimitWithoutAWorkItemFailsRatherThanGoingOut)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    std::vector<ReadRequest*> faults;
+
+    for (ULONG i = 0; i < READ_FAIR_MAX_FETCHES; i++)
+    {
+        ReadRequest* fault = PrepareRead(Fcb, i * 4ull, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, NewBuffer(4));
+        ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &fault->Irp));
+        faults.push_back(fault);
+    }
+
+    ShimFailNextWorkItem();
+
+    ReadRequest* over = PrepareRead(Fcb, READ_FAIR_MAX_FETCHES * 4ull, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, NewBuffer(4));
+
+    EXPECT_EQ(STATUS_INSUFFICIENT_RESOURCES, BlorgRead(Volume, &over->Irp));
+    EXPECT_EQ(1, over->Irp.CompletionCount);
+    EXPECT_EQ(C_CAST(ULONG, READ_FAIR_MAX_FETCHES), SandboxSocketsCreated())
+        << "a fault with nothing to wait on went to the network past the fetch limit";
+
+    Settle();
+
+    for (ReadRequest* fault : faults)
+    {
+        EXPECT_EQ(1, fault->Irp.CompletionCount);
+        EXPECT_EQ(STATUS_SUCCESS, fault->Irp.IoStatus.Status);
+    }
+}
+
+//
+// A fault has an application blocked on it and read-ahead does not, so
+// when a slot frees, a waiting fault takes it ahead of read-ahead that
+// was held first. Every fetch but one stalls, so exactly one slot frees
+// on the first drain; the read-ahead's file has nothing in flight, so the
+// budget alone would never have held it.
+//
+TEST_F(ReadFairTest, WaitingDemandGoesAheadOfHeldReadAhead)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    static const SANDBOX_STEP stalled[] =
+    {
+        { SandboxStepStall, nullptr, 0, STATUS_SUCCESS, FALSE },
+        DELIVER_LATER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(stalled, RTL_NUMBER_OF(stalled));
+
+    for (ULONG i = 0; i + 1 < READ_FAIR_MAX_FETCHES; i++)
+    {
+        ReadRequest* fault = PrepareRead(Fcb, i * 4ull, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, NewBuffer(4));
+        ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &fault->Irp));
+    }
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    ReadRequest* last = PrepareRead(Fcb, 0, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, NewBuffer(4));
+    ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &last->Irp));
+
+    ReadRequest* readAhead = ReadAhead(CopyFcb, NewBuffer(4));
+
+    unsigned char* waitingBuffer = NewBuffer(4);
+    ReadRequest* waiting = PrepareRead(Fcb, 4, 4, IRP_PAGING_IO | IRP_NOCACHE, 0, waitingBuffer);
+    ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &waiting->Irp));
+
+    ASSERT_EQ(C_CAST(ULONG, READ_FAIR_MAX_FETCHES), SandboxSocketsCreated());
+
+    SandboxDrainCompletions();
+    ASSERT_EQ(1, last->Irp.CompletionCount);
+    ShimDrainWorkItems();
+    SandboxDrainCompletions();
+
+    EXPECT_EQ(1, waiting->Irp.CompletionCount)
+        << "the slot a settled fetch freed did not go to the waiting fault";
+    EXPECT_EQ(STATUS_SUCCESS, waiting->Irp.IoStatus.Status);
+    EXPECT_EQ(0, memcmp(waitingBuffer, "WXYZ", 4));
+    EXPECT_EQ(0, readAhead->Irp.CompletionCount)
+        << "read-ahead took the freed slot ahead of a fault an application is blocked on";
+
+    SandboxResumeStalled();
+    Settle();
+
+    EXPECT_EQ(1, readAhead->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, readAhead->Irp.IoStatus.Status);
+}
+
 } // namespace
