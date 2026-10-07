@@ -115,19 +115,24 @@ Write-Host "workload: $($cur['Workload'])" -ForegroundColor Cyan
 # ---------------------------------------------------------------- invariants
 
 #
-# Every inline paging read issues exactly one direct fetch now that the
-# prefetch ring is gone, so ReadsPagingInline can never exceed FetchesIssued.
-# The reverse is allowed: posted non-paging reads issue fetches too.
+# Every inline paging read either issues at least one direct fetch or is
+# served wholly from the disk cache (a read served partly from it fetches
+# the blocks it lacks), so ReadsPagingInline can never exceed FetchesIssued
+# plus DiskCacheHits. The reverse is allowed: posted non-paging reads issue
+# fetches too. A report from before the disk cache has no DiskCacheHits,
+# which counts as zero.
 #
 $paging = Get-Num $cur 'ReadsPagingInline'
 $issuedForPaging = Get-Num $cur 'FetchesIssued'
+$diskHits = Get-Num $cur 'DiskCacheHits'
+if ($null -eq $diskHits) { $diskHits = 0 }
 
 if ($null -ne $paging -and $null -ne $issuedForPaging) {
-    if ($paging -gt $issuedForPaging) {
-        $failures.Add("INVARIANT ReadsPagingInline $paging exceeds FetchesIssued $issuedForPaging (a paging read fetched nothing)")
+    if ($paging -gt $issuedForPaging + $diskHits) {
+        $failures.Add("INVARIANT ReadsPagingInline $paging exceeds FetchesIssued $issuedForPaging plus DiskCacheHits $diskHits (a paging read was neither fetched nor served)")
     }
     else {
-        $notes.Add("invariant ok: every inline paging read has a fetch ($paging <= $issuedForPaging)")
+        $notes.Add("invariant ok: every inline paging read was fetched or served ($paging <= $issuedForPaging + $diskHits)")
     }
 }
 

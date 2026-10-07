@@ -978,7 +978,7 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
 
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
 
-    BlorgDiskCacheAdmit(
+    (VOID)BlorgDiskCacheAdmit(
         ReadFairNode(irp),
         FileBuffer,
         C_CAST(ULONG64, irpSp->Parameters.Read.ByteOffset.QuadPart),
@@ -990,27 +990,34 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
 }
 
 //
-//  Completion for a read the disk cache served (BlorgDiskCacheRead), at
-//  <= DISPATCH_LEVEL like ReadComplete. Valid is the trimmed length the
-//  read was offered with. One the cache could not finish is fetched
-//  instead: a fetch can only be built at PASSIVE_LEVEL, so it goes through
-//  ReadFairWorker, which trims and issues it as it would a held read.
+//  Completion for a read the disk cache served (BlorgDiskCacheRead), wholly
+//  or with the blocks it lacked fetched, at <= DISPATCH_LEVEL like
+//  ReadComplete. Valid is the trimmed length the read was offered with. One
+//  the cache could not finish is fetched whole instead, when Refetch says
+//  to: a fetch can only be built at PASSIVE_LEVEL, so it goes through
+//  ReadFairWorker, which trims and issues it as it would a held read. A
+//  fetch of the read's that failed fails it, as it would a read not served
+//  from the cache. A partly held read was admitted to the fair share
+//  before its fetches began (BlorgVolumeRead) and is settled here, unless
+//  it is fetched whole, which settles it as any fetch does.
 //
-static VOID ReadDiskComplete(PIRP Irp, NTSTATUS Status, ULONG Valid)
+static VOID ReadDiskComplete(PIRP Irp, NTSTATUS Status, ULONG Valid, BOOLEAN Refetch)
 {
     const LONG64 arrivedQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[3]));
 
     if (NT_SUCCESS(Status))
     {
+        ReadFairSettle(Irp);
         Irp->IoStatus.Information = Valid;
         ReadSucceeded(Irp, arrivedQpc);
         return;
     }
 
-    PIO_WORKITEM workItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
+    PIO_WORKITEM workItem = Refetch ? IoAllocateWorkItem(global.FileSystemDeviceObject) : NULL;
 
     if (!workItem)
     {
+        ReadFairSettle(Irp);
         ReadRecordUserLatency(NULL, arrivedQpc);
         BlorgCompleteRequest(Irp, Status, IO_DISK_INCREMENT);
         return;
@@ -1476,12 +1483,24 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         IoMarkIrpPending(Irp);
 
-        if (BlorgDiskCacheRead(Irp, fcb->NonPaged, C_CAST(ULONG64, startingByte.QuadPart), bytesLength, realLength, ReadDiskComplete))
+        //
+        // A read the disk cache holds whole never reaches the link, so it
+        // is served before the fair share sees it. One it holds only part
+        // of still fetches the rest, so it is admitted first, charged as a
+        // fetch of its whole length, and a held one is fetched whole when
+        // released.
+        //
+        if (BlorgDiskCacheRead(Irp, fcb->NonPaged, &fcb->FullPath, C_CAST(ULONG64, startingByte.QuadPart), bytesLength, realLength, FALSE, ReadDiskComplete))
         {
             return STATUS_PENDING;
         }
 
         if (ReadFairAdmit(Irp, speculative))
+        {
+            return STATUS_PENDING;
+        }
+
+        if (BlorgDiskCacheRead(Irp, fcb->NonPaged, &fcb->FullPath, C_CAST(ULONG64, startingByte.QuadPart), bytesLength, realLength, TRUE, ReadDiskComplete))
         {
             return STATUS_PENDING;
         }

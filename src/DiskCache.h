@@ -36,6 +36,25 @@
 #define DISK_CACHE_GHOST_WAYS 4
 
 //
+// Slots the clock looks at for one victim, under the index spin lock at up
+// to DISPATCH_LEVEL. Unbounded, a sweep after a pass that served every
+// block walked a whole turn of the hand clearing marks: 262,144 slots at
+// 16 GB, with every fetch completion waiting on the lock. Past this the
+// first unpinned slot it passed is taken, marked or not.
+//
+#define DISK_CACHE_CLOCK_REACH 256
+
+//
+// Fetches one read served partly from the cache may issue for the blocks
+// it does not hold. The clock leaves what it keeps scattered through a
+// file larger than the cache, so a read can find several holes; past this
+// many, the runs closest together are fetched as one, held blocks between
+// them included. Simulated, four keeps nearly all of what an unbounded
+// split serves.
+//
+#define DISK_CACHE_MAX_READ_FETCHES 4
+
+//
 // Where the cache file lives unless the DiskCachePath registry value says
 // otherwise. ProgramData is on the system volume and always exists; the
 // BlorgFS directory under it is created with the file.
@@ -116,7 +135,7 @@ typedef enum _DISK_CACHE_ADMIT
     DiskCacheReserved,    // A slot is reserved for the block: write it, then commit
     DiskCacheHeld,        // Already held or being filled; nothing to write
     DiskCacheFirstMiss,   // Not admitted until it is missed again
-    DiskCacheNoVictim     // Every slot is pinned
+    DiskCacheNoVictim     // Every slot in the clock's reach is pinned
 } DISK_CACHE_ADMIT;
 
 //
@@ -128,13 +147,26 @@ NTSTATUS BlorgDiskCacheIndexInitialize(PDISK_CACHE_INDEX Index, ULONG SlotCount)
 VOID BlorgDiskCacheIndexCleanup(PDISK_CACHE_INDEX Index);
 
 //
-// Pins every block Key names from Key->Block to LastBlock, in order, into
-// Slots, but only if every one of them is held: TRUE with all pinned, or
-// FALSE with none. A pinned slot is not reused until unpinned, so its bytes
-// stay Key's while a read is in flight against them. <= DISPATCH_LEVEL.
+// Pins every block Key names from Key->Block to LastBlock that is held,
+// writing its slot into Slots in order and DISK_CACHE_NO_SLOT for each one
+// that is not, and returns how many it pinned. A pinned slot is not reused
+// until unpinned, so its bytes stay Key's while a read is in flight against
+// them. Unpin with Served marks the slot as used since the clock last passed
+// it; a block pinned but then fetched instead is unpinned unserved.
+// <= DISPATCH_LEVEL.
 //
-BOOLEAN BlorgDiskCacheIndexPinRange(PDISK_CACHE_INDEX Index, const DISK_CACHE_KEY* Key, ULONG64 LastBlock, PULONG Slots);
-VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, ULONG Slot);
+ULONG BlorgDiskCacheIndexPinHeld(PDISK_CACHE_INDEX Index, const DISK_CACHE_KEY* Key, ULONG64 LastBlock, PULONG Slots);
+VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, ULONG Slot, BOOLEAN Served);
+
+//
+// Decides which blocks of a read pinned by PinHeld are fetched rather than
+// served: every run of DISK_CACHE_NO_SLOT in Slots[0..Count), and, while
+// there are more than DISK_CACHE_MAX_READ_FETCHES runs, the held blocks of
+// the shortest gap between two of them, which joins them into one. Blocks
+// given up are unpinned and become DISK_CACHE_NO_SLOT. Held is how many
+// PinHeld pinned; returns how many are left to serve. <= DISPATCH_LEVEL.
+//
+ULONG BlorgDiskCacheIndexPlanRead(PDISK_CACHE_INDEX Index, PULONG Slots, ULONG Count, ULONG Held);
 
 //
 // Reserves a slot to fill with Key's block, pinned, unless the block is
@@ -164,18 +196,26 @@ VOID BlorgDiskCacheNoteFile(PNON_PAGED_NODE Node, const UNICODE_STRING* Path, UL
 
 //
 // Serves a non-cached read of Length bytes at Offset into Irp->MdlAddress
-// from the cache, if every block it covers is held for Node's version.
-// TRUE means the read is under way and Completion will be called once with
-// the IRP, its outcome and the Valid it was given, at <= DISPATCH_LEVEL;
-// FALSE means nothing was started and the caller fetches as usual. Offset
-// and Length must be page multiples; Valid is how much of the read lies
-// before end of file. PASSIVE_LEVEL: BlorgVolumeRead issues a paging read
-// inline only at PASSIVE_LEVEL and posts any other to the FSP.
+// from the cache, as far as the blocks it covers are held for Node's
+// version: held blocks are read from the cache file, and the runs between
+// them -- at most DISK_CACHE_MAX_READ_FETCHES, the closest merged -- are
+// fetched from Path on the server into the same buffer and offered to the
+// cache as any fetch is. TRUE means the read is under way and Completion
+// will be called once with the IRP, its outcome and the Valid it was
+// given, at <= DISPATCH_LEVEL, and with Refetch set when the caller is to
+// fetch the read whole instead: the cache file failed, or a fetched run
+// was of another version than the held blocks. FALSE means no block was
+// held, nothing was started, and the caller fetches as usual. Without
+// MayFetch only a read whose every block is held is served, so a caller
+// can charge what the rest would fetch to the link before it starts.
+// Offset and Length must be page multiples; Valid is how much of the read
+// lies before end of file. PASSIVE_LEVEL: BlorgVolumeRead issues a paging
+// read inline only at PASSIVE_LEVEL and posts any other to the FSP.
 //
-typedef VOID DISK_CACHE_READ_COMPLETION(PIRP Irp, NTSTATUS Status, ULONG Valid);
+typedef VOID DISK_CACHE_READ_COMPLETION(PIRP Irp, NTSTATUS Status, ULONG Valid, BOOLEAN Refetch);
 typedef DISK_CACHE_READ_COMPLETION* PDISK_CACHE_READ_COMPLETION;
 
-BOOLEAN BlorgDiskCacheRead(PIRP Irp, PNON_PAGED_NODE Node, ULONG64 Offset, ULONG Length, ULONG Valid, PDISK_CACHE_READ_COMPLETION Completion);
+BOOLEAN BlorgDiskCacheRead(PIRP Irp, PNON_PAGED_NODE Node, const UNICODE_STRING* Path, ULONG64 Offset, ULONG Length, ULONG Valid, BOOLEAN MayFetch, PDISK_CACHE_READ_COMPLETION Completion);
 
 //
 // Whether the cache is taking fills. A fetch made while it is lands in a
@@ -194,6 +234,7 @@ BOOLEAN BlorgDiskCacheLive(VOID);
 // block of the file, if the fetch reached end of file -- is copied and
 // queued to be written, if admitted. Nothing is kept unless that version
 // is the one Node's reads are for, nor from a fetch received straight into
-// the reader's pages. <= DISPATCH_LEVEL, from a fetch completion.
+// the reader's pages. FALSE means the fetch was of another version than
+// that. <= DISPATCH_LEVEL, from a fetch completion.
 //
-VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length);
+BOOLEAN BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length);
