@@ -1806,13 +1806,26 @@ RAM.
   written from a work item. Copies waiting for their write are capped at
   32 MB; past it, blocks are dropped rather than queued.
 - **Reads.** The non-cached path in `BlorgVolumeRead` asks
-  `BlorgDiskCacheRead` first. A page-aligned read of at most 64 blocks
-  whose every block is held is pinned and served by the driver's own
-  non-cached IRPs to the cache file's device, one per run of consecutive
-  slots, each into a partial MDL of the read's own buffer, completed by a
-  completion routine. Nothing waits on the calling thread, which may be a
-  paging read with APCs disabled. Anything else is fetched as before. A
-  read the cache fails part-way is fetched through `ReadFairWorker`.
+  `BlorgDiskCacheRead` first. A page-aligned read of at most 64 blocks has
+  its held blocks pinned and served by the driver's own non-cached IRPs to
+  the cache file's device, one per run of consecutive slots, each into a
+  partial MDL of the read's own buffer, completed by a completion routine.
+  The blocks it lacks are fetched, one ranged GET per run, into the
+  client's buffer like any fetch while the cache is live, admitted, and
+  copied into the read's pages; past
+  `DISK_CACHE_MAX_READ_FETCHES` (4) runs, the closest are joined
+  (`BlorgDiskCacheIndexPlanRead`). Serving only reads whose every block
+  was held served almost nothing once a file outgrew the cache, because
+  the clock leaves what it keeps scattered: simulated, a file 1.5x the
+  cache re-read had 0% of reads served against 40% of blocks held. A read
+  held whole is served before the fair share sees it, since it never
+  reaches the link; one held only in part is admitted first, charged as a
+  fetch of its whole length, and fetched whole if the fair share held it.
+  Nothing waits on the calling thread, which may be a paging read with
+  APCs disabled. A read with no block held is fetched as before. One whose
+  cache file read fails, or whose fetched run is of another version than
+  its held blocks, is fetched whole through `ReadFairWorker`; one whose
+  fetch fails fails, as a read the cache had no part in would.
 - **Versions.** Blocks are keyed by two hashes of the path plus the size
   and last-write time the FCB names, and a fill is kept only if the
   response's entity tag names that same version (`HttpParseFileVersion`;
@@ -1825,10 +1838,15 @@ RAM.
   only, through a four-way ghost table of tags (a direct-mapped one lost
   about a fifth of a re-read file to blocks evicting each other's tag).
   Replacement is a CLOCK over the slots, with a per-slot pin count so a
-  slot is never reused while a read or write is in flight on it. CLOCK
-  and second-miss admission cover what segmented LRU would: a scan read
-  once never gets in, and a block served since the hand last passed
-  survives a turn.
+  slot is never reused while a read or write is in flight on it. The hand
+  looks at `DISK_CACHE_CLOCK_REACH` (256) slots at most per victim, then
+  takes the first unpinned slot it passed: unbounded, the sweep after a
+  pass that served every block walked the whole cache (262,144 slots at
+  16 GB) under the index spin lock. A block is marked for the clock only
+  when a read it was pinned for succeeds. CLOCK and second-miss admission
+  cover what segmented LRU would: a scan read once never gets in, and a
+  block served since the hand last passed survives a turn, unless every
+  slot within the hand's reach is marked too.
 
 ### Why it is safe
 
@@ -1878,8 +1896,10 @@ RAM.
 - Blocks for reads Cc serves from its own cache never reach the store;
   only non-cached reads (Cc's own paging reads included) fill it.
 
-Counters: `PerfHarness stats` prints `DiskCacheHits`, `HitBytes`,
-`ReadFailures`, `FirstMisses`, `Fills`, `FillFailures`, `Dropped` and
+Counters: `PerfHarness stats` prints `DiskCacheHits` (served wholly),
+`PartialHits` (served partly, the rest fetched), `HitBytes` (read from the
+cache file by both), `ReadFailures` (the cache file's, not the server's),
+`FirstMisses`, `Fills`, `FillFailures`, `Dropped` and
 `Stale` (a fetch whose tag named another version than the FCB).
 
 Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),

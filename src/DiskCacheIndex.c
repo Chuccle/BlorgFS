@@ -2,8 +2,9 @@
 
 //
 // The disk cache's index: which slot of the cache file holds which block,
-// and which slot to give up for the next one. No I/O; DiskCache.c does
-// that, and the sandbox drives this directly.
+// which slot to give up for the next one, and which blocks of a partly held
+// read to fetch rather than serve. No I/O; DiskCache.c does that, and the
+// sandbox drives this directly.
 //
 // A slot is found by hashing its key into a chain. Every state change
 // happens under the one spin lock, held for a chain walk or a short clock
@@ -16,14 +17,17 @@
 // to read from or write to the cache file without holding the lock: the
 // bytes behind a pinned slot are its key's until the pin is dropped. A
 // newly filled slot starts unmarked, so a block read once more after it was
-// written survives a pass and one never read again does not.
+// written survives a pass and one never read again does not. The hand looks
+// at DISK_CACHE_CLOCK_REACH slots at most for one victim, so the time the
+// lock is held does not grow with the cache; when every slot in that reach
+// was marked, it takes the first unpinned one, marked or not.
 //
 // Admission waits for a block's second miss. The first only records the
 // block's tag in a small set-associative ghost table, newest first, oldest
 // falling out; the block is written when it is fetched again while its tag
-// is still there. A file read once, which is
-// most of what a copy or a scan touches, then costs the disk nothing, and
-// it cannot push out what is read repeatedly.
+// is still there. A file read once, which is most of what a copy or a scan
+// touches, then costs the disk nothing, and it cannot push out what is read
+// repeatedly.
 //
 
 #define DISK_CACHE_INDEX_TAG 'iDPB'
@@ -81,13 +85,17 @@ static VOID DiskCacheIndexUnlink(PDISK_CACHE_INDEX Index, ULONG Slot)
 
 //
 // The next slot the clock gives up: the first unpinned slot that is free
-// or was not served since the hand last passed it. Two turns of the hand
-// clear every mark, so failing after that means every slot is pinned.
-// Under Lock.
+// or was not served since the hand last passed it, within
+// DISK_CACHE_CLOCK_REACH slots of the hand, or else the first unpinned slot
+// the hand passed on the way, its mark already cleared. Fails only when
+// every slot in reach is pinned. Under Lock.
 //
 static ULONG DiskCacheIndexVictim(PDISK_CACHE_INDEX Index)
 {
-    for (ULONG64 looked = 0; looked < 2ull * Index->SlotCount; ++looked)
+    ULONG fallback = DISK_CACHE_NO_SLOT;
+    const ULONG reach = min(Index->SlotCount, DISK_CACHE_CLOCK_REACH);
+
+    for (ULONG looked = 0; looked < reach; ++looked)
     {
         const ULONG slot = Index->Hand;
         PDISK_CACHE_SLOT entry = &Index->Slots[slot];
@@ -102,13 +110,14 @@ static ULONG DiskCacheIndexVictim(PDISK_CACHE_INDEX Index)
         if (DiskCacheSlotFree != entry->State && entry->Referenced)
         {
             entry->Referenced = FALSE;
+            fallback = (DISK_CACHE_NO_SLOT == fallback) ? slot : fallback;
             continue;
         }
 
         return slot;
     }
 
-    return DISK_CACHE_NO_SLOT;
+    return fallback;
 }
 
 NTSTATUS BlorgDiskCacheIndexInitialize(PDISK_CACHE_INDEX Index, ULONG SlotCount)
@@ -180,47 +189,35 @@ VOID BlorgDiskCacheIndexCleanup(PDISK_CACHE_INDEX Index)
     Index->SlotCount = 0;
 }
 
-BOOLEAN BlorgDiskCacheIndexPinRange(PDISK_CACHE_INDEX Index, const DISK_CACHE_KEY* Key, ULONG64 LastBlock, PULONG Slots)
+ULONG BlorgDiskCacheIndexPinHeld(PDISK_CACHE_INDEX Index, const DISK_CACHE_KEY* Key, ULONG64 LastBlock, PULONG Slots)
 {
     DISK_CACHE_KEY key = *Key;
     ULONG pinned = 0;
-    BOOLEAN held = TRUE;
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&Index->Lock, &oldIrql);
 
-    for (; key.Block <= LastBlock; ++key.Block)
+    for (ULONG i = 0; key.Block <= LastBlock; ++key.Block, ++i)
     {
         const ULONG slot = DiskCacheIndexFind(Index, &key, DiskCacheIndexMix(&key));
 
         if (DISK_CACHE_NO_SLOT == slot || DiskCacheSlotValid != Index->Slots[slot].State)
         {
-            held = FALSE;
-            break;
+            Slots[i] = DISK_CACHE_NO_SLOT;
+            continue;
         }
 
         Index->Slots[slot].Pins++;
-        Slots[pinned++] = slot;
-    }
-
-    for (ULONG i = 0; i < pinned; ++i)
-    {
-        if (held)
-        {
-            Index->Slots[Slots[i]].Referenced = TRUE;
-        }
-        else
-        {
-            Index->Slots[Slots[i]].Pins--;
-        }
+        Slots[i] = slot;
+        pinned++;
     }
 
     KeReleaseSpinLock(&Index->Lock, oldIrql);
 
-    return held;
+    return pinned;
 }
 
-VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, ULONG Slot)
+VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, ULONG Slot, BOOLEAN Served)
 {
     KIRQL oldIrql;
     KeAcquireSpinLock(&Index->Lock, &oldIrql);
@@ -228,7 +225,60 @@ VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, ULONG Slot)
     NT_ASSERT(0 < Index->Slots[Slot].Pins);
     Index->Slots[Slot].Pins--;
 
+    if (Served)
+    {
+        Index->Slots[Slot].Referenced = TRUE;
+    }
+
     KeReleaseSpinLock(&Index->Lock, oldIrql);
+}
+
+ULONG BlorgDiskCacheIndexPlanRead(PDISK_CACHE_INDEX Index, PULONG Slots, ULONG Count, ULONG Held)
+{
+    for (;;)
+    {
+        ULONG runs = 0;
+        ULONG gapStart = 0;
+        ULONG gapLength = MAXULONG;
+
+        for (ULONG i = 0; i < Count; ++i)
+        {
+            if (DISK_CACHE_NO_SLOT != Slots[i] || (0 != i && DISK_CACHE_NO_SLOT == Slots[i - 1]))
+            {
+                continue;
+            }
+
+            if (0 != runs)
+            {
+                ULONG start = i;
+
+                while (0 < start && DISK_CACHE_NO_SLOT != Slots[start - 1])
+                {
+                    start--;
+                }
+
+                if (i - start < gapLength)
+                {
+                    gapStart = start;
+                    gapLength = i - start;
+                }
+            }
+
+            runs++;
+        }
+
+        if (runs <= DISK_CACHE_MAX_READ_FETCHES)
+        {
+            return Held;
+        }
+
+        for (ULONG i = gapStart; i < gapStart + gapLength; ++i)
+        {
+            BlorgDiskCacheIndexUnpin(Index, Slots[i], FALSE);
+            Slots[i] = DISK_CACHE_NO_SLOT;
+            Held--;
+        }
+    }
 }
 
 DISK_CACHE_ADMIT BlorgDiskCacheIndexReserve(PDISK_CACHE_INDEX Index, const DISK_CACHE_KEY* Key, PULONG Slot)
