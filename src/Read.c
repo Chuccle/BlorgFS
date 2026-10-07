@@ -190,6 +190,14 @@ static ULONG64 ReadCurrentStreak(const FCB* Fcb)
 #define READ_AHEAD_ADAPT_GREEDY_IDLE_PERCENT 25
 
 //
+// Largest fetch received into a buffer of the client's while the disk cache
+// is live (ReadIssueFetch). A larger one, which only a non-cached read asks
+// for, goes straight into the IRP's pages and is not offered to the cache,
+// rather than make the client find that much nonpaged pool at once.
+//
+#define READ_BUFFERED_FETCH_MAX (4ul * 1024ul * 1024ul)
+
+//
 // Fetches in flight below which a greedy consumer is taken to be alone on
 // the transport, and above which slack is not consulted at all.
 //
@@ -309,8 +317,17 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
 // reader that asks for less than its share is always waiting on.
 //
 // A fetch an application is blocked on, a demand fault or an uncached
-// read, is never held. It is charged to its file and counted in flight,
-// so a file that faults does not also get extra read-ahead.
+// read, is never held for the budget. It is charged to its file and
+// counted in flight, so a file that faults does not also get extra
+// read-ahead.
+//
+// Every fetch, demand included, waits once READ_FAIR_MAX_FETCHES are in
+// flight, and demand waiting for that goes out ahead of any read-ahead.
+// Nothing else bounds demand: after a few buffered reads of a 40 MB file,
+// the guest's mapped read of it faulted a page at a time and issued
+// 10,100 4 KB fetches at once. Their connects overran the server's accept
+// queue, up to 3,267 at a time, then timed out and failed the reads, and
+// PrefetchVirtualMemory with them.
 //
 // Held, not waited for: Cc issues read-ahead from its own worker threads,
 // which every file on the system shares, and blocking one there would
@@ -320,15 +337,16 @@ static BOOLEAN ReadIsGreedy(const FCB* Fcb)
 // built at PASSIVE_LEVEL (HttpBuildRequest), so each held IRP is issued
 // from a work item allocated when it was held.
 //
-// Nothing is held unless its own file has something in flight, so a
-// completion on that file is always coming to release it. The budget
-// alone cannot be what releases it: demand is never held, and other files
-// faulting can keep the link past the budget for as long as they run.
-// Beside two copies on the reference link that stranded a player's
-// read-ahead for 25 s, and its next read with it, on fetches that never
-// took more than 417 ms. So when a file's last fetch settles, its earliest
-// held read goes out whatever the budget, which is the rule admission
-// already keeps. Admission and release both decide under the lock:
+// Nothing is held for the budget unless its own file has something in
+// flight, so a completion on that file is always coming to release it,
+// and nothing waits for the fetch limit unless that many are in flight.
+// The budget alone cannot be what releases it: demand is never held for
+// it, and other files faulting can keep the link past the budget for as
+// long as they run. Beside two copies on the reference link that stranded
+// a player's read-ahead for 25 s, and its next read with it, on fetches
+// that never took more than 417 ms. So when a file's last fetch settles,
+// its earliest held read goes out whatever the budget, which is the rule
+// admission already keeps. Admission and release both decide under the lock:
 // holding after the last fetch has already settled would strand the IRP.
 // The bytes counted are the IRP's own Parameters.Read.Length, not the
 // trimmed length, so admission and settlement always agree.
@@ -338,7 +356,9 @@ static struct
     KSPIN_LOCK Lock;
     ULONG64 InFlightBytes;      // Bytes of admitted fetches not yet settled
     ULONG64 VirtualTime;        // Start tag of the latest fetch admitted
+    ULONG InFlightFetches;      // Admitted fetches not yet settled
     LIST_ENTRY Held;            // Held read-ahead IRPs, in arrival order
+    LIST_ENTRY Waiting;         // Demand held for READ_FAIR_MAX_FETCHES, in arrival order
 } ReadFair;
 
 VOID BlorgReadInit(VOID)
@@ -346,7 +366,9 @@ VOID BlorgReadInit(VOID)
     KeInitializeSpinLock(&ReadFair.Lock);
     ReadFair.InFlightBytes = 0;
     ReadFair.VirtualTime = 0;
+    ReadFair.InFlightFetches = 0;
     InitializeListHead(&ReadFair.Held);
+    InitializeListHead(&ReadFair.Waiting);
 }
 
 static IO_WORKITEM_ROUTINE ReadFairWorker;
@@ -366,14 +388,15 @@ static PNON_PAGED_NODE ReadFairNode(PIRP Irp)
 
 //
 // Charges a fetch to its file and admits it to the link, or holds it when
-// MayHold, the link is past its budget and the file already has a fetch in
-// flight. TRUE means it was held.
+// READ_FAIR_MAX_FETCHES are already in flight, or when MayHold, the link is
+// past its budget and the file already has a fetch in flight. TRUE means
+// it was held.
 //
 // The work item that will release it is allocated before the lock, and
 // lives in DriverContext[2] until then -- the slot ReadIssueFetch stamps
 // with the issue time, which a held IRP has not reached. Its start tag
 // waits in DriverContext[1], which only the create path otherwise uses.
-// The unlocked read of the bytes in flight only saves the allocation in
+// The unlocked read of what is in flight only saves the allocation in
 // the common case of room on the link; the locked one decides.
 //
 // PASSIVE_LEVEL: BlorgVolumeRead's inline path.
@@ -386,7 +409,8 @@ static BOOLEAN ReadFairAdmit(PIRP Irp, BOOLEAN MayHold)
 
     PIO_WORKITEM workItem = NULL;
 
-    if (MayHold && 0 != budget && ReadFair.InFlightBytes >= budget && 0 != node->ReadFetchesInFlight)
+    if (ReadFair.InFlightFetches >= READ_FAIR_MAX_FETCHES ||
+        (MayHold && 0 != budget && ReadFair.InFlightBytes >= budget && 0 != node->ReadFetchesInFlight))
     {
         workItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
     }
@@ -397,18 +421,20 @@ static BOOLEAN ReadFairAdmit(PIRP Irp, BOOLEAN MayHold)
     const ULONG64 start = (node->ReadFinishTag > ReadFair.VirtualTime) ? node->ReadFinishTag : ReadFair.VirtualTime;
     node->ReadFinishTag = start + length;
 
-    const BOOLEAN hold = (NULL != workItem) && (ReadFair.InFlightBytes >= budget) && (0 != node->ReadFetchesInFlight);
+    const BOOLEAN overBudget = MayHold && (0 != budget) && (ReadFair.InFlightBytes >= budget) && (0 != node->ReadFetchesInFlight);
+    const BOOLEAN hold = (NULL != workItem) && (overBudget || ReadFair.InFlightFetches >= READ_FAIR_MAX_FETCHES);
 
     if (hold)
     {
         Irp->Tail.Overlay.DriverContext[1] = C_CAST(PVOID, C_CAST(ULONG_PTR, start));
         Irp->Tail.Overlay.DriverContext[2] = workItem;
-        InsertTailList(&ReadFair.Held, &Irp->Tail.Overlay.ListEntry);
+        InsertTailList(MayHold ? &ReadFair.Held : &ReadFair.Waiting, &Irp->Tail.Overlay.ListEntry);
     }
     else
     {
         ReadFair.VirtualTime = start;
         ReadFair.InFlightBytes += length;
+        ReadFair.InFlightFetches++;
         node->ReadFetchesInFlight++;
         BlorgSetIrpContextFlag(Irp, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
     }
@@ -417,7 +443,10 @@ static BOOLEAN ReadFairAdmit(PIRP Irp, BOOLEAN MayHold)
 
     if (hold)
     {
-        BLORGFS_STAT_INC(ReadsHeld);
+        if (MayHold)
+        {
+            BLORGFS_STAT_INC(ReadsHeld);
+        }
     }
     else if (workItem)
     {
@@ -429,10 +458,11 @@ static BOOLEAN ReadFairAdmit(PIRP Irp, BOOLEAN MayHold)
 
 //
 // Settles an admitted fetch, whether it completed or failed to issue, and
-// admits held reads, lowest start tag first, while the link has room. A
-// file this leaves with nothing in flight gets its own earliest held read
-// admitted whether or not there is room. A read that was never admitted
-// carries no flag and settles nothing.
+// admits held reads while fewer than READ_FAIR_MAX_FETCHES are in flight:
+// waiting demand first, in arrival order, then read-ahead, lowest start
+// tag first, while the link has room. A file with nothing in flight gets
+// its earliest held read admitted whether or not there is room. A read
+// that was never admitted carries no flag and settles nothing.
 //
 // <= DISPATCH_LEVEL: called from ReadComplete on the WSK completion chain.
 //
@@ -454,29 +484,33 @@ static VOID ReadFairSettle(PIRP Irp)
     PNON_PAGED_NODE node = ReadFairNode(Irp);
 
     ReadFair.InFlightBytes -= IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
+    ReadFair.InFlightFetches--;
     node->ReadFetchesInFlight--;
 
-    while (!IsListEmpty(&ReadFair.Held))
+    while (ReadFair.InFlightFetches < READ_FAIR_MAX_FETCHES)
     {
-        const BOOLEAN room = ReadFair.InFlightBytes < global.ReadFairBudget;
-
-        if (!room && 0 != node->ReadFetchesInFlight)
-        {
-            break;
-        }
-
         PIRP next = NULL;
         ULONG64 nextStart = MAXULONG64;
 
-        for (PLIST_ENTRY entry = ReadFair.Held.Flink; entry != &ReadFair.Held; entry = entry->Flink)
+        if (!IsListEmpty(&ReadFair.Waiting))
         {
-            PIRP held = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
-            const ULONG64 start = C_CAST(ULONG64, C_CAST(ULONG_PTR, held->Tail.Overlay.DriverContext[1]));
+            next = CONTAINING_RECORD(ReadFair.Waiting.Flink, IRP, Tail.Overlay.ListEntry);
+            nextStart = C_CAST(ULONG64, C_CAST(ULONG_PTR, next->Tail.Overlay.DriverContext[1]));
+        }
+        else
+        {
+            const BOOLEAN room = ReadFair.InFlightBytes < global.ReadFairBudget;
 
-            if (start < nextStart && (room || ReadFairNode(held) == node))
+            for (PLIST_ENTRY entry = ReadFair.Held.Flink; entry != &ReadFair.Held; entry = entry->Flink)
             {
-                next = held;
-                nextStart = start;
+                PIRP held = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+                const ULONG64 start = C_CAST(ULONG64, C_CAST(ULONG_PTR, held->Tail.Overlay.DriverContext[1]));
+
+                if (start < nextStart && (room || 0 == ReadFairNode(held)->ReadFetchesInFlight))
+                {
+                    next = held;
+                    nextStart = start;
+                }
             }
         }
 
@@ -492,6 +526,7 @@ static VOID ReadFairSettle(PIRP Irp)
             ReadFair.VirtualTime = nextStart;
         }
         ReadFair.InFlightBytes += IoGetCurrentIrpStackLocation(next)->Parameters.Read.Length;
+        ReadFair.InFlightFetches++;
         ReadFairNode(next)->ReadFetchesInFlight++;
         BlorgSetIrpContextFlag(next, IRP_CONTEXT_FLAG_FETCH_ADMITTED);
 
@@ -818,6 +853,36 @@ BOOLEAN BlorgFastIoRead(
 }
 
 //
+//  Completes a non-cached read whose bytes are in its buffer and whose
+//  IoStatus.Information is set, fetched or served from the disk cache
+//  alike. For non-paging reads, this mirrors the post-read bookkeeping the
+//  synchronous path used to do: advance the file position for synchronous
+//  file objects and note that a fast-IO read happened. <= DISPATCH_LEVEL.
+//
+static VOID ReadSucceeded(PIRP Irp, LONG64 ArrivedQpc)
+{
+    if (!BooleanFlagOn(Irp->Flags, IRP_PAGING_IO))
+    {
+        BLORGFS_STAT_INC(UserFileReads);
+        BLORGFS_STAT_ADD(UserFileReadBytes, Irp->IoStatus.Information);
+
+        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+
+        if (BooleanFlagOn(irpSp->FileObject->Flags, FO_SYNCHRONOUS_IO))
+        {
+            irpSp->FileObject->CurrentByteOffset.QuadPart =
+                irpSp->Parameters.Read.ByteOffset.QuadPart + Irp->IoStatus.Information;
+        }
+
+        SetFlag(irpSp->FileObject->Flags, FO_FILE_FAST_IO_READ);
+    }
+
+    ReadRecordUserLatency(NULL, ArrivedQpc);
+
+    BlorgCompleteRequest(Irp, STATUS_SUCCESS, IO_DISK_INCREMENT);
+}
+
+//
 //  Completion for an async non-cached read. Invoked from the WSK
 //  completion path at <= DISPATCH_LEVEL, so everything it touches must be
 //  legal there: the source body lives in the NonPagedPoolNx HTTP receive
@@ -825,11 +890,13 @@ BOOLEAN BlorgFastIoRead(
 //  Irp->MdlAddress by BlorgPrePostIrp when the IRP was posted to the FSP queue.
 //  CallerContext is the PIRP.
 //
-//  This is a zero-copy read (BlorgHttpGetFileMdl): the body was received
+//  Usually a zero-copy read (BlorgHttpGetFileMdl): the body was received
 //  directly into Irp->MdlAddress by the client, so there is nothing to
 //  map, copy, or free here -- FileBuffer carries only the byte count
 //  (the client validated it against the requested range length, so it
-//  never exceeds the locked user buffer).
+//  never exceeds the locked user buffer). While the disk cache is live the
+//  body arrives in a buffer of its own instead (ReadIssueFetch), and is
+//  copied into the IRP's pages here, after the cache has taken its copy.
 //
 //  Two spans are closed here, and they are not the same span.
 //  DriverContext[2] carries the fetch issue stamp set at the direct-fetch
@@ -840,9 +907,8 @@ BOOLEAN BlorgFastIoRead(
 //  here formats a %wZ/%Z: this runs at <= DISPATCH on the WSK completion
 //  chain, where that would touch paged code and bugcheck.
 //
-//  For non-paging reads, this mirrors the post-read bookkeeping the
-//  synchronous path used to do: advance the file position for
-//  synchronous file objects and note that a fast-IO read happened.
+//  What arrived is offered to the disk cache before the IRP is completed,
+//  while its pages are still this read's (BlorgDiskCacheAdmit).
 //
 static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
 {
@@ -861,6 +927,22 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
         ReadRecordUserLatency(NULL, arrivedQpc);
         BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
+    }
+
+    if (FileBuffer->BodyBuffer)
+    {
+        PVOID target = MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
+
+        if (!target)
+        {
+            BlorgFreeHttpFile(FileBuffer);
+            BLORGFS_STAT_INC(FetchesFailed);
+            ReadRecordUserLatency(NULL, arrivedQpc);
+            BlorgCompleteRequest(irp, STATUS_INSUFFICIENT_RESOURCES, IO_DISK_INCREMENT);
+            return;
+        }
+
+        RtlCopyMemory(target, FileBuffer->BodyBuffer, FileBuffer->BodyBufferSize);
     }
 
     irp->IoStatus.Information = FileBuffer->BodyBufferSize;
@@ -894,25 +976,48 @@ static VOID ReadComplete(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerC
         }
     }
 
-    if (!BooleanFlagOn(irp->Flags, IRP_PAGING_IO))
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
+
+    BlorgDiskCacheAdmit(
+        ReadFairNode(irp),
+        FileBuffer,
+        C_CAST(ULONG64, irpSp->Parameters.Read.ByteOffset.QuadPart),
+        C_CAST(ULONG, FileBuffer->BodyBufferSize));
+
+    BlorgFreeHttpFile(FileBuffer);
+
+    ReadSucceeded(irp, arrivedQpc);
+}
+
+//
+//  Completion for a read the disk cache served (BlorgDiskCacheRead), at
+//  <= DISPATCH_LEVEL like ReadComplete. Valid is the trimmed length the
+//  read was offered with. One the cache could not finish is fetched
+//  instead: a fetch can only be built at PASSIVE_LEVEL, so it goes through
+//  ReadFairWorker, which trims and issues it as it would a held read.
+//
+static VOID ReadDiskComplete(PIRP Irp, NTSTATUS Status, ULONG Valid)
+{
+    const LONG64 arrivedQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[3]));
+
+    if (NT_SUCCESS(Status))
     {
-        BLORGFS_STAT_INC(UserFileReads);
-        BLORGFS_STAT_ADD(UserFileReadBytes, irp->IoStatus.Information);
-
-        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
-
-        if (BooleanFlagOn(irpSp->FileObject->Flags, FO_SYNCHRONOUS_IO))
-        {
-            irpSp->FileObject->CurrentByteOffset.QuadPart =
-                irpSp->Parameters.Read.ByteOffset.QuadPart + irp->IoStatus.Information;
-        }
-
-        SetFlag(irpSp->FileObject->Flags, FO_FILE_FAST_IO_READ);
+        Irp->IoStatus.Information = Valid;
+        ReadSucceeded(Irp, arrivedQpc);
+        return;
     }
 
-    ReadRecordUserLatency(NULL, arrivedQpc);
+    PIO_WORKITEM workItem = IoAllocateWorkItem(global.FileSystemDeviceObject);
 
-    BlorgCompleteRequest(irp, STATUS_SUCCESS, IO_DISK_INCREMENT);
+    if (!workItem)
+    {
+        ReadRecordUserLatency(NULL, arrivedQpc);
+        BlorgCompleteRequest(Irp, Status, IO_DISK_INCREMENT);
+        return;
+    }
+
+    Irp->Tail.Overlay.DriverContext[2] = workItem;
+    IoQueueWorkItem(workItem, ReadFairWorker, DelayedWorkQueue, Irp);
 }
 
 //
@@ -984,6 +1089,11 @@ static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG B
 // read is counted when it actually reaches the network rather than when it
 // arrived.
 //
+// While the disk cache is live a fetch of up to READ_BUFFERED_FETCH_MAX is
+// received into a buffer of the client's rather than the IRP's pages, for
+// the reason BlorgDiskCacheLive gives; ReadComplete copies it across. The
+// copy is memory bandwidth against a network transfer of the same bytes.
+//
 // PASSIVE_LEVEL: HttpBuildRequest is. A return other than STATUS_PENDING
 // means ReadComplete never ran and the IRP is still the caller's.
 //
@@ -996,13 +1106,20 @@ static NTSTATUS ReadIssueFetch(PIRP Irp, PFCB Fcb, LONGLONG StartingByte, ULONG 
     BLORGFS_STAT_INC(UserDiskReads);
     BLORGFS_STAT_INC(NonCachedDiskReads);
 
-    NTSTATUS fetchStatus = BlorgHttpGetFileMdl(
-        &Fcb->FullPath,
-        StartingByte,
-        Length,
-        Irp->MdlAddress,
-        ReadComplete,
-        Irp);
+    NTSTATUS fetchStatus = ((Length <= READ_BUFFERED_FETCH_MAX) && BlorgDiskCacheLive()) ?
+        BlorgHttpGetFile(
+            &Fcb->FullPath,
+            StartingByte,
+            Length,
+            ReadComplete,
+            Irp) :
+        BlorgHttpGetFileMdl(
+            &Fcb->FullPath,
+            StartingByte,
+            Length,
+            Irp->MdlAddress,
+            ReadComplete,
+            Irp);
 
     if (STATUS_PENDING != fetchStatus)
     {
@@ -1014,10 +1131,11 @@ static NTSTATUS ReadIssueFetch(PIRP Irp, PFCB Fcb, LONGLONG StartingByte, ULONG 
 
 //
 // Issues a read ReadFairAdmit held, at PASSIVE_LEVEL, once ReadFairSettle
-// has admitted it. The length is trimmed again rather than carried: the
-// file size of a read-only volume does not change, so the trim gives the
-// same answer it gave on arrival, and the IRP has no free slot to carry it
-// in.
+// has admitted it, or one the disk cache could not finish
+// (ReadDiskComplete), which was never admitted and settles nothing. The
+// length is trimmed again rather than carried: the file size of a
+// read-only volume does not change, so the trim gives the same answer it
+// gave on arrival, and the IRP has no free slot to carry it in.
 //
 // Nothing else will complete this IRP: BlorgVolumeRead already returned
 // STATUS_PENDING for it. A failed issue settles its admission first, as
@@ -1350,7 +1468,18 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             }
         }
 
+        BlorgDiskCacheNoteFile(
+            fcb->NonPaged,
+            &fcb->FullPath,
+            C_CAST(ULONG64, fcb->Header.FileSize.QuadPart),
+            fcb->LastModifiedTime);
+
         IoMarkIrpPending(Irp);
+
+        if (BlorgDiskCacheRead(Irp, fcb->NonPaged, C_CAST(ULONG64, startingByte.QuadPart), bytesLength, realLength, ReadDiskComplete))
+        {
+            return STATUS_PENDING;
+        }
 
         if (ReadFairAdmit(Irp, speculative))
         {
