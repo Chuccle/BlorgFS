@@ -142,7 +142,7 @@ jobs:
             'tests\sandbox\DispatchSandbox.vcxproj'
           )
           foreach ($proj in $projects) {
-            msbuild $proj /p:Configuration=Debug /p:Platform=x64 /m /v:minimal
+            msbuild $proj /p:Configuration=Release /p:Platform=x64 /m /v:minimal
             if ($LASTEXITCODE -ne 0) { throw "$proj failed to build" }
           }
 
@@ -151,7 +151,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $searchRoots = @('x64\Debug', 'tests\sandbox\x64\Debug')
+          $searchRoots = @('x64\Release', 'tests\sandbox\x64\Release')
           $failed = @()
 
           foreach ($suite in @('${{ matrix.suite }}')) {
