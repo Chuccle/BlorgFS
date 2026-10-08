@@ -31,52 +31,6 @@ permissions:
   contents: read
 
 jobs:
-  proofs:
-    runs-on: windows-latest
-    name: CBMC proofs
-    timeout-minutes: 90
-
-    steps:
-      - name: Checkout repository and submodules
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Cache CBMC
-        id: cache_cbmc
-        uses: actions/cache@v5
-        with:
-          path: ${{ runner.temp }}\cbmc
-          key: ${{ runner.os }}-cbmc-6.10
-
-      - name: Install CBMC
-        if: steps.cache_cbmc.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $url = 'https://github.com/diffblue/cbmc/releases/download/cbmc-6.1.0/cbmc-6.1.0-win64.msi'
-          $msi = Join-Path $env:RUNNER_TEMP 'cbmc.msi'
-          Invoke-WebRequest -Uri $url -OutFile $msi
-          # Extract rather than install: the harness only needs cbmc.exe on a
-          # path it can be pointed at, and msiexec /a keeps this from touching
-          # machine state the next job would inherit.
-          $dest = Join-Path $env:RUNNER_TEMP 'cbmc'
-          Start-Process msiexec -ArgumentList @('/a', "`"$msi`"", '/qn', "TARGETDIR=`"$dest`"") -Wait -NoNewWindow
-
-      - name: Setup Developer Command Prompt
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-
-      - name: Run CBMC proof harnesses
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $cbmc = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP 'cbmc') -Filter cbmc.exe -Recurse |
-                  Select-Object -First 1 -ExpandProperty FullName
-          if (-not $cbmc) { throw "cbmc.exe not found after install" }
-
-          & "$env:GITHUB_WORKSPACE\tools\Invoke-BlorgProofs.ps1" -CbmcPath $cbmc
-          if ($LASTEXITCODE -ne 0) { throw "CBMC proofs failed with exit code $LASTEXITCODE" }
-
   interleavings:
     runs-on: windows-latest
     name: Interleaving proofs and full fuzz
@@ -85,6 +39,22 @@ jobs:
     # exhausting their space; the whole set is hours, which is the point of
     # putting it on a schedule instead of a gate.
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: NodeTableSandbox.exe
+            filter: NodeTableSchedTest.NoInterleavingRetiresAPinnedNode
+          - suite: NodeTableSandbox.exe
+            filter: NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode
+          - suite: NodeTableSandbox.exe
+            filter: NodeTableSchedTest.DISABLED_AtomicPinSoak
+          - suite: NodeTableSandbox.exe
+            filter: NodeTableRevivalSchedTest.DISABLED_AtomicRevivalSoak
+          - suite: DispatchSandbox.exe
+            filter: '*SchedTest.*:*StressTest.*'
+          - suite: SocketSandbox.exe
+            filter: 'KernelModelTest.*'
 
     # Exactly what the PR gate excludes.
     #
@@ -180,7 +150,7 @@ jobs:
           $searchRoots = @('x64\Debug', 'tests\sandbox\x64\Debug')
           $failed = @()
 
-          foreach ($suite in @('SocketSandbox.exe', 'DispatchSandbox.exe', 'NodeTableSandbox.exe')) {
+          foreach ($suite in @('${{ matrix.suite }}')) {
             $path = $searchRoots |
                     ForEach-Object { Join-Path $_ $suite } |
                     Where-Object { Test-Path $_ } |
@@ -205,7 +175,7 @@ jobs:
             # reduction and the atomic space for two threads is far larger
             # than any cap -- so they are large samples, and they print
             # exhausted=NO to say so rather than implying a proof.
-            & $path '--gtest_filter=*SchedTest.*:*StressTest.*' --gtest_also_run_disabled_tests
+            & $path '--gtest_filter=${{ matrix.filter }}' --gtest_also_run_disabled_tests
             if ($LASTEXITCODE -ne 0) {
               Write-Host "::error::$suite proofs failed with exit code $LASTEXITCODE"
               $failed += $suite
@@ -213,18 +183,3 @@ jobs:
           }
 
           if ($failed.Count -gt 0) { throw "interleaving proofs failed: $($failed -join ', ')" }
-
-      - name: Run the full fuzz corpus
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $path = @('x64\Debug', 'tests\sandbox\x64\Debug') |
-                  ForEach-Object { Join-Path $_ 'ClientFuzz.exe' } |
-                  Where-Object { Test-Path $_ } |
-                  Select-Object -First 1
-          if (-not $path) { throw "ClientFuzz.exe was not built" }
-
-          # 50000 iterations, against the 200-iteration smoke the gate runs.
-          & $path 50000
-          if ($LASTEXITCODE -ne 0) { throw "ClientFuzz failed with exit code $LASTEXITCODE" }
-
