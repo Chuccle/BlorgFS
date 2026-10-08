@@ -382,7 +382,7 @@ extern struct GLOBAL
     //
     //  Settable two ways, which interact --
     //
-    //    * Registry, read once at DriverEntry (DriverReadRegistryConfig
+    //    * Registry, read once at DriverEntry (BlorgReadRegistryConfig
     //      in Driver.c): HKLM\<service key>\Parameters\TlsEnabled
     //      (REG_DWORD). This also picks the default remote port (443 if
     //      TRUE, 8080 if FALSE, unless Parameters\RemotePort explicitly

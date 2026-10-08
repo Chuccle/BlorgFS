@@ -162,6 +162,7 @@
     <ClCompile Include="Security.c" />
     <ClCompile Include="VolumeInfo.c" />
     <ClCompile Include="Read.c" />
+    <ClCompile Include="Registry.c" />
     <ClCompile Include="FspWorkQueue.c" />
     <ClCompile Include="Write.c" />
   </ItemGroup>
@@ -171,6 +172,7 @@
     <ClInclude Include="Client.h" />
     <ClInclude Include="DiskCache.h" />
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="Registry.h" />
     <ClInclude Include="flatbuffers_common_reader.h" />
     <ClInclude Include="Socket.h" />
     <ClInclude Include="Tls.h" />

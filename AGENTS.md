@@ -372,6 +372,15 @@ The sandbox projects put their own directory on the include path so
 `src/Driver.h` can pull in `SandboxPrelude.h` without the driver naming a
 test directory.
 
+### Registry configuration tests
+
+`Registry.c` is compiled into both the driver and DispatchSandbox.
+`RegistryTest.cpp` scripts the NT query layout through `RegistryModel.c`: missing
+keys, wrong types, truncated DWORDs/headers, overflowing KB settings, optional
+string terminators, embedded NULs and output capacities must keep defaults or
+accept only the complete value. DriverEntry seeds defaults before calling
+`BlorgReadRegistryConfig`; the parser remains PASSIVE-only.
+
 ### Build gotchas
 
 - **Use the 64-bit MSBuild.** The WDK NuGet picks its PREfast and ApiValidator
