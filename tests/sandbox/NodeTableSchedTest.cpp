@@ -343,7 +343,7 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
 // invariants directly.
     //
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 100000);
+        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 2000000000);
 
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a pinned node was retired";
@@ -726,7 +726,7 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
     proof.Path = MakePath(path);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 200000);
+        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000000);
 
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a revived node was freed under its opener";
@@ -827,7 +827,7 @@ TEST_F(NodeTableSchedTest, DISABLED_AtomicPinSoak)
     KmSchedSetRaceDetection(1);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 2000000);
+        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 2000000000);
 
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
@@ -1018,7 +1018,7 @@ TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
     KmSchedSetRaceDetection(1);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000);
+        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000000);
 
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);

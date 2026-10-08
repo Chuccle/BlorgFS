@@ -1113,6 +1113,13 @@ KM_SCHED_RESULT KmExploreInterleavings(
 
         result.Schedules++;
 
+        if (0 == result.Schedules % 1000000)
+        {
+            printf("[progress] %d schedules, %llu ms, depth %d, recorded %d\n", result.Schedules,
+                (unsigned long long)GetTickCount64(), result.MaxDepth, RecordedDepth);
+            fflush(stdout);
+        }
+
         if (Depth > result.MaxDepth)
         {
             result.MaxDepth = Depth;
