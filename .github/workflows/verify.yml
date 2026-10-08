@@ -55,6 +55,10 @@ jobs:
             filter: '*SchedTest.*:*StressTest.*'
           - suite: SocketSandbox.exe
             filter: 'KernelModelTest.*'
+          - suite: NodeTableSandbox.exe
+            filter: 'SchedulerAudit.*'
+          - suite: NodeTableSandbox.exe
+            filter: 'NodeTableSchedTest.NoInterleavingRetiresAPinnedNodeAtomicSample:NodeTableSchedTest.RandomAtomicPinSmoke'
 
     # Exactly what the PR gate excludes.
     #
