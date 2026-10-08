@@ -579,6 +579,7 @@ PVOID MmGetSystemAddressForMdlSafe(PMDL Mdl, ULONG Priority);
 VOID IoBuildPartialMdl(PMDL SourceMdl, PMDL TargetMdl, PVOID VirtualAddress, ULONG Length);
 
 VOID ShimFailNextMdlMapping(VOID);
+VOID ShimFailNextMdlAllocation(VOID);
 
 //
 // MDLs built by a test rather than by the driver: the paging-read path

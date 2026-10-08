@@ -453,6 +453,17 @@ NTSTATUS KeWaitForSingleObject(PVOID Object, KWAIT_REASON Reason, KPROCESSOR_MOD
 static volatile LONG MdlMappingFailPending = 0;
 static volatile LONG WorkItemFailPending = 0;
 
+static volatile LONG ShimMdlAllocationFailPending;
+
+//
+// MDLs allocate independently of pool buffers. Exercise rollback after a
+// fill owns its slot and buffer but cannot allocate its final descriptor.
+//
+VOID ShimFailNextMdlAllocation(VOID)
+{
+    InterlockedExchange(&ShimMdlAllocationFailPending, 1);
+}
+
 VOID ShimFailNextMdlMapping(VOID)
 {
     InterlockedExchange(&MdlMappingFailPending, 1);
@@ -470,6 +481,11 @@ PMDL IoAllocateMdl(PVOID Base, ULONG Length, BOOLEAN Secondary, BOOLEAN ChargeQu
 {
     (void)Secondary;
     (void)ChargeQuota;
+
+    if (InterlockedExchange(&ShimMdlAllocationFailPending, 0))
+    {
+        return NULL;
+    }
 
     PMDL mdl = (PMDL)calloc(1, sizeof(MDL));
 
@@ -951,6 +967,7 @@ VOID ShimReset(VOID)
     ShimPoolFailAt(-1);
     ShimWatchFree(NULL, NULL);
     InterlockedExchange(&MdlMappingFailPending, 0);
+    InterlockedExchange(&ShimMdlAllocationFailPending, 0);
     InterlockedExchange(&WorkItemFailPending, 0);
 }
 

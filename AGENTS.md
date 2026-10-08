@@ -1904,7 +1904,11 @@ RAM.
   read fetches is checked against the version its held blocks were pinned
   under, not the FCB's current one, and whether or not the cache is still
   taking fills, so a reopen that moves the FCB on mid-read cannot return
-  one read made of two versions.
+  one read made of two versions. `ReadSnapshotFile` takes size and write
+  time together under `PagingIoResource`, then releases it before cache or
+  network I/O. Initial reads and fair-queue retries trim and build their
+  immutable key from that same snapshot. The cache rejects valid bytes
+  beyond the key's EOF even when a matching tail block is held.
 - **Admission and replacement.** A block is written on its second miss
   only, through a four-way ghost table of tags (a direct-mapped one lost
   about a fifth of a re-read file to blocks evicting each other's tag).
@@ -1918,6 +1922,12 @@ RAM.
   cover what segmented LRU would: a scan read once never gets in, and a
   block served since the hand last passed survives a turn, unless every
   slot within the hand's reach is marked too.
+
+  Once a fill hits the backlog or an allocation failure, it stops trying
+  that fetch and counts every remaining eligible block as dropped, including
+  a final partial EOF block. A failed reservation is rolled back and its
+  byte charge returned. The reservation consumed that block's ghost tag, so
+  the first retry can admit its later blocks before it admits the first.
 
 ### Why it is safe
 

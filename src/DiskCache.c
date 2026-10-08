@@ -976,7 +976,8 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, const UNICODE_ST
 
     *Fetches = 0;
 
-    if (!ReadNoFence(&DiskCache.Live) || !Irp->MdlAddress || 0 == Valid || Valid > Length)
+    if (!ReadNoFence(&DiskCache.Live) || !Irp->MdlAddress || 0 == Valid || Valid > Length ||
+        Offset >= Key->Size || Valid > Key->Size - Offset)
     {
         return FALSE;
     }
@@ -1120,14 +1121,16 @@ BOOLEAN BlorgDiskCacheLive(VOID)
 // Copies every whole block of Length bytes at Offset of Key's file in
 // Source -- or the file's last block, if they reach end of file -- and
 // queues it to be written, if the index admits it. Source is a body of the
-// version Key names. <= DISPATCH_LEVEL, from a fetch completion.
+// version Key names. A full backlog or allocation failure drops the rest
+// of the eligible blocks with one count; retrying per block cannot make
+// progress on this completion. <= DISPATCH_LEVEL, from a fetch completion.
 //
 static VOID DiskCacheFill(const DISK_CACHE_KEY* Key, const UCHAR* Source, ULONG64 Offset, ULONG Length)
 {
     DISK_CACHE_KEY key = *Key;
     const ULONG64 end = Offset + Length;
 
-    if (!Source || 0 == Length || end > key.Size)
+    if (!Source || 0 == Length || Offset > key.Size || Length > key.Size - Offset)
     {
         return;
     }
@@ -1145,8 +1148,10 @@ static VOID DiskCacheFill(const DISK_CACHE_KEY* Key, const UCHAR* Source, ULONG6
         if (InterlockedAdd64(&DiskCache.FillBytes, DISK_CACHE_BLOCK_SIZE) > C_CAST(LONG64, DISK_CACHE_FILL_BACKLOG))
         {
             DiskCacheUnchargeFill();
-            BLORGFS_STAT_INC(DiskCacheDropped);
-            continue;
+            BLORGFS_STAT_ADD(DiskCacheDropped,
+                (end >> DISK_CACHE_BLOCK_SHIFT) - key.Block +
+                ((end == key.Size && (end & (DISK_CACHE_BLOCK_SIZE - 1))) ? 1 : 0));
+            break;
         }
 
         if (!DiskCacheEnter())
@@ -1191,7 +1196,9 @@ static VOID DiskCacheFill(const DISK_CACHE_KEY* Key, const UCHAR* Source, ULONG6
             }
 
             BlorgDiskCacheIndexCommit(&DiskCache.Index, slot, FALSE);
-            BLORGFS_STAT_INC(DiskCacheDropped);
+            BLORGFS_STAT_ADD(DiskCacheDropped,
+                (end >> DISK_CACHE_BLOCK_SHIFT) - key.Block +
+                ((end == key.Size && (end & (DISK_CACHE_BLOCK_SIZE - 1))) ? 1 : 0));
             DiskCacheUnchargeFill();
             DiskCacheLeave();
             break;

@@ -1111,6 +1111,30 @@ static VOID ReadDiskComplete(PIRP Irp, NTSTATUS Status, ULONG Valid, ULONG Fetch
     IoQueueWorkItem(workItem, ReadRefetchWorker, DelayedWorkQueue, Irp);
 }
 
+typedef struct _READ_FILE_VERSION
+{
+    LARGE_INTEGER Size;
+    ULONG64 ModifiedTime;
+} READ_FILE_VERSION;
+
+//
+// Refresh publishes size and modification time under PagingIoResource.
+// Take one stamp for trimming and the cache key, then release the resource
+// before any cache call or network I/O. A second sample could name another
+// version than the length this read accepted.
+//
+static READ_FILE_VERSION ReadSnapshotFile(PFCB Fcb)
+{
+    READ_FILE_VERSION version;
+
+    ExAcquireResourceSharedLite(Fcb->Header.PagingIoResource, TRUE);
+    version.Size = Fcb->Header.FileSize;
+    version.ModifiedTime = Fcb->LastModifiedTime;
+    ExReleaseResourceLite(Fcb->Header.PagingIoResource);
+
+    return version;
+}
+
 //
 // Shared by both the non-cached and cached read paths below, which used
 // to each carry an identical copy of this check: trims BytesLength down
@@ -1129,12 +1153,12 @@ static VOID ReadDiskComplete(PIRP Irp, NTSTATUS Status, ULONG Valid, ULONG Fetch
 // declared size but cannot be bounded by it, which is the same
 // caller-visible answer as any other tail past EOF.
 //
-static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG BytesLength, PIRP Irp, PULONG RealLengthOut)
+static NTSTATUS ReadTrimToFileSize(LARGE_INTEGER FileSize, LARGE_INTEGER StartingByte, ULONG BytesLength, PIRP Irp, PULONG RealLengthOut)
 {
-    if (StartingByte.QuadPart >= Fcb->Header.FileSize.QuadPart)
+    if (StartingByte.QuadPart >= FileSize.QuadPart)
     {
         BLORGFS_PRINT("Read beyond file size - file size = %llu, requested starting byte = %llu, requested length = %lu\n",
-            Fcb->Header.FileSize.QuadPart,
+            FileSize.QuadPart,
             StartingByte.QuadPart,
             BytesLength);
 
@@ -1146,7 +1170,7 @@ static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG B
     if (StartingByte.QuadPart > MAXLONGLONG - C_CAST(LONGLONG, BytesLength))
     {
         BLORGFS_PRINT("Read end unrepresentable - file size = %llu, requested starting byte = %llu, requested length = %lu\n",
-            Fcb->Header.FileSize.QuadPart,
+            FileSize.QuadPart,
             StartingByte.QuadPart,
             BytesLength);
 
@@ -1155,14 +1179,14 @@ static NTSTATUS ReadTrimToFileSize(PFCB Fcb, LARGE_INTEGER StartingByte, ULONG B
         return STATUS_END_OF_FILE;
     }
 
-    if (StartingByte.QuadPart + BytesLength > Fcb->Header.FileSize.QuadPart)
+    if (StartingByte.QuadPart + BytesLength > FileSize.QuadPart)
     {
         BLORGFS_PRINT("Read beyond file size - file size = %llu, requested starting byte = %llu, requested length = %lu\n",
-            Fcb->Header.FileSize.QuadPart,
+            FileSize.QuadPart,
             StartingByte.QuadPart,
             BytesLength);
 
-        ULONG trimLength = C_CAST(ULONG, (StartingByte.QuadPart + BytesLength) - Fcb->Header.FileSize.QuadPart);
+        ULONG trimLength = C_CAST(ULONG, (StartingByte.QuadPart + BytesLength) - FileSize.QuadPart);
         *RealLengthOut = BytesLength - trimLength;
     }
     else
@@ -1252,18 +1276,18 @@ static BOOLEAN ReadFromDiskCache(PIRP Irp, PFCB Fcb, const DISK_CACHE_KEY* Key, 
 //
 // Offers a read ReadFairAdmit held to the disk cache once it is admitted,
 // as BlorgVolumeRead would have had it not been held: whole, or in part
-// through ReadFromDiskCache. Its key is taken from the FCB again, as the
-// read's own (BlorgDiskCacheNoteFile). TRUE means the cache took the read.
+// through ReadFromDiskCache. The retry's single snapshot supplies both
+// the key and Valid. TRUE means the cache took the read.
 // PASSIVE_LEVEL.
 //
-static BOOLEAN ReadFromDiskCacheReleased(PIRP Irp, PFCB Fcb, ULONG Valid)
+static BOOLEAN ReadFromDiskCacheReleased(PIRP Irp, PFCB Fcb, const READ_FILE_VERSION* Version, ULONG Valid)
 {
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     const ULONG64 offset = C_CAST(ULONG64, irpSp->Parameters.Read.ByteOffset.QuadPart);
     DISK_CACHE_KEY key;
     ULONG runs = 0;
 
-    BlorgDiskCacheNoteFile(Fcb->NonPaged, &Fcb->FullPath, C_CAST(ULONG64, Fcb->Header.FileSize.QuadPart), Fcb->LastModifiedTime, &key);
+    BlorgDiskCacheNoteFile(Fcb->NonPaged, &Fcb->FullPath, C_CAST(ULONG64, Version->Size.QuadPart), Version->ModifiedTime, &key);
 
     return BlorgDiskCacheRead(Irp, &key, &Fcb->FullPath, offset, irpSp->Parameters.Read.Length, Valid, &runs, ReadDiskComplete) ||
         ((0 != runs) && ReadFromDiskCache(Irp, Fcb, &key, offset, irpSp->Parameters.Read.Length, Valid, runs));
@@ -1273,10 +1297,10 @@ static BOOLEAN ReadFromDiskCacheReleased(PIRP Irp, PFCB Fcb, ULONG Valid)
 // Issues a read ReadFairAdmit held, at PASSIVE_LEVEL, once ReadFairSettle
 // has admitted it, or one the disk cache could not finish
 // (ReadDiskComplete). The length is trimmed again rather than carried: the
-// backend can refresh a closed FCB while the request waits, so the retry
-// must resample its size. A held read is offered to the disk cache first,
-// as it would have
-// been had it not been held, so the blocks the cache holds of it are not
+// backend can refresh a closed FCB while the request waits. The new
+// snapshot bounds this retry and names its cache key consistently. A held
+// read is offered to the disk cache first, as it would have been had it not
+// been held, so the blocks the cache holds of it are not
 // fetched again; one the cache could not finish is fetched whole. A read
 // the cache was to serve whole was never admitted, and is admitted now,
 // before it fetches, which may hold it in turn.
@@ -1293,9 +1317,10 @@ static VOID ReadIssueReleased(PIRP Irp, BOOLEAN FromDiskCache)
     IoFreeWorkItem(C_CAST(PIO_WORKITEM, Irp->Tail.Overlay.DriverContext[2]));
 
     ULONG realLength = 0;
+    const READ_FILE_VERSION version = ReadSnapshotFile(fcb);
 
     NTSTATUS status = ReadTrimToFileSize(
-        fcb, irpSp->Parameters.Read.ByteOffset, irpSp->Parameters.Read.Length, Irp, &realLength);
+        version.Size, irpSp->Parameters.Read.ByteOffset, irpSp->Parameters.Read.Length, Irp, &realLength);
 
     if (NT_SUCCESS(status) &&
         !BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_FETCH_ADMITTED))
@@ -1310,7 +1335,7 @@ static VOID ReadIssueReleased(PIRP Irp, BOOLEAN FromDiskCache)
 
     if (NT_SUCCESS(status))
     {
-        if (FromDiskCache && ReadFromDiskCacheReleased(Irp, fcb, realLength))
+        if (FromDiskCache && ReadFromDiskCacheReleased(Irp, fcb, &version, realLength))
         {
             return;
         }
@@ -1577,11 +1602,13 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         }
     }
 
+    const READ_FILE_VERSION version = ReadSnapshotFile(fcb);
+
     if (BooleanFlagOn(Irp->Flags, IRP_NOCACHE))
     {
         BLORGFS_PRINT("Non cached read.\n");
 
-        NTSTATUS trimStatus = ReadTrimToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);
+        NTSTATUS trimStatus = ReadTrimToFileSize(version.Size, startingByte, bytesLength, Irp, &realLength);
 
         if (STATUS_END_OF_FILE == trimStatus)
         {
@@ -1645,8 +1672,8 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         BlorgDiskCacheNoteFile(
             fcb->NonPaged,
             &fcb->FullPath,
-            C_CAST(ULONG64, fcb->Header.FileSize.QuadPart),
-            fcb->LastModifiedTime,
+            C_CAST(ULONG64, version.Size.QuadPart),
+            version.ModifiedTime,
             &cacheKey);
 
         IoMarkIrpPending(Irp);
@@ -1698,7 +1725,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             }
         }
 
-        NTSTATUS trimStatus = ReadTrimToFileSize(fcb, startingByte, bytesLength, Irp, &realLength);
+        NTSTATUS trimStatus = ReadTrimToFileSize(version.Size, startingByte, bytesLength, Irp, &realLength);
 
         if (STATUS_END_OF_FILE == trimStatus)
         {

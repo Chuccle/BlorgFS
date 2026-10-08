@@ -25,6 +25,7 @@
 
 extern "C" {
 #include "SandboxSocket.h"
+#include "Scheduler.h"
 }
 
 #include "DeviceKindScope.h"
@@ -350,6 +351,61 @@ protected:
         }
 
         Settle();
+    }
+
+    struct SnapshotProof
+    {
+        DiskCacheTest* Fixture;
+        ULONG64 Size;
+        ULONG64 Time;
+        ULONG64 Trimmed;
+        ULONG Bad;
+    };
+
+    static void SnapshotWriter(void* Context)
+    {
+        SnapshotProof* proof = C_CAST(SnapshotProof*, Context);
+        PFCB fcb = proof->Fixture->Fcb;
+        ExAcquireResourceExclusiveLite(fcb->Header.PagingIoResource, TRUE);
+        fcb->Header.FileSize.QuadPart = 2 * kBlock;
+        KmSchedYield();
+        fcb->LastModifiedTime = kModifiedTime + 10000000;
+        ExReleaseResourceLite(fcb->Header.PagingIoResource);
+    }
+
+    static void SnapshotReader(void* Context)
+    {
+        SnapshotProof* proof = C_CAST(SnapshotProof*, Context);
+        unsigned char* buffer = nullptr;
+        proof->Fixture->Start(kBlock, 3 * kBlock, &buffer);
+        PNON_PAGED_NODE node = proof->Fixture->Fcb->NonPaged;
+        proof->Size = node->DiskCacheSize;
+        proof->Time = node->DiskCacheModifiedTime;
+        proof->Trimmed = proof->Fixture->Totals().NonCachedReadBytes;
+    }
+
+    static void SnapshotSetup(void* Context)
+    {
+        SnapshotProof* proof = C_CAST(SnapshotProof*, Context);
+        proof->Fixture->Fcb->Header.FileSize.QuadPart = kFileSize;
+        proof->Fixture->Fcb->LastModifiedTime = kModifiedTime;
+        proof->Fixture->ScriptedEtag = "unversioned";
+        BlorgStatisticsReset();
+        proof->Fixture->Answer(kBlock, 3 * kBlock);
+        KmSchedSpawn(SnapshotWriter, Context);
+        KmSchedSpawn(SnapshotReader, Context);
+    }
+
+    static void SnapshotTeardown(void* Context)
+    {
+        SnapshotProof* proof = C_CAST(SnapshotProof*, Context);
+        const bool oldVersion = kFileSize == proof->Size && kModifiedTime == proof->Time &&
+            3 * kBlock == proof->Trimmed;
+        const bool newVersion = 2 * kBlock == proof->Size &&
+            kModifiedTime + 10000000 == proof->Time && kBlock == proof->Trimmed;
+        proof->Bad += !oldVersion && !newVersion;
+        proof->Fixture->Settle();
+        BlorgCleanupWskClient();
     }
 
     DEVICE_OBJECT FileSystemDevice = {};
@@ -849,6 +905,41 @@ TEST_F(DiskCacheTest, APartlyHeldReadAheadPastTheBudgetIsHeld)
 }
 
 //
+// Refresh can change a stamp after fair admission held the IRP. Release
+// must trim to the new size and publish that same key, so old warm blocks
+// cannot supply the head while the network supplies the new tail.
+//
+TEST_F(DiskCacheTest, FairQueueReleaseResamplesSizeAndTimeBeforeUsingWarmBlocks)
+{
+    StartCache();
+    Warm(0, kBlock);
+    global.ReadFairBudget = kBlock;
+    Answer(2 * kBlock, kBlock, TRUE);
+    unsigned char* ahead = nullptr;
+    ReadRequest* inFlight = Start(2 * kBlock, kBlock, &ahead, TRUE);
+    SandboxDrainCompletions();
+    unsigned char* buffer = nullptr;
+    ReadRequest* held = Start(0, 3 * kBlock, &buffer, TRUE);
+    ASSERT_EQ(1u, Totals().ReadsHeld);
+    ExAcquireResourceExclusiveLite(Fcb->Header.PagingIoResource, TRUE);
+    Fcb->Header.FileSize.QuadPart = 2 * kBlock;
+    Fcb->LastModifiedTime = kModifiedTime + 10000000;
+    ExReleaseResourceLite(Fcb->Header.PagingIoResource);
+    Body.assign(2 * kBlock, 0xA6);
+    ScriptedEtag = "\"2.0-20000\"";
+    Answer(0, 2 * kBlock);
+    SandboxResumeStalled();
+    Settle();
+    EXPECT_EQ(1, inFlight->Irp.CompletionCount);
+    EXPECT_EQ(1, held->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, held->Irp.IoStatus.Status);
+    EXPECT_EQ(2 * kBlock, held->Irp.IoStatus.Information);
+    EXPECT_EQ(0, memcmp(buffer, Body.data(), 2 * kBlock));
+    EXPECT_EQ(2 * kBlock, Fcb->NonPaged->DiskCacheSize);
+    EXPECT_EQ(kModifiedTime + 10000000, Fcb->NonPaged->DiskCacheModifiedTime);
+}
+
+//
 // Each run a partly held read fetches is a request of its own, and every
 // request counts against READ_FAIR_MAX_FETCHES. With one slot left, the
 // read's own admission, its two holes are fetched as one run, the held
@@ -995,6 +1086,106 @@ TEST_F(DiskCacheTest, FetchedBlocksPastTheFillBacklogAreDropped)
     EXPECT_EQ(0u, Totals().DiskCacheFillFailures);
 
     BlorgFreeFileContext(large, Volume);
+}
+
+//
+// A failed fill has already consumed its block's second-miss ghost tag.
+// Its first retry fills the other two blocks; one more admission fills
+// the failed block. Check all allocation stages, including a partial EOF
+// block, so successful retry alone cannot hide leaked reservations or an
+// incorrect remaining-block count.
+//
+TEST_F(DiskCacheTest, FillAllocationFailuresCountTheRemainingBlocksAndRollBack)
+{
+    for (ULONG length : {3 * kBlock, 3 * kBlock - 1})
+    {
+        for (LONG stage : {0, 1, 2})
+        {
+            StartCache(8);
+            DISK_CACHE_KEY key;
+            const ULONG64 size = (length & (kBlock - 1)) ? length : kFileSize;
+            BlorgDiskCacheNoteFile(Fcb->NonPaged, &Fcb->FullPath, size, kModifiedTime, &key);
+            FILE_BUFFER body = {};
+            body.BodyBuffer = C_CAST(PCHAR, Body.data());
+            body.BodyBufferSize = Body.size();
+            body.HasVersion = TRUE;
+            body.VersionSize = size;
+            body.VersionTime = kModifiedTime;
+            ASSERT_TRUE(BlorgDiskCacheAdmit(Fcb->NonPaged, &body, 0, length));
+
+            const ULONG64 dropped = Totals().DiskCacheDropped;
+            const ULONG64 filled = Totals().DiskCacheFills;
+            if (2 == stage)
+            {
+                ShimFailNextMdlAllocation();
+            }
+            else
+            {
+                ShimPoolFailAt(stage);
+            }
+            ASSERT_TRUE(BlorgDiskCacheAdmit(Fcb->NonPaged, &body, 0, length));
+            ShimPoolFailAt(-1);
+            EXPECT_EQ(dropped + 3, Totals().DiskCacheDropped);
+            ASSERT_TRUE(BlorgDiskCacheAdmit(Fcb->NonPaged, &body, 0, length));
+            Settle();
+            EXPECT_EQ(filled + 2, Totals().DiskCacheFills);
+            ASSERT_TRUE(BlorgDiskCacheAdmit(Fcb->NonPaged, &body, 0, length));
+            Settle();
+            EXPECT_EQ(filled + 3, Totals().DiskCacheFills);
+            BlorgDiskCacheCleanup();
+        }
+    }
+}
+
+//
+// A caller's length and key can disagree even when held blocks exist.
+// Reject before pinning or I/O; a hit/miss assertion alone misses a read
+// that silently rounds beyond the version's declared end.
+//
+TEST_F(DiskCacheTest, ValidBytesCannotExtendBeyondTheImmutableKey)
+{
+    StartCache(8);
+    Fcb->Header.FileSize.QuadPart = kBlock - 1;
+    ScriptedEtag = "\"1.0-ffff\"";
+    Warm(0, kBlock);
+    DISK_CACHE_KEY key;
+    BlorgDiskCacheNoteFile(Fcb->NonPaged, &Fcb->FullPath, kBlock - 1, kModifiedTime, &key);
+    IRP irp = {};
+    irp.MdlAddress = IoAllocateMdl(PageAlignedBuffer(kBlock), kBlock, FALSE, FALSE, nullptr);
+    ULONG fetches = 0;
+    const ULONG reads = DiskCacheModelIrps(IRP_MJ_READ);
+    EXPECT_FALSE(BlorgDiskCacheRead(&irp, &key, &Fcb->FullPath, 0, kBlock, kBlock,
+        &fetches, DirectComplete));
+    EXPECT_EQ(reads, DiskCacheModelIrps(IRP_MJ_READ));
+    DirectStatus = STATUS_PENDING;
+    ASSERT_TRUE(BlorgDiskCacheRead(&irp, &key, &Fcb->FullPath, 0, kBlock, kBlock - 1,
+        &fetches, DirectComplete));
+    Settle();
+    EXPECT_EQ(STATUS_SUCCESS, DirectStatus);
+    EXPECT_EQ(reads + 1, DiskCacheModelIrps(IRP_MJ_READ));
+    IoFreeMdl(irp.MdlAddress);
+}
+
+//
+// Pause a refresh between its size and timestamp writes while it holds
+// PagingIoResource. The actual BlorgRead must wait or use the whole old
+// stamp: trimming and cache-key publication must describe one version.
+// Deleting ReadSnapshotFile's lock exposes the mixed stamp in this test,
+// because the writer's explicit yield remains a scheduling point.
+//
+TEST_F(DiskCacheTest, PagingResourceKeepsTrimAndCacheKeyInOneVersion)
+{
+    StartCache(8);
+    SnapshotProof proof = {};
+    proof.Fixture = this;
+    KmSchedSetAtomicYields(0);
+    KmSchedSetReduction(0);
+    const KM_SCHED_RESULT result = KmExploreInterleavings(SnapshotSetup, SnapshotTeardown,
+        &proof, 50000);
+    EXPECT_LT(result.Schedules, 50000);
+    EXPECT_EQ(0, result.Truncated);
+    EXPECT_EQ(0, result.Deadlocks);
+    EXPECT_EQ(0u, proof.Bad);
 }
 
 //
