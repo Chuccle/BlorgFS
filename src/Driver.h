@@ -156,6 +156,7 @@
 #include "Structs.h"
 #include "Util.h"
 #include "Client.h"
+#include "ChangeFeed.h"
 #include "Statistics.h"
 #include "CacheManager.h"
 #include "FspWorkQueue.h"
@@ -344,6 +345,54 @@ extern struct GLOBAL
     BOOLEAN ReadAheadAdapt;
 
     //
+    // Whether to follow the server's change feed at all (ChangeFeed.c),
+    // from the ChangeFeed registry value; on by default. Off, the metadata
+    // caches expire on their short TTL as they did before the feed, which
+    // is the comparison arm for measuring it.
+    //
+    BOOLEAN ChangeFeed;
+
+    //
+    //  Master switch for the TLS client (Tls.c/TlsHandshake.c). Defaults to
+    //  FALSE, so HttpOnSocket only attempts a TLS handshake on a fresh
+    //  connection when this is TRUE.
+    //
+    //  Settable two ways, which interact --
+    //
+    //    * Registry, read once at DriverEntry (DriverReadRegistryConfig
+    //      in Driver.c): HKLM\<service key>\Parameters\TlsEnabled
+    //      (REG_DWORD). This also picks the default remote port (443 if
+    //      TRUE, 8080 if FALSE, unless Parameters\RemotePort explicitly
+    //      overrides it) -- the port is resolved once, at load time, via
+    //      BlorgGetHttpAddrInfo.
+    //
+    //    * The debugger, live, no rebuild or reload needed:
+    //
+    //          eb blorgfs!global.TlsEnabled 1
+    //
+    //      but this does NOT re-resolve global.RemoteAddressInfo -- that
+    //      already happened at DriverEntry with whichever port the
+    //      registry (or its default) picked at the time. A live toggle
+    //      only reaches a working target if the registry already pointed
+    //      the port at a TLS-speaking listener before this driver
+    //      instance loaded. Toggling this against a port still speaking
+    //      plaintext fails every connection cleanly (a plaintext server
+    //      can't parse a ClientHello), but does nothing useful.
+    //
+    //  A handshake also needs Parameters\TlsPin (REG_BINARY, 32 bytes --
+    //  see BlorgTlsSetPin/BlorgTlsCheckPin in TlsHandshake.c) or the runtime
+    //  IOCTL_BLORGFS_SET_TLS_PIN (DevIoCtrl.c) configured, or every
+    //  handshake fails closed at the Certificate message regardless of
+    //  this flag.
+    //
+    //  volatile: read from HttpOnSocket at <= DISPATCH_LEVEL and writable
+    //  live from the debugger at any time from any core -- documents the
+    //  intentional cross-IRQL, asynchronously-toggled read and stops the
+    //  compiler from caching the value across that branch.
+    //
+    volatile BOOLEAN TlsEnabled;  // TRUE to attempt TLS on new connections
+
+    //
     // Largest granule the policy may grow to, in bytes, from the
     // ReadAheadMaxGranularityKb registry value.
     //
@@ -371,44 +420,14 @@ extern struct GLOBAL
     PSECURITY_DESCRIPTOR FileSecurityDescriptor;
 
     //
-    //  Master switch for the TLS client (Tls.c/TlsHandshake.c). Defaults to
-    //  FALSE, so HttpOnSocket only attempts a TLS handshake on a fresh
-    //  connection when this is TRUE.
+    // Nonzero while the change feed is live: every change the server sees
+    // is being reported and invalidated, so PathCache.c trusts an entry for
+    // its long lifetime instead of the short TTL. Written only through
+    // BlorgPathCacheFollowFeed, which orders it against the flush that
+    // going live needs; read with acquire semantics. A LONG for
+    // ReadAcquire/WriteRelease.
     //
-    //  Settable two ways, which interact --
-    //
-    //    * Registry, read once at DriverEntry (DriverReadRegistryConfig
-    //      in Driver.c): HKLM\<service key>\Parameters\TlsEnabled
-    //      (REG_DWORD). This also picks the default remote port (443 if
-    //      TRUE, 8080 if FALSE, unless Parameters\RemotePort explicitly
-    //      overrides it) -- the port is resolved once, at load time, via
-    //      BlorgGetHttpAddrInfo.
-    //
-    //    * The debugger, live, no rebuild or reload needed:
-    //
-    //          ed blorgfs!global.TlsEnabled 1
-    //
-    //      but this does NOT re-resolve global.RemoteAddressInfo -- that
-    //      already happened at DriverEntry with whichever port the
-    //      registry (or its default) picked at the time. A live toggle
-    //      only reaches a working target if the registry already pointed
-    //      the port at a TLS-speaking listener before this driver
-    //      instance loaded. Toggling this against a port still speaking
-    //      plaintext fails every connection cleanly (a plaintext server
-    //      can't parse a ClientHello), but does nothing useful.
-    //
-    //  A handshake also needs Parameters\TlsPin (REG_BINARY, 32 bytes --
-    //  see BlorgTlsSetPin/BlorgTlsCheckPin in TlsHandshake.c) or the runtime
-    //  IOCTL_BLORGFS_SET_TLS_PIN (DevIoCtrl.c) configured, or every
-    //  handshake fails closed at the Certificate message regardless of
-    //  this flag.
-    //
-    //  volatile: read from HttpOnSocket at <= DISPATCH_LEVEL and writable
-    //  live from the debugger at any time from any core -- documents the
-    //  intentional cross-IRQL, asynchronously-toggled read and stops the
-    //  compiler from caching the value across that branch.
-    //
-    volatile BOOLEAN TlsEnabled;  // TRUE to attempt TLS on new connections
+    LONG ChangeFeedLive;
 
 
 #ifdef DBG

@@ -124,6 +124,9 @@ VOID SandboxDrainCompletions(VOID);
 //
 VOID SandboxResumeStalled(VOID);
 
+// Receives parked on a Stall step, waiting for SandboxResumeStalled.
+ULONG SandboxSocketsParked(VOID);
+
 // Counters a scenario asserts on.
 ULONG SandboxSocketsCreated(VOID);
 ULONG SandboxSocketsClosed(VOID);
