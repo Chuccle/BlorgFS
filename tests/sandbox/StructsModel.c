@@ -17,6 +17,7 @@
 #define BLORGFS_SHIM_INTERNAL
 
 #include "..\..\src\Driver.h"
+#include "Scheduler.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -146,6 +147,8 @@ static MODEL_DEVICE_OBJECT* ModelDevice = NULL;
 PDEVICE_OBJECT StructsModelCreateVolume(VOID)
 {
     ModelDevice = (MODEL_DEVICE_OBJECT*)calloc(1, sizeof(MODEL_DEVICE_OBJECT));
+
+    KmSchedNoteAllocation(ModelDevice, sizeof(MODEL_DEVICE_OBJECT));
 
     ModelDevice->Object.DeviceExtension = &ModelDevice->Extension;
 

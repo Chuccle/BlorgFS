@@ -360,6 +360,8 @@ void KmResetLockOrder(void)
 
 void KmInitializeLock(KM_LOCK* Lock, const char* Name)
 {
+    KmSchedNoteFootprint(Lock, 1, 1);
+
     if (Lock->Initialized)
     {
         KmReleaseLockId(Lock->Id);
@@ -550,6 +552,8 @@ void KmReleaseLockId(int Id)
         return;
     }
 
+    KmSchedNoteFootprint(&NextLockId, sizeof(NextLockId), 1);
+
     KmEnsureOrderCs();
     EnterCriticalSection(&OrderCs);
 
@@ -572,6 +576,12 @@ void KmReleaseLockId(int Id)
 
 int KmAllocateLockId(void)
 {
+    //
+    // Which id a lock gets depends on the order locks were minted and
+    // retired in, so the steps that do either do not commute.
+    //
+    KmSchedNoteFootprint(&NextLockId, sizeof(NextLockId), 1);
+
     KmEnsureOrderCs();
     EnterCriticalSection(&OrderCs);
 
@@ -702,6 +712,7 @@ void KmReleaseLock(KM_LOCK* Lock, unsigned char OldIrql)
     if (KmSchedActive())
     {
         Lock->SchedState = 0;
+        KmSchedNoteFootprint(Lock, 1, 1);
         KmSchedYield();
         return;
     }
@@ -747,6 +758,7 @@ void KmReleaseLockShared(KM_LOCK* Lock)
         }
 
         Lock->SchedState--;
+        KmSchedNoteFootprint(Lock, 1, 1);
         KmSchedYield();
         return;
     }
@@ -1184,6 +1196,7 @@ void KmInitializeBarrier(KM_BARRIER* Barrier, long Target)
 
 void KmBarrierWait(KM_BARRIER* Barrier)
 {
+    KmSchedNoteFootprint(&Barrier->Count, sizeof(Barrier->Count), 1);
     InterlockedIncrement(&Barrier->Count);
 
     while (Barrier->Count < Barrier->Target)
@@ -1193,9 +1206,10 @@ void KmBarrierWait(KM_BARRIER* Barrier)
             //
             // A spinning fiber never yields the host thread, so the
             // thread being waited for could never run; wait
-            // cooperatively instead.
+            // cooperatively instead. The re-read starts a new step.
             //
             KmSchedYield();
+            KmSchedNoteFootprint(&Barrier->Count, sizeof(Barrier->Count), 0);
         }
         else
         {

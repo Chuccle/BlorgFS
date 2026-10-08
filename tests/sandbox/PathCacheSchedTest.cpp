@@ -613,4 +613,115 @@ TEST_F(PathCacheSchedTest, NoInterleavingStampsAnFcbCurrentWithWhatAnInvalidatio
     printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
 }
 
+
+//
+// The listing budget is one counter shared by every listing bucket, and two
+// publishes into different buckets hold different locks. Each listing here
+// fits the budget alone and the two together do not, so whatever the
+// order, at most one may be kept. Testing the counter and then adding to
+// it kept both whenever both tested before either added, which only
+// interleaving the interlocked operations themselves reaches; hence atomic
+// yields, and the reduction, since a publish that finds the budget full
+// first sweeps all 256 listing buckets.
+//
+struct ListingBudgetProof
+{
+    UNICODE_STRING First;
+    wchar_t FirstBuffer[32];
+
+    UNICODE_STRING Second;
+    wchar_t SecondBuffer[32];
+
+    PDIRECTORY_INFO Listing;
+
+    volatile long PublishesRan;
+    long BothKept;
+};
+
+void ListingBudgetFirstThread(void* Parameter)
+{
+    ListingBudgetProof* proof = (ListingBudgetProof*)Parameter;
+
+    BlorgPathCachePublishListing(&proof->First, proof->Listing, nullptr);
+
+    InterlockedIncrement(&proof->PublishesRan);
+}
+
+void ListingBudgetSecondThread(void* Parameter)
+{
+    ListingBudgetProof* proof = (ListingBudgetProof*)Parameter;
+
+    BlorgPathCachePublishListing(&proof->Second, proof->Listing, nullptr);
+
+    InterlockedIncrement(&proof->PublishesRan);
+}
+
+void ListingBudgetSetup(void* Parameter)
+{
+    ListingBudgetProof* proof = (ListingBudgetProof*)Parameter;
+
+    ShimReset();
+    BlorgPathCacheInit();
+
+    // About 20 MB: over half the 32 MB budget.
+    proof->Listing = BuildSyntheticListing(36000, 0);
+
+    KmSchedSpawn(ListingBudgetFirstThread, proof);
+    KmSchedSpawn(ListingBudgetSecondThread, proof);
+}
+
+void ListingBudgetTeardown(void* Parameter)
+{
+    ListingBudgetProof* proof = (ListingBudgetProof*)Parameter;
+
+    PDIRECTORY_INFO first = BlorgPathCacheLookupListing(&proof->First, TRUE, nullptr, nullptr, nullptr);
+    PDIRECTORY_INFO second = BlorgPathCacheLookupListing(&proof->Second, TRUE, nullptr, nullptr, nullptr);
+
+    if (first && second)
+    {
+        proof->BothKept++;
+    }
+
+    BlorgReleaseDirectoryInfo(first);
+    BlorgReleaseDirectoryInfo(second);
+    BlorgReleaseDirectoryInfo(proof->Listing);
+
+    BlorgPathCacheCleanup();
+}
+
+TEST_F(PathCacheSchedTest, NoInterleavingOfPublishesInTwoBucketsOverrunsTheListingBudget)
+{
+    static ListingBudgetProof proof;
+
+    proof = {};
+
+    wcscpy_s(proof.FirstBuffer, L"\\budget\\first");
+    proof.First.Buffer = proof.FirstBuffer;
+    proof.First.Length = (USHORT)(wcslen(proof.FirstBuffer) * sizeof(wchar_t));
+    proof.First.MaximumLength = proof.First.Length;
+
+    wcscpy_s(proof.SecondBuffer, L"\\budget\\second");
+    proof.Second.Buffer = proof.SecondBuffer;
+    proof.Second.Length = (USHORT)(wcslen(proof.SecondBuffer) * sizeof(wchar_t));
+    proof.Second.MaximumLength = proof.Second.Length;
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetReduction(1);
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(ListingBudgetSetup, ListingBudgetTeardown, &proof, 100000);
+
+    KmSchedSetReduction(0);
+    KmSchedSetAtomicYields(0);
+
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ(0, result.Truncated);
+    EXPECT_LT(result.Schedules, 100000) << "hit the schedule cap -- sampled, not exhausted";
+
+    EXPECT_EQ(0, proof.BothKept) << "two listings over the budget together were both kept";
+    EXPECT_GT(proof.PublishesRan, 0);
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+}
+
 } // namespace
