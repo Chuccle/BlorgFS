@@ -507,5 +507,110 @@ TEST_F(PathCacheSchedTest, ConcurrentStaleLookupsOweExactlyOneRefresh)
 }
 
 
+//
+// The same window for a resident FCB, which is stamped with the ticket of
+// the lookup that resolved its open (Create.c) and trusted while that
+// ticket is current. A lookup that finds the path's entry after the
+// invalidation advanced the sequence but before it swept the entry reads
+// what preceded the change; were the stamp the lookup's own ticket, it
+// would pass for current after the invalidation finished.
+//
+struct StampProof
+{
+    UNICODE_STRING Path;
+    wchar_t PathBuffer[48];
+
+    PATH_CACHE_TICKET Ticket;
+    BOOLEAN Hit;
+
+    volatile long LookupRan;
+    volatile long InvalidateRan;
+    volatile long Hits;
+    long Violations;
+};
+
+void StampLookupThread(void* Parameter)
+{
+    StampProof* proof = (StampProof*)Parameter;
+
+    DIRECTORY_ENTRY_METADATA meta = {};
+    BlorgPathCacheTakeTicket(&proof->Ticket);
+    proof->Hit = (PathCacheExists == BlorgPathCacheLookupDated(&proof->Path, &meta, &proof->Ticket));
+
+    if (proof->Hit)
+    {
+        InterlockedIncrement(&proof->Hits);
+    }
+
+    InterlockedIncrement(&proof->LookupRan);
+}
+
+void StampInvalidateThread(void* Parameter)
+{
+    StampProof* proof = (StampProof*)Parameter;
+
+    BlorgPathCacheInvalidate(&proof->Path);
+
+    InterlockedIncrement(&proof->InvalidateRan);
+}
+
+void StampSetup(void* Parameter)
+{
+    StampProof* proof = (StampProof*)Parameter;
+
+    ShimReset();
+    BlorgPathCacheInit();
+
+    proof->Hit = FALSE;
+
+    wcscpy_s(proof->PathBuffer, L"\\media\\stamp\\resident.bin");
+    proof->Path.Buffer = proof->PathBuffer;
+    proof->Path.Length = (USHORT)(wcslen(proof->PathBuffer) * sizeof(wchar_t));
+    proof->Path.MaximumLength = proof->Path.Length;
+
+    PATH_CACHE_TICKET read;
+    BlorgPathCacheTakeTicket(&read);
+
+    DIRECTORY_ENTRY_METADATA meta = {};
+    meta.Size = 4096;
+    BlorgPathCacheInsertExists(&proof->Path, &meta, &read);
+
+    KmSchedSpawn(StampLookupThread, proof);
+    KmSchedSpawn(StampInvalidateThread, proof);
+}
+
+void StampTeardown(void* Parameter)
+{
+    StampProof* proof = (StampProof*)Parameter;
+
+    if (proof->Hit && BlorgPathCacheTicketCurrent(&proof->Ticket))
+    {
+        proof->Violations++;
+    }
+
+    BlorgPathCacheCleanup();
+}
+
+TEST_F(PathCacheSchedTest, NoInterleavingStampsAnFcbCurrentWithWhatAnInvalidationOvertook)
+{
+    static StampProof proof;
+
+    proof = {};
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(StampSetup, StampTeardown, &proof, 20000);
+
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ(0, result.Truncated);
+    EXPECT_LT(result.Schedules, 20000) << "hit the schedule cap -- sampled, not exhausted";
+
+    EXPECT_EQ(0, proof.Violations)
+        << "a stamp from an entry the invalidation had not yet swept was current after it";
+    EXPECT_GT(proof.Hits, 0) << "no schedule found the entry before the sweep";
+    EXPECT_GT(proof.LookupRan, 0);
+    EXPECT_GT(proof.InvalidateRan, 0);
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+}
 
 } // namespace

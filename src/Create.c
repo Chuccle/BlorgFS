@@ -215,6 +215,112 @@ static inline NTSTATUS OpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const 
 }
 
 //
+//  Whether a resident FCB may answer an open as it is. An FCB outlives its
+//  handles while Cc or Mm still reference its file object, so without this
+//  a file changed on the server reopened with the size and pages of the
+//  copy read before it. The FCB follows the path cache's rule, which the
+//  TTL and the change feed keep honest, so it inherits both without
+//  invalidation plumbing of its own. Its own stamp answers first, with no
+//  lock taken: nothing invalidated since its metadata was read, and that
+//  read younger than the cache's lifetime. Any invalidation anywhere fails
+//  the stamp, so it then asks the path cache, and trusts the FCB while the
+//  entry there has the same size and write time. Anything else sends the
+//  open down the cold path for current metadata, which CreateFcbRefresh
+//  applies.
+//
+//  A file some handle still has open is trusted as it is. Its handles share
+//  one FCB and one cache, and changing the size under them would tear the
+//  view a reader is in the middle of, so the refresh waits for the first
+//  open after the last cleanup: NFS's close-to-open rule.
+//  ShareAccess.OpenCount is that count: IoSetShareAccess counts only opens
+//  with data access, the only ones that can read the cache, and each
+//  cleanup removes one. Read here without the FCB resource it is a hint;
+//  CreateFcbRefresh re-reads it under the resource before acting on it.
+//
+static BOOLEAN CreateFcbIsCurrent(PFCB Fcb)
+{
+    if ((0 != ReadNoFence(C_CAST(LONG*, &Fcb->ShareAccess.OpenCount))) ||
+        BlorgPathCacheTicketCurrent(&Fcb->MetaTicket))
+    {
+        return TRUE;
+    }
+
+    DIRECTORY_ENTRY_METADATA cached;
+
+    if (PathCacheExists != BlorgPathCachePeek(&Fcb->FullPath, &cached))
+    {
+        return FALSE;
+    }
+
+    return !cached.IsDirectory &&
+           (C_CAST(LONGLONG, cached.Size) == Fcb->Header.FileSize.QuadPart) &&
+           (cached.LastModifiedTime == Fcb->LastModifiedTime);
+}
+
+//
+//  Applies current metadata, read under Ticket, to a resident FCB on the
+//  cold path, under the VCB resource exclusive and before OpenExistingFcb.
+//  When the size and write time match, which is the usual case, only the
+//  stamp moves: the FCB is known current as of Ticket. Otherwise what Cc
+//  and Mm hold of the old contents is dropped and the FCB takes the new
+//  size and times. Dropping them needs no handle open, no user-mapped view
+//  left (a view outlives its handle) and no image section (a running
+//  executable). When any of those holds the old pages the FCB keeps the
+//  old copy, which is still internally consistent, and is stamped anyway:
+//  every open would otherwise take the VCB resource exclusive to fail the
+//  same purge, so the next attempt waits for the stamp to lapse, a
+//  lifetime or the next invalidation on.
+//
+//  The sizes change under the paging resource as well, which is what Mm
+//  reads them under. A shared cache map can outlive the purge until Cc's
+//  lazy teardown reaches it, so it is told the new sizes through the file
+//  object being opened, which is about to point at this FCB anyway.
+//
+static VOID CreateFcbRefresh(PFCB Fcb, const DIRECTORY_ENTRY_METADATA* Meta, const PATH_CACHE_TICKET* Ticket, PFILE_OBJECT FileObject)
+{
+    PSECTION_OBJECT_POINTERS sections = &Fcb->NonPaged->SectionObjectPointers;
+
+    ExAcquireResourceExclusiveLite(Fcb->Header.Resource, TRUE);
+
+    if ((C_CAST(LONGLONG, Meta->Size) == Fcb->Header.FileSize.QuadPart) &&
+        (Meta->LastModifiedTime == Fcb->LastModifiedTime))
+    {
+        Fcb->MetaTicket = *Ticket;
+        ExReleaseResourceLite(Fcb->Header.Resource);
+        return;
+    }
+
+    if ((0 != Fcb->ShareAccess.OpenCount) ||
+        !MmFlushImageSection(sections, MmFlushForWrite) ||
+        !CcPurgeCacheSection(sections, NULL, 0, UNINITIALIZE_CACHE_MAPS))
+    {
+        BLORGFS_STAT_INC(FcbRefreshesDeferred);
+        Fcb->MetaTicket = *Ticket;
+        ExReleaseResourceLite(Fcb->Header.Resource);
+        return;
+    }
+
+    ExAcquireResourceExclusiveLite(Fcb->Header.PagingIoResource, TRUE);
+    Fcb->Header.FileSize.QuadPart = Fcb->Header.AllocationSize.QuadPart = C_CAST(LONGLONG, Meta->Size);
+    Fcb->CreationTime = Meta->CreationTime;
+    Fcb->LastAccessedTime = Meta->LastAccessedTime;
+    Fcb->LastModifiedTime = Meta->LastModifiedTime;
+    ExReleaseResourceLite(Fcb->Header.PagingIoResource);
+
+    Fcb->MetaTicket = *Ticket;
+
+    FileObject->SectionObjectPointer = sections;
+
+    if (CcIsFileCached(FileObject))
+    {
+        CcSetFileSizes(FileObject, C_CAST(PCC_FILE_SIZES, &Fcb->Header.AllocationSize));
+    }
+
+    BLORGFS_STAT_INC(FcbRefreshes);
+    ExReleaseResourceLite(Fcb->Header.Resource);
+}
+
+//
 //  Opens a handle to an already-resident non-root DCB: same pattern as
 //  OpenExistingFcb (access check, oplock break, RefCount bump, share
 //  access, all under the Dcb resource), but also allocates the CCB used
@@ -411,7 +517,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
 
     BlorgPathCacheInsertExists(&netCtx->Path, FileInfo, &netCtx->Ticket);
 
-    PDIRECTORY_ENTRY_METADATA stash = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(DIRECTORY_ENTRY_METADATA), 'CRET');
+    PCREATE_NET_RESULT stash = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(CREATE_NET_RESULT), 'CRET');
 
     if (!stash)
     {
@@ -421,7 +527,8 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
         return;
     }
 
-    *stash = *FileInfo;
+    stash->Meta = *FileInfo;
+    stash->Ticket = netCtx->Ticket;
     irp->Tail.Overlay.DriverContext[1] = stash;
 
     BlorgSetIrpContextFlag(irp, IRP_CONTEXT_FLAG_NET_DONE);
@@ -602,6 +709,10 @@ static BOOLEAN FindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Na
 //  a pre-existing zero-handle node is deferred to the reap worker, which
 //  re-checks pins under the bucket lock before freeing.
 //
+//  A resident FCB answers on the warm path only while CreateFcbIsCurrent
+//  holds. Otherwise its open resolves like a miss, and CreateFcbRefresh
+//  brings the FCB up to date on the cold path before opening it.
+//
 //  A relative open (RelatedFileObject set -- OBJECT_ATTRIBUTES.RootDirectory
 //  at the Nt layer) is the one shape where the full path has to be built
 //  here rather than taken from FileObject->FileName, and both halves of
@@ -653,6 +764,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
     ULONG_PTR irpFlags = C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]);
     DIRECTORY_ENTRY_METADATA dirEntInfo = { 0 };
+    PATH_CACHE_TICKET resolvedTicket = { 0 };
     BOOLEAN haveDirEntInfo = FALSE;
 
     if (BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_NET_DONE))
@@ -660,11 +772,17 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         BlorgClearIrpContextFlag(Irp, IRP_CONTEXT_FLAG_NET_DONE);
         ClearFlag(irpFlags, IRP_CONTEXT_FLAG_NET_DONE);
 
-        PDIRECTORY_ENTRY_METADATA stash = Irp->Tail.Overlay.DriverContext[1];
+        PCREATE_NET_RESULT stash = Irp->Tail.Overlay.DriverContext[1];
 
         if (stash)
         {
-            dirEntInfo = *stash;
+            dirEntInfo = stash->Meta;
+
+            if (!dirEntInfo.NoStore)
+            {
+                resolvedTicket = stash->Ticket;
+            }
+
             ExFreePool(stash);
             Irp->Tail.Overlay.DriverContext[1] = NULL;
             haveDirEntInfo = TRUE;
@@ -800,6 +918,12 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             }
             case BLORGFS_FCB_SIGNATURE:
             {
+                if (!CreateFcbIsCurrent(C_CAST(PFCB, desiredNode)))
+                {
+                    BlorgNodeUnpin(desiredNode);
+                    break;
+                }
+
                 NTSTATUS result;
 
                 if (BooleanFlagOn(options, FILE_DIRECTORY_FILE))
@@ -825,8 +949,10 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
     if (!haveDirEntInfo)
     {
+        BlorgPathCacheTakeTicket(&resolvedTicket);
+
         DIRECTORY_ENTRY_METADATA cached;
-        PATH_CACHE_RESULT pc = BlorgPathCacheLookup(&filePath.String, &cached);
+        PATH_CACHE_RESULT pc = BlorgPathCacheLookupDated(&filePath.String, &cached, &resolvedTicket);
 
         if (PathCacheExists == pc)
         {
@@ -874,6 +1000,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     BLORGFS_STAT_INC(CreateHits);
                     BLORGFS_LOG("Create listing HIT (exists): %wZ\n", &filePath.String);
                     BlorgPathCacheInsertExists(&filePath.String, &dirEntInfo, &ticket);
+                    resolvedTicket = ticket;
                     haveDirEntInfo = TRUE;
                 }
                 else
@@ -1030,6 +1157,8 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                     return STATUS_NOT_A_DIRECTORY;
                 }
 
+                CreateFcbRefresh(C_CAST(PFCB, desiredNode), &dirEntInfo, &resolvedTicket, fileObject);
+
                 result = OpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
 
                 if (STATUS_SUCCESS == result)
@@ -1097,6 +1226,8 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             }
             case BLORGFS_FCB_SIGNATURE:
             {
+                C_CAST(PFCB, desiredNode)->MetaTicket = resolvedTicket;
+
                 result = OpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
 
                 if (STATUS_SUCCESS == result)

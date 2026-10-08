@@ -937,4 +937,67 @@ TEST_F(PathCacheFeedTest, GoingLiveDropsWhatWasReadBeforeIt)
         << "a read ticketed before the feed came up was cached under it";
 }
 
+
+//
+// A ticket held outside the caches (a resident FCB's stamp, Create.c) is
+// judged by the same rule an entry is: any invalidation fails it, and so
+// does age past the lifetime in force when it is asked. A ticket never
+// taken is never current.
+//
+TEST_F(PathCacheFeedTest, TicketStaysCurrentUntilAnInvalidationOrTheLifetime)
+{
+    PATH_CACHE_TICKET never = {};
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&never));
+
+    PATH_CACHE_TICKET ticket;
+    BlorgPathCacheTakeTicket(&ticket);
+    EXPECT_TRUE(BlorgPathCacheTicketCurrent(&ticket));
+
+    UNICODE_STRING elsewhere = RTL_CONSTANT_STRING(L"\\feed\\ticket\\other.bin");
+    BlorgPathCacheInvalidate(&elsewhere);
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&ticket))
+        << "the stamp cannot tell which path changed, so any change must fail it";
+
+    BlorgPathCacheTakeTicket(&ticket);
+    ShimAdvanceInterruptTime(5 * kSecond);
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&ticket)) << "past the short TTL with the feed down";
+
+    BlorgPathCacheFollowFeed(TRUE);
+    BlorgPathCacheTakeTicket(&ticket);
+    ShimAdvanceInterruptTime(60 * kSecond);
+    EXPECT_TRUE(BlorgPathCacheTicketCurrent(&ticket)) << "the feed's lifetime applies while it is live";
+
+    BlorgPathCacheFollowFeed(FALSE);
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&ticket)) << "the feed going down shortens a held stamp at once";
+}
+
+//
+// A lookup that resolves an open hands back the ticket its entry was read
+// under, and that is what a resident FCB is stamped with: the stamp
+// vouches for the read, not the lookup. So an invalidation anywhere since
+// the read fails the stamp at once, as it fails every other ticket from
+// before it, and the FCB is checked against the cache again.
+//
+TEST_F(PathCacheFeedTest, ALookupHandsBackTheTicketItsEntryWasReadUnder)
+{
+    UNICODE_STRING path = RTL_CONSTANT_STRING(L"\\feed\\dated\\resident.bin");
+    DIRECTORY_ENTRY_METADATA meta = MakeMeta(4096, FALSE);
+
+    PATH_CACHE_TICKET read;
+    BlorgPathCacheTakeTicket(&read);
+    BlorgPathCacheInsertExists(&path, &meta, &read);
+
+    UNICODE_STRING elsewhere = RTL_CONSTANT_STRING(L"\\feed\\dated\\other.bin");
+    BlorgPathCacheInvalidate(&elsewhere);
+
+    PATH_CACHE_TICKET ticket;
+    BlorgPathCacheTakeTicket(&ticket);
+    ASSERT_EQ(PathCacheExists, BlorgPathCacheLookupDated(&path, &meta, &ticket));
+
+    EXPECT_EQ(read.Sequence, ticket.Sequence);
+    EXPECT_EQ(read.IssueTime, ticket.IssueTime);
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&ticket))
+        << "a stamp from an entry read before an invalidation passed for current";
+}
+
 } // namespace
