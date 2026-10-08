@@ -17,6 +17,7 @@
 // header chain, and an undeclared KmGetThreadScratch would be assumed
 // to return int -- truncating a pointer on x64.
 #include "KernelModel.h"
+#include "Scheduler.h"
 
 #include <stdarg.h>
 #include <stdlib.h>
@@ -54,6 +55,27 @@ static volatile LONG PoolAllocationCounter = 0;
 static PVOID WatchedBlock = NULL;
 static volatile LONG* WatchedFlag = NULL;
 
+//
+// Allocation and free reach shared state -- which address comes back,
+// the failure-injection count, the quarantine -- so for the partial-order
+// reduction every step that does either writes this token, and a free
+// also writes the block it gives up. The scheduler is told about each
+// block, so footprints can name memory in it the same way every replay.
+//
+static volatile LONG ShimHeapToken = 0;
+
+static VOID NoteHeapAllocation(PVOID Block, SIZE_T Size)
+{
+    KmSchedNoteFootprint((const void*)&ShimHeapToken, sizeof(ShimHeapToken), 1);
+    KmSchedNoteAllocation(Block, Size);
+}
+
+static VOID NoteHeapFree(PVOID Block, SIZE_T Size)
+{
+    KmSchedNoteFootprint((const void*)&ShimHeapToken, sizeof(ShimHeapToken), 1);
+    KmSchedNoteFootprint(Block, Size, 1);
+}
+
 VOID ShimWatchFree(PVOID Block, volatile LONG* Flag)
 {
     WatchedBlock = Block;
@@ -64,6 +86,7 @@ static VOID NoteFree(PVOID Block)
 {
     if (Block && Block == WatchedBlock && WatchedFlag)
     {
+        KmSchedNoteFootprint((const void*)WatchedFlag, sizeof(*WatchedFlag), 1);
         InterlockedExchange((LONG*)WatchedFlag, 1);
     }
 }
@@ -113,6 +136,8 @@ static PVOID ShimAllocate(POOL_TYPE PoolType, SIZE_T NumberOfBytes, ULONG Tag, B
         return NULL;
     }
 
+    NoteHeapAllocation(NULL, 0);
+
     LONG index = InterlockedIncrement(&PoolAllocationCounter) - 1;
     LONG failAt = PoolFailIndex;
 
@@ -128,6 +153,8 @@ static PVOID ShimAllocate(POOL_TYPE PoolType, SIZE_T NumberOfBytes, ULONG Tag, B
     {
         return NULL;
     }
+
+    NoteHeapAllocation(header, sizeof(SHIM_POOL_HEADER) + NumberOfBytes + sizeof(ULONG64));
 
     header->Size = NumberOfBytes;
     header->Tag = Tag;
@@ -224,6 +251,9 @@ VOID ExFreePool(PVOID P)
     NoteFree(P);
 
     SHIM_POOL_HEADER* header = ((SHIM_POOL_HEADER*)P) - 1;
+
+    NoteHeapFree(header, sizeof(*header) + header->Size + sizeof(ULONG64));
+    KmSchedNoteFree(header);
 
     if (SHIM_POOL_GUARD != header->FrontGuard)
     {
@@ -362,12 +392,14 @@ LONG KeSetEvent(PKEVENT Event, LONG Increment, BOOLEAN Wait)
     (void)Increment;
     (void)Wait;
 
+    KmSchedNoteFootprint(Event, sizeof(*Event), 1);
     SetEvent(Event->Handle);
     return 0;
 }
 
 VOID KeClearEvent(PKEVENT Event)
 {
+    KmSchedNoteFootprint(Event, sizeof(*Event), 1);
     ResetEvent(Event->Handle);
 }
 
@@ -439,6 +471,8 @@ PMDL IoAllocateMdl(PVOID Base, ULONG Length, BOOLEAN Secondary, BOOLEAN ChargeQu
     (void)ChargeQuota;
 
     PMDL mdl = (PMDL)calloc(1, sizeof(MDL));
+
+    NoteHeapAllocation(mdl, sizeof(MDL));
 
     if (!mdl)
     {
@@ -530,6 +564,7 @@ VOID IoFreeMdl(PMDL Mdl)
     }
 
     KmObjectDestroyed(KmObjectMdl);
+    NoteHeapFree(Mdl, sizeof(*Mdl));
     free(Mdl);
 }
 
@@ -587,6 +622,8 @@ PIRP IoAllocateIrp(CCHAR StackSize, BOOLEAN ChargeQuota)
 
     PIRP irp = (PIRP)calloc(1, sizeof(IRP) + sizeof(IO_STACK_LOCATION));
 
+    NoteHeapAllocation(irp, sizeof(IRP) + sizeof(IO_STACK_LOCATION));
+
     if (irp)
     {
         irp->StackLocation = (PIO_STACK_LOCATION)(irp + 1);
@@ -618,6 +655,7 @@ VOID IoFreeIrp(PIRP Irp)
     Irp->Freed = TRUE;
     KmObjectDestroyed(KmObjectIrp);
 
+    NoteHeapFree(Irp, sizeof(IRP) + sizeof(IO_STACK_LOCATION));
     free(Irp);
 }
 
@@ -957,6 +995,8 @@ PIO_WORKITEM IoAllocateWorkItem(PDEVICE_OBJECT DeviceObject)
 {
     PIO_WORKITEM item = (PIO_WORKITEM)calloc(1, sizeof(IO_WORKITEM));
 
+    NoteHeapAllocation(item, sizeof(IO_WORKITEM));
+
     if (item)
     {
         item->DeviceObject = DeviceObject;
@@ -980,6 +1020,7 @@ VOID IoFreeWorkItem(PIO_WORKITEM IoWorkItem)
     }
 
     KmObjectDestroyed(KmObjectWorkItem);
+    NoteHeapFree(IoWorkItem, sizeof(*IoWorkItem));
     free(IoWorkItem);
 }
 
@@ -993,6 +1034,9 @@ VOID IoFreeWorkItem(PIO_WORKITEM IoWorkItem)
 VOID IoQueueWorkItem(PIO_WORKITEM IoWorkItem, PIO_WORKITEM_ROUTINE Routine, WORK_QUEUE_TYPE QueueType, PVOID Context)
 {
     (void)QueueType;
+
+    KmSchedNoteFootprint((const void*)&WorkItemHead, sizeof(WorkItemHead), 1);
+    KmSchedNoteFootprint(IoWorkItem, sizeof(*IoWorkItem), 1);
 
     EnsureWorkItemCs();
     EnterCriticalSection(&WorkItemCs);
@@ -1027,6 +1071,8 @@ VOID IoQueueWorkItem(PIO_WORKITEM IoWorkItem, PIO_WORKITEM_ROUTINE Routine, WORK
 
 ULONG ShimPendingWorkItems(VOID)
 {
+    KmSchedNoteFootprint((const void*)&WorkItemHead, sizeof(WorkItemHead), 0);
+
     EnsureWorkItemCs();
     EnterCriticalSection(&WorkItemCs);
 
@@ -1054,6 +1100,11 @@ ULONG ShimDrainWorkItems(VOID)
 
     for (;;)
     {
+        //
+        // A work item can yield, so each pop may start a step of its own.
+        //
+        KmSchedNoteFootprint((const void*)&WorkItemHead, sizeof(WorkItemHead), 1);
+
         EnsureWorkItemCs();
         EnterCriticalSection(&WorkItemCs);
 
@@ -1061,6 +1112,8 @@ ULONG ShimDrainWorkItems(VOID)
 
         if (item)
         {
+            KmSchedNoteFootprint(item, sizeof(*item), 1);
+
             WorkItemHead = item->Next;
 
             if (!WorkItemHead)

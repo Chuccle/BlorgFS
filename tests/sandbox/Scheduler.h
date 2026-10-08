@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 //
 // Systematic interleaving exploration: run a concurrent body under EVERY
 // thread schedule rather than under whichever one the OS happens to pick.
@@ -55,10 +57,13 @@ typedef void (*KM_SCHED_BODY)(void* Context);
 
 typedef struct _KM_SCHED_RESULT
 {
+    unsigned __int64 OutcomeDigest; // order-independent summary of the outcome set
     int Schedules;       // distinct interleavings actually executed
     int MaxDepth;        // most scheduling points seen in any one run
     int Deadlocks;       // runs where every thread was blocked
     int Truncated;       // runs cut off at KM_SCHED_MAX_DEPTH
+    int Pruned;          // runs the reduction stopped branching from
+    int Outcomes;        // distinct KmSchedNoteOutcome values reported
 } KM_SCHED_RESULT;
 
 //
@@ -118,16 +123,49 @@ void KmSchedNoteAcquire(const void* LockAddress);
 void KmSchedNoteRelease(const void* LockAddress);
 
 //
-// The next lever, deliberately not pulled yet: partial-order reduction.
-// Depth-first enumeration replays ever-longer shared prefixes and
-// explores interleavings that differ only in the order of independent
-// operations. Sleep sets or happens-before pruning would cut these
-// spaces by orders of magnitude -- but SOUND reduction needs to know
-// which memory each scheduling point's step actually touched, and
-// nothing records that today. Guessing conflicts would silently shrink
-// coverage, which is the one failure mode worse than slowness. If this
-// is ever built: instrument the primitives' reads and writes first, and
-// let the reduction derive from what was really accessed.
+// Partial-order reduction, opt-in per exploration. Depth-first enumeration
+// otherwise explores every order of steps that touch nothing in common,
+// and those orders all end in the same state. With the reduction on, the
+// explorer records which memory each step touched and skips an order once
+// one equivalent to it has run (sleep sets; see Scheduler.c). Every
+// reachable outcome, deadlock and violation is still reached.
+//
+// The footprints come from the primitives: lock operations, the
+// interlocked and ReadNoFence-family shims, pool allocation and free, and
+// the shim's shared queues. Memory a body shares without going through
+// one of those must be registered with KmSchedNoteAccess or
+// KmSchedNoteFootprint, or the reduction treats the steps touching it as
+// independent. The driver's own plain accesses are not recorded: the
+// reduction relies on them being protected by something that is.
+//
+void KmSchedSetReduction(int Enabled);
+
+//
+// Adds a range to the footprint of the calling thread's current step.
+// Called by the primitives; a body calls it for shared memory it touches
+// with plain accesses.
+//
+void KmSchedNoteFootprint(const void* Address, size_t Length, int IsWrite);
+
+//
+// Heap blocks allocated while an exploration runs, from the shim's
+// allocators. Footprints name memory inside them by allocation order
+// rather than address, which is what lets a footprint recorded in one
+// replay be compared with steps taken in the next. Pool blocks are also
+// reported when freed: their memory sits in the shim's quarantine rather
+// than going back to the heap, and a step whose footprint lands in one is
+// reported as a use after free, with or without the reduction.
+//
+void KmSchedNoteAllocation(const void* Block, size_t Size);
+void KmSchedNoteFree(const void* Block);
+
+//
+// Reports what one run ended in, from Teardown. The explorer keeps the
+// set of distinct values and returns its size and digest, which is how a
+// reduced exploration is checked against the full one: on any space both
+// can finish, the outcome sets must be identical.
+//
+void KmSchedNoteOutcome(unsigned __int64 Outcome);
 
 //
 // Starts a thread that participates in the exploration. Only valid inside
