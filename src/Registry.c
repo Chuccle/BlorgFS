@@ -150,7 +150,7 @@ static VOID RegistryCopyString(PUNICODE_STRING Output, const WCHAR* Value, USHOR
 // Read optional Parameters overrides at PASSIVE_LEVEL. Missing, malformed
 // or oversized values retain defaults. Granularities must fit ULONG bytes
 // and satisfy Cc's power-of-two/page-size contract; zero leaves Cc's default
-// unchanged. FastFat starts at 256 KB; this driver's measured starting value
+// unchanged. FastFat uses 64 KB; this driver's measured starting value
 // and adaptive ceiling are documented in Driver.h. DiskCachePath is an NT
 // path. Strings accept an optional trailing NUL and are copied into the
 // supplied counted output buffers.
