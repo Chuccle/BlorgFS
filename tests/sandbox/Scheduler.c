@@ -2378,6 +2378,12 @@ KM_SCHED_RESULT KmExploreInterleavings(
 
         result.Schedules++;
 
+        if (0 == result.Schedules % 10000000)
+        {
+            fprintf(stderr, "[sched] %d runs\n", result.Schedules);
+            fflush(stderr);
+        }
+
         if (Depth > result.MaxDepth)
         {
             result.MaxDepth = Depth;
