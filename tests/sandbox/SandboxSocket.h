@@ -55,7 +55,8 @@ typedef enum _SANDBOX_STEP_KIND
     //
     // Deliver nothing and leave the request outstanding. Models a peer
     // that accepts and never answers -- in the driver the watchdog kills
-    // this; here the scenario asserts the request is still parked.
+    // this; here the scenario asserts the request is still parked, and
+    // SandboxResumeStalled can let it carry on.
     //
     SandboxStepStall
 } SANDBOX_STEP_KIND;
@@ -106,8 +107,22 @@ VOID SandboxSetPeerScript(const SANDBOX_STEP* Steps, SIZE_T StepCount);
 // Fails the next N socket acquisitions, for the connect-failure paths.
 VOID SandboxFailNextAcquires(ULONG Count);
 
+//
+// The same, with the status a failed connect reports: STATUS_IO_TIMEOUT is
+// what the real connect watchdog produces, and the client retries only that.
+//
+VOID SandboxFailNextAcquiresWith(ULONG Count, NTSTATUS Status);
+
 // Runs deferred (non-inline) completions until none remain.
 VOID SandboxDrainCompletions(VOID);
+
+//
+// Lets every receive parked on a Stall step carry on with the step after
+// it, as a peer that was slow rather than dead. A scenario that needs a
+// fetch kept in flight across drains stalls it, then resumes it here so
+// it still completes before teardown.
+//
+VOID SandboxResumeStalled(VOID);
 
 // Counters a scenario asserts on.
 ULONG SandboxSocketsCreated(VOID);
