@@ -347,7 +347,7 @@ typedef struct _HTTP_CONTEXT
     // (a reused-connection retry may resend it); freed in HttpFreeContext.
     //
     PCHAR RequestBuffer;
-    ANSI_STRING EncodedPathBuffer;    // owns the URL-encoded path memory until request is built
+    ANSI_STRING EncodedPathBuffer;    // owns URL-encoded construction storage until context cleanup
 
     //
     // TLS-encrypted record wrapping RequestBuffer, sent instead of it
@@ -2089,12 +2089,12 @@ static VOID HttpOnTlsHandshakeComplete(NTSTATUS Status, PVOID CallerContext)
 // pooled reused connection, otherwise advances to the receive stage.
 // BytesTransferred is unused: WskSend's contract is "all or error" for
 // stream sockets, so a successful completion means the whole request is on
-// the wire. RequestBuffer and EncodedPathBuffer are deliberately NOT freed
-// here even though the send is done: a reused connection can still turn
-// out to be dead on the subsequent receive (the common idle-close case --
-// the send is accepted into the local TCP buffer but the peer's FIN
-// surfaces as a 0-byte receive), and the retry resends the same request.
-// Both are freed unconditionally in HttpFreeContext.
+// the wire. RequestBuffer remains owned for a receive-side retry: a
+// successful send can still be followed by a 0-byte receive when the
+// peer closed an idle connection. That retry resends RequestBuffer;
+// EncodedPathBuffer remains context-owned construction storage, although
+// the completed request already contains the encoded path. Both buffers
+// are freed unconditionally in HttpFreeContext.
 //
 static VOID HttpOnSend(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID CompletionContext)
 {
