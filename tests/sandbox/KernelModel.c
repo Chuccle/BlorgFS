@@ -626,6 +626,8 @@ static void KmSpinLockClaim(void* Context)
 {
     KM_LOCK* lock = (KM_LOCK*)Context;
 
+    KmSchedNoteAcquire(lock);
+
     lock->SchedState = 1;
     lock->OwnerThread = KmSchedThreadId();
 }
@@ -639,6 +641,8 @@ static void KmSpinLockClaim(void* Context)
 //
 static void KmSpinLockSharedClaim(void* Context)
 {
+    KmSchedNoteAcquire(Context);
+
     ((KM_LOCK*)Context)->SchedState++;
 }
 
@@ -712,7 +716,7 @@ void KmReleaseLock(KM_LOCK* Lock, unsigned char OldIrql)
     if (KmSchedActive())
     {
         Lock->SchedState = 0;
-        KmSchedNoteFootprint(Lock, 1, 1);
+        KmSchedNoteRelease(Lock);
         KmSchedYield();
         return;
     }
@@ -758,7 +762,7 @@ void KmReleaseLockShared(KM_LOCK* Lock)
         }
 
         Lock->SchedState--;
-        KmSchedNoteFootprint(Lock, 1, 1);
+        KmSchedNoteRelease(Lock);
         KmSchedYield();
         return;
     }

@@ -337,16 +337,30 @@ void KmSchedWaitUntilClaim(KM_SCHED_PREDICATE Predicate, void* PredicateContext,
 //
 void KmSchedSetAtomicYields(int Enabled);
 
-long KmSchedInterlockedIncrement(long volatile* Target);
-long KmSchedInterlockedDecrement(long volatile* Target);
-long KmSchedInterlockedExchange(long volatile* Target, long Value);
-long KmSchedInterlockedCompareExchange(long volatile* Target, long Exchange, long Comparand);
-__int64 KmSchedInterlockedIncrement64(__int64 volatile* Target);
-__int64 KmSchedInterlockedDecrement64(__int64 volatile* Target);
-long KmSchedInterlockedOr(long volatile* Target, long Value);
-__int64 KmSchedInterlockedAdd64(__int64 volatile* Target, __int64 Value);
-__int64 KmSchedInterlockedExchangeAdd64(__int64 volatile* Target, __int64 Value);
-void* KmSchedInterlockedCompareExchangePointer(void* volatile* Target, void* Exchange, void* Comparand);
+//
+// The ordering each shim below is asked for, as bits: an acquire joins
+// what the write it reads released, a release publishes the writer's
+// clock with its write, and a full fence also orders the access against
+// every other full fence. The unsuffixed Interlocked operations are full
+// fences; their Acquire, Release and NoFence forms are the weaker orders.
+// They differ only under weak memory (KmSchedSetWeakMemory).
+//
+#define KM_ORDER_RELAXED  0
+#define KM_ORDER_ACQUIRE  1
+#define KM_ORDER_RELEASE  2
+#define KM_ORDER_ACQ_REL  (KM_ORDER_ACQUIRE | KM_ORDER_RELEASE)
+#define KM_ORDER_SEQ_CST  (KM_ORDER_ACQ_REL | 4)
+
+long KmSchedInterlockedIncrement(long volatile* Target, int Order);
+long KmSchedInterlockedDecrement(long volatile* Target, int Order);
+long KmSchedInterlockedExchange(long volatile* Target, long Value, int Order);
+long KmSchedInterlockedCompareExchange(long volatile* Target, long Exchange, long Comparand, int Order);
+__int64 KmSchedInterlockedIncrement64(__int64 volatile* Target, int Order);
+__int64 KmSchedInterlockedDecrement64(__int64 volatile* Target, int Order);
+long KmSchedInterlockedOr(long volatile* Target, long Value, int Order);
+__int64 KmSchedInterlockedAdd64(__int64 volatile* Target, __int64 Value, int Order);
+__int64 KmSchedInterlockedExchangeAdd64(__int64 volatile* Target, __int64 Value, int Order);
+void* KmSchedInterlockedCompareExchangePointer(void* volatile* Target, void* Exchange, void* Comparand, int Order);
 
 //
 // The unlocked reads and writes the driver makes of memory other threads
@@ -363,11 +377,20 @@ void* KmSchedInterlockedCompareExchangePointer(void* volatile* Target, void* Exc
 // drop and its read as one step, and never reaches the schedule in which
 // both droppers drop first and then both read.
 //
-long KmSchedReadLong(long volatile* Source);
-__int64 KmSchedReadLong64(__int64 volatile* Source);
-void* KmSchedReadPointer(void* volatile* Source);
-void KmSchedWriteLong(long volatile* Target, long Value);
-void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value);
+long KmSchedReadLong(long volatile* Source, int Order);
+__int64 KmSchedReadLong64(__int64 volatile* Source, int Order);
+void* KmSchedReadPointer(void* volatile* Source, int Order);
+void KmSchedWriteLong(long volatile* Target, long Value, int Order);
+void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value, int Order);
+void KmSchedMemoryBarrier(void);
+
+//
+// Weak memory, opt-in per exploration: a read may return an older write
+// than the last, as far as the orderings and full fences in the program
+// allow, and each value it may return is a branch of the search. See the
+// weak memory section of Scheduler.c for the model.
+//
+void KmSchedSetWeakMemory(int Enabled);
 
 #ifdef __cplusplus
 }
