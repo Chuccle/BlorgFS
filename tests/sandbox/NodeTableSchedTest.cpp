@@ -2889,3 +2889,24 @@ TEST(SchedulerAudit, ReadOfAFreedPoolBlockIsReported)
 }
 
 } // namespace
+
+
+TEST_F(NodeTableSchedTest, ScOnlyStrandsAnIdleNode)
+{
+    DropProof proof = {};
+    proof.Volume = Volume;
+    proof.Path = MakePath(L"\\dropped.bin");
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetRaceDetection(1);
+
+    const KM_SCHED_RESULT result =
+        KmExploreInterleavings(DropProofSetup, DropProofTeardown, &proof, 1000000);
+
+    KmSchedSetAtomicYields(0);
+    KmSchedSetRaceDetection(0);
+
+    EXPECT_EQ(0, proof.Stranded);
+    EXPECT_LT(result.Schedules, 1000000);
+    printf("[  sched   ] SC drop proof: %d runs, %ld stranded, %ld reaped\n", result.Schedules, proof.Stranded, proof.Reaped);
+}

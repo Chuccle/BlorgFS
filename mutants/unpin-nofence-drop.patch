@@ -1,0 +1,13 @@
+diff --git a/src/Structs.c b/src/Structs.c
+index 49d1601..f4674a5 100644
+--- a/src/Structs.c
++++ b/src/Structs.c
+@@ -699,7 +699,7 @@ VOID BlorgNodeUnpin(PCOMMON_CONTEXT Node)
+     KeEnterCriticalRegion();
+     ExAcquirePushLockShared(&bucket->Lock);
+ 
+-    InterlockedDecrement(&Node->PinCount);
++    InterlockedDecrementNoFence(&Node->PinCount);
+     NodeDeferReapIfIdleLocked(Node);
+ 
+     ExReleasePushLockShared(&bucket->Lock);
