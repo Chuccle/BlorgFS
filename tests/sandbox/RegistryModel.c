@@ -8,8 +8,8 @@
 static struct
 {
     PCWSTR Name;
-    ULONG Type;
     const VOID* Data;
+    ULONG Type;
     ULONG Length;
     NTSTATUS OpenStatus;
     NTSTATUS QueryStatus;

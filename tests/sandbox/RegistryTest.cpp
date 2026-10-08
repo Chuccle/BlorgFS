@@ -101,7 +101,7 @@ TEST_F(RegistryTest, TruncatedAndOversizedQueryRepliesKeepDefaults)
     EXPECT_EQ(0u, global.DiskCacheMb);
 }
 
-TEST_F(RegistryTest, GranulesRejectKilobyteWrapAndNonPowersOfTwo)
+TEST_F(RegistryTest, GranularitiesRejectKilobyteWrapAndNonPowersOfTwo)
 {
     const ULONG invalid[] = {1, 3, 100, 0x400000, 0x400004, MAXULONG};
     for (ULONG value : invalid)
@@ -124,6 +124,7 @@ TEST_F(RegistryTest, CountedStringsAcceptAnOptionalTerminator)
     const WCHAR port[] = L"65535";
     for (ULONG length : {C_CAST(ULONG, sizeof(port)), C_CAST(ULONG, sizeof(port) - sizeof(WCHAR))})
     {
+        Port.Length = 0;
         RegistryModelValue(L"RemotePort", REG_SZ, port, length);
         Read();
         EXPECT_EQ(L"65535", std::wstring(Port.Buffer, Port.Length / sizeof(WCHAR)));

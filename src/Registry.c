@@ -8,8 +8,6 @@
 #include "Socket.h"
 #include "TlsHandshake.h"
 
-#define BLORGFS_REG_TAG 'GRBT'
-
 //
 // Reads a single registry value of the expected type into Buffer, failing
 // if the stored value doesn't match ExpectedType or exceeds BufferSize.
@@ -150,9 +148,12 @@ static VOID RegistryCopyString(PUNICODE_STRING Output, const WCHAR* Value, USHOR
 
 //
 // Read optional Parameters overrides at PASSIVE_LEVEL. Missing, malformed
-// or oversized values retain defaults. Granules must fit ULONG bytes and
-// satisfy Cc's power-of-two/page-size contract. Strings accept an optional
-// trailing NUL and are copied into the supplied counted output buffers.
+// or oversized values retain defaults. Granularities must fit ULONG bytes
+// and satisfy Cc's power-of-two/page-size contract; zero leaves Cc's default
+// unchanged. FastFat starts at 256 KB; this driver's measured starting value
+// and adaptive ceiling are documented in Driver.h. DiskCachePath is an NT
+// path. Strings accept an optional trailing NUL and are copied into the
+// supplied counted output buffers.
 //
 VOID BlorgReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRING PortOut, PUNICODE_STRING HostOut, PUNICODE_STRING DiskCachePathOut)
 {
@@ -210,12 +211,6 @@ VOID BlorgReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRIN
             (granularity >= PAGE_SIZE && 0 == (granularity & (granularity - 1))))
         {
             global.ReadAheadGranularity = granularity;
-            BLORGFS_LOG("BlorgReadRegistryConfig() - read-ahead granularity override: %lu KB\n", granularityKb);
-        }
-        else
-        {
-            BLORGFS_LOG("BlorgReadRegistryConfig() - ignoring ReadAheadGranularityKb=%lu: "
-                "granularity must be zero or a power of two at least PAGE_SIZE\n", granularityKb);
         }
     }
 
@@ -280,7 +275,6 @@ VOID BlorgReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRIN
     if (NT_SUCCESS(RegistryReadValue(parametersKey, L"ReadAheadSlackGrowth", REG_DWORD, &slackGrowthValue, sizeof(slackGrowthValue), &actualSize)))
     {
         global.ReadAheadSlackGrowth = (0 != slackGrowthValue);
-        BLORGFS_LOG("BlorgReadRegistryConfig() - slack-driven growth: %lu\n", slackGrowthValue);
     }
 
     UCHAR pinValue[TLS_HASH_LEN];
@@ -300,10 +294,6 @@ VOID BlorgReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRIN
         if (RegistryValidPortString(portValue, portChars))
         {
             RegistryCopyString(PortOut, portValue, portChars);
-        }
-        else
-        {
-            BLORGFS_LOG("BlorgReadRegistryConfig() - ignoring invalid RemotePort registry value, using scheme default\n");
         }
     }
 

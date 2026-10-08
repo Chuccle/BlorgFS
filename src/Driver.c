@@ -482,7 +482,6 @@ VOID BlorgDriverUnload(PDRIVER_OBJECT DriverObject)
     BlorgFreeSecurityDescriptor();
 }
 
-#define BLORGFS_REG_TAG 'GRBT'
 //
 //  Kept identical to DefaultRemoteHost in BlorgFS.inf, which seeds
 //  Parameters\RemoteHost with the same string at install time. If the two
@@ -497,7 +496,7 @@ VOID BlorgDriverUnload(PDRIVER_OBJECT DriverObject)
 // the trailing NUL, and BLORGFS_REG_PORT_MAX_CHARS covers the ':'
 // separator plus the port's characters. Client.c sizes its Host-header
 // reads against BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES (Driver.h), so a bump
-// to either cap here must be reflected there -- this assert is what makes
+// to either registry cap must be reflected there -- this assert is what makes
 // that drift a build break instead of a free-build NT_ASSERT no-op.
 //
 static_assert(

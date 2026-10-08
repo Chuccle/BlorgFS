@@ -25,8 +25,8 @@
 #include <algorithm>
 
 extern "C" {
-#include "..\..\src\Driver.h"
 #include "Scheduler.h"
+#include "..\..\src\Driver.h"
 }
 
 namespace
