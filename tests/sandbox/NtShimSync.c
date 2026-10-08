@@ -53,6 +53,7 @@ VOID ExInitializePushLock(PEX_PUSH_LOCK Lock)
     InitializeSRWLock(&Lock->Lock);
     Lock->Initialized = 1;
     Lock->SchedState = 0;
+    Lock->SchedExclusiveWaiters = 0;
     Lock->ExclusiveOwner = 0;
     Lock->Id = KmAllocateLockId();
     Lock->Name = "push-lock";
@@ -84,9 +85,19 @@ static int PushLockFreePredicate(void* Context)
     return ((PEX_PUSH_LOCK)Context)->SchedState == 0;
 }
 
+//
+// A shared acquire waits for an exclusive holder, and also for an
+// exclusive acquirer already waiting: a push lock does not let new readers
+// overtake a queued writer. Granting them would hide every deadlock in
+// which a reader re-takes a lock, or waits on a thread that will, while a
+// writer is queued on it -- the kernel blocks that reader and the model
+// must too.
+//
 static int PushLockSharablePredicate(void* Context)
 {
-    return ((PEX_PUSH_LOCK)Context)->SchedState >= 0;
+    const PEX_PUSH_LOCK lock = (PEX_PUSH_LOCK)Context;
+
+    return lock->SchedState >= 0 && 0 == lock->SchedExclusiveWaiters;
 }
 
 //
@@ -108,6 +119,13 @@ static void PushLockExclusiveClaim(void* Context)
 
     lock->SchedState = -1;
     lock->ExclusiveOwner = KmSchedThreadId();
+}
+
+static void PushLockExclusiveClaimAfterWait(void* Context)
+{
+    ((PEX_PUSH_LOCK)Context)->SchedExclusiveWaiters--;
+
+    PushLockExclusiveClaim(Context);
 }
 
 static void PushLockSharedClaim(void* Context)
@@ -135,8 +153,21 @@ VOID ExAcquirePushLockExclusive(PEX_PUSH_LOCK Lock)
 
     if (KmSchedActive())
     {
+        //
+        // Tested under the same baton as the wait's own first test, so a
+        // writer counts itself as waiting exactly when it is about to.
+        //
+        if (PushLockFreePredicate(Lock))
+        {
+            KmSchedWaitUntilClaim(PushLockFreePredicate, Lock,
+                PushLockExclusiveClaim, Lock, "push lock exclusive");
+            return;
+        }
+
+        Lock->SchedExclusiveWaiters++;
+
         KmSchedWaitUntilClaim(PushLockFreePredicate, Lock,
-            PushLockExclusiveClaim, Lock, "push lock exclusive");
+            PushLockExclusiveClaimAfterWait, Lock, "push lock exclusive");
         return;
     }
 
@@ -238,6 +269,7 @@ NTSTATUS ExInitializeResourceLite(PERESOURCE Resource)
     Resource->Initialized = 1;
     Resource->ExclusiveOwner = 0;
     Resource->SchedState = 0;
+    Resource->SchedExclusiveWaiters = 0;
     Resource->Id = KmAllocateLockId();
 
     return STATUS_SUCCESS;
@@ -248,9 +280,21 @@ static int EresourceFreePredicate(void* Context)
     return ((PERESOURCE)Context)->SchedState == 0;
 }
 
+//
+// The same queued-writer rule as the push lock's, with the ERESOURCE
+// exception: a thread that already holds the resource is granted another
+// shared hold however many writers wait, so it takes the plain predicate.
+//
 static int EresourceSharablePredicate(void* Context)
 {
     return ((PERESOURCE)Context)->SchedState >= 0;
+}
+
+static int EresourceSharableBehindWaitersPredicate(void* Context)
+{
+    const PERESOURCE resource = (PERESOURCE)Context;
+
+    return resource->SchedState >= 0 && 0 == resource->SchedExclusiveWaiters;
 }
 
 //
@@ -279,6 +323,13 @@ static void EresourceExclusiveClaim(void* Context)
     resource->ExclusiveOwner = KmSchedThreadId();
 }
 
+static void EresourceExclusiveClaimAfterWait(void* Context)
+{
+    ((PERESOURCE)Context)->SchedExclusiveWaiters--;
+
+    EresourceExclusiveClaim(Context);
+}
+
 static void EresourceSharedClaim(void* Context)
 {
     PERESOURCE resource = (PERESOURCE)Context;
@@ -305,8 +356,6 @@ NTSTATUS ExDeleteResourceLite(PERESOURCE Resource)
 
 BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE Resource, BOOLEAN Wait)
 {
-    (void)Wait;
-
     KmRequireIrqlAtMost(APC_LEVEL, "ExAcquireResourceExclusiveLite");
 
     if (Resource->ExclusiveOwner == KmSchedThreadId())
@@ -319,14 +368,44 @@ BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE Resource, BOOLEAN Wait)
         return TRUE;
     }
 
-    KmNoteLockAcquire(Resource->Id, "eresource");
-
     if (KmSchedActive())
     {
-        KmSchedWaitUntilClaim(EresourceFreePredicate, Resource,
-            EresourceExclusiveClaim, Resource, "eresource exclusive");
+        //
+        // A caller that cannot wait gets FALSE, and the driver takes its
+        // other path (posting the request). Waiting regardless would only
+        // ever explore the path that blocks.
+        //
+        if (!Wait && !EresourceFreePredicate(Resource))
+        {
+            return FALSE;
+        }
+
+        KmNoteLockAcquire(Resource->Id, "eresource");
+
+        if (EresourceFreePredicate(Resource))
+        {
+            KmSchedWaitUntilClaim(EresourceFreePredicate, Resource,
+                EresourceExclusiveClaim, Resource, "eresource exclusive");
+        }
+        else
+        {
+            Resource->SchedExclusiveWaiters++;
+
+            KmSchedWaitUntilClaim(EresourceFreePredicate, Resource,
+                EresourceExclusiveClaimAfterWait, Resource, "eresource exclusive");
+        }
+
+        return TRUE;
     }
-    else
+
+    if (!Wait && !TryAcquireSRWLockExclusive(&Resource->Lock))
+    {
+        return FALSE;
+    }
+
+    KmNoteLockAcquire(Resource->Id, "eresource");
+
+    if (Wait)
     {
         AcquireSRWLockExclusive(&Resource->Lock);
     }
@@ -338,23 +417,44 @@ BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE Resource, BOOLEAN Wait)
 
 BOOLEAN ExAcquireResourceSharedLite(PERESOURCE Resource, BOOLEAN Wait)
 {
-    (void)Wait;
-
     KmRequireIrqlAtMost(APC_LEVEL, "ExAcquireResourceSharedLite");
-
-    KmNoteLockAcquire(Resource->Id, "eresource");
 
     if (KmSchedActive())
     {
+        //
+        // Decided before KmNoteLockAcquire records this hold, or every
+        // caller would appear to hold the resource already.
+        //
+        const KM_SCHED_PREDICATE sharable = KmHoldsLock(Resource->Id)
+            ? EresourceSharablePredicate
+            : EresourceSharableBehindWaitersPredicate;
+
+        if (!Wait && !sharable(Resource))
+        {
+            return FALSE;
+        }
+
+        KmNoteLockAcquire(Resource->Id, "eresource");
+
         //
         // Same claim-under-the-baton as the exclusive path: an exclusive
         // acquirer running between this wait returning and the count below
         // would corrupt the state both sides release against.
         //
-        KmSchedWaitUntilClaim(EresourceSharablePredicate, Resource,
+        KmSchedWaitUntilClaim(sharable, Resource,
             EresourceSharedClaim, Resource, "eresource shared");
+
+        return TRUE;
     }
-    else
+
+    if (!Wait && !TryAcquireSRWLockShared(&Resource->Lock))
+    {
+        return FALSE;
+    }
+
+    KmNoteLockAcquire(Resource->Id, "eresource");
+
+    if (Wait)
     {
         AcquireSRWLockShared(&Resource->Lock);
     }
