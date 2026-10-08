@@ -181,6 +181,9 @@ jobs:
 
     - name: Run the dispatched script
       if: always() && env.SCRIPT != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
       run: |
         printf '%s\n' "$SCRIPT" > "$RUNNER_TEMP/script.sh"
         tools/blorg guest run --out guest-results "$RUNNER_TEMP/script.sh"
