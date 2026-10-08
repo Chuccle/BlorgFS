@@ -168,6 +168,26 @@ void KmSchedNoteFree(const void* Block);
 void KmSchedNoteOutcome(unsigned __int64 Outcome);
 
 //
+// Copies the last exploration's outcome set, as the explorer stores it,
+// and returns its size. A sharded search is checked one shard at a time:
+// every outcome a shard reaches must also be one the reduced search
+// reaches, and the reduced search reaches nothing the full one cannot,
+// since each of its runs is a run of the full search.
+//
+int KmSchedCopyOutcomes(unsigned __int64* Outcomes, int Capacity);
+
+//
+// Splits the full search between Count processes; this one explores the
+// runs of shard Index. Runs are grouped by their first few choices and the
+// groups dealt out in turn, so the shards' runs together are exactly the
+// unsharded search's. A run in another shard's group is still executed
+// once, unrecorded, to find where the next group starts; its outcome is
+// not reported and it is not counted. Ignored with the reduction on;
+// KmSchedSetShard(0, 1) turns it off.
+//
+void KmSchedSetShard(int Index, int Count);
+
+//
 // Starts a thread that participates in the exploration. Only valid inside
 // a body; the thread does not run until the scheduler picks it.
 //
@@ -310,11 +330,10 @@ void KmSchedWaitUntilClaim(KM_SCHED_PREDICATE Predicate, void* PredicateContext,
 // That is a sample rather than a proof -- it hit the cap -- but it is
 // three orders of magnitude past where the divergence used to appear.
 //
-// Cost is no longer the reason the gated proofs run at lock granularity:
-// under the fiber executor the exhaustive lock-granularity proofs take
-// seconds and the two-million-schedule soak about two minutes. They stay
-// DISABLED_ tests in NodeTableSchedTest.cpp purely to keep the default
-// gate fast; run them on demand.
+// With partial-order reduction on (KmSchedSetReduction) both node-table
+// bodies exhaust their atomic-granularity spaces in a few thousand runs:
+// NodeTableSchedTest.NoAtomicInterleavingRetiresAPinnedNode and
+// NodeTableRevivalSchedTest.NoAtomicInterleavingFreesARevivedNode.
 //
 void KmSchedSetAtomicYields(int Enabled);
 

@@ -22,6 +22,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 extern "C" {
 #include "..\..\src\Driver.h"
 #include "Scheduler.h"
@@ -85,6 +87,75 @@ static KM_SCHED_RESULT ExploreReduced(
     KmSchedSetReduction(0);
 
     return result;
+}
+
+//
+// The shard of the full search this process runs, from KM_SCHED_SHARD
+// ("index/count"), which verify.yml sets to split the long proofs between
+// runners. Unset or empty, the whole search runs. Returns the shard count, or 0 for
+// a value that does not parse.
+//
+static int ShardFromEnvironment()
+{
+    const char* shard = getenv("KM_SCHED_SHARD");
+    int index = 0;
+    int count = 1;
+
+    if (shard && *shard &&
+        (2 != sscanf(shard, "%d/%d", &index, &count) || count < 1 || index < 0 || index >= count))
+    {
+        return 0;
+    }
+
+    KmSchedSetShard(index, count);
+
+    return count;
+}
+
+//
+// The reduction's gate on real driver code. Every outcome the full search
+// reached, or this shard of it, must be one the reduced search reaches.
+// The converse holds by construction, since each reduced run is also a run
+// of the full search, so an unsharded search must match it exactly.
+//
+static void ExpectReductionReachesFullOutcomes(
+    KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context,
+    const KM_SCHED_RESULT& Full, int Shards)
+{
+    static unsigned __int64 full[65536];
+    static unsigned __int64 reduced[65536];
+
+    const int fullCount = KmSchedCopyOutcomes(full, 65536);
+    const KM_SCHED_RESULT result = ExploreReduced(Setup, Teardown, Context, 1000000);
+    const int reducedCount = KmSchedCopyOutcomes(reduced, 65536);
+
+    EXPECT_EQ(0, result.Deadlocks);
+    EXPECT_LT(result.Schedules, 1000000) << "the reduced search hit its schedule cap";
+
+    std::sort(reduced, reduced + reducedCount);
+
+    int missing = 0;
+
+    for (int i = 0; i < fullCount; ++i)
+    {
+        if (!std::binary_search(reduced, reduced + reducedCount, full[i]))
+        {
+            missing++;
+        }
+    }
+
+    EXPECT_EQ(0, missing) << "the full search reached outcomes the reduced search did not";
+
+    if (1 == Shards)
+    {
+        EXPECT_EQ(Full.Outcomes, result.Outcomes)
+            << "the reduced search reached a different number of outcomes";
+        EXPECT_EQ(Full.OutcomeDigest, result.OutcomeDigest)
+            << "the reduced search reached a different set of outcomes";
+    }
+
+    printf("[  sched   ] reduced: %d runs, %d pruned, %d outcomes; full: %d outcomes\n",
+        result.Schedules, result.Pruned, result.Outcomes, Full.Outcomes);
 }
 
 //
@@ -356,11 +427,10 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
 
     //
     // Lock granularity, deliberately: threads interleave at push-lock
-    // acquire/release and explicit yields, not at every interlocked op. At
-    // that granularity the pin/retire arbitration is fully bounded and
-    // exhausts in low thousands of schedules -- see
-    // NoInterleavingRetiresAPinnedNodeAtomicSample below for why atomic
-    // granularity, though strictly stronger, does not run here.
+    // acquire/release and explicit yields, not at every interlocked op.
+    // This is the space the full search can still exhaust, which makes it
+    // the space the partial-order reduction is checked against below.
+    // NoAtomicInterleavingRetiresAPinnedNode covers atomic granularity.
     //
     //
     // 100000, not 20000: raised 2026-08-20 when making ERESOURCE
@@ -395,9 +465,22 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
 // both proofs remain exhaustive under their caps with zero divergence,
 // deadlock and violation, and SchedulerAudit pins the underlying
 // invariants directly.
+//
+// Corrected a fourth time, 2026-10-08: 41330 to 4,531,882 here,
+// 149769 to 25,847,776 for the revival proof. Both spaces had outgrown
+// their caps, and a run that hit the cap printed a note and passed. With
+// the lock-id release made proportional to its own edges the full spaces
+// finish (82 s and about 25 min in Release), so the caps leave headroom
+// and hitting one is a failure again. verify.yml splits both between
+// runners with KM_SCHED_SHARD; the caps are per shard.
     //
+    const int shards = ShardFromEnvironment();
+    ASSERT_NE(0, shards) << "KM_SCHED_SHARD is not index/count";
+
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 100000);
+        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 10000000);
+
+    KmSchedSetShard(0, 1);
 
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a pinned node was retired";
@@ -411,16 +494,15 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
 
-    if (result.Schedules >= 100000)
-    {
-        printf("[  sched   ] hit the schedule cap -- proof is statistical, not exhaustive\n");
-    }
-    else
-    {
-        EXPECT_LT(result.Schedules, 100000)
-            << "hit the schedule cap -- the space was sampled, not exhausted, "
-               "so this proves nothing stronger than the stress test does";
-    }
+    EXPECT_LT(result.Schedules, 10000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted, "
+           "so this proves nothing stronger than the stress test does";
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+
+    ExpectReductionReachesFullOutcomes(PinProofSetup, PinProofTeardown, &proof, result, shards);
+
+    EXPECT_EQ(0, proof.Violations);
 
     //
     // Coverage, not behaviour. If the lookup never succeeded or the retire
@@ -434,91 +516,6 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind)
         << "replays left nodes in the table; the next replay is a different program";
 
-    printf("[  sched   ] %d interleavings, max depth %d, %ld pins, %ld retires\n",
-        result.Schedules, result.MaxDepth, proof.PinsObserved, proof.RetiresObserved);
-
-    //
-    // The reduction's gate on real driver code: on a space the full search
-    // exhausted, the reduced search must end in exactly the same outcomes.
-    //
-    if (result.Schedules < 100000)
-    {
-        const KM_SCHED_RESULT reduced =
-            ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 100000);
-
-        EXPECT_EQ(0, proof.Violations);
-        EXPECT_EQ(0, reduced.Deadlocks);
-        EXPECT_EQ(result.Outcomes, reduced.Outcomes)
-            << "the reduced search reached a different number of outcomes";
-        EXPECT_EQ(result.OutcomeDigest, reduced.OutcomeDigest)
-            << "the reduced search reached a different set of outcomes";
-
-        printf("[  sched   ] reduced: %d runs, %d pruned, %d outcomes\n",
-            reduced.Schedules, reduced.Pruned, reduced.Outcomes);
-    }
-}
-
-//
-// Atomic-granularity sample. Not run in the default gate.
-//
-// Turning on KmSchedSetAtomicYields widens the proof to interleavings
-// inside BlorgNodeTableLookupPin/BlorgNodeUnpin/BlorgNodeDeferReap/
-// NodeReapWorker's own interlocked operations, not just around the push
-// lock -- strictly stronger than the test above. It is also strictly more
-// expensive: this protocol has roughly a dozen interlocked call sites
-// across the two thread bodies, and the number of DISTINCT interleavings
-// of that many events grows combinatorially (binomial, not exponential in
-// the branching factor, but still large enough that a first attempt at
-// 200,000 schedules ran over twenty minutes without reaching either the
-// cap or exhaustion).
-//
-// So this runs as a bounded SAMPLE -- 200 schedules, not a proof. The cap
-// is small on purpose and the smallness is itself the finding: growth is
-// not the roughly-linear cost a schedule count alone would suggest (200
-// finishes in well under a second) -- pushing the cap to 4,000 was tried
-// and did not finish in three minutes. This scheduler does no partial-
-// order reduction, so depth-first enumeration keeps replaying longer and
-// longer shared prefixes to reach each remaining fresh choice as the
-// cheap shallow branches are exhausted first; a real POR-based tool
-// (dynamic partial-order reduction) would collapse the many equivalent
-// orderings of independent events instead of enumerating each one. This
-// scheduler does not have that, and pretending a bigger cap would finish
-// "soon" would be the same kind of overclaim the vacuous proofs earlier
-// in this project turned out to be.
-//
-TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNodeAtomicSample)
-{
-    const wchar_t* path = L"\\media\\contended.bin";
-
-    PinProof proof = {};
-    proof.Volume = Volume;
-    proof.Root = Root;
-    proof.Vcb = Vcb;
-    proof.Path = MakePath(path);
-
-    KmSchedSetAtomicYields(1);
-    KmSchedSetRaceDetection(1);
-
-    KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 200);
-
-    KmSchedSetAtomicYields(0);
-    KmSchedSetRaceDetection(0);
-
-    EXPECT_EQ(0, proof.Violations)
-        << "an interleaving exists in which a pinned node was retired";
-
-    //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
-
-    EXPECT_GT(proof.PinsObserved, 0);
-    EXPECT_GT(proof.RetiresObserved, 0);
-
-    printf("[  sched   ] (atomic sample, NOT exhaustive) %d interleavings, max depth %d\n",
-        result.Schedules, result.MaxDepth);
 }
 
 //
@@ -835,8 +832,13 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
     proof = {};
     proof.Path = MakePath(path);
 
+    const int shards = ShardFromEnvironment();
+    ASSERT_NE(0, shards) << "KM_SCHED_SHARD is not index/count";
+
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 200000);
+        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 50000000);
+
+    KmSchedSetShard(0, 1);
 
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a revived node was freed under its opener";
@@ -850,25 +852,14 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
 
-    //
-    // The push-lock redesign of the reap gate serializes the list push
-    // and the Queued latch more tightly than the original interlocked
-    // pair, which narrows the interleaving window the explorer can
-    // observe. This can push the schedule count to the cap without
-    // finding the revived-while-queued interleaving. An exhaustive
-    // proof would require a deeper budget; the 200K schedules below
-    // still provide strong statistical coverage -- no violations were
-    // found across that many diverse interleavings.
-    //
-    if (result.Schedules >= 200000)
-    {
-        printf("[  sched   ] hit the schedule cap -- proof is statistical, not exhaustive\n");
-    }
-    else
-    {
-        EXPECT_LT(result.Schedules, 200000)
-            << "hit the schedule cap -- the space was sampled, not exhausted";
-    }
+    EXPECT_LT(result.Schedules, 50000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+
+    ExpectReductionReachesFullOutcomes(RevivalProofSetup, RevivalProofTeardown, &proof, result, shards);
+
+    EXPECT_EQ(0, proof.Violations);
 
     EXPECT_GT(proof.RevivalsObserved, 0) << "no schedule ever revived the node";
     EXPECT_GT(proof.RetiresObserved, 0) << "no schedule ever retired the node";
@@ -878,48 +869,16 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     // been caught by twice: every schedule could have revived a node the
     // reap worker had never been told about, which is not the race.
     //
-    // Gated on space exhaustion: when the schedule cap is hit the space
-    // was sampled, not exhausted, so a zero count is inconclusive --
-    // the interleaving may exist beyond the budget. The push-lock
-    // redesign of the reap gate (NodeReap.Lock serializes the list
-    // push and the Queued latch) narrows the window the explorer can
-    // observe, which may require a larger budget on future hardware or
-    // model changes.
-    //
-    if (result.Schedules < 200000)
-    {
-        EXPECT_GT(proof.RevivedWhileQueued, 0)
-            << "no schedule revived a node that was already claimed for reap";
-    }
+    EXPECT_GT(proof.RevivedWhileQueued, 0)
+        << "no schedule revived a node that was already claimed for reap";
 
     EXPECT_EQ(0, proof.LeftBehind)
         << "replays left nodes in the table; the next replay is a different program";
 
-    printf("[  sched   ] %d interleavings, max depth %d, %ld revivals (%ld while queued), %ld retires\n",
-        result.Schedules, result.MaxDepth, proof.RevivalsObserved,
-        proof.RevivedWhileQueued, proof.RetiresObserved);
-
-    if (result.Schedules < 200000)
-    {
-        const KM_SCHED_RESULT reduced =
-            ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 200000);
-
-        EXPECT_EQ(0, proof.Violations);
-        EXPECT_EQ(0, reduced.Deadlocks);
-        EXPECT_EQ(result.Outcomes, reduced.Outcomes)
-            << "the reduced search reached a different number of outcomes";
-        EXPECT_EQ(result.OutcomeDigest, reduced.OutcomeDigest)
-            << "the reduced search reached a different set of outcomes";
-
-        printf("[  sched   ] reduced: %d runs, %d pruned, %d outcomes\n",
-            reduced.Schedules, reduced.Pruned, reduced.Outcomes);
-    }
 }
 
 //
-// Atomic-granularity soaks. DISABLED_, so they are run deliberately
-// (--gtest_also_run_disabled_tests) and never by the gate: these take
-// tens of minutes, where the lock-granularity proofs above take seconds.
+// Atomic-granularity proofs.
 //
 // What they add over those proofs is scheduling points at every
 // interlocked operation, not just around locks. That is strictly stronger
@@ -928,18 +887,19 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 // that matters, because the thing being revived is an InterlockedIncrement64
 // on a counter the worker reads to decide whether to free.
 //
-// They are SAMPLES unless the schedule count comes back under the cap.
-// This scheduler does no partial-order reduction, so depth-first
-// enumeration replays ever-longer shared prefixes as the cheap shallow
-// branches are exhausted, and the atomic space for a two-thread body is
-// large. Read the printed count before calling either of these a proof.
+// The full atomic space does not finish: the pin body ran 140 million
+// schedules in an hour without exhausting it. These run with
+// partial-order reduction, which explores one order of each run of
+// independent steps and exhausts both spaces in a few thousand runs. The
+// lock-granularity proofs above are where that reduction is checked
+// against the full search.
 //
 // Scheduler.h records that atomic granularity on the node-table proof
 // reported replay divergence at depth 17, and that it had not been tracked
 // down. These runs are what re-tests that claim now that the model's
 // ERESOURCE no longer hands two threads the same exclusive hold.
 //
-TEST_F(NodeTableSchedTest, DISABLED_AtomicPinSoak)
+TEST_F(NodeTableSchedTest, NoAtomicInterleavingRetiresAPinnedNode)
 {
     const wchar_t* path = L"\\media\\contended.bin";
 
@@ -953,7 +913,7 @@ TEST_F(NodeTableSchedTest, DISABLED_AtomicPinSoak)
     KmSchedSetRaceDetection(1);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 2000000);
+        ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 1000000);
 
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
@@ -967,14 +927,18 @@ TEST_F(NodeTableSchedTest, DISABLED_AtomicPinSoak)
 //
 ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes in the table";
+    EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the pin body";
+    EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
+    EXPECT_LT(result.Schedules, 1000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
 
     EXPECT_GT(proof.PinsObserved, 0);
     EXPECT_GT(proof.RetiresObserved, 0);
 
-    printf("[  sched   ] atomic pin soak: %d interleavings, max depth %d, "
-           "%ld pins, %ld retires, exhausted=%s\n",
-        result.Schedules, result.MaxDepth, proof.PinsObserved, proof.RetiresObserved,
-        (result.Schedules < 2000000) ? "YES" : "NO (sampled)");
+    printf("[  sched   ] atomic pin proof: %d runs, %d pruned, max depth %d, "
+           "%ld pins, %ld retires\n",
+        result.Schedules, result.Pruned, result.MaxDepth,
+        proof.PinsObserved, proof.RetiresObserved);
 }
 
 //
@@ -1086,9 +1050,9 @@ TEST(SchedulerAudit, RaceDetectorFlagsUnsynchronizedAccess)
 
 //
 // A random sample through the atomic-granularity space of the pin body.
-// The DISABLED_ soak below enumerates that space; this one exists for the
-// gate, where a few seconds of breadth catches gross granularity
-// regressions -- a shim atomic silently ceasing to be a scheduling
+// NoAtomicInterleavingRetiresAPinnedNode enumerates that space with the
+// partial-order reduction on; this one samples it with the reduction off,
+// and a few seconds of breadth catches gross granularity regressions -- a shim atomic silently ceasing to be a scheduling
 // point, say -- without paying for enumeration. Seeded, so a failure
 // reproduces exactly; on a hit, raise the count and re-run before
 // believing the seed was lucky.
@@ -1131,7 +1095,7 @@ TEST_F(NodeTableSchedTest, RandomAtomicPinSmoke)
         result.Schedules, result.MaxDepth);
 }
 
-TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
+TEST_F(NodeTableRevivalSchedTest, NoAtomicInterleavingFreesARevivedNode)
 {
     const wchar_t* path = L"\\revived.bin";
 
@@ -1144,7 +1108,7 @@ TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
     KmSchedSetRaceDetection(1);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000);
+        ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 1000000);
 
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
@@ -1158,28 +1122,20 @@ TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
     //
     ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes linked under the root";
+    EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the revival body";
+    EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
+    EXPECT_LT(result.Schedules, 1000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
 
     EXPECT_GT(proof.RevivalsObserved, 0);
     EXPECT_GT(proof.RetiresObserved, 0);
+    EXPECT_GT(proof.RevivedWhileQueued, 0)
+        << "no schedule revived a node that was already claimed for reap";
 
-    //
-    // Gated on exhaustion, as in NoInterleavingFreesARevivedNode and for
-    // the same reason: a depth-first walk that hits the cap has varied only
-    // its late choices, and the reap claim is taken early, so a sampled run
-    // can miss the revived-while-queued schedule without that saying
-    // anything about whether it exists.
-    //
-    if (result.Schedules < 2000000)
-    {
-        EXPECT_GT(proof.RevivedWhileQueued, 0)
-            << "no schedule revived a node that was already claimed for reap";
-    }
-
-    printf("[  sched   ] atomic revival soak: %d interleavings, max depth %d, "
-           "%ld revivals (%ld while queued), %ld retires, exhausted=%s\n",
-        result.Schedules, result.MaxDepth, proof.RevivalsObserved,
-        proof.RevivedWhileQueued, proof.RetiresObserved,
-        (result.Schedules < 2000000) ? "YES" : "NO (sampled)");
+    printf("[  sched   ] atomic revival proof: %d runs, %d pruned, max depth %d, "
+           "%ld revivals (%ld while queued), %ld retires\n",
+        result.Schedules, result.Pruned, result.MaxDepth, proof.RevivalsObserved,
+        proof.RevivedWhileQueued, proof.RetiresObserved);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -2159,6 +2115,81 @@ TEST(SchedulerAudit, ReductionReachesEveryOutcomeOfALostUpdate)
     EXPECT_EQ(full.OutcomeDigest, reduced.OutcomeDigest)
         << "the reduced exploration reached a different set of outcomes";
     EXPECT_LT(reduced.Schedules, full.Schedules);
+}
+
+//
+// Sharding: the shards' runs together must be the unsharded search's, no
+// run lost and none counted twice. Two threads of four unlocked
+// increments run deeper than the shard depth, so runs are dealt out by
+// their prefix rather than one by one.
+//
+static void RepeatedIncrementer(void* Parameter)
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        UnlockedIncrementer(Parameter);
+    }
+}
+
+static void RepeatedIncrementSetup(void* Parameter)
+{
+    LostUpdateAudit* audit = (LostUpdateAudit*)Parameter;
+
+    audit->Counter = 0;
+
+    KmSchedSpawn(RepeatedIncrementer, audit);
+    KmSchedSpawn(RepeatedIncrementer, audit);
+}
+
+TEST(SchedulerAudit, ShardsTogetherRunTheWholeSearch)
+{
+    static LostUpdateAudit audit;
+    static unsigned __int64 whole[64];
+    static unsigned __int64 combined[64];
+
+    KmSchedSetAtomicYields(1);
+
+    const KM_SCHED_RESULT full =
+        KmExploreInterleavings(RepeatedIncrementSetup, LostUpdateTeardown, &audit, 100000);
+    const int wholeCount = KmSchedCopyOutcomes(whole, 64);
+
+    int schedules = 0;
+    int unionCount = 0;
+
+    for (int shard = 0; shard < 3; ++shard)
+    {
+        KmSchedSetShard(shard, 3);
+
+        const KM_SCHED_RESULT part =
+            KmExploreInterleavings(RepeatedIncrementSetup, LostUpdateTeardown, &audit, 100000);
+
+        EXPECT_GT(part.Schedules, 0) << "shard " << shard << " ran nothing";
+        schedules += part.Schedules;
+
+        unsigned __int64 outcomes[64];
+        const int count = KmSchedCopyOutcomes(outcomes, 64);
+
+        for (int i = 0; i < count; ++i)
+        {
+            if (std::find(combined, combined + unionCount, outcomes[i]) == combined + unionCount)
+            {
+                combined[unionCount++] = outcomes[i];
+            }
+        }
+    }
+
+    KmSchedSetShard(0, 1);
+    KmSchedSetAtomicYields(0);
+
+    ASSERT_LT(full.Schedules, 100000) << "the full space was sampled, not exhausted";
+    EXPECT_GT(full.MaxDepth, 12) << "no run reached the shard depth";
+    EXPECT_EQ(full.Schedules, schedules) << "the shards ran a different number of schedules";
+
+    std::sort(whole, whole + wholeCount);
+    std::sort(combined, combined + unionCount);
+
+    EXPECT_TRUE(std::equal(whole, whole + wholeCount, combined, combined + unionCount))
+        << "the shards reached a different set of outcomes";
 }
 
 TEST(SchedulerAudit, ReductionStillFindsADeadlockThatNeedsOneOrder)
