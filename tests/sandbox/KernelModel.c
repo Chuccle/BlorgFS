@@ -224,6 +224,21 @@ static const char* LockNames[KM_MAX_LOCKS];
 static long NextLockId = 0;
 
 //
+// The ids each id shares an edge with, in either direction, so clearing an
+// id's edges touches only the edges it has. Clearing a full row and column
+// instead walks a 2 KB-strided column through all 4 MB of LockOrder, and an
+// exploration whose Setup re-initialises a 256-bucket table does that 256
+// times per replay -- 2 ms of every replay spent zeroing entries that were
+// already zero. An id with more partners than fit is marked overflowed and
+// cleared the full way, so a short list costs speed, never an edge.
+//
+#define KM_MAX_LOCK_PARTNERS 32
+
+static unsigned short LockPartners[KM_MAX_LOCKS][KM_MAX_LOCK_PARTNERS];
+static unsigned char LockPartnerCount[KM_MAX_LOCKS];
+static unsigned char LockPartnerOverflow[KM_MAX_LOCKS];
+
+//
 // Ids returned by KmReleaseLockId, reused before any new one is minted.
 //
 static int FreeLockIds[KM_MAX_LOCKS];
@@ -255,6 +270,68 @@ void KmSetLockIdRecycling(int Enabled)
     LeaveCriticalSection(&OrderCs);
 }
 
+static void KmAddLockPartner(int Id, int Partner)
+{
+    if (LockPartnerOverflow[Id])
+    {
+        return;
+    }
+
+    if (LockPartnerCount[Id] == KM_MAX_LOCK_PARTNERS)
+    {
+        LockPartnerOverflow[Id] = 1;
+        return;
+    }
+
+    LockPartners[Id][LockPartnerCount[Id]++] = (unsigned short)Partner;
+}
+
+static void KmRemoveLockPartner(int Id, int Partner)
+{
+    for (int i = 0; i < LockPartnerCount[Id]; ++i)
+    {
+        if (LockPartners[Id][i] == Partner)
+        {
+            LockPartners[Id][i] = LockPartners[Id][--LockPartnerCount[Id]];
+            return;
+        }
+    }
+}
+
+//
+// Removes every edge into and out of Id. Called under OrderCs.
+//
+static void KmClearLockEdges(int Id)
+{
+    if (LockPartnerOverflow[Id])
+    {
+        for (int i = 0; i < KM_MAX_LOCKS; ++i)
+        {
+            if (LockOrder[Id][i] || LockOrder[i][Id])
+            {
+                LockOrder[Id][i] = 0;
+                LockOrder[i][Id] = 0;
+                KmRemoveLockPartner(i, Id);
+            }
+        }
+
+        LockPartnerOverflow[Id] = 0;
+    }
+    else
+    {
+        for (int i = 0; i < LockPartnerCount[Id]; ++i)
+        {
+            const int partner = LockPartners[Id][i];
+
+            LockOrder[Id][partner] = 0;
+            LockOrder[partner][Id] = 0;
+            KmRemoveLockPartner(partner, Id);
+        }
+    }
+
+    LockPartnerCount[Id] = 0;
+}
+
 //
 // Clears the observed-order edges. Deliberately does NOT reset the id
 // counter: locks created by an earlier test are still live and still hold
@@ -266,7 +343,18 @@ void KmResetLockOrder(void)
 {
     KmEnsureOrderCs();
     EnterCriticalSection(&OrderCs);
-    memset(LockOrder, 0, sizeof(LockOrder));
+
+    //
+    // Every id with an edge was handed out by KmAllocateLockId, which
+    // never returns one above NextLockId, so that bound covers the graph.
+    //
+    const long minted = (NextLockId < KM_MAX_LOCKS) ? NextLockId : KM_MAX_LOCKS - 1;
+
+    for (int id = 1; id <= minted; ++id)
+    {
+        KmClearLockEdges(id);
+    }
+
     LeaveCriticalSection(&OrderCs);
 }
 
@@ -342,7 +430,21 @@ static void KmRecordOrder(int AcquiringId)
             EnterCriticalSection(&OrderCs);
         }
 
-        LockOrder[heldId][AcquiringId] = 1;
+        if (!LockOrder[heldId][AcquiringId])
+        {
+            LockOrder[heldId][AcquiringId] = 1;
+
+            //
+            // Both ends record the edge, so it goes when either id does.
+            // An edge already recorded the other way round is already in
+            // both lists.
+            //
+            if (!LockOrder[AcquiringId][heldId])
+            {
+                KmAddLockPartner(heldId, AcquiringId);
+                KmAddLockPartner(AcquiringId, heldId);
+            }
+        }
     }
 
     LeaveCriticalSection(&OrderCs);
@@ -418,11 +520,7 @@ void KmReleaseLockId(int Id)
     // lock's edges would invent inversions between locks that never
     // coexisted.
     //
-    for (int i = 0; i < KM_MAX_LOCKS; ++i)
-    {
-        LockOrder[Id][i] = 0;
-        LockOrder[i][Id] = 0;
-    }
+    KmClearLockEdges(Id);
 
     LockNames[Id] = NULL;
 

@@ -183,6 +183,103 @@ TEST_F(KernelModelTest, ConsistentLockOrderIsNotFlagged)
 }
 
 //
+// A recycled id is a new lock. It must not inherit the edges of the lock
+// that held the id before it, or the model reports inversions between
+// locks that never coexisted (an unexpected violation aborts the run) --
+// and edges recorded after the reuse must still catch a real inversion.
+//
+TEST_F(KernelModelTest, RecycledLockIdStartsWithNoOrderEdges)
+{
+    KmSetLockIdRecycling(1);
+
+    KM_LOCK a = {};
+    KM_LOCK b = {};
+
+    KmInitializeLock(&a, "recycle-A");
+    KmInitializeLock(&b, "recycle-B");
+
+    unsigned char irqlA = KmAcquireLock(&a);
+    unsigned char irqlB = KmAcquireLock(&b);
+    KmReleaseLock(&b, irqlB);
+    KmReleaseLock(&a, irqlA);
+
+    const int oldId = b.Id;
+    KmInitializeLock(&b, "recycle-B2");
+    ASSERT_EQ(oldId, b.Id) << "re-initialising did not recycle the id";
+
+    irqlB = KmAcquireLock(&b);
+    irqlA = KmAcquireLock(&a);
+    KmReleaseLock(&a, irqlA);
+    KmReleaseLock(&b, irqlB);
+
+    irqlA = KmAcquireLock(&a);
+
+    KmExpectViolation(KmViolationLockOrder);
+    irqlB = KmAcquireLock(&b);
+
+    EXPECT_EQ(KmViolationLockOrder, KmTakeViolation())
+        << "an edge recorded after recycling was lost";
+
+    KmReleaseLock(&b, irqlB);
+    KmReleaseLock(&a, irqlA);
+
+    KmSetLockIdRecycling(0);
+}
+
+//
+// The same, for an id with more partners than its edge list holds. That
+// id falls back to clearing its whole row and column, and must still
+// leave nothing behind on either side.
+//
+TEST_F(KernelModelTest, RecycledLockIdWithManyPartnersStartsWithNoOrderEdges)
+{
+    KmSetLockIdRecycling(1);
+
+    KM_LOCK hub = {};
+    KM_LOCK spokes[48] = {};
+
+    KmInitializeLock(&hub, "hub");
+
+    for (KM_LOCK& spoke : spokes)
+    {
+        KmInitializeLock(&spoke, "spoke");
+    }
+
+    for (KM_LOCK& spoke : spokes)
+    {
+        unsigned char irqlHub = KmAcquireLock(&hub);
+        unsigned char irqlSpoke = KmAcquireLock(&spoke);
+        KmReleaseLock(&spoke, irqlSpoke);
+        KmReleaseLock(&hub, irqlHub);
+    }
+
+    const int oldId = hub.Id;
+    KmInitializeLock(&hub, "hub2");
+    ASSERT_EQ(oldId, hub.Id) << "re-initialising did not recycle the id";
+
+    for (KM_LOCK& spoke : spokes)
+    {
+        unsigned char irqlSpoke = KmAcquireLock(&spoke);
+        unsigned char irqlHub = KmAcquireLock(&hub);
+        KmReleaseLock(&hub, irqlHub);
+        KmReleaseLock(&spoke, irqlSpoke);
+    }
+
+    unsigned char irqlHub = KmAcquireLock(&hub);
+
+    KmExpectViolation(KmViolationLockOrder);
+    unsigned char irqlSpoke = KmAcquireLock(&spokes[47]);
+
+    EXPECT_EQ(KmViolationLockOrder, KmTakeViolation())
+        << "an edge recorded after recycling was lost";
+
+    KmReleaseLock(&spokes[47], irqlSpoke);
+    KmReleaseLock(&hub, irqlHub);
+
+    KmSetLockIdRecycling(0);
+}
+
+//
 // Holding a spin lock raises to DISPATCH and releasing restores. The
 // driver's IRQL reasoning depends on this, and so does the paged-pool
 // check above -- if the raise did not happen, an allocation under a lock
