@@ -447,7 +447,7 @@ static NODE_REAP_STATE NodeReap;
 static IO_WORKITEM_ROUTINE NodeReapWorker;
 
 //
-// Hashes Path case-insensitively, matching BlorgArePathComponentsEqual's
+// Hashes Path case-insensitively, matching NodeArePathComponentsEqual's
 // compare, mixed so the top bits pick a bucket: every table keyed by path
 // (the node table here, the path and listing caches) takes its index from
 // the high bits of this. Falls back to a manual hash on
@@ -750,7 +750,7 @@ NTSTATUS BlorgNodeTableInit(PDEVICE_OBJECT VolumeDeviceObject)
 //
 // Volume teardown: suppresses further kicks, waits out an in-flight
 // worker pass, then discards the queue (the nodes themselves are freed by
-// FreeFileContextTree immediately after) and resets the buckets. Runs at
+// DriverFreeFileContextTree immediately after) and resets the buckets. Runs at
 // PASSIVE after the FSP queue is drained, so no new pushes can race it.
 //
 // Teardown latches under the same lock the kicks claim through, so a kick
@@ -944,7 +944,7 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // Returns the final path component (substring, not a copy) of Path,
 // skipping one trailing separator if present.
 //
-static UNICODE_STRING GetLastComponent(const UNICODE_STRING* Path)
+static UNICODE_STRING NodeGetLastComponent(const UNICODE_STRING* Path)
 {
     UNICODE_STRING lastComponent = { 0 };
 
@@ -989,7 +989,7 @@ static UNICODE_STRING GetLastComponent(const UNICODE_STRING* Path)
 // Case-insensitive equality check for a single path component. Length
 // check first as a cheap short-circuit before the NT string compare.
 //
-inline static BOOLEAN BlorgArePathComponentsEqual(const UNICODE_STRING* Component1, const UNICODE_STRING* Component2)
+inline static BOOLEAN NodeArePathComponentsEqual(const UNICODE_STRING* Component1, const UNICODE_STRING* Component2)
 {
     if (Component1->Length != Component2->Length)
     {
@@ -1003,7 +1003,7 @@ inline static BOOLEAN BlorgArePathComponentsEqual(const UNICODE_STRING* Componen
 // Linear scan of ParentDcb's immediate children for one whose last path
 // component matches Name.
 //
-inline static PCOMMON_CONTEXT BlorgSearchByName(const DCB* ParentDcb, const UNICODE_STRING* Name)
+inline static PCOMMON_CONTEXT NodeSearchByName(const DCB* ParentDcb, const UNICODE_STRING* Name)
 {
     PCOMMON_CONTEXT child = NULL;
     UNICODE_STRING lastComponent;
@@ -1013,9 +1013,9 @@ inline static PCOMMON_CONTEXT BlorgSearchByName(const DCB* ParentDcb, const UNIC
         entry = entry->Flink)
     {
         child = CONTAINING_RECORD(entry, COMMON_CONTEXT, Links);
-        lastComponent = GetLastComponent(&child->FullPath);
+        lastComponent = NodeGetLastComponent(&child->FullPath);
 
-        if (BlorgArePathComponentsEqual(Name, &lastComponent))
+        if (NodeArePathComponentsEqual(Name, &lastComponent))
         {
             return child;
         }
@@ -1051,9 +1051,9 @@ PCOMMON_CONTEXT BlorgSearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Pa
             ASSERT(entry);
 
             child = CONTAINING_RECORD(entry, COMMON_CONTEXT, Links);
-            lastComponent = GetLastComponent(&child->FullPath);
+            lastComponent = NodeGetLastComponent(&child->FullPath);
 
-            if (BlorgArePathComponentsEqual(&component, &lastComponent))
+            if (NodeArePathComponentsEqual(&component, &lastComponent))
             {
                 matchingChild = child;
                 break;
@@ -1123,7 +1123,7 @@ NTSTATUS BlorgInsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIR
         FsRtlDissectName(remainingPath, &firstPart, &remainingPart);
 
         BOOLEAN isLastComponent = (0 == remainingPart.Length);
-        PCOMMON_CONTEXT existing = BlorgSearchByName(currentDcb, &firstPart);
+        PCOMMON_CONTEXT existing = NodeSearchByName(currentDcb, &firstPart);
 
         if (existing)
         {

@@ -893,6 +893,8 @@ static VOID ReadRecordUserLatency(FCB* Fcb, LONG64 ArrivedQpc)
 // Recorded only when fast I/O actually handled the read. A FALSE return
 // means the I/O manager will reissue it as an IRP, which BlorgRead times
 // on its own; counting both would double every fallback.
+// Successful fast reads also count consumption for read-ahead adaptation;
+// FsRtlCopyRead has initialised the cache map at PASSIVE_LEVEL.
 //
 BOOLEAN BlorgFastIoRead(
     PFILE_OBJECT FileObject,
@@ -920,15 +922,6 @@ BOOLEAN BlorgFastIoRead(
 
         ReadRecordUserLatency(fcb, arrivedQpc);
 
-        //
-        // Fast I/O is where most application reads land -- buffered
-        // synchronous reads of a cached file never become an IRP at all --
-        // so the adaptive policy has to count them or its denominator is a
-        // small unrepresentative slice and every file looks like pure
-        // waste. FsRtlCopyRead returning TRUE means the cache map is
-        // initialised and this ran at PASSIVE_LEVEL, which is what
-        // CcSetReadAheadGranularity needs.
-        //
         if (fcb)
         {
             fcb->ReadAheadConsumedBytes += IoStatus->Information;
@@ -1280,9 +1273,9 @@ static BOOLEAN ReadFromDiskCacheReleased(PIRP Irp, PFCB Fcb, ULONG Valid)
 // Issues a read ReadFairAdmit held, at PASSIVE_LEVEL, once ReadFairSettle
 // has admitted it, or one the disk cache could not finish
 // (ReadDiskComplete). The length is trimmed again rather than carried: the
-// file size of a read-only volume does not change, so the trim gives the
-// same answer it gave on arrival, and the IRP has no free slot to carry it
-// in. A held read is offered to the disk cache first, as it would have
+// backend can refresh a closed FCB while the request waits, so the retry
+// must resample its size. A held read is offered to the disk cache first,
+// as it would have
 // been had it not been held, so the blocks the cache holds of it are not
 // fetched again; one the cache could not finish is fetched whole. A read
 // the cache was to serve whole was never admitted, and is admitted now,
@@ -1496,6 +1489,10 @@ static VOID ReadRefetchWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // fetches the rest, so it is admitted first, charged as a fetch of its
 // whole length; a held one is offered to the cache again when released.
 //
+// Every paging read counts fetched bytes, including granule-rounded demand
+// faults. Cached reads count consumption and adapt at PASSIVE_LEVEL with
+// the cache map initialised, as CcSetReadAheadGranularity requires.
+//
 NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     NTSTATUS result = STATUS_INVALID_DEVICE_REQUEST;
@@ -1635,13 +1632,6 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             ReadTrackStream(fcb, C_CAST(ULONG64, startingByte.QuadPart), realLength);
 
-            //
-            // What read-ahead cost, for the adaptive policy. Counted on
-            // every paging read rather than only the speculative ones: a
-            // demand fault whose length was rounded up by the granule is
-            // over-fetching too, and attributing only Cc's own read-ahead
-            // would understate the waste it causes.
-            //
             fcb->ReadAheadFetchedBytes += realLength;
 
             if (realLength > fcb->ReadMaxPagingBytes)
@@ -1719,13 +1709,6 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         BLORGFS_STAT_INC(ReadsCached);
 
-        //
-        // A cached read is the application asking for bytes, which is the
-        // denominator the policy compares fetches against. Evaluated here
-        // rather than at the fetch site because this is the path that runs
-        // at PASSIVE_LEVEL with the file object's cache map initialised,
-        // which CcSetReadAheadGranularity needs.
-        //
         fcb->ReadAheadConsumedBytes += realLength;
         ReadAdaptGranularity(fcb, IrpSp->FileObject);
 

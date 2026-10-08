@@ -8,7 +8,7 @@
 
 //
 // Blocks until every in-flight HTTP request has finished and refuses any
-// new one. PASSIVE_LEVEL only, called once from DriverUnload before the
+// new one. PASSIVE_LEVEL only, called once from BlorgDriverUnload before the
 // device objects are torn down. See BlorgDrainHttpClient in Client.c.
 //
 VOID BlorgDrainHttpClient(VOID);

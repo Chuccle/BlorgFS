@@ -310,7 +310,7 @@ extern struct GLOBAL
     //  ANSI hostname (no port) for the ClientHello SNI extension, built in
     //  DriverEntry alongside RemoteHostAnsi. NULL when TLS is disabled at
     //  load, when the configured host is an IPv4/IPv6 literal (RFC 6066
-    //  forbids literals in SNI -- see HostStringIsIpLiteral, Driver.c), or
+    //  forbids literals in SNI -- see DriverHostStringIsIpLiteral, Driver.c), or
     //  on allocation failure; BlorgTlsStartHandshakeAsync omits the extension
     //  in all three cases. NUL-terminated (pool-zero allocated), bounded
     //  by BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES like RemoteHostAnsi.
@@ -438,7 +438,7 @@ extern struct GLOBAL
     //  requested portions) for every IRP_MJ_QUERY_SECURITY. BlorgFS does not
     //  store per-file security -- the volume is a read-only public share --
     //  so one permissive descriptor serves all nodes. Built once in
-    //  DriverEntry, freed in DriverUnload.
+    //  DriverEntry, freed in BlorgDriverUnload.
     //
     PSECURITY_DESCRIPTOR FileSecurityDescriptor;
 

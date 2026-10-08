@@ -1,42 +1,33 @@
 ﻿//
-// Directory create/open coverage over the real Create.c: CheckDirectoryAccess,
-// OpenExistingDcb, OpenRootDcb, BreakHandleOplockOnSharingViolation,
-// SplitPathLeaf and FindEntryByName -- none of which any other sandbox
+// Directory create/open coverage over the real Create.c: CreateCheckDirectoryAccess,
+// CreateOpenExistingDcb, CreateOpenRootDcb, CreateBreakHandleOplockOnSharingViolation,
+// CreateSplitPathLeaf and CreateFindEntryByName -- none of which any other sandbox
 // target drives. DispatchTest/DispatchSchedTest/DispatchStressTest all open
 // FILES through BlorgCreate; a directory open takes a structurally
 // different branch in BlorgVolumeCreate (FILE_NON_DIRECTORY_FILE checks,
-// OpenExistingDcb's CCB allocation, the root-path shortcut) that a
+// CreateOpenExistingDcb's CCB allocation, the root-path shortcut) that a
 // file-only opener never touches. The same plumbing drives the reopen of
 // a resident file after the server's copy changed (FcbReopenTest, at the
 // end), the one file-open branch those targets do not reach.
 //
-// CheckFileAccess and CheckDirectoryAccess are `static inline` in
+// CreateCheckFileAccess and CreateCheckDirectoryAccess are `static inline` in
 // Create.c, unreachable from any other translation unit -- the same
-// situation DispatchTest.cpp documents for OpenExistingFcb. Matching that
+// situation DispatchTest.cpp documents for CreateOpenExistingFcb. Matching that
 // file's approach, this drives them through real directory- and file-open
 // IRPs rather than declaring them extern, which would test a copy of the
 // mask rather than the mask the driver actually applies.
 //
-// One branch is intentionally NOT covered here: CheckFileAccess and
-// CheckDirectoryAccess's IsReadOnly=FALSE side (the FullMask that allows
-// FILE_WRITE_DATA). All four call sites -- OpenExistingFcb, OpenExistingDcb,
-// OpenVcb, OpenRootDcb -- hardcode IsReadOnly=TRUE, and BlorgFS has no
-// write path yet (see the write-path-unimplemented note), so FullMask has
-// no caller to reach it through. Testing it would mean calling the static
-// inline through a synthetic wrapper -- exactly the "copy of the contract"
-// this file avoids elsewhere -- so it stays untested until a write path
-// gives it a real caller.
+// Access checks apply the read-only masks directly; there is no write-mode
+// helper branch. The bit-by-bit tests below cover file and directory masks.
 //
 // CreateComplete (the async BlorgHttpGetFileInformation completion)
-// is also still 0%: reaching it means scripting a real HTTP round trip
-// through the real Client.c and SandboxSocket peer, which is follow-on
-// work, not done here; the re-drive that consumes what it stashes is
-// driven directly (FcbReopenTest). What IS covered without a network
-// round trip is the OTHER way BlorgVolumeCreate resolves a cold path: a
+// is not exercised by these tests: it needs a real HTTP round trip through
+// Client.c and the SandboxSocket peer. FcbReopenTest drives the re-drive
+// directly. Cold paths here resolve through a
 // fresh listing of the parent in the listing cache, which is exactly how
 // a warm directory's children resolve once DirCtrlComplete has published
-// its listing. That path exercises SplitPathLeaf and both of
-// FindEntryByName's loops for free.
+// its listing. That path exercises CreateSplitPathLeaf and both of
+// CreateFindEntryByName's loops for free.
 //
 // DispatchSandbox.vcxproj lists this TU BEFORE DispatchSchedTest.cpp, not
 // alphabetically or by habit: KmExploreInterleavings (Scheduler.c) turns
@@ -80,7 +71,7 @@ protected:
         global.VolumeDeviceObject = Volume;
 
         //
-        // OpenExistingDcb/OpenRootDcb wire FileObject->Vpb from
+        // CreateOpenExistingDcb/CreateOpenRootDcb wire FileObject->Vpb from
         // global.DiskDeviceObject on every successful open; without it
         // they dereference a null Vpb pointer.
         //
@@ -211,7 +202,7 @@ protected:
     //
     // Publishes a synthetic listing of Dir with one file and one
     // subdirectory entry into the listing cache, the way DirCtrlComplete
-    // would have -- so BlorgVolumeCreate's listing-hit branch (FindEntryByName,
+    // would have -- so BlorgVolumeCreate's listing-hit branch (CreateFindEntryByName,
     // reached without any network round trip) can be driven directly. The
     // layout arithmetic lives in ListingBuilder.h, shared with
     // DirCtrlTest.cpp rather than copied.
@@ -298,7 +289,7 @@ protected:
 };
 
 ///////////////////////////////////////////////////////////////////////////
-// CheckDirectoryAccess / OpenExistingDcb
+// CreateCheckDirectoryAccess / CreateOpenExistingDcb
 ///////////////////////////////////////////////////////////////////////////
 
 TEST_F(CreateDirectoryTest, OpenExistingDcbSucceedsWithReadOnlyAccessMask)
@@ -315,15 +306,15 @@ TEST_F(CreateDirectoryTest, OpenExistingDcbSucceedsWithReadOnlyAccessMask)
     EXPECT_EQ(STATUS_SUCCESS, opener.CreateIrp.IoStatus.Status);
     EXPECT_EQ(node, opener.FileObject.FsContext);
     EXPECT_NE(nullptr, opener.FileObject.FsContext2)
-        << "OpenExistingDcb must allocate a CCB for the directory handle";
+        << "CreateOpenExistingDcb must allocate a CCB for the directory handle";
     EXPECT_EQ((ULONG_PTR)FILE_OPENED, opener.CreateIrp.IoStatus.Information);
 
     CloseOpener(&opener);
 }
 
 //
-// The entire reason CheckDirectoryAccess exists separately from
-// CheckFileAccess: a directory's read-only mask additionally permits
+// The entire reason CreateCheckDirectoryAccess exists separately from
+// CreateCheckFileAccess: a directory's read-only mask additionally permits
 // FILE_ADD_SUBDIRECTORY/FILE_ADD_FILE/FILE_DELETE_CHILD, because adding or
 // removing a child is a normal directory operation, not a data write. The
 // same bits against a FILE must still be denied -- proving the allowance
@@ -346,7 +337,7 @@ TEST_F(CreateDirectoryTest, DirectoryReadOnlyMaskAllowsChildMutationBitsThatFile
 
     EXPECT_EQ(STATUS_SUCCESS, dirOpener.CreateIrp.IoStatus.Status)
         << "FILE_ADD_SUBDIRECTORY/FILE_ADD_FILE/FILE_DELETE_CHILD are inside "
-           "CheckDirectoryAccess's read-only mask";
+           "CreateCheckDirectoryAccess's read-only mask";
 
     CloseOpener(&dirOpener);
 
@@ -355,7 +346,7 @@ TEST_F(CreateDirectoryTest, DirectoryReadOnlyMaskAllowsChildMutationBitsThatFile
     BlorgCreate(Volume, &fileOpener.CreateIrp);
 
     EXPECT_EQ(STATUS_ACCESS_DENIED, fileOpener.CreateIrp.IoStatus.Status)
-        << "the same bits are outside CheckFileAccess's read-only mask -- a "
+        << "the same bits are outside CreateCheckFileAccess's read-only mask -- a "
            "file has no children to add or delete";
     EXPECT_EQ(nullptr, fileOpener.FileObject.FsContext);
 }
@@ -481,7 +472,7 @@ TEST_F(CreateDirectoryTest, OpenExistingDcbDeniesAccessOutsideReadOnlyMask)
 
     //
     // GENERIC_WRITE, not one of the FILE_WRITE_DATA/FILE_APPEND_DATA bits:
-    // every low FILE_* bit CheckDirectoryAccess's read-only mask omits for
+    // every low FILE_* bit CreateCheckDirectoryAccess's read-only mask omits for
     // files (WRITE_DATA=0x2, APPEND_DATA=0x4) aliases a directory-specific
     // bit the SAME mask explicitly allows (ADD_FILE=0x2, ADD_SUBDIRECTORY
     // =0x4 -- see the test above), so those bits cannot demonstrate a
@@ -498,11 +489,11 @@ TEST_F(CreateDirectoryTest, OpenExistingDcbDeniesAccessOutsideReadOnlyMask)
     EXPECT_EQ(nullptr, opener.FileObject.FsContext)
         << "a denied open must not wire up the file object";
     EXPECT_EQ(0, ReadNoFence64(&node->RefCount))
-        << "CheckDirectoryAccess must reject before OpenExistingDcb takes a reference";
+        << "CreateCheckDirectoryAccess must reject before CreateOpenExistingDcb takes a reference";
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// OpenRootDcb
+// CreateOpenRootDcb
 ///////////////////////////////////////////////////////////////////////////
 
 TEST_F(CreateDirectoryTest, OpenRootDcbSucceedsWithReadOnlyAccessMask)
@@ -515,7 +506,7 @@ TEST_F(CreateDirectoryTest, OpenRootDcbSucceedsWithReadOnlyAccessMask)
     EXPECT_EQ(STATUS_SUCCESS, opener.CreateIrp.IoStatus.Status);
     EXPECT_EQ(Root, opener.FileObject.FsContext);
     EXPECT_NE(nullptr, opener.FileObject.FsContext2)
-        << "OpenRootDcb must allocate a CCB just like OpenExistingDcb";
+        << "CreateOpenRootDcb must allocate a CCB just like CreateOpenExistingDcb";
 
     CloseOpener(&opener);
 }
@@ -535,7 +526,7 @@ TEST_F(CreateDirectoryTest, OpenRootDcbDeniesAccessOutsideReadOnlyMask)
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// BreakHandleOplockOnSharingViolation
+// CreateBreakHandleOplockOnSharingViolation
 ///////////////////////////////////////////////////////////////////////////
 
 //
@@ -562,7 +553,7 @@ TEST_F(CreateDirectoryTest, SharingViolationOnDirectoryOpenTriggersOplockBreakAn
 
     EXPECT_EQ(STATUS_SHARING_VIOLATION, second.CreateIrp.IoStatus.Status);
     EXPECT_EQ(nullptr, second.FileObject.FsContext2)
-        << "a failed directory open must not leak the CCB OpenExistingDcb "
+        << "a failed directory open must not leak the CCB CreateOpenExistingDcb "
            "allocated before the share-access check failed";
 
     PDCB dcb = C_CAST(PDCB, node);
@@ -575,7 +566,7 @@ TEST_F(CreateDirectoryTest, SharingViolationOnDirectoryOpenTriggersOplockBreakAn
 
 //
 // FILE_COMPLETE_IF_OPLOCKED means the caller explicitly asked not to
-// trigger a break, so BreakHandleOplockOnSharingViolation must take its
+// trigger a break, so CreateBreakHandleOplockOnSharingViolation must take its
 // early-return branch and hand the sharing violation straight back
 // without calling FsRtlOplockBreakH at all -- the other half of that
 // function's one `if`, not exercised by the unconditional-break test above.
@@ -601,14 +592,14 @@ TEST_F(CreateDirectoryTest, SharingViolationWithCompleteIfOplockedSkipsTheOplock
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// SplitPathLeaf / FindEntryByName, via a cached parent listing
+// CreateSplitPathLeaf / CreateFindEntryByName, via a cached parent listing
 ///////////////////////////////////////////////////////////////////////////
 
 //
 // A directory neither in the node table nor the path cache, but present in
 // its parent's already-cached listing, is exactly how a warm directory's
-// children resolve day to day -- and it reaches SplitPathLeaf and
-// FindEntryByName's subdirectory loop without a network round trip.
+// children resolve day to day -- and it reaches CreateSplitPathLeaf and
+// CreateFindEntryByName's subdirectory loop without a network round trip.
 //
 TEST_F(CreateDirectoryTest, NewSubdirectoryResolvedThroughCachedParentListingIsOpenedAndPublished)
 {
@@ -624,12 +615,12 @@ TEST_F(CreateDirectoryTest, NewSubdirectoryResolvedThroughCachedParentListingIsO
     ASSERT_EQ(STATUS_SUCCESS, dirOpener.CreateIrp.IoStatus.Status);
     ASSERT_NE(nullptr, dirOpener.FileObject.FsContext);
     EXPECT_EQ(BLORGFS_DCB_SIGNATURE, GET_NODE_TYPE(dirOpener.FileObject.FsContext))
-        << "FindEntryByName's subdirectory match must produce IsDirectory=TRUE";
+        << "CreateFindEntryByName's subdirectory match must produce IsDirectory=TRUE";
 
     CloseOpener(&dirOpener);
 
     //
-    // Same listing, the file half -- FindEntryByName's OTHER loop
+    // Same listing, the file half -- CreateFindEntryByName's OTHER loop
     // (FileCount, checked before SubDirCount).
     //
     CreateOpener fileOpener;

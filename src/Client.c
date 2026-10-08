@@ -567,7 +567,7 @@ static NTSTATUS HttpDeserializeChangeBatch(HTTP_CONTEXT* Ctx, PCHANGE_BATCH* Out
 // Small string/parsing helpers
 ///////////////////////////////////////////////////////////////////////////
 
-static NTSTATUS StrToSize(const char* AsciiBuffer, SIZE_T Length, PSIZE_T Result)
+static NTSTATUS HttpStrToSize(const char* AsciiBuffer, SIZE_T Length, PSIZE_T Result)
 {
     if (!AsciiBuffer || !Result || 0 == Length)
     {
@@ -646,7 +646,7 @@ static BOOLEAN HttpTokenEquals(const char* Name, SIZE_T NameLength, const char* 
 // entirely, which is what "be conservative in what you accept" means for a
 // length-prefixed protocol.
 //
-static NTSTATUS GetContentLengthFromHeaders(const struct phr_header* Headers, SIZE_T HeaderCount, PSIZE_T ContentLength)
+static NTSTATUS HttpGetContentLengthFromHeaders(const struct phr_header* Headers, SIZE_T HeaderCount, PSIZE_T ContentLength)
 {
     static const char contentLengthName[] = "content-length";
 
@@ -664,7 +664,7 @@ static NTSTATUS GetContentLengthFromHeaders(const struct phr_header* Headers, SI
             return STATUS_INVALID_NETWORK_RESPONSE;
         }
 
-        result = StrToSize(Headers[i].value, Headers[i].value_len, ContentLength);
+        result = HttpStrToSize(Headers[i].value, Headers[i].value_len, ContentLength);
     }
 
     return result;
@@ -853,15 +853,15 @@ static BOOLEAN HttpParseFileVersion(const struct phr_header* Headers, SIZE_T Hea
 // Tests whether a byte is an RFC 3986 unreserved character that can pass
 // through URL-encoding unescaped.
 //
-static BOOLEAN IsCharacterSafeForUrl(UCHAR c)
+static BOOLEAN HttpIsCharacterSafeForUrl(UCHAR C)
 {
-    if ((c >= 'A' && c <= 'Z') ||
-        (c >= 'a' && c <= 'z') ||
-        (c >= '0' && c <= '9') ||
-        c == '-' ||
-        c == '.' ||
-        c == '_' ||
-        c == '~')
+    if ((C >= 'A' && C <= 'Z') ||
+        (C >= 'a' && C <= 'z') ||
+        (C >= '0' && C <= '9') ||
+        C == '-' ||
+        C == '.' ||
+        C == '_' ||
+        C == '~')
     {
         return TRUE;
     }
@@ -885,7 +885,7 @@ static BOOLEAN IsCharacterSafeForUrl(UCHAR c)
 // on failure the buffer is freed here and nulled, so a failed call leaves
 // nothing to clean up.
 //
-static NTSTATUS UrlEncodePathToAnsi(const UNICODE_STRING* InputString, PANSI_STRING OutputString)
+static NTSTATUS HttpUrlEncodePathToAnsi(const UNICODE_STRING* InputString, PANSI_STRING OutputString)
 {
     UTF8_STRING utf8String;
 
@@ -902,7 +902,7 @@ static NTSTATUS UrlEncodePathToAnsi(const UNICODE_STRING* InputString, PANSI_STR
     for (ULONG i = 0; i < utf8Length; i++)
     {
         UCHAR c = utf8Buffer[i];
-        encodedLength += IsCharacterSafeForUrl(c) ? 1 : 3;
+        encodedLength += HttpIsCharacterSafeForUrl(c) ? 1 : 3;
     }
 
     if (encodedLength + 1 > MAXUSHORT)
@@ -932,7 +932,7 @@ static NTSTATUS UrlEncodePathToAnsi(const UNICODE_STRING* InputString, PANSI_STR
     {
         UCHAR c = utf8Buffer[i];
 
-        if (IsCharacterSafeForUrl(c))
+        if (HttpIsCharacterSafeForUrl(c))
         {
             if (j + 1 > C_CAST(ULONG, encodedLength))
             {
@@ -1014,7 +1014,7 @@ static PCHAR HttpAlignBodyInPlace(PCHAR Body, SIZE_T BodyLen)
 // RtlUTF8ToUnicodeN straight into the entry's Name -- no per-name
 // intermediate allocation -- bounded to leave room for a NUL (the entry
 // block is zero-allocated, so a bounded conversion stays terminated, and
-// EnumerateDirectoryEntries reads Name as null-terminated). A name too
+// DirCtrlEnumerateDirectoryEntries reads Name as null-terminated). A name too
 // long for the field fails its conversion outright and rejects the
 // listing, the same policy the old explicit length check enforced.
 //
@@ -2947,7 +2947,7 @@ static NTSTATUS HttpParseHeaders(HTTP_CONTEXT* Ctx)
     Ctx->BodyOffset = C_CAST(SIZE_T, bytesProcessed);
 
     SIZE_T contentLength = 0;
-    NTSTATUS status = GetContentLengthFromHeaders(Ctx->Headers, Ctx->HeaderCount, &contentLength);
+    NTSTATUS status = HttpGetContentLengthFromHeaders(Ctx->Headers, Ctx->HeaderCount, &contentLength);
 
     if (!NT_SUCCESS(status))
     {
@@ -3355,7 +3355,7 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 // -supplied format string.
 //
 // PASSIVE_LEVEL only, and still so after the path stopped being formatted
-// as %wZ: UrlEncodePathToAnsi's RtlUnicodeStringToUTF8String is itself
+// as %wZ: HttpUrlEncodePathToAnsi's RtlUnicodeStringToUTF8String is itself
 // paged-code, so no request may ever be issued above PASSIVE. Today every
 // issue path (create/dir-control/read FSP workers)
 // already is, and the driver's issuance rule names this conversion as the
@@ -3392,7 +3392,7 @@ static NTSTATUS HttpBuildRequest(
     HTTP_CONTEXT* Ctx
 )
 {
-    NTSTATUS result = Path ? UrlEncodePathToAnsi(Path, &Ctx->EncodedPathBuffer) : STATUS_SUCCESS;
+    NTSTATUS result = Path ? HttpUrlEncodePathToAnsi(Path, &Ctx->EncodedPathBuffer) : STATUS_SUCCESS;
 
     if (!NT_SUCCESS(result))
     {
@@ -3480,7 +3480,7 @@ static NTSTATUS HttpBuildRequest(
 static NTSTATUS HttpBuildSubtreeRequest(const UNICODE_STRING* Path, ULONG Entries, const char* FormatString, HTTP_CONTEXT* Ctx)
 {
     ANSI_STRING encoded;
-    NTSTATUS result = UrlEncodePathToAnsi(Path, &encoded);
+    NTSTATUS result = HttpUrlEncodePathToAnsi(Path, &encoded);
 
     if (!NT_SUCCESS(result))
     {

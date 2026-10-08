@@ -716,7 +716,7 @@ VOID BlorgStatisticsRecordSlowFetch(
 //
 NTSTATUS BlorgStatisticsInitialize(VOID);
 
-// Frees the per-processor table. Called once from DriverUnload.
+// Frees the per-processor table. Called once from BlorgDriverUnload.
 VOID BlorgStatisticsCleanup(VOID);
 
 //
