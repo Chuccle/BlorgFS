@@ -1146,8 +1146,11 @@ TEST_F(DiskCacheTest, ValidBytesCannotExtendBeyondTheImmutableKey)
 {
     StartCache(8);
     Fcb->Header.FileSize.QuadPart = kBlock - 1;
+    Body.resize(kBlock - 1);
     ScriptedEtag = "\"1.0-ffff\"";
     Warm(0, kBlock);
+    ASSERT_EQ(STATUS_SUCCESS, LastStatus);
+    ASSERT_EQ(kBlock - 1, LastInformation);
     DISK_CACHE_KEY key;
     BlorgDiskCacheNoteFile(Fcb->NonPaged, &Fcb->FullPath, kBlock - 1, kModifiedTime, &key);
     IRP irp = {};
