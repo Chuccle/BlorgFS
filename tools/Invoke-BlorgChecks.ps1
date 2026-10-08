@@ -223,6 +223,7 @@ function Invoke-TestExe {
     if ($Arguments) { $psi.Arguments = $Arguments }
     if ($CoverageOnly) {
         $coveragePath = Join-Path $CoverageDirectory "$($Label -replace ':', '-').cov"
+        Write-Host "==> $Label ($Pattern $Arguments)"
         $psi.FileName = $coverageTool
         $psi.Arguments = "--quiet --sources `"$repoRoot\src`" --export_type=binary:`"$coveragePath`" -- `"$($exe.FullName)`" $Arguments"
     }
@@ -246,10 +247,15 @@ function Invoke-TestExe {
     $errorOutput = $stderr.Result
 
     Set-Content -Encoding utf8 -Path (Join-Path $env:TEMP "$($Label -replace ':', '-').out") -Value $output
+    if ($CoverageOnly) {
+        Set-Content -Encoding utf8 -Path (Join-Path $CoverageDirectory "$($Label -replace ':', '-').out") -Value $output
+        Set-Content -Encoding utf8 -Path (Join-Path $CoverageDirectory "$($Label -replace ':', '-').err") -Value $errorOutput
+    }
 
     if ($proc.ExitCode -ne 0) {
         $tail = ($output -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 3) -join ' | '
-        if (-not $tail) { $tail = $errorOutput }
+        $errorTail = ($errorOutput -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 3) -join ' | '
+        if ($errorTail) { $tail = "$tail | $errorTail" }
         Add-Result $Label 'FAIL' "exit $($proc.ExitCode): $tail"
         return $false
     }
@@ -427,9 +433,11 @@ if ($CoverageOnly) {
         @('TlsFuzzTest.exe', 'coverage:tls-fuzz', 300, ''),
         @('ClientSandbox.exe', 'coverage:client', 600, $FastFilter),
         @('ClientFuzz.exe', 'coverage:client-fuzz', 600, "2000 $FastFilter"),
-        @('SocketSandbox.exe', 'coverage:socket', 900, ''),
+        @('SocketSandbox.exe', 'coverage:socket', 900, $FastFilter),
         @('NodeTableSandbox.exe', 'coverage:nodes', 600, $FastFilter),
-        @('DispatchSandbox.exe', 'coverage:dispatch', 1800, ''),
+        @('DispatchSandbox.exe', 'coverage:dispatch', 900, $FastFilter),
+        @('SocketSandbox.exe', 'coverage:socket-proofs', 900, '--gtest_filter=*SchedTest.*:*StressTest.*'),
+        @('DispatchSandbox.exe', 'coverage:dispatch-proofs', 1800, '--gtest_filter=*SchedTest.*:*StressTest.*'),
         @('TlsHandshakeSandbox.exe', 'coverage:handshake', 600, ''))) {
         $ok = (Invoke-TestExe $test[0] $test[1] $test[2] $test[3]) -and $ok
     }
@@ -446,8 +454,10 @@ if ($CoverageOnly) {
         $manifest = @{
             Head = (& git -C $repoRoot rev-parse HEAD)
             Configuration = $Configuration
+            CoverageToolVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($coverageTool).FileVersion
             Scope = 'src files linked into sandbox and TLS binaries; Driver.c excluded'
             Profile = 'Fast plus dispatch/socket Sched/Stress; ClientFuzz 2000; node-table Sched/Stress excluded'
+            Isolation = 'Fast and scheduling suites use separate processes, matching the Fast/Proof tiers'
             Pins = @(& git -C $repoRoot submodule status)
         }
         $manifest | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $CoverageDirectory 'manifest.json')
