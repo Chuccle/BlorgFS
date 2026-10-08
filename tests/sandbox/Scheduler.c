@@ -1027,6 +1027,7 @@ static int ReduceFreshNode(const int* Runnable, int Count)
                 StepFootprint[Depth][t] = StepFootprint[parent][t];
             }
         }
+
     }
 
     const unsigned awake = runnableSet & ~asleep;
@@ -1648,6 +1649,13 @@ KM_SCHED_RESULT KmExploreInterleavings(
         RunOnce(Setup, Teardown, Context);
 
         result.Schedules++;
+
+        if (0 == result.Schedules % 1000000)
+        {
+            printf("[progress] %d schedules, %llu ms, depth %d, recorded %d, pruned %d\n", result.Schedules,
+                (unsigned long long)GetTickCount64(), result.MaxDepth, RecordedDepth, result.Pruned);
+            fflush(stdout);
+        }
 
         if (Depth > result.MaxDepth)
         {

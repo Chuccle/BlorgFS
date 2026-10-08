@@ -397,7 +397,7 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
 // invariants directly.
     //
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 100000);
+        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 2000000000);
 
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a pinned node was retired";
@@ -441,10 +441,10 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     // The reduction's gate on real driver code: on a space the full search
     // exhausted, the reduced search must end in exactly the same outcomes.
     //
-    if (result.Schedules < 100000)
+    if (result.Schedules < 2000000000)
     {
         const KM_SCHED_RESULT reduced =
-            ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 100000);
+            ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 2000000000);
 
         EXPECT_EQ(0, proof.Violations);
         EXPECT_EQ(0, reduced.Deadlocks);
@@ -836,7 +836,7 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
     proof.Path = MakePath(path);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 200000);
+        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000000);
 
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a revived node was freed under its opener";
@@ -899,10 +899,10 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
         result.Schedules, result.MaxDepth, proof.RevivalsObserved,
         proof.RevivedWhileQueued, proof.RetiresObserved);
 
-    if (result.Schedules < 200000)
+    if (result.Schedules < 2000000000)
     {
         const KM_SCHED_RESULT reduced =
-            ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 200000);
+            ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000000);
 
         EXPECT_EQ(0, proof.Violations);
         EXPECT_EQ(0, reduced.Deadlocks);
@@ -953,7 +953,7 @@ TEST_F(NodeTableSchedTest, DISABLED_AtomicPinSoak)
     KmSchedSetRaceDetection(1);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 2000000);
+        ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 2000000000);
 
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
@@ -1144,7 +1144,7 @@ TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
     KmSchedSetRaceDetection(1);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000);
+        ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000000);
 
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
