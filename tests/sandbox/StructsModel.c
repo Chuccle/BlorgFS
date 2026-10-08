@@ -17,6 +17,7 @@
 #define BLORGFS_SHIM_INTERNAL
 
 #include "..\..\src\Driver.h"
+#include "Scheduler.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -147,6 +148,8 @@ PDEVICE_OBJECT StructsModelCreateVolume(VOID)
 {
     ModelDevice = (MODEL_DEVICE_OBJECT*)calloc(1, sizeof(MODEL_DEVICE_OBJECT));
 
+    KmSchedNoteAllocation(ModelDevice, sizeof(MODEL_DEVICE_OBJECT));
+
     ModelDevice->Object.DeviceExtension = &ModelDevice->Extension;
 
     BLORGFS_VDO_DEVICE_EXTENSION* extension = &ModelDevice->Extension;
@@ -175,6 +178,7 @@ VOID StructsModelDestroyVolume(PDEVICE_OBJECT VolumeDeviceObject)
     ExDeletePagedLookasideList(&device->Extension.DcbLookasideList);
     ExDeletePagedLookasideList(&device->Extension.CcbLookasideList);
 
+    KmSchedNoteFree(device);
     free(device);
     ModelDevice = NULL;
 }

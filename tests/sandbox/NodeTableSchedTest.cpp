@@ -52,6 +52,14 @@ struct PinProof
     volatile long RetiresObserved;
     volatile long LeftBehind;
     volatile long PoolAtSetup;
+
+    //
+    // The counters as Setup found them, so Teardown can tell what this one
+    // run did.
+    //
+    long PinsBefore;
+    long RetiresBefore;
+    long ViolationsBefore;
 };
 
 UNICODE_STRING MakePath(const wchar_t* text)
@@ -61,6 +69,22 @@ UNICODE_STRING MakePath(const wchar_t* text)
     name.Length = (USHORT)(wcslen(text) * sizeof(wchar_t));
     name.MaximumLength = name.Length;
     return name;
+}
+
+//
+// The same exploration with partial-order reduction on. On a space the
+// full search exhausts, both must report the same set of outcomes.
+//
+static KM_SCHED_RESULT ExploreReduced(
+    KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context, int MaxSchedules)
+{
+    KmSchedSetReduction(1);
+
+    KM_SCHED_RESULT result = KmExploreInterleavings(Setup, Teardown, Context, MaxSchedules);
+
+    KmSchedSetReduction(0);
+
+    return result;
 }
 
 //
@@ -102,6 +126,8 @@ void PinningThread(void* Parameter)
     // Read through the pin. A freed node reads back the guarded pool's
     // poison, 0xDDDDDDDD, which is negative.
     //
+    KmSchedNoteFootprint(&found->PinCount, sizeof(found->PinCount), 0);
+
     if (found->PinCount <= 0)
     {
         InterlockedIncrement(&proof->Violations);
@@ -161,6 +187,9 @@ void PinProofSetup(void* Parameter)
 
     proof->PinHeld = 0;
     proof->Freed = 0;
+    proof->PinsBefore = proof->PinsObserved;
+    proof->RetiresBefore = proof->RetiresObserved;
+    proof->ViolationsBefore = proof->Violations;
 
     DIRECTORY_ENTRY_METADATA meta = {};
     meta.Size = 4096;
@@ -183,6 +212,29 @@ void PinProofSetup(void* Parameter)
 }
 
 //
+// What one run ended in: which of the two threads got through, whether the
+// node was freed, and, when it was not, the counts it was left with.
+//
+unsigned __int64 PinOutcome(const PinProof* proof)
+{
+    unsigned __int64 outcome =
+        (unsigned __int64)(proof->PinsObserved - proof->PinsBefore) |
+        ((unsigned __int64)(proof->RetiresObserved - proof->RetiresBefore) << 2) |
+        ((unsigned __int64)(proof->Violations - proof->ViolationsBefore) << 4) |
+        ((unsigned __int64)(proof->Freed != 0) << 6) |
+        ((unsigned __int64)(proof->PinHeld != 0) << 7);
+
+    if (!proof->Freed)
+    {
+        outcome |= ((unsigned __int64)(proof->Node->PinCount & 0xFF) << 8) |
+            ((unsigned __int64)(proof->Node->RefCount & 0xFF) << 16) |
+            ((unsigned __int64)(proof->Node->OnReapList != 0) << 24);
+    }
+
+    return outcome;
+}
+
+//
 // A schedule in which the reap declined leaves the node published and
 // alive. It has to go before the next replay, or the table accumulates one
 // node per interleaving and the pool never balances.
@@ -197,6 +249,8 @@ void PinProofTeardown(void* Parameter)
     {
         return;
     }
+
+    KmSchedNoteOutcome(PinOutcome(proof));
 
     if (!proof->Freed)
     {
@@ -382,6 +436,26 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     printf("[  sched   ] %d interleavings, max depth %d, %ld pins, %ld retires\n",
         result.Schedules, result.MaxDepth, proof.PinsObserved, proof.RetiresObserved);
+
+    //
+    // The reduction's gate on real driver code: on a space the full search
+    // exhausted, the reduced search must end in exactly the same outcomes.
+    //
+    if (result.Schedules < 100000)
+    {
+        const KM_SCHED_RESULT reduced =
+            ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 100000);
+
+        EXPECT_EQ(0, proof.Violations);
+        EXPECT_EQ(0, reduced.Deadlocks);
+        EXPECT_EQ(result.Outcomes, reduced.Outcomes)
+            << "the reduced search reached a different number of outcomes";
+        EXPECT_EQ(result.OutcomeDigest, reduced.OutcomeDigest)
+            << "the reduced search reached a different set of outcomes";
+
+        printf("[  sched   ] reduced: %d runs, %d pruned, %d outcomes\n",
+            reduced.Schedules, reduced.Pruned, reduced.Outcomes);
+    }
 }
 
 //
@@ -483,6 +557,11 @@ struct RevivalProof
     volatile long RevivedWhileQueued;
     volatile long RetiresObserved;
     volatile long LeftBehind;
+
+    long RevivalsBefore;
+    long QueuedBefore;
+    long RetiresBefore;
+    long ViolationsBefore;
 };
 
 //
@@ -547,6 +626,8 @@ void RevivingThread(void* Parameter)
     // Read through the reference. A freed node reads back the guarded
     // pool's poison, which is negative.
     //
+    KmSchedNoteFootprint(&found->RefCount, sizeof(found->RefCount), 0);
+
     if (found->RefCount <= 0)
     {
         InterlockedIncrement(&proof->Violations);
@@ -601,6 +682,10 @@ void RevivalProofSetup(void* Parameter)
 
     proof->HandleHeld = 0;
     proof->Freed = 0;
+    proof->RevivalsBefore = proof->RevivalsObserved;
+    proof->QueuedBefore = proof->RevivedWhileQueued;
+    proof->RetiresBefore = proof->RetiresObserved;
+    proof->ViolationsBefore = proof->Violations;
 
     proof->Volume = StructsModelCreateVolume();
 
@@ -642,11 +727,36 @@ void RevivalProofSetup(void* Parameter)
     KmSchedSpawn(RevivalRetiringThread, proof);
 }
 
+unsigned __int64 RevivalOutcome(const RevivalProof* proof)
+{
+    unsigned __int64 outcome =
+        (unsigned __int64)(proof->RevivalsObserved - proof->RevivalsBefore) |
+        ((unsigned __int64)(proof->RevivedWhileQueued - proof->QueuedBefore) << 2) |
+        ((unsigned __int64)(proof->RetiresObserved - proof->RetiresBefore) << 4) |
+        ((unsigned __int64)(proof->Violations - proof->ViolationsBefore) << 6) |
+        ((unsigned __int64)(proof->Freed != 0) << 8) |
+        ((unsigned __int64)(proof->HandleHeld != 0) << 9);
+
+    if (!proof->Freed)
+    {
+        outcome |= ((unsigned __int64)(proof->Node->PinCount & 0xFF) << 16) |
+            ((unsigned __int64)(proof->Node->RefCount & 0xFF) << 24) |
+            ((unsigned __int64)(proof->Node->OnReapList != 0) << 32);
+    }
+
+    return outcome;
+}
+
 void RevivalProofTeardown(void* Parameter)
 {
     RevivalProof* proof = (RevivalProof*)Parameter;
 
     ShimWatchFree(nullptr, nullptr);
+
+    if (proof->Node)
+    {
+        KmSchedNoteOutcome(RevivalOutcome(proof));
+    }
 
     if (proof->Node && !proof->Freed)
     {
@@ -788,6 +898,22 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     printf("[  sched   ] %d interleavings, max depth %d, %ld revivals (%ld while queued), %ld retires\n",
         result.Schedules, result.MaxDepth, proof.RevivalsObserved,
         proof.RevivedWhileQueued, proof.RetiresObserved);
+
+    if (result.Schedules < 200000)
+    {
+        const KM_SCHED_RESULT reduced =
+            ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 200000);
+
+        EXPECT_EQ(0, proof.Violations);
+        EXPECT_EQ(0, reduced.Deadlocks);
+        EXPECT_EQ(result.Outcomes, reduced.Outcomes)
+            << "the reduced search reached a different number of outcomes";
+        EXPECT_EQ(result.OutcomeDigest, reduced.OutcomeDigest)
+            << "the reduced search reached a different set of outcomes";
+
+        printf("[  sched   ] reduced: %d runs, %d pruned, %d outcomes\n",
+            reduced.Schedules, reduced.Pruned, reduced.Outcomes);
+    }
 }
 
 //
@@ -1920,6 +2046,194 @@ TEST(SchedulerAudit, AcquireThatMayNotWaitFailsWhileHeld)
         << "hit the schedule cap -- the space was sampled, not exhausted";
     EXPECT_GT(audit.Refused, 0) << "no schedule refused the acquire while it was held";
     EXPECT_GT(audit.Granted, 0) << "no schedule granted the acquire while it was free";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Partial-order reduction. A reduced exploration skips orders of steps
+// that touch nothing in common, so it must reach exactly the outcomes the
+// full one does -- the same final states, the same deadlocks -- in fewer
+// schedules. Each body here is explored both ways and the outcome sets
+// compared; the bodies are the shapes a reduction gets wrong when its
+// footprints are: a lost update through unlocked accesses, a deadlock
+// that needs one particular order, and steps that are truly independent.
+///////////////////////////////////////////////////////////////////////////
+
+struct LostUpdateAudit
+{
+    volatile long Counter;
+};
+
+static void UnlockedIncrementer(void* Parameter)
+{
+    LostUpdateAudit* audit = (LostUpdateAudit*)Parameter;
+
+    const long seen = ReadNoFence(&audit->Counter);
+    WriteRelease(&audit->Counter, seen + 1);
+}
+
+static void LostUpdateSetup(void* Parameter)
+{
+    LostUpdateAudit* audit = (LostUpdateAudit*)Parameter;
+
+    audit->Counter = 0;
+
+    KmSchedSpawn(UnlockedIncrementer, audit);
+    KmSchedSpawn(UnlockedIncrementer, audit);
+    KmSchedSpawn(UnlockedIncrementer, audit);
+}
+
+static void LostUpdateTeardown(void* Parameter)
+{
+    KmSchedNoteOutcome((unsigned __int64)((LostUpdateAudit*)Parameter)->Counter);
+}
+
+TEST(SchedulerAudit, ReductionReachesEveryOutcomeOfALostUpdate)
+{
+    static LostUpdateAudit audit;
+
+    KmSchedSetAtomicYields(1);
+
+    const KM_SCHED_RESULT full =
+        KmExploreInterleavings(LostUpdateSetup, LostUpdateTeardown, &audit, 100000);
+    const KM_SCHED_RESULT reduced =
+        ExploreReduced(LostUpdateSetup, LostUpdateTeardown, &audit, 100000);
+
+    KmSchedSetAtomicYields(0);
+
+    ASSERT_LT(full.Schedules, 100000) << "the full space was sampled, not exhausted";
+    EXPECT_EQ(3, full.Outcomes) << "three incrementers end on 1, 2 or 3";
+    EXPECT_EQ(full.Outcomes, reduced.Outcomes);
+    EXPECT_EQ(full.OutcomeDigest, reduced.OutcomeDigest)
+        << "the reduced exploration reached a different set of outcomes";
+    EXPECT_LT(reduced.Schedules, full.Schedules);
+}
+
+TEST(SchedulerAudit, ReductionStillFindsADeadlockThatNeedsOneOrder)
+{
+    static QueuedWriterAudit audit;
+
+    audit.UseResource = 0;
+
+    const KM_SCHED_RESULT full =
+        KmExploreInterleavings(QueuedWriterSetup, nullptr, &audit, 1000);
+    const KM_SCHED_RESULT reduced =
+        ExploreReduced(QueuedWriterSetup, nullptr, &audit, 1000);
+
+    ASSERT_GT(full.Deadlocks, 0);
+    EXPECT_GT(reduced.Deadlocks, 0)
+        << "the reduction skipped the only order in which a queued writer "
+           "holds back a reader's re-take";
+}
+
+struct IndependentAudit
+{
+    volatile long Own[3];
+};
+
+static void OwnCounterWorker(void* Parameter)
+{
+    volatile long* own = (volatile long*)Parameter;
+
+    InterlockedIncrement(own);
+    InterlockedIncrement(own);
+    InterlockedIncrement(own);
+}
+
+static void IndependentSetup(void* Parameter)
+{
+    IndependentAudit* audit = (IndependentAudit*)Parameter;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        audit->Own[i] = 0;
+        KmSchedSpawn(OwnCounterWorker, (void*)&audit->Own[i]);
+    }
+}
+
+static void IndependentTeardown(void* Parameter)
+{
+    IndependentAudit* audit = (IndependentAudit*)Parameter;
+
+    KmSchedNoteOutcome(((unsigned __int64)audit->Own[0] << 32) |
+        ((unsigned __int64)audit->Own[1] << 16) | (unsigned __int64)audit->Own[2]);
+}
+
+TEST(SchedulerAudit, ReductionRunsIndependentStepsInOneOrder)
+{
+    static IndependentAudit audit;
+
+    KmSchedSetAtomicYields(1);
+
+    const KM_SCHED_RESULT full =
+        KmExploreInterleavings(IndependentSetup, IndependentTeardown, &audit, 100000);
+    const KM_SCHED_RESULT reduced =
+        ExploreReduced(IndependentSetup, IndependentTeardown, &audit, 100000);
+
+    KmSchedSetAtomicYields(0);
+
+    ASSERT_LT(full.Schedules, 100000) << "the full space was sampled, not exhausted";
+    EXPECT_EQ(1, full.Outcomes);
+    EXPECT_EQ(full.OutcomeDigest, reduced.OutcomeDigest);
+
+    //
+    // Three threads touching only their own counter commute everywhere:
+    // one order is explored, and every other run stops at its first
+    // branch.
+    //
+    EXPECT_EQ(1, reduced.Schedules - reduced.Pruned)
+        << "the reduction explored more than one order of steps that commute";
+}
+
+//
+// The reduction's own check on its footprints. The writer changes a flag
+// without recording it, and the flag decides what the reader's next step
+// touches. The reduction takes the two first steps as independent and
+// puts the reader to sleep across the write; when a pruned run later
+// resumes the reader, its step no longer matches the footprint it was
+// put to sleep with, which is what an unrecorded shared access looks like.
+//
+struct UnrecordedWriteAudit
+{
+    long Flag;
+    volatile long Left;
+    volatile long Right;
+};
+
+static void FlagDependentReader(void* Parameter)
+{
+    UnrecordedWriteAudit* audit = (UnrecordedWriteAudit*)Parameter;
+
+    (void)ReadNoFence(audit->Flag ? &audit->Left : &audit->Right);
+}
+
+static void UnrecordedFlagWriter(void* Parameter)
+{
+    UnrecordedWriteAudit* audit = (UnrecordedWriteAudit*)Parameter;
+
+    audit->Flag = 1;
+    KmSchedYield();
+}
+
+static void UnrecordedWriteSetup(void* Parameter)
+{
+    UnrecordedWriteAudit* audit = (UnrecordedWriteAudit*)Parameter;
+
+    audit->Flag = 0;
+
+    KmSchedSpawn(FlagDependentReader, audit);
+    KmSchedSpawn(UnrecordedFlagWriter, audit);
+}
+
+TEST(SchedulerAudit, ReductionReportsAnUnrecordedSharedWrite)
+{
+    static UnrecordedWriteAudit audit;
+
+    KmExpectViolation(KmViolationLifetime);
+
+    ExploreReduced(UnrecordedWriteSetup, nullptr, &audit, 1000);
+
+    EXPECT_EQ(KmViolationLifetime, KmTakeViolation())
+        << "a step whose footprint changed under an unrecorded write went unreported";
 }
 
 } // namespace

@@ -45,6 +45,8 @@ VOID ExInitializePushLock(PEX_PUSH_LOCK Lock)
     // table fixtures re-init all 256 buckets per test, and without this
     // each run mints 256 fresh ids until the model's lock table is full.
     //
+    KmSchedNoteFootprint(Lock, 1, 1);
+
     if (Lock->Initialized)
     {
         KmReleaseLockId(Lock->Id);
@@ -260,6 +262,8 @@ VOID ExReleasePushLockShared(PEX_PUSH_LOCK Lock)
 
 NTSTATUS ExInitializeResourceLite(PERESOURCE Resource)
 {
+    KmSchedNoteFootprint(Resource, 1, 1);
+
     if (Resource->Initialized)
     {
         KmReleaseLockId(Resource->Id);
@@ -341,6 +345,8 @@ static void EresourceSharedClaim(void* Context)
 
 NTSTATUS ExDeleteResourceLite(PERESOURCE Resource)
 {
+    KmSchedNoteFootprint(Resource, 1, 1);
+
     if (Resource->ExclusiveOwner != 0)
     {
         KmReportViolation(KmViolationLifetime, "ExDeleteResourceLite on a held resource");
@@ -375,6 +381,8 @@ BOOLEAN ExAcquireResourceExclusiveLite(PERESOURCE Resource, BOOLEAN Wait)
         // other path (posting the request). Waiting regardless would only
         // ever explore the path that blocks.
         //
+        KmSchedNoteFootprint(Resource, 1, 0);
+
         if (!Wait && !EresourceFreePredicate(Resource))
         {
             return FALSE;
@@ -428,6 +436,8 @@ BOOLEAN ExAcquireResourceSharedLite(PERESOURCE Resource, BOOLEAN Wait)
         const KM_SCHED_PREDICATE sharable = KmHoldsLock(Resource->Id)
             ? EresourceSharablePredicate
             : EresourceSharableBehindWaitersPredicate;
+
+        KmSchedNoteFootprint(Resource, 1, 0);
 
         if (!Wait && !sharable(Resource))
         {
