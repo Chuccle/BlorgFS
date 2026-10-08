@@ -1573,4 +1573,353 @@ TEST(SchedulerAudit, ReplayDivergenceInThreadStateIsCaught)
         << "hit the schedule cap before exhausting the space";
 }
 
+///////////////////////////////////////////////////////////////////////////
+// Under atomic yields, every unlocked shared access is a scheduling point:
+// the interlocked operations, and the ReadNoFence family the driver uses
+// to read what they write.
+//
+// Two droppers each decrement their own counter and read the other's --
+// the shape of BlorgNodeUnpin racing BlorgNodeDereference over a node's
+// PinCount and RefCount. When the read is not a scheduling point, each
+// drop runs together with its read and the schedule in which both see the
+// other at zero is never explored. When an operation is not a scheduling
+// point, a two-thread body using only that operation has exactly the two
+// schedules that pick which thread starts.
+///////////////////////////////////////////////////////////////////////////
+
+struct UnlockedReadAudit
+{
+    volatile long Left;
+    volatile long Right;
+    volatile long SawLeft;
+    volatile long SawRight;
+    volatile long BothSawZero;
+};
+
+static void LeftDropper(void* Parameter)
+{
+    UnlockedReadAudit* audit = (UnlockedReadAudit*)Parameter;
+
+    InterlockedDecrement(&audit->Left);
+    audit->SawRight = ReadNoFence(&audit->Right);
+}
+
+static void RightDropper(void* Parameter)
+{
+    UnlockedReadAudit* audit = (UnlockedReadAudit*)Parameter;
+
+    InterlockedDecrement(&audit->Right);
+    audit->SawLeft = ReadNoFence(&audit->Left);
+}
+
+static void UnlockedReadSetup(void* Parameter)
+{
+    UnlockedReadAudit* audit = (UnlockedReadAudit*)Parameter;
+
+    audit->Left = 1;
+    audit->Right = 1;
+    audit->SawLeft = -1;
+    audit->SawRight = -1;
+
+    KmSchedSpawn(LeftDropper, audit);
+    KmSchedSpawn(RightDropper, audit);
+}
+
+static void UnlockedReadTeardown(void* Parameter)
+{
+    UnlockedReadAudit* audit = (UnlockedReadAudit*)Parameter;
+
+    if (0 == audit->SawLeft && 0 == audit->SawRight)
+    {
+        audit->BothSawZero++;
+    }
+}
+
+TEST(SchedulerAudit, UnlockedReadsAreSchedulingPointsUnderAtomicYields)
+{
+    static UnlockedReadAudit audit;
+
+    audit = {};
+
+    KmSchedSetAtomicYields(1);
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(UnlockedReadSetup, UnlockedReadTeardown, &audit, 20000);
+
+    KmSchedSetAtomicYields(0);
+
+    EXPECT_LT(result.Schedules, 20000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+
+    EXPECT_GT(audit.BothSawZero, 0)
+        << "no schedule had both drops before both reads -- ReadNoFence is "
+           "not a scheduling point";
+}
+
+enum class SharedAccess
+{
+    Or,
+    Add64,
+    ExchangeAdd64,
+    CompareExchangePointer,
+    ReadNoFence,
+    ReadNoFence64,
+    ReadAcquire,
+    ReadAcquire64,
+    ReadPointerAcquire,
+    WriteRelease,
+    WriteRelease64,
+};
+
+struct SharedAccessAudit
+{
+    SharedAccess Access;
+    volatile long Value;
+    volatile LONG64 Value64;
+    PVOID volatile Pointer;
+};
+
+static void SharedAccessThread(void* Parameter)
+{
+    SharedAccessAudit* audit = (SharedAccessAudit*)Parameter;
+
+    switch (audit->Access)
+    {
+    case SharedAccess::Or:
+        InterlockedOr(&audit->Value, 1);
+        break;
+    case SharedAccess::Add64:
+        InterlockedAdd64(&audit->Value64, 1);
+        break;
+    case SharedAccess::ExchangeAdd64:
+        InterlockedExchangeAdd64(&audit->Value64, 1);
+        break;
+    case SharedAccess::CompareExchangePointer:
+        InterlockedCompareExchangePointer(&audit->Pointer, audit, nullptr);
+        break;
+    case SharedAccess::ReadNoFence:
+        (void)ReadNoFence(&audit->Value);
+        break;
+    case SharedAccess::ReadNoFence64:
+        (void)ReadNoFence64(&audit->Value64);
+        break;
+    case SharedAccess::ReadAcquire:
+        (void)ReadAcquire(&audit->Value);
+        break;
+    case SharedAccess::ReadAcquire64:
+        (void)ReadAcquire64(&audit->Value64);
+        break;
+    case SharedAccess::ReadPointerAcquire:
+        (void)ReadPointerAcquire(&audit->Pointer);
+        break;
+    case SharedAccess::WriteRelease:
+        WriteRelease(&audit->Value, 1);
+        break;
+    case SharedAccess::WriteRelease64:
+        WriteRelease64(&audit->Value64, 1);
+        break;
+    }
+}
+
+static void SharedAccessSetup(void* Parameter)
+{
+    SharedAccessAudit* audit = (SharedAccessAudit*)Parameter;
+
+    audit->Value = 0;
+    audit->Value64 = 0;
+    audit->Pointer = nullptr;
+
+    KmSchedSpawn(SharedAccessThread, audit);
+    KmSchedSpawn(SharedAccessThread, audit);
+}
+
+TEST(SchedulerAudit, EveryUnlockedSharedAccessIsASchedulingPoint)
+{
+    static SharedAccessAudit audit;
+
+    const SharedAccess accesses[] = {
+        SharedAccess::Or,
+        SharedAccess::Add64,
+        SharedAccess::ExchangeAdd64,
+        SharedAccess::CompareExchangePointer,
+        SharedAccess::ReadNoFence,
+        SharedAccess::ReadNoFence64,
+        SharedAccess::ReadAcquire,
+        SharedAccess::ReadAcquire64,
+        SharedAccess::ReadPointerAcquire,
+        SharedAccess::WriteRelease,
+        SharedAccess::WriteRelease64,
+    };
+
+    KmSchedSetAtomicYields(1);
+
+    for (SharedAccess access : accesses)
+    {
+        audit.Access = access;
+
+        KM_SCHED_RESULT result =
+            KmExploreInterleavings(SharedAccessSetup, nullptr, &audit, 100);
+
+        EXPECT_GT(result.Schedules, 2)
+            << "access " << (int)access << " is not a scheduling point";
+    }
+
+    KmSchedSetAtomicYields(0);
+}
+
+///////////////////////////////////////////////////////////////////////////
+// A queued writer holds back new readers. In the kernel, an exclusive
+// acquirer waiting on a shared-held push lock makes every later shared
+// acquire wait too, so a reader that re-takes the lock shared while a
+// writer is queued deadlocks against it. An ERESOURCE grants the re-take,
+// because the reader already owns the resource. The model has to make
+// both calls the way the kernel does, or that whole class of deadlock is
+// invisible to every proof.
+///////////////////////////////////////////////////////////////////////////
+
+struct QueuedWriterAudit
+{
+    EX_PUSH_LOCK PushLock;
+    ERESOURCE Resource;
+    int UseResource;
+};
+
+static void RecursiveReader(void* Parameter)
+{
+    QueuedWriterAudit* audit = (QueuedWriterAudit*)Parameter;
+
+    if (audit->UseResource)
+    {
+        ExAcquireResourceSharedLite(&audit->Resource, TRUE);
+        KmSchedYield();
+        ExAcquireResourceSharedLite(&audit->Resource, TRUE);
+        ExReleaseResourceLite(&audit->Resource);
+        ExReleaseResourceLite(&audit->Resource);
+        return;
+    }
+
+    ExAcquirePushLockShared(&audit->PushLock);
+    KmSchedYield();
+    ExAcquirePushLockShared(&audit->PushLock);
+    ExReleasePushLockShared(&audit->PushLock);
+    ExReleasePushLockShared(&audit->PushLock);
+}
+
+static void QueuedWriter(void* Parameter)
+{
+    QueuedWriterAudit* audit = (QueuedWriterAudit*)Parameter;
+
+    if (audit->UseResource)
+    {
+        ExAcquireResourceExclusiveLite(&audit->Resource, TRUE);
+        ExReleaseResourceLite(&audit->Resource);
+        return;
+    }
+
+    ExAcquirePushLockExclusive(&audit->PushLock);
+    ExReleasePushLockExclusive(&audit->PushLock);
+}
+
+static void QueuedWriterSetup(void* Parameter)
+{
+    QueuedWriterAudit* audit = (QueuedWriterAudit*)Parameter;
+
+    ExInitializePushLock(&audit->PushLock);
+    ExInitializeResourceLite(&audit->Resource);
+
+    KmSchedSpawn(RecursiveReader, audit);
+    KmSchedSpawn(QueuedWriter, audit);
+}
+
+TEST(SchedulerAudit, QueuedWriterHoldsBackANewPushLockReader)
+{
+    static QueuedWriterAudit audit;
+
+    audit.UseResource = 0;
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(QueuedWriterSetup, nullptr, &audit, 1000);
+
+    EXPECT_GT(result.Deadlocks, 0)
+        << "a shared re-take overtook a queued writer -- the kernel blocks it";
+}
+
+TEST(SchedulerAudit, QueuedWriterDoesNotHoldBackAnEresourceOwner)
+{
+    static QueuedWriterAudit audit;
+
+    audit.UseResource = 1;
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(QueuedWriterSetup, nullptr, &audit, 1000);
+
+    EXPECT_EQ(0, result.Deadlocks)
+        << "a shared re-take by an owner waited behind a queued writer";
+    EXPECT_LT(result.Schedules, 1000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// An acquire that may not wait fails when the resource is unavailable,
+// and the driver posts the request instead. The model used to block
+// regardless, so only the waiting path was ever explored.
+///////////////////////////////////////////////////////////////////////////
+
+struct NoWaitAudit
+{
+    ERESOURCE Resource;
+    volatile long Refused;
+    volatile long Granted;
+};
+
+static void NoWaitHolder(void* Parameter)
+{
+    NoWaitAudit* audit = (NoWaitAudit*)Parameter;
+
+    ExAcquireResourceExclusiveLite(&audit->Resource, TRUE);
+    KmSchedYield();
+    ExReleaseResourceLite(&audit->Resource);
+}
+
+static void NoWaitTrier(void* Parameter)
+{
+    NoWaitAudit* audit = (NoWaitAudit*)Parameter;
+
+    if (!ExAcquireResourceSharedLite(&audit->Resource, FALSE))
+    {
+        audit->Refused++;
+        return;
+    }
+
+    audit->Granted++;
+    ExReleaseResourceLite(&audit->Resource);
+}
+
+static void NoWaitSetup(void* Parameter)
+{
+    NoWaitAudit* audit = (NoWaitAudit*)Parameter;
+
+    ExInitializeResourceLite(&audit->Resource);
+
+    KmSchedSpawn(NoWaitHolder, audit);
+    KmSchedSpawn(NoWaitTrier, audit);
+}
+
+TEST(SchedulerAudit, AcquireThatMayNotWaitFailsWhileHeld)
+{
+    static NoWaitAudit audit;
+
+    audit.Refused = 0;
+    audit.Granted = 0;
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(NoWaitSetup, nullptr, &audit, 1000);
+
+    EXPECT_EQ(0, result.Deadlocks);
+    EXPECT_LT(result.Schedules, 1000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+    EXPECT_GT(audit.Refused, 0) << "no schedule refused the acquire while it was held";
+    EXPECT_GT(audit.Granted, 0) << "no schedule granted the acquire while it was free";
+}
+
 } // namespace

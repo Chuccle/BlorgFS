@@ -28,9 +28,10 @@
 //
 // What it does not model: weak memory. Every thread sees every write
 // immediately, so this finds ordering bugs and missing mutual exclusion,
-// not missing barriers. BlorgFS uses interlocked operations and push locks
-// (both full fences) for everything cross-thread, so that gap is narrow --
-// but it is a gap, and ReadNoFence is where it would hide.
+// not missing barriers. Interlocked operations and push locks are full or
+// acquire/release fences, but the driver also shares counters and flags
+// through ReadNoFence, ReadAcquire and WriteRelease, and ships for ARM64,
+// where those can reorder in ways no schedule here represents.
 //
 
 #ifdef __cplusplus
@@ -285,6 +286,31 @@ long KmSchedInterlockedExchange(long volatile* Target, long Value);
 long KmSchedInterlockedCompareExchange(long volatile* Target, long Exchange, long Comparand);
 __int64 KmSchedInterlockedIncrement64(__int64 volatile* Target);
 __int64 KmSchedInterlockedDecrement64(__int64 volatile* Target);
+long KmSchedInterlockedOr(long volatile* Target, long Value);
+__int64 KmSchedInterlockedAdd64(__int64 volatile* Target, __int64 Value);
+__int64 KmSchedInterlockedExchangeAdd64(__int64 volatile* Target, __int64 Value);
+void* KmSchedInterlockedCompareExchangePointer(void* volatile* Target, void* Exchange, void* Comparand);
+
+//
+// The unlocked reads and writes the driver makes of memory other threads
+// change: ReadNoFence, ReadAcquire, WriteRelease and their 64-bit and
+// pointer forms. They are scheduling points under atomic yields for the
+// same reason the interlocked operations are.
+//
+// Yielding only at locks and interlocked operations covers every
+// interleaving only when nothing else is shared without a lock -- and
+// these accesses exist precisely because something is. A node's RefCount
+// and PinCount are dropped by interlocked operations under different
+// locks and read back with ReadNoFence to decide whether the node is
+// idle. Without a scheduling point at the read, the explorer runs each
+// drop and its read as one step, and never reaches the schedule in which
+// both droppers drop first and then both read.
+//
+long KmSchedReadLong(long volatile* Source);
+__int64 KmSchedReadLong64(__int64 volatile* Source);
+void* KmSchedReadPointer(void* volatile* Source);
+void KmSchedWriteLong(long volatile* Target, long Value);
+void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value);
 
 #ifdef __cplusplus
 }

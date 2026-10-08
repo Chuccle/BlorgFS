@@ -350,6 +350,12 @@ typedef struct _EX_PUSH_LOCK
     // SRWLOCK above.
     //
     int SchedState;
+
+    //
+    // Exclusive acquirers waiting under exploration. While any are, a new
+    // shared acquire waits behind them, as it does in the kernel.
+    //
+    int SchedExclusiveWaiters;
 } EX_PUSH_LOCK, * PEX_PUSH_LOCK;
 
 VOID ExInitializePushLock(PEX_PUSH_LOCK Lock);
@@ -372,6 +378,7 @@ typedef struct _ERESOURCE
     // the scheduler can wake it.
     //
     int SchedState;
+    int SchedExclusiveWaiters;
 } ERESOURCE, * PERESOURCE;
 
 NTSTATUS ExInitializeResourceLite(PERESOURCE Resource);
@@ -1050,5 +1057,29 @@ VOID ShimReset(VOID);
 #define InterlockedCompareExchange      KmSchedInterlockedCompareExchange
 #define InterlockedIncrement64          KmSchedInterlockedIncrement64
 #define InterlockedDecrement64          KmSchedInterlockedDecrement64
+
+#undef InterlockedOr
+#undef InterlockedAdd64
+#undef InterlockedExchangeAdd64
+#undef InterlockedCompareExchangePointer
+
+#define InterlockedOr                   KmSchedInterlockedOr
+#define InterlockedAdd64                KmSchedInterlockedAdd64
+#define InterlockedExchangeAdd64        KmSchedInterlockedExchangeAdd64
+#define InterlockedCompareExchangePointer KmSchedInterlockedCompareExchangePointer
+
+#undef ReadNoFence
+#undef ReadNoFence64
+#undef ReadPointerAcquire
+#undef ReadAcquire
+#undef WriteRelease
+
+#define ReadNoFence(p)                  KmSchedReadLong((volatile LONG*)(p))
+#define ReadNoFence64(p)                KmSchedReadLong64((volatile LONG64*)(p))
+#define ReadPointerAcquire(p)           KmSchedReadPointer((PVOID volatile*)(p))
+#define ReadAcquire(p)                  KmSchedReadLong((volatile LONG*)(p))
+#define WriteRelease(p, v)              KmSchedWriteLong((volatile LONG*)(p), (v))
+#define ReadAcquire64(p)                KmSchedReadLong64((volatile LONG64*)(p))
+#define WriteRelease64(p, v)            KmSchedWriteLong64((volatile LONG64*)(p), (v))
 
 #endif
