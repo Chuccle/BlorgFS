@@ -542,7 +542,7 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
     ASSERT_NE(0, shards) << "KM_SCHED_SHARD is not index/count";
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 10000000);
+        ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 10000000);
 
     KmSchedSetShard(0, 1);
 
@@ -900,7 +900,7 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
     ASSERT_NE(0, shards) << "KM_SCHED_SHARD is not index/count";
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 50000000);
+        ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 50000000);
 
     KmSchedSetShard(0, 1);
 

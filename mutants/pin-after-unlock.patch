@@ -1,0 +1,24 @@
+diff --git a/src/Structs.c b/src/Structs.c
+index 49d1601..fcccf47 100644
+--- a/src/Structs.c
++++ b/src/Structs.c
+@@ -671,7 +671,6 @@ PCOMMON_CONTEXT BlorgNodeTableLookupPin(const UNICODE_STRING* Path)
+         if (node->FullPath.Length == Path->Length &&
+             RtlEqualUnicodeString(&node->FullPath, Path, TRUE))
+         {
+-            InterlockedIncrement(&node->PinCount);
+             found = node;
+             break;
+         }
+@@ -680,6 +679,11 @@ PCOMMON_CONTEXT BlorgNodeTableLookupPin(const UNICODE_STRING* Path)
+     ExReleasePushLockShared(&bucket->Lock);
+     KeLeaveCriticalRegion();
+ 
++    if (found)
++    {
++        InterlockedIncrement(&found->PinCount);
++    }
++
+     return found;
+ }
+ 

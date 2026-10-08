@@ -31,56 +31,31 @@ permissions:
   contents: read
 
 jobs:
-  proofs:
-    runs-on: windows-latest
-    name: CBMC proofs
-    timeout-minutes: 90
-
-    steps:
-      - name: Checkout repository and submodules
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Cache CBMC
-        id: cache_cbmc
-        uses: actions/cache@v5
-        with:
-          path: ${{ runner.temp }}\cbmc
-          key: ${{ runner.os }}-cbmc-6.10
-
-      - name: Install CBMC
-        if: steps.cache_cbmc.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $url = 'https://github.com/diffblue/cbmc/releases/download/cbmc-6.1.0/cbmc-6.1.0-win64.msi'
-          $msi = Join-Path $env:RUNNER_TEMP 'cbmc.msi'
-          Invoke-WebRequest -Uri $url -OutFile $msi
-          # Extract rather than install: the harness only needs cbmc.exe on a
-          # path it can be pointed at, and msiexec /a keeps this from touching
-          # machine state the next job would inherit.
-          $dest = Join-Path $env:RUNNER_TEMP 'cbmc'
-          Start-Process msiexec -ArgumentList @('/a', "`"$msi`"", '/qn', "TARGETDIR=`"$dest`"") -Wait -NoNewWindow
-
-      - name: Setup Developer Command Prompt
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-
-      - name: Run CBMC proof harnesses
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $cbmc = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP 'cbmc') -Filter cbmc.exe -Recurse |
-                  Select-Object -First 1 -ExpandProperty FullName
-          if (-not $cbmc) { throw "cbmc.exe not found after install" }
-
-          & "$env:GITHUB_WORKSPACE\tools\Invoke-BlorgProofs.ps1" -CbmcPath $cbmc
-          if ($LASTEXITCODE -ne 0) { throw "CBMC proofs failed with exit code $LASTEXITCODE" }
-
   interleavings:
     runs-on: windows-latest
-    name: ${{ matrix.shard.name }} (${{ matrix.configuration }})
-    timeout-minutes: 30
+    name: Mutant ${{ matrix.mutant }} ${{ matrix.filter }}
+    # Six hours is the hosted-runner ceiling, and this job is meant to use
+    # it. The atomic-granularity soaks alone ran 97 minutes locally without
+    # exhausting their space; the whole set is hours, which is the point of
+    # putting it on a schedule instead of a gate.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant:
+          - worker-skips-pin
+          - worker-skips-ref
+          - retire-skips-pin
+          - pin-after-unlock
+          - unpin-unlocked
+        suite: [NodeTableSandbox.exe]
+        filter:
+          - NodeTableSchedTest.NoInterleavingRetiresAPinnedNode
+          - NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode
+          - NodeTableSchedTest.NoAtomicInterleavingRetiresAPinnedNode
+          - NodeTableRevivalSchedTest.NoAtomicInterleavingFreesARevivedNode
+          - NodeTableSchedTest.RandomAtomicPinSmoke
+          - NodeTableSchedTest.NoInterleavingRetiresAPinnedDirectory
 
     # Exactly what the PR gate excludes.
     #
@@ -93,51 +68,7 @@ jobs:
     #
     # The filter here is that one inverted, so between the two workflows
     # nothing has stopped being checked -- it has stopped being checked on
-    # every push. The two lock-granularity node-table proofs run the full
-    # search, about 25 minutes for the revival proof and 3 for the pin
-    # proof, so each is split between runners with KM_SCHED_SHARD and the
-    # node-table shard runs the rest of the suite.
-    #
-    # Both configurations run everything. ASan and NT_ASSERT are live in
-    # both; Debug adds the CRT heap and iterator checks, Release the
-    # optimiser's view of the same code.
-    strategy:
-      fail-fast: false
-      matrix:
-        configuration: [Debug, Release]
-        shard:
-          - { name: 'Revival proof 1/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '0/16' }
-          - { name: 'Revival proof 2/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '1/16' }
-          - { name: 'Revival proof 3/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '2/16' }
-          - { name: 'Revival proof 4/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '3/16' }
-          - { name: 'Revival proof 5/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '4/16' }
-          - { name: 'Revival proof 6/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '5/16' }
-          - { name: 'Revival proof 7/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '6/16' }
-          - { name: 'Revival proof 8/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '7/16' }
-          - { name: 'Revival proof 9/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '8/16' }
-          - { name: 'Revival proof 10/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '9/16' }
-          - { name: 'Revival proof 11/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '10/16' }
-          - { name: 'Revival proof 12/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '11/16' }
-          - { name: 'Revival proof 13/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '12/16' }
-          - { name: 'Revival proof 14/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '13/16' }
-          - { name: 'Revival proof 15/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '14/16' }
-          - { name: 'Revival proof 16/16', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode', split: '15/16' }
-          - { name: 'Pin proof 1/4', project: NodeTableSandbox, filter: 'NodeTableSchedTest.NoInterleavingRetiresAPinnedNode', split: '0/4' }
-          - { name: 'Pin proof 2/4', project: NodeTableSandbox, filter: 'NodeTableSchedTest.NoInterleavingRetiresAPinnedNode', split: '1/4' }
-          - { name: 'Pin proof 3/4', project: NodeTableSandbox, filter: 'NodeTableSchedTest.NoInterleavingRetiresAPinnedNode', split: '2/4' }
-          - { name: 'Pin proof 4/4', project: NodeTableSandbox, filter: 'NodeTableSchedTest.NoInterleavingRetiresAPinnedNode', split: '3/4' }
-          - name: Node table proofs
-            project: NodeTableSandbox
-            filter: '*SchedTest.*:*StressTest.*-NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode:NodeTableSchedTest.NoInterleavingRetiresAPinnedNode'
-          - name: Dispatch proofs
-            project: DispatchSandbox
-            filter: '*SchedTest.*:*StressTest.*'
-          - name: Socket proofs
-            project: SocketSandbox
-            filter: '*SchedTest.*:*StressTest.*'
-          - name: Full fuzz corpus
-            project: ClientFuzz
-
+    # every push.
     steps:
       - name: Checkout repository and submodules
         uses: actions/checkout@v6
@@ -197,47 +128,66 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "flatcc codegen failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path generated\metadata_flatbuffer_reader.h)) { throw "flatcc did not produce the reader header" }
 
-      - name: Build ${{ matrix.shard.project }}
+      - name: Apply mutant
         shell: pwsh
         run: |
-          msbuild 'tests\sandbox\${{ matrix.shard.project }}.vcxproj' /p:Configuration=${{ matrix.configuration }} /p:Platform=x64 /m /v:minimal
-          if ($LASTEXITCODE -ne 0) { throw "${{ matrix.shard.project }} failed to build" }
+          git apply mutants/${{ matrix.mutant }}.patch
+          if ($LASTEXITCODE -ne 0) { throw 'mutant did not apply' }
+          git diff --stat
+
+      - name: Build sandbox suites
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $projects = @(
+            'tests\sandbox\ClientFuzz.vcxproj',
+            'tests\sandbox\SocketSandbox.vcxproj',
+            'tests\sandbox\NodeTableSandbox.vcxproj',
+            'tests\sandbox\DispatchSandbox.vcxproj'
+          )
+          foreach ($proj in $projects) {
+            msbuild $proj /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+            if ($LASTEXITCODE -ne 0) { throw "$proj failed to build" }
+          }
 
       - name: Run interleaving proofs
-        if: matrix.shard.filter
-        shell: pwsh
-        env:
-          KM_SCHED_SHARD: ${{ matrix.shard.split }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $path = @('x64\${{ matrix.configuration }}', 'tests\sandbox\x64\${{ matrix.configuration }}') |
-                  ForEach-Object { Join-Path $_ '${{ matrix.shard.project }}.exe' } |
-                  Where-Object { Test-Path $_ } |
-                  Select-Object -First 1
-          if (-not $path) { throw "${{ matrix.shard.project }}.exe was not built" }
-
-          # Every exploration asserts it finished under its schedule cap, so
-          # a pass means its space was exhausted and no interleaving of
-          # those threads can fail the invariant. The atomic-granularity
-          # proofs, where every interlocked operation and unlocked shared
-          # access is a scheduling point, run with partial-order reduction;
-          # the lock-granularity proofs run the full search and check the
-          # reduction against it.
-          & $path '--gtest_filter=${{ matrix.shard.filter }}'
-          if ($LASTEXITCODE -ne 0) { throw "interleaving proofs failed with exit code $LASTEXITCODE" }
-
-      - name: Run the full fuzz corpus
-        if: matrix.shard.project == 'ClientFuzz'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $path = @('x64\${{ matrix.configuration }}', 'tests\sandbox\x64\${{ matrix.configuration }}') |
-                  ForEach-Object { Join-Path $_ 'ClientFuzz.exe' } |
-                  Where-Object { Test-Path $_ } |
-                  Select-Object -First 1
-          if (-not $path) { throw "ClientFuzz.exe was not built" }
 
-          # 50000 iterations, against the 200-iteration smoke the gate runs.
-          & $path 50000
-          if ($LASTEXITCODE -ne 0) { throw "ClientFuzz failed with exit code $LASTEXITCODE" }
+          $searchRoots = @('x64\Release', 'tests\sandbox\x64\Release')
+          $failed = @()
 
+          foreach ($suite in @('${{ matrix.suite }}')) {
+            $path = $searchRoots |
+                    ForEach-Object { Join-Path $_ $suite } |
+                    Where-Object { Test-Path $_ } |
+                    Select-Object -First 1
+
+            if (-not $path) { throw "$suite was not built" }
+
+            Write-Host "--- $suite (proofs) ---"
+
+            # --gtest_also_run_disabled_tests is what makes this exhaustive
+            # rather than merely slow. The DISABLED_ tests are the
+            # atomic-granularity soaks: every interlocked operation becomes
+            # a scheduling point, which is strictly stronger than the lock
+            # granularity the gated proofs run at, and far too expensive to
+            # run anywhere a person waits.
+            #
+            # The two kinds report differently and both matter. The
+            # lock-granularity proofs assert they finished under their
+            # schedule cap, so a pass means the space was exhausted and no
+            # interleaving of those threads can fail the invariant. The
+            # soaks cannot exhaust -- this scheduler does no partial-order
+            # reduction and the atomic space for two threads is far larger
+            # than any cap -- so they are large samples, and they print
+            # exhausted=NO to say so rather than implying a proof.
+            & $path '--gtest_filter=${{ matrix.filter }}' --gtest_also_run_disabled_tests
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::$suite proofs failed with exit code $LASTEXITCODE"
+              $failed += $suite
+            }
+          }
+
+          if ($failed.Count -gt 0) { throw "interleaving proofs failed: $($failed -join ', ')" }

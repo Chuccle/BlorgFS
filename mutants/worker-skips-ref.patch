@@ -1,0 +1,13 @@
+diff --git a/src/Structs.c b/src/Structs.c
+index 49d1601..96ebc8a 100644
+--- a/src/Structs.c
++++ b/src/Structs.c
+@@ -892,7 +892,7 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+ 
+             ExAcquirePushLockExclusive(&bucket->Lock);
+ 
+-            if ((0 == ReadNoFence64(&node->RefCount)) &&
++            if (
+                 (0 == ReadNoFence(&node->PinCount)) &&
+                 ((BLORGFS_DCB_SIGNATURE != GET_NODE_TYPE(node)) ||
+                  IsListEmpty(&C_CAST(PDCB, node)->ChildrenList)))

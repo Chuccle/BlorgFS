@@ -1,0 +1,12 @@
+diff --git a/src/Structs.c b/src/Structs.c
+index 49d1601..9861d3e 100644
+--- a/src/Structs.c
++++ b/src/Structs.c
+@@ -614,7 +614,6 @@ static BOOLEAN NodeTableTryRetire(PCOMMON_CONTEXT Node)
+     ExAcquirePushLockExclusive(&bucket->Lock);
+ 
+     if (0 == ReadNoFence64(&Node->RefCount) &&
+-        0 == ReadNoFence(&Node->PinCount) &&
+         !InterlockedCompareExchange(&Node->OnReapList, TRUE, FALSE))
+     {
+         if (Node->TableLink.Flink)
