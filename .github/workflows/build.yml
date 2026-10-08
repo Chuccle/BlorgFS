@@ -389,6 +389,7 @@ jobs:
           ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/*.inf
           ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/*.cat
           ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/BlorgFS/
+          ${{ github.workspace }}/${{ matrix.platform }}/${{ matrix.config }}/PerfHarness.exe
           ${{ github.workspace }}/msbuild.binlog
         if-no-files-found: warn
 

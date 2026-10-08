@@ -4,6 +4,10 @@ Kernel-mode Windows filesystem driver that presents an HTTP backend as a
 mounted, read-only volume (`B:`). Built on async WSK networking, an optional
 hand-rolled TLS 1.3 client, and a keep-alive connection pool.
 
+Release build artifacts include `PerfHarness.exe` for guest measurement
+sessions. Dispatched guest scripts can read recorded build artifacts with the
+workflow's read-only Actions token to compare isolated packages.
+
 ## Repository layout
 
 ```
