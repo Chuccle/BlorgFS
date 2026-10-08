@@ -1045,41 +1045,109 @@ VOID ShimReset(VOID);
 #ifndef BLORGFS_SHIM_INTERNAL
 
 #undef InterlockedIncrement
+#undef InterlockedIncrementAcquire
+#undef InterlockedIncrementRelease
+#undef InterlockedIncrementNoFence
 #undef InterlockedDecrement
+#undef InterlockedDecrementAcquire
+#undef InterlockedDecrementRelease
+#undef InterlockedDecrementNoFence
 #undef InterlockedExchange
+#undef InterlockedExchangeAcquire
+#undef InterlockedExchangeNoFence
 #undef InterlockedCompareExchange
+#undef InterlockedCompareExchangeAcquire
+#undef InterlockedCompareExchangeRelease
+#undef InterlockedCompareExchangeNoFence
 #undef InterlockedIncrement64
+#undef InterlockedIncrementAcquire64
+#undef InterlockedIncrementRelease64
+#undef InterlockedIncrementNoFence64
 #undef InterlockedDecrement64
-
-#define InterlockedIncrement            KmSchedInterlockedIncrement
-#define InterlockedDecrement            KmSchedInterlockedDecrement
-#define InterlockedExchange             KmSchedInterlockedExchange
-#define InterlockedCompareExchange      KmSchedInterlockedCompareExchange
-#define InterlockedIncrement64          KmSchedInterlockedIncrement64
-#define InterlockedDecrement64          KmSchedInterlockedDecrement64
-
+#undef InterlockedDecrementAcquire64
+#undef InterlockedDecrementRelease64
+#undef InterlockedDecrementNoFence64
 #undef InterlockedOr
+#undef InterlockedOrAcquire
+#undef InterlockedOrRelease
+#undef InterlockedOrNoFence
 #undef InterlockedAdd64
+#undef InterlockedAddAcquire64
+#undef InterlockedAddRelease64
+#undef InterlockedAddNoFence64
 #undef InterlockedExchangeAdd64
+#undef InterlockedExchangeAddAcquire64
+#undef InterlockedExchangeAddRelease64
+#undef InterlockedExchangeAddNoFence64
 #undef InterlockedCompareExchangePointer
+#undef InterlockedCompareExchangePointerAcquire
+#undef InterlockedCompareExchangePointerRelease
+#undef InterlockedCompareExchangePointerNoFence
 
-#define InterlockedOr                   KmSchedInterlockedOr
-#define InterlockedAdd64                KmSchedInterlockedAdd64
-#define InterlockedExchangeAdd64        KmSchedInterlockedExchangeAdd64
-#define InterlockedCompareExchangePointer KmSchedInterlockedCompareExchangePointer
+#define InterlockedIncrement(p)                           KmSchedInterlockedIncrement((p), KM_ORDER_SEQ_CST)
+#define InterlockedIncrementAcquire(p)                    KmSchedInterlockedIncrement((p), KM_ORDER_ACQUIRE)
+#define InterlockedIncrementRelease(p)                    KmSchedInterlockedIncrement((p), KM_ORDER_RELEASE)
+#define InterlockedIncrementNoFence(p)                    KmSchedInterlockedIncrement((p), KM_ORDER_RELAXED)
+#define InterlockedDecrement(p)                           KmSchedInterlockedDecrement((p), KM_ORDER_SEQ_CST)
+#define InterlockedDecrementAcquire(p)                    KmSchedInterlockedDecrement((p), KM_ORDER_ACQUIRE)
+#define InterlockedDecrementRelease(p)                    KmSchedInterlockedDecrement((p), KM_ORDER_RELEASE)
+#define InterlockedDecrementNoFence(p)                    KmSchedInterlockedDecrement((p), KM_ORDER_RELAXED)
+#define InterlockedExchange(p, v)                         KmSchedInterlockedExchange((p), (v), KM_ORDER_SEQ_CST)
+#define InterlockedExchangeAcquire(p, v)                  KmSchedInterlockedExchange((p), (v), KM_ORDER_ACQUIRE)
+#define InterlockedExchangeNoFence(p, v)                  KmSchedInterlockedExchange((p), (v), KM_ORDER_RELAXED)
+#define InterlockedCompareExchange(p, e, c)               KmSchedInterlockedCompareExchange((p), (e), (c), KM_ORDER_SEQ_CST)
+#define InterlockedCompareExchangeAcquire(p, e, c)        KmSchedInterlockedCompareExchange((p), (e), (c), KM_ORDER_ACQUIRE)
+#define InterlockedCompareExchangeRelease(p, e, c)        KmSchedInterlockedCompareExchange((p), (e), (c), KM_ORDER_RELEASE)
+#define InterlockedCompareExchangeNoFence(p, e, c)        KmSchedInterlockedCompareExchange((p), (e), (c), KM_ORDER_RELAXED)
+#define InterlockedIncrement64(p)                         KmSchedInterlockedIncrement64((p), KM_ORDER_SEQ_CST)
+#define InterlockedIncrementAcquire64(p)                  KmSchedInterlockedIncrement64((p), KM_ORDER_ACQUIRE)
+#define InterlockedIncrementRelease64(p)                  KmSchedInterlockedIncrement64((p), KM_ORDER_RELEASE)
+#define InterlockedIncrementNoFence64(p)                  KmSchedInterlockedIncrement64((p), KM_ORDER_RELAXED)
+#define InterlockedDecrement64(p)                         KmSchedInterlockedDecrement64((p), KM_ORDER_SEQ_CST)
+#define InterlockedDecrementAcquire64(p)                  KmSchedInterlockedDecrement64((p), KM_ORDER_ACQUIRE)
+#define InterlockedDecrementRelease64(p)                  KmSchedInterlockedDecrement64((p), KM_ORDER_RELEASE)
+#define InterlockedDecrementNoFence64(p)                  KmSchedInterlockedDecrement64((p), KM_ORDER_RELAXED)
+#define InterlockedOr(p, v)                               KmSchedInterlockedOr((p), (v), KM_ORDER_SEQ_CST)
+#define InterlockedOrAcquire(p, v)                        KmSchedInterlockedOr((p), (v), KM_ORDER_ACQUIRE)
+#define InterlockedOrRelease(p, v)                        KmSchedInterlockedOr((p), (v), KM_ORDER_RELEASE)
+#define InterlockedOrNoFence(p, v)                        KmSchedInterlockedOr((p), (v), KM_ORDER_RELAXED)
+#define InterlockedAdd64(p, v)                            KmSchedInterlockedAdd64((p), (v), KM_ORDER_SEQ_CST)
+#define InterlockedAddAcquire64(p, v)                     KmSchedInterlockedAdd64((p), (v), KM_ORDER_ACQUIRE)
+#define InterlockedAddRelease64(p, v)                     KmSchedInterlockedAdd64((p), (v), KM_ORDER_RELEASE)
+#define InterlockedAddNoFence64(p, v)                     KmSchedInterlockedAdd64((p), (v), KM_ORDER_RELAXED)
+#define InterlockedExchangeAdd64(p, v)                    KmSchedInterlockedExchangeAdd64((p), (v), KM_ORDER_SEQ_CST)
+#define InterlockedExchangeAddAcquire64(p, v)             KmSchedInterlockedExchangeAdd64((p), (v), KM_ORDER_ACQUIRE)
+#define InterlockedExchangeAddRelease64(p, v)             KmSchedInterlockedExchangeAdd64((p), (v), KM_ORDER_RELEASE)
+#define InterlockedExchangeAddNoFence64(p, v)             KmSchedInterlockedExchangeAdd64((p), (v), KM_ORDER_RELAXED)
+#define InterlockedCompareExchangePointer(p, e, c)        KmSchedInterlockedCompareExchangePointer((p), (e), (c), KM_ORDER_SEQ_CST)
+#define InterlockedCompareExchangePointerAcquire(p, e, c) KmSchedInterlockedCompareExchangePointer((p), (e), (c), KM_ORDER_ACQUIRE)
+#define InterlockedCompareExchangePointerRelease(p, e, c) KmSchedInterlockedCompareExchangePointer((p), (e), (c), KM_ORDER_RELEASE)
+#define InterlockedCompareExchangePointerNoFence(p, e, c) KmSchedInterlockedCompareExchangePointer((p), (e), (c), KM_ORDER_RELAXED)
 
 #undef ReadNoFence
-#undef ReadNoFence64
-#undef ReadPointerAcquire
 #undef ReadAcquire
+#undef ReadNoFence64
+#undef ReadAcquire64
+#undef ReadPointerNoFence
+#undef ReadPointerAcquire
+#undef WriteNoFence
 #undef WriteRelease
+#undef WriteNoFence64
+#undef WriteRelease64
+#undef KeMemoryBarrier
+#undef MemoryBarrier
 
-#define ReadNoFence(p)                  KmSchedReadLong((volatile LONG*)(p))
-#define ReadNoFence64(p)                KmSchedReadLong64((volatile LONG64*)(p))
-#define ReadPointerAcquire(p)           KmSchedReadPointer((PVOID volatile*)(p))
-#define ReadAcquire(p)                  KmSchedReadLong((volatile LONG*)(p))
-#define WriteRelease(p, v)              KmSchedWriteLong((volatile LONG*)(p), (v))
-#define ReadAcquire64(p)                KmSchedReadLong64((volatile LONG64*)(p))
-#define WriteRelease64(p, v)            KmSchedWriteLong64((volatile LONG64*)(p), (v))
+#define ReadNoFence(p)                                    KmSchedReadLong((volatile LONG*)(p), KM_ORDER_RELAXED)
+#define ReadAcquire(p)                                    KmSchedReadLong((volatile LONG*)(p), KM_ORDER_ACQUIRE)
+#define ReadNoFence64(p)                                  KmSchedReadLong64((volatile LONG64*)(p), KM_ORDER_RELAXED)
+#define ReadAcquire64(p)                                  KmSchedReadLong64((volatile LONG64*)(p), KM_ORDER_ACQUIRE)
+#define ReadPointerNoFence(p)                             KmSchedReadPointer((PVOID volatile*)(p), KM_ORDER_RELAXED)
+#define ReadPointerAcquire(p)                             KmSchedReadPointer((PVOID volatile*)(p), KM_ORDER_ACQUIRE)
+#define WriteNoFence(p, v)                                KmSchedWriteLong((volatile LONG*)(p), (v), KM_ORDER_RELAXED)
+#define WriteRelease(p, v)                                KmSchedWriteLong((volatile LONG*)(p), (v), KM_ORDER_RELEASE)
+#define WriteNoFence64(p, v)                              KmSchedWriteLong64((volatile LONG64*)(p), (v), KM_ORDER_RELAXED)
+#define WriteRelease64(p, v)                              KmSchedWriteLong64((volatile LONG64*)(p), (v), KM_ORDER_RELEASE)
+#define KeMemoryBarrier()                                 KmSchedMemoryBarrier()
+#define MemoryBarrier()                                   KmSchedMemoryBarrier()
 
 #endif

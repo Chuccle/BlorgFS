@@ -975,10 +975,12 @@ TEST_F(NodeTableSchedTest, NoAtomicInterleavingRetiresAPinnedNode)
 
     KmSchedSetAtomicYields(1);
     KmSchedSetRaceDetection(1);
+    KmSchedSetWeakMemory(1);
 
     KM_SCHED_RESULT result =
         ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 1000000);
 
+    KmSchedSetWeakMemory(0);
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
 
@@ -1040,10 +1042,12 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedDirectory)
 
     KmSchedSetAtomicYields(1);
     KmSchedSetRaceDetection(1);
+    KmSchedSetWeakMemory(1);
 
     const KM_SCHED_RESULT atomic =
         ExploreReduced(DirectoryPinProofSetup, PinProofTeardown, &proof, 1000000);
 
+    KmSchedSetWeakMemory(0);
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
 
@@ -1062,6 +1066,154 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedDirectory)
 
     printf("[  sched   ] atomic: %d runs, %d pruned, max depth %d, %ld pins, %ld retires\n",
         atomic.Schedules, atomic.Pruned, atomic.MaxDepth, proof.PinsObserved, proof.RetiresObserved);
+}
+
+//
+// The last unpin and the last close race to notice the node is idle. Each
+// drops its own count and reads the other's, under the bucket lock shared,
+// which orders neither against the other: the shape of store buffering.
+// What keeps both from reading the other's count from before its drop is
+// the full barrier of the interlocked drop, and nothing else. Lose it and
+// in some execution neither defers the node, which then stays idle and
+// published with nothing left to reap it. Atomic granularity under weak
+// memory, the full search checked against the reduction.
+//
+struct DropProof
+{
+    PDEVICE_OBJECT Volume;
+    PCOMMON_CONTEXT Node;
+    UNICODE_STRING Path;
+
+    volatile LONG Freed;
+    long Stranded;
+    long Reaped;
+};
+
+void UnpinningThread(void* Parameter)
+{
+    BlorgNodeUnpin(((DropProof*)Parameter)->Node);
+}
+
+void ClosingThread(void* Parameter)
+{
+    BlorgNodeDereference(((DropProof*)Parameter)->Node);
+}
+
+//
+// A node opened once and pinned once, both through the driver.
+//
+void DropProofSetup(void* Parameter)
+{
+    DropProof* proof = (DropProof*)Parameter;
+
+    proof->Freed = 0;
+    proof->Node = nullptr;
+
+    DIRECTORY_ENTRY_METADATA meta = {};
+    meta.Size = 4096;
+
+    PDCB root = BlorgGetVolumeDeviceExtension(proof->Volume)->RootDcb;
+    PCOMMON_CONTEXT node = nullptr;
+
+    if (!NT_SUCCESS(BlorgInsertByPath(root, &proof->Path, &meta, proof->Volume, &node)) || !node)
+    {
+        return;
+    }
+
+    BlorgNodeTablePublish(node);
+
+    if (node != BlorgNodeTableLookupPin(&proof->Path))
+    {
+        return;
+    }
+
+    InterlockedIncrement64(&node->RefCount);
+
+    proof->Node = node;
+
+    ShimWatchFree(node, &proof->Freed);
+
+    KmSchedSpawn(UnpinningThread, proof);
+    KmSchedSpawn(ClosingThread, proof);
+}
+
+//
+// Runs the reap worker for whatever the two queued. A node it did not
+// free was never deferred: count it, and reap it here so the next replay
+// starts from an empty table.
+//
+void DropProofTeardown(void* Parameter)
+{
+    DropProof* proof = (DropProof*)Parameter;
+
+    if (!proof->Node)
+    {
+        ShimWatchFree(nullptr, nullptr);
+        return;
+    }
+
+    while (ShimDrainWorkItems() > 0)
+    {
+    }
+
+    const bool freed = 0 != proof->Freed;
+
+    ShimWatchFree(nullptr, nullptr);
+    KmSchedNoteOutcome(freed);
+
+    if (freed)
+    {
+        proof->Reaped++;
+    }
+    else
+    {
+        proof->Stranded++;
+
+        BlorgNodeDeferReap(proof->Node);
+
+        while (ShimDrainWorkItems() > 0)
+        {
+        }
+    }
+
+    proof->Node = nullptr;
+}
+
+TEST_F(NodeTableSchedTest, NoInterleavingStrandsAnIdleNode)
+{
+    DropProof proof = {};
+    proof.Volume = Volume;
+    proof.Path = MakePath(L"\\dropped.bin");
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetRaceDetection(1);
+    KmSchedSetWeakMemory(1);
+
+    const KM_SCHED_RESULT result =
+        KmExploreInterleavings(DropProofSetup, DropProofTeardown, &proof, 1000000);
+
+    ExpectReductionReachesFullOutcomes(DropProofSetup, DropProofTeardown, &proof, result, 1);
+
+    KmSchedSetWeakMemory(0);
+    KmSchedSetAtomicYields(0);
+    KmSchedSetRaceDetection(0);
+
+    EXPECT_EQ(0, proof.Stranded)
+        << "an execution left the node idle and unreaped: each dropper read the other's "
+           "count from before its drop";
+
+    //
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the drop body";
+    EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
+    EXPECT_LT(result.Schedules, 1000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+    EXPECT_GT(proof.Reaped, 0) << "no execution reaped the node";
+
+    printf("[  sched   ] drop proof: %d runs, max depth %d\n", result.Schedules, result.MaxDepth);
 }
 
 //
@@ -1229,10 +1381,12 @@ TEST_F(NodeTableRevivalSchedTest, NoAtomicInterleavingFreesARevivedNode)
 
     KmSchedSetAtomicYields(1);
     KmSchedSetRaceDetection(1);
+    KmSchedSetWeakMemory(1);
 
     KM_SCHED_RESULT result =
         ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 1000000);
 
+    KmSchedSetWeakMemory(0);
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
 
@@ -2313,6 +2467,308 @@ TEST(SchedulerAudit, ShardsTogetherRunTheWholeSearch)
 
     EXPECT_TRUE(std::equal(whole, whole + wholeCount, combined, combined + unionCount))
         << "the shards reached a different set of outcomes";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Weak memory. The classic litmus shapes, each explored with and without
+// the reduction, across the orderings: what relaxed accesses may return,
+// and what release, acquire, an acquire or release read-modify-write, a
+// full fence, or the coherence of one location rule out. Outcome counts
+// pin the allowed sets: each shape has exactly one outcome that only an
+// unordered pair reaches.
+///////////////////////////////////////////////////////////////////////////
+
+struct LitmusAudit
+{
+    KM_SCHED_BODY Left;
+    KM_SCHED_BODY Right;
+    volatile long X;
+    volatile long Y;
+    long Seen0;
+    long Seen1;
+};
+
+static void LitmusSetup(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->X = 0;
+    audit->Y = 0;
+    audit->Seen0 = 0;
+    audit->Seen1 = 0;
+
+    KmSchedSpawn(audit->Left, audit);
+    KmSchedSpawn(audit->Right, audit);
+}
+
+static void LitmusTeardown(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    KmSchedNoteOutcome((unsigned __int64)(audit->Seen0 | (audit->Seen1 << 4)));
+}
+
+static int LitmusOutcomes(KM_SCHED_BODY Left, KM_SCHED_BODY Right, int Weak)
+{
+    static LitmusAudit audit;
+
+    audit.Left = Left;
+    audit.Right = Right;
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetWeakMemory(Weak);
+
+    const KM_SCHED_RESULT full = KmExploreInterleavings(LitmusSetup, LitmusTeardown, &audit, 100000);
+    const KM_SCHED_RESULT reduced = ExploreReduced(LitmusSetup, LitmusTeardown, &audit, 100000);
+
+    KmSchedSetWeakMemory(0);
+    KmSchedSetAtomicYields(0);
+
+    EXPECT_LT(full.Schedules, 100000) << "the full space was sampled, not exhausted";
+    EXPECT_EQ(full.Outcomes, reduced.Outcomes);
+    EXPECT_EQ(full.OutcomeDigest, reduced.OutcomeDigest)
+        << "the reduced exploration reached a different set of outcomes";
+
+    return full.Outcomes;
+}
+
+//
+// Store buffering: each thread writes one location and reads the other.
+// Only a full fence between the two keeps both reads from missing.
+//
+static void StoreReleaseLoadY(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteRelease(&audit->X, 1);
+    audit->Seen0 = ReadNoFence(&audit->Y);
+}
+
+static void StoreReleaseLoadX(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteRelease(&audit->Y, 1);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryLetsBothStoresBeBuffered)
+{
+    EXPECT_EQ(3, LitmusOutcomes(StoreReleaseLoadY, StoreReleaseLoadX, 0))
+        << "sequential consistency has one thread see the other's store";
+    EXPECT_EQ(4, LitmusOutcomes(StoreReleaseLoadY, StoreReleaseLoadX, 1))
+        << "neither thread saw the other's store in no schedule";
+}
+
+static void ExchangeLoadY(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    InterlockedExchange(&audit->X, 1);
+    audit->Seen0 = ReadNoFence(&audit->Y);
+}
+
+static void ExchangeLoadX(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    InterlockedExchange(&audit->Y, 1);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryKeepsInterlockedStoresOrdered)
+{
+    EXPECT_EQ(3, LitmusOutcomes(ExchangeLoadY, ExchangeLoadX, 1))
+        << "the full fences of two interlocked operations let both loads miss";
+}
+
+static void ExchangeAcquireLoadY(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    InterlockedExchangeAcquire(&audit->X, 1);
+    audit->Seen0 = ReadNoFence(&audit->Y);
+}
+
+static void ExchangeAcquireLoadX(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    InterlockedExchangeAcquire(&audit->Y, 1);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryLetsAcquireExchangesBeBuffered)
+{
+    EXPECT_EQ(4, LitmusOutcomes(ExchangeAcquireLoadY, ExchangeAcquireLoadX, 1))
+        << "an acquire exchange ordered the load after it as a full fence would";
+}
+
+static void StoreFenceLoadY(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    KeMemoryBarrier();
+    audit->Seen0 = ReadNoFence(&audit->Y);
+}
+
+static void StoreFenceLoadX(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->Y, 1);
+    KeMemoryBarrier();
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryKeepsFencedStoresOrdered)
+{
+    EXPECT_EQ(3, LitmusOutcomes(StoreFenceLoadY, StoreFenceLoadX, 1))
+        << "two full fences let both loads miss";
+}
+
+//
+// Message passing: one thread writes data then a flag, the other reads
+// the flag then the data. Seeing the flag without the data needs the
+// writer or the reader to leave its pair unordered.
+//
+static void PublishDataThenFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteRelease(&audit->X, 1);
+    WriteRelease(&audit->Y, 1);
+}
+
+static void StoreDataThenFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    WriteNoFence(&audit->Y, 1);
+}
+
+static void StoreDataFenceFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    KeMemoryBarrier();
+    WriteNoFence(&audit->Y, 1);
+}
+
+static void StoreDataReleaseFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    InterlockedIncrementRelease(&audit->Y);
+}
+
+static void StoreDataUnfencedFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    InterlockedIncrementNoFence(&audit->Y);
+}
+
+static void ReadFlagThenData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = ReadNoFence(&audit->Y);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+static void AcquireFlagThenData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = ReadAcquire(&audit->Y);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+static void ReadFlagFenceData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = ReadNoFence(&audit->Y);
+    KeMemoryBarrier();
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+static void OrAcquireFlagThenData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = InterlockedOrAcquire(&audit->Y, 0);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+static void OrUnfencedFlagThenData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = InterlockedOrNoFence(&audit->Y, 0);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryLetsAnUnfencedReaderSeeTheFlagBeforeTheData)
+{
+    EXPECT_EQ(4, LitmusOutcomes(PublishDataThenFlag, ReadFlagThenData, 1))
+        << "no schedule read the flag set and the data unset";
+    EXPECT_EQ(4, LitmusOutcomes(PublishDataThenFlag, OrUnfencedFlagThenData, 1))
+        << "an unfenced read-modify-write of the flag ordered the data read after it";
+}
+
+TEST(SchedulerAudit, WeakMemoryLetsAnUnfencedWriterPublishTheFlagBeforeTheData)
+{
+    EXPECT_EQ(4, LitmusOutcomes(StoreDataThenFlag, AcquireFlagThenData, 1))
+        << "an unfenced flag write released the data written before it";
+    EXPECT_EQ(4, LitmusOutcomes(StoreDataUnfencedFlag, AcquireFlagThenData, 1))
+        << "an unfenced read-modify-write of the flag released the data written before it";
+}
+
+TEST(SchedulerAudit, WeakMemoryKeepsAnAcquiringReaderAfterTheData)
+{
+    EXPECT_EQ(3, LitmusOutcomes(PublishDataThenFlag, AcquireFlagThenData, 1))
+        << "an acquire that read the flag still missed the data released before it";
+    EXPECT_EQ(3, LitmusOutcomes(PublishDataThenFlag, OrAcquireFlagThenData, 1))
+        << "an acquire read-modify-write of the flag still missed the data";
+    EXPECT_EQ(3, LitmusOutcomes(PublishDataThenFlag, ReadFlagFenceData, 1))
+        << "a full fence after reading the flag still missed the data";
+}
+
+TEST(SchedulerAudit, WeakMemoryKeepsAReleasingWriterBeforeTheFlag)
+{
+    EXPECT_EQ(3, LitmusOutcomes(StoreDataFenceFlag, AcquireFlagThenData, 1))
+        << "a full fence before writing the flag did not release the data";
+    EXPECT_EQ(3, LitmusOutcomes(StoreDataReleaseFlag, AcquireFlagThenData, 1))
+        << "a release read-modify-write of the flag did not release the data";
+}
+
+static void StoreOneThenTwo(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    WriteNoFence(&audit->X, 2);
+}
+
+static void ReadTwice(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = ReadNoFence(&audit->X);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryNeverReadsALocationBackwards)
+{
+    EXPECT_EQ(6, LitmusOutcomes(StoreOneThenTwo, ReadTwice, 1))
+        << "two reads of one location saw its writes out of order, or missed an order";
 }
 
 TEST(SchedulerAudit, ReductionStillFindsADeadlockThatNeedsOneOrder)

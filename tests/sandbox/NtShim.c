@@ -1099,6 +1099,8 @@ VOID IoQueueWorkItem(PIO_WORKITEM IoWorkItem, PIO_WORKITEM_ROUTINE Routine, WORK
     WorkItemTail = IoWorkItem;
 
     LeaveCriticalSection(&WorkItemCs);
+
+    KmSchedNoteRelease((const void*)&WorkItemHead);
 }
 
 ULONG ShimPendingWorkItems(VOID)
@@ -1144,6 +1146,7 @@ ULONG ShimDrainWorkItems(VOID)
 
         if (item)
         {
+            KmSchedNoteAcquire((const void*)&WorkItemHead);
             KmSchedNoteFootprint(item, sizeof(*item), 1);
 
             WorkItemHead = item->Next;
