@@ -591,6 +591,22 @@ C_ASSERT(sizeof(ULONG_PTR) == 8);
 static int ReplayedDepth = 0;
 
 //
+// Splitting the full search between processes. A run's group is its first
+// KM_SHARD_DEPTH choices; groups are numbered in the order the search
+// reaches them and dealt out round-robin. A run whose group belongs to
+// another shard is finished unrecorded, like a pruned one, and the search
+// backtracks straight past it.
+//
+#define KM_SHARD_DEPTH 12
+
+static int ShardIndex = 0;
+static int ShardCount = 1;
+static int ShardGroups = 0;
+static int ShardNewGroup = 0;
+static int ShardOwned = 1;
+static int Unowned = 0;
+
+//
 // Distinct outcomes the bodies reported this exploration, as an open-
 // addressed set of mixed signatures (zero marks an empty slot).
 //
@@ -785,8 +801,55 @@ void KmSchedSetReduction(int Enabled)
     Reduction = Enabled;
 }
 
+void KmSchedSetShard(int Index, int Count)
+{
+    ShardIndex = Index;
+    ShardCount = Count;
+}
+
+//
+// Called once per run, at the shard depth or at the run's end if it never
+// gets there: a run that starts a new group decides whether this shard
+// owns it, and every other run inherits the decision of its group.
+//
+static void ShardDecide(void)
+{
+    if (ShardNewGroup)
+    {
+        ShardOwned = (ShardGroups++ % ShardCount) == ShardIndex;
+        ShardNewGroup = 0;
+    }
+
+    Unowned = !ShardOwned;
+
+    if (Unowned && RecordedDepth > Depth)
+    {
+        RecordedDepth = Depth;
+    }
+}
+
+int KmSchedCopyOutcomes(unsigned __int64* Outcomes, int Capacity)
+{
+    int count = 0;
+
+    for (int slot = 0; slot < KM_OUTCOME_SLOTS && count < Capacity; ++slot)
+    {
+        if (OutcomeSet[slot])
+        {
+            Outcomes[count++] = OutcomeSet[slot];
+        }
+    }
+
+    return count;
+}
+
 void KmSchedNoteOutcome(unsigned __int64 Outcome)
 {
+    if (Unowned)
+    {
+        return;
+    }
+
     //
     // splitmix64 finaliser: spreads structured signatures over the table
     // and makes the digest below a fair summary of the set.
@@ -1273,7 +1336,12 @@ static int ChooseNext(void)
     // its checks still run, but every order it could branch into from
     // here was explored elsewhere.
     //
-    if (Pruned)
+    if (ShardCount > 1 && !Reduction && Depth == KM_SHARD_DEPTH)
+    {
+        ShardDecide();
+    }
+
+    if (Pruned || Unowned)
     {
         Depth++;
         return runnable[0];
@@ -1566,6 +1634,7 @@ static void RunOnce(KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context)
     Deadlocked = 0;
     Abandoned = 0;
     Pruned = 0;
+    Unowned = 0;
     StepNode = -1;
     SleeperCheck = 0;
     BlockCount = 0;
@@ -1598,6 +1667,11 @@ static void RunOnce(KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context)
                 exit(2);
             }
         }
+    }
+
+    if (ShardCount > 1 && !Reduction && ShardNewGroup)
+    {
+        ShardDecide();
     }
 
     if (Teardown)
@@ -1637,6 +1711,7 @@ static int NextSchedule(void)
         {
             Choice[d]++;
             RecordedDepth = d + 1;
+            ShardNewGroup |= d < KM_SHARD_DEPTH;
             return 1;
         }
     }
@@ -1655,6 +1730,9 @@ KM_SCHED_RESULT KmExploreInterleavings(
     ReplayedDepth = 0;
     RacesReported = 0;
     FootprintReported = 0;
+    ShardGroups = 0;
+    ShardNewGroup = 1;
+    ShardOwned = 1;
     ResetOutcomes();
 
     for (int d = 0; d < KM_SCHED_MAX_DEPTH; ++d)
@@ -1676,6 +1754,11 @@ KM_SCHED_RESULT KmExploreInterleavings(
     do
     {
         RunOnce(Setup, Teardown, Context);
+
+        if (Unowned)
+        {
+            continue;
+        }
 
         result.Schedules++;
 
