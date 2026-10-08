@@ -189,6 +189,7 @@ static KM_RACE_ENTRY RaceTable[KM_RACE_SLOTS];
 static KM_LOCK_CLOCK LockClocks[KM_RACE_SLOTS];
 static unsigned long Vc[KM_SCHED_MAX_THREADS + 1][KM_SCHED_MAX_THREADS + 1];
 static int RaceDetection = 0;
+static int WeakMemory = 0;
 //
 // Set the moment any registration happens, so the per-replay reset of
 // the race tables -- tens of kilobytes -- is paid only by explorations
@@ -363,7 +364,7 @@ void KmSchedNoteAcquire(const void* LockAddress)
 
     KmSchedNoteFootprint(LockAddress, 1, 1);
 
-    if (!RaceDetection || !LockAddress)
+    if ((!RaceDetection && !WeakMemory) || !LockAddress)
     {
         return;
     }
@@ -379,7 +380,7 @@ void KmSchedNoteAcquire(const void* LockAddress)
     }
 
     //
-    // Join: everything the last releaser of THIS lock had seen is now
+    // Join: everything the releasers of THIS lock had seen is now
     // happens-before us.
     //
     for (int t = 0; t <= KM_SCHED_MAX_THREADS; ++t)
@@ -399,7 +400,7 @@ void KmSchedNoteRelease(const void* LockAddress)
 
     KmSchedNoteFootprint(LockAddress, 1, 1);
 
-    if (!RaceDetection || !LockAddress)
+    if ((!RaceDetection && !WeakMemory) || !LockAddress)
     {
         return;
     }
@@ -414,10 +415,23 @@ void KmSchedNoteRelease(const void* LockAddress)
         return;
     }
 
+    //
+    // Joined rather than overwritten: a lock's releasers have each seen
+    // the last one, so for a lock the two agree, and a queue's pushers
+    // (the shim's work queue) have not.
+    //
     for (int t = 0; t <= KM_SCHED_MAX_THREADS; ++t)
     {
-        clock->Clock[t] = myVc[t];
+        if (myVc[t] > clock->Clock[t])
+        {
+            clock->Clock[t] = myVc[t];
+        }
     }
+
+    //
+    // What this thread does next is not part of what it released.
+    //
+    myVc[slot]++;
 }
 
 //
@@ -501,6 +515,13 @@ typedef struct _KM_FOOTPRINT
     // which costs reduction and never coverage.
     //
     unsigned char Overflow;
+
+    //
+    // The union of the paths a step took for different values of its
+    // weak-memory reads; a step taken again must fall within it rather
+    // than repeat it.
+    //
+    unsigned char Merged;
 } KM_FOOTPRINT;
 
 static int Reduction = 0;
@@ -523,6 +544,27 @@ static unsigned char Asleep[KM_SCHED_MAX_DEPTH];
 static unsigned char Explored[KM_SCHED_MAX_DEPTH];
 
 //
+// Set when a node's thread is picked, so the first step taken from it
+// replaces whatever an earlier subtree recorded there, and cleared once
+// it has: later runs of the same step, down other values of its reads,
+// add to its footprint instead.
+//
+static unsigned char StepFresh[KM_SCHED_MAX_DEPTH];
+
+//
+// Nodes that choose a value for a weak-memory read rather than a thread,
+// and the thread node whose step made the read.
+//
+static unsigned char ValueNode[KM_SCHED_MAX_DEPTH];
+static int ValueOwner[KM_SCHED_MAX_DEPTH];
+
+//
+// Whether the running step has read with more than one value to choose
+// from.
+//
+static int StepValues = 0;
+
+//
 // Depth of the recorded node whose step is running, or -1 when the step
 // belongs to no recorded node (truncated, abandoned or pruned).
 //
@@ -542,6 +584,358 @@ static KM_FOOTPRINT SleeperFootprint;
 // there is to say.
 //
 static int FootprintReported = 0;
+
+//
+// ---- Weak memory -------------------------------------------------------
+//
+// Opt-in per exploration (KmSchedSetWeakMemory). Without it every read of
+// a shared location returns the last value written, which is sequential
+// consistency, and neither ARM64 nor the compiler promise that: a read
+// may return an older value than the last one written, as long as the
+// orderings in the program allow it.
+//
+// The model is the C++ one less load buffering, over the happens-before
+// clocks the race detector keeps. Every location the shims touch keeps its
+// writes in the order they happened. A read may return the newest write,
+// or any older one down to the newest write that happens-before the
+// reader, and never older than one the same thread already read or wrote
+// there. It never returns a write not yet made, which is the load
+// buffering left out (Scheduler.h). Each value it may return is a branch
+// the explorer takes, recorded in the schedule like a choice of thread.
+//
+// The orderings (KM_ORDER_*):
+//
+// - Relaxed (NoFence): orders nothing. A relaxed write publishes only
+//   what the writer's last full fence covered, and what a relaxed read
+//   reads is joined at the reader's next full fence.
+// - Acquire: the read joins the clock released with the write it reads.
+// - Release: the write publishes the writer's clock.
+// - Acquire-release: both, for a read-modify-write.
+// - Sequentially consistent: the unsuffixed Interlocked operations, which
+//   Windows makes full barriers, as are KeMemoryBarrier and MemoryBarrier.
+//   A full fence acquires everything earlier fences published and
+//   publishes everything its thread has seen, so the fences fall in one
+//   order every thread agrees on.
+// - Consume is not modelled apart from acquire, which is how compilers
+//   implement it and what ReadPointerAcquire asks for. ReadPointerNoFence
+//   is relaxed, though ARM64 orders a dereference after the read it
+//   depends on: the model is weaker there than the hardware, never
+//   stronger.
+//
+// A read-modify-write reads the newest write and carries forward what
+// that write released, so an acquire that reads it synchronizes with the
+// release it continues. Locks acquire and release their own clocks and
+// are not fences. A write made without a shim, which the model cannot see
+// happen, is taken to be visible to every thread as soon as a shim next
+// touches the location.
+//
+#define KM_WM_LOCATIONS 256
+#define KM_WM_HISTORY 128
+
+typedef struct _KM_WM_WRITE
+{
+    __int64 Value;
+
+    //
+    // What an acquire that reads this write joins.
+    //
+    unsigned long Released[KM_SCHED_MAX_THREADS + 1];
+    unsigned long Clock;
+
+    //
+    // Slot of the writer, or -1 for a write every thread already sees,
+    // and the recorded node whose step made it, or -1.
+    //
+    int Thread;
+    int Node;
+} KM_WM_WRITE;
+
+typedef struct _KM_WM_LOCATION
+{
+    const volatile void* Address;
+    int Size;
+    int Count;
+
+    //
+    // Per thread, the oldest write it may still read here.
+    //
+    int Seen[KM_SCHED_MAX_THREADS + 1];
+    KM_WM_WRITE Writes[KM_WM_HISTORY];
+} KM_WM_LOCATION;
+
+static KM_WM_LOCATION WmLocations[KM_WM_LOCATIONS];
+static int WmLocationCount = 0;
+
+//
+// The clock full fences publish to each other; per thread, its clock at
+// its last full fence, which its relaxed writes publish; and the clocks
+// of the writes its relaxed reads read since then, which its next full
+// fence acquires.
+//
+static unsigned long WmFenceClock[KM_SCHED_MAX_THREADS + 1];
+static unsigned long WmFenced[KM_SCHED_MAX_THREADS + 1][KM_SCHED_MAX_THREADS + 1];
+static unsigned long WmPending[KM_SCHED_MAX_THREADS + 1][KM_SCHED_MAX_THREADS + 1];
+
+//
+// A read that began its step and returned an older write than the newest
+// one: the footprint entry of the read, and the first recorded node since
+// the reader's previous step that wrote the location again, or -1.
+//
+static int StaleNode = -1;
+static ULONG_PTR StaleStart;
+static ULONG_PTR StaleEnd;
+
+static int ChooseValue(int Count);
+
+void KmSchedSetWeakMemory(int Enabled)
+{
+    WeakMemory = Enabled;
+}
+
+static void ClockJoin(unsigned long* Into, const unsigned long* From)
+{
+    for (int t = 0; t <= KM_SCHED_MAX_THREADS; ++t)
+    {
+        if (From[t] > Into[t])
+        {
+            Into[t] = From[t];
+        }
+    }
+}
+
+static void WmFullFence(int Slot)
+{
+    //
+    // The fence order decides what later reads may return, so for the
+    // reduction every full fence writes it, and no two commute.
+    //
+    KmSchedNoteFootprint((const void*)WmFenceClock, sizeof(WmFenceClock), 1);
+
+    ClockJoin(Vc[Slot], WmFenceClock);
+    ClockJoin(Vc[Slot], WmPending[Slot]);
+    ZeroMemory(WmPending[Slot], sizeof(WmPending[Slot]));
+    ClockJoin(WmFenceClock, Vc[Slot]);
+    CopyMemory(WmFenced[Slot], Vc[Slot], sizeof(WmFenced[Slot]));
+}
+
+static __int64 WmLoad(const volatile void* Address, int Size)
+{
+    return (8 == Size) ? *(const volatile __int64*)Address : *(const volatile long*)Address;
+}
+
+static KM_WM_WRITE* WmAppend(KM_WM_LOCATION* Location, __int64 Value, int Slot)
+{
+    if (KM_WM_HISTORY == Location->Count)
+    {
+        KmReportViolation(KmViolationLifetime,
+            "weak memory: more than %d writes to one location in a run", KM_WM_HISTORY);
+        return NULL;
+    }
+
+    KM_WM_WRITE* write = &Location->Writes[Location->Count];
+
+    write->Value = Value;
+    write->Thread = Slot;
+    write->Node = StepNode;
+    ZeroMemory(write->Released, sizeof(write->Released));
+
+    if (Slot >= 0)
+    {
+        write->Clock = Vc[Slot][Slot];
+        Location->Seen[Slot] = Location->Count;
+    }
+    else
+    {
+        //
+        // Seen by everyone from here on.
+        //
+        write->Clock = 0;
+
+        for (int t = 0; t <= KM_SCHED_MAX_THREADS; ++t)
+        {
+            Location->Seen[t] = Location->Count;
+        }
+    }
+
+    Location->Count++;
+
+    return write;
+}
+
+//
+// The location a shim is about to touch, or NULL when the access is not
+// modelled: weak memory off, or no modelled thread running. A value that
+// differs from the last write recorded was written without a shim.
+//
+static KM_WM_LOCATION* WmBegin(const volatile void* Address, int Size, int* Slot)
+{
+    if (!WeakMemory || Current < 0)
+    {
+        return NULL;
+    }
+
+    RaceStateDirty = 1;
+    RaceMyClock(Slot);
+
+    for (int i = 0; i < WmLocationCount; ++i)
+    {
+        KM_WM_LOCATION* location = &WmLocations[i];
+
+        if (location->Address == Address)
+        {
+            const __int64 now = WmLoad(Address, Size);
+
+            if (now != location->Writes[location->Count - 1].Value)
+            {
+                WmAppend(location, now, -1);
+            }
+
+            return location;
+        }
+    }
+
+    if (KM_WM_LOCATIONS == WmLocationCount)
+    {
+        KmReportViolation(KmViolationLifetime,
+            "weak memory: more than %d locations in a run", KM_WM_LOCATIONS);
+        return NULL;
+    }
+
+    KM_WM_LOCATION* location = &WmLocations[WmLocationCount++];
+
+    location->Address = Address;
+    location->Size = Size;
+    location->Count = 0;
+    WmAppend(location, WmLoad(Address, Size), -1);
+
+    return location;
+}
+
+//
+// A read that is not part of a read-modify-write: picks the write it
+// returns.
+//
+static __int64 WmRead(KM_WM_LOCATION* Location, int Slot, int Order)
+{
+    int oldest = Location->Seen[Slot];
+
+    for (int i = Location->Count - 1; i > oldest; --i)
+    {
+        const KM_WM_WRITE* write = &Location->Writes[i];
+
+        if (write->Thread < 0 || write->Clock <= Vc[Slot][write->Thread])
+        {
+            oldest = i;
+            break;
+        }
+    }
+
+    const int read = Location->Count - 1 - ChooseValue(Location->Count - oldest);
+    const KM_WM_WRITE* write = &Location->Writes[read];
+
+    Location->Seen[Slot] = read;
+
+    if (Reduction && StepNode >= 0 && 1 == Step.Count && !Step.Overflow)
+    {
+        int previous = StepNode - 1;
+
+        while (previous >= 0 && (ValueNode[previous] || Picked[previous] != Picked[StepNode]))
+        {
+            previous--;
+        }
+
+        for (int i = read + 1; i < Location->Count; ++i)
+        {
+            if (Location->Writes[i].Node > previous)
+            {
+                StaleNode = Location->Writes[i].Node;
+                StaleStart = Step.Start[0];
+                StaleEnd = Step.End[0];
+                break;
+            }
+        }
+    }
+
+    ClockJoin((Order & KM_ORDER_ACQUIRE) ? Vc[Slot] : WmPending[Slot], write->Released);
+
+    return write->Value;
+}
+
+//
+// After the shim's write, or its read-modify-write, which reads the
+// newest write: records the value now in memory.
+//
+static void WmWrite(KM_WM_LOCATION* Location, int Slot, int ReadModifyWrite, int Order)
+{
+    unsigned long continued[KM_SCHED_MAX_THREADS + 1] = { 0 };
+
+    if (ReadModifyWrite)
+    {
+        const KM_WM_WRITE* read = &Location->Writes[Location->Count - 1];
+
+        CopyMemory(continued, read->Released, sizeof(continued));
+        ClockJoin((Order & KM_ORDER_ACQUIRE) ? Vc[Slot] : WmPending[Slot], read->Released);
+    }
+
+    KM_WM_WRITE* write = WmAppend(Location, WmLoad(Location->Address, Location->Size), Slot);
+
+    if (write)
+    {
+        ClockJoin(write->Released, (Order & KM_ORDER_RELEASE) ? Vc[Slot] : WmFenced[Slot]);
+        ClockJoin(write->Released, continued);
+    }
+
+    Vc[Slot][Slot]++;
+}
+
+//
+// A read-modify-write, with a full fence on either side when it is
+// sequentially consistent.
+//
+static KM_WM_LOCATION* WmBeginReadModifyWrite(const volatile void* Address, int Size, int Order, int* Slot)
+{
+    KM_WM_LOCATION* location = WmBegin(Address, Size, Slot);
+
+    if (location && KM_ORDER_SEQ_CST == Order)
+    {
+        WmFullFence(*Slot);
+    }
+
+    return location;
+}
+
+static void WmEndReadModifyWrite(KM_WM_LOCATION* Location, int Slot, int Order)
+{
+    if (Location)
+    {
+        WmWrite(Location, Slot, 1, Order);
+
+        if (KM_ORDER_SEQ_CST == Order)
+        {
+            WmFullFence(Slot);
+        }
+    }
+}
+
+//
+// Memory reused by an allocation is a new location.
+//
+static void WmForget(ULONG_PTR Start, ULONG_PTR End)
+{
+    for (int i = 0; i < WmLocationCount; )
+    {
+        const ULONG_PTR address = (ULONG_PTR)WmLocations[i].Address;
+
+        if (address >= Start && address < End)
+        {
+            WmLocations[i] = WmLocations[--WmLocationCount];
+        }
+        else
+        {
+            ++i;
+        }
+    }
+}
 
 //
 // Heap blocks allocated during the current replay, sorted by address.
@@ -708,6 +1102,8 @@ void KmSchedNoteAllocation(const void* Block, size_t Size)
         return;
     }
 
+    WmForget((ULONG_PTR)Block, (ULONG_PTR)Block + (Size ? Size : 1));
+
     if (BlockCount == KM_TRACKED_BLOCKS)
     {
         BlocksOverflowed = 1;
@@ -788,6 +1184,78 @@ static int FootprintsEqual(const KM_FOOTPRINT* A, const KM_FOOTPRINT* B)
     for (int i = 0; i < A->Count; ++i)
     {
         if (A->Start[i] != B->Start[i] || A->End[i] != B->End[i] || A->Write[i] != B->Write[i])
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void FootprintMerge(KM_FOOTPRINT* Into, const KM_FOOTPRINT* From)
+{
+    Into->Merged = 1;
+    Into->Overflow |= From->Overflow;
+
+    for (int j = 0; j < From->Count && !Into->Overflow; ++j)
+    {
+        int i = 0;
+
+        while (i < Into->Count && (Into->Start[i] != From->Start[j] || Into->End[i] != From->End[j]))
+        {
+            i++;
+        }
+
+        if (i == Into->Count)
+        {
+            if (KM_FOOTPRINT_SLOTS == Into->Count)
+            {
+                Into->Overflow = 1;
+                break;
+            }
+
+            Into->Start[i] = From->Start[j];
+            Into->End[i] = From->End[j];
+            Into->Write[i] = 0;
+            Into->Count++;
+        }
+
+        Into->Write[i] |= From->Write[j];
+    }
+}
+
+//
+// Whether a step taken again touched what it was recorded touching: the
+// same, or for a merged footprint, nothing outside it.
+//
+static int FootprintMatches(const KM_FOOTPRINT* Step, const KM_FOOTPRINT* Recorded)
+{
+    if (!Recorded->Merged)
+    {
+        return FootprintsEqual(Step, Recorded);
+    }
+
+    if (Recorded->Overflow)
+    {
+        return 1;
+    }
+
+    if (Step->Overflow)
+    {
+        return 0;
+    }
+
+    for (int j = 0; j < Step->Count; ++j)
+    {
+        int i = 0;
+
+        while (i < Recorded->Count &&
+               (Recorded->Start[i] != Step->Start[j] || Recorded->End[i] != Step->End[j]))
+        {
+            i++;
+        }
+
+        if (i == Recorded->Count || (Step->Write[j] && !Recorded->Write[i]))
         {
             return 0;
         }
@@ -1106,7 +1574,13 @@ static int ReduceFreshNode(const int* Runnable, int Count)
         // siblings explored before the step just taken, stay asleep here
         // when their next step commutes with it.
         //
-        const int parent = Depth - 1;
+        int parent = Depth - 1;
+
+        while (parent > 0 && ValueNode[parent])
+        {
+            parent--;
+        }
+
         const int ran = Picked[parent];
         const KM_FOOTPRINT* taken = &StepFootprint[parent][ran];
         const unsigned candidates = (Asleep[parent] | Explored[parent]) & ~(1u << ran);
@@ -1136,6 +1610,104 @@ static int ReduceFreshNode(const int* Runnable, int Count)
     Asleep[Depth] = asleep;
     Explored[Depth] = 0;
     Picked[Depth] = (unsigned char)first;
+    StepFresh[Depth] = 1;
+
+    return 1;
+}
+
+//
+// Which of Count values a weak-memory read returns: a node of the
+// schedule like a choice of thread, so replay and backtracking treat both
+// alike. 0, the newest write, is the first explored.
+//
+static int ChooseValue(int Count)
+{
+    if (Count <= 1)
+    {
+        return 0;
+    }
+
+    StepValues = 1;
+
+    if (RandomMode && !Abandoned)
+    {
+        return RngNext(Count);
+    }
+
+    if (Abandoned || Pruned || Unowned || RandomMode)
+    {
+        return 0;
+    }
+
+    if (Depth >= KM_SCHED_MAX_DEPTH)
+    {
+        Truncated = 1;
+        return 0;
+    }
+
+    if (ShardCount > 1 && !Reduction && Depth == KM_SHARD_DEPTH)
+    {
+        ShardDecide();
+
+        if (Unowned)
+        {
+            return 0;
+        }
+    }
+
+    if (Depth >= RecordedDepth)
+    {
+        Choice[Depth] = 0;
+        Options[Depth] = Count;
+        StateSnapshot[Depth] = 0;
+        ValueNode[Depth] = 1;
+        ValueOwner[Depth] = StepNode;
+        RecordedDepth = Depth + 1;
+    }
+    else if (!ValueNode[Depth] || Options[Depth] != Count)
+    {
+        KmReportViolation(KmViolationLifetime,
+            "scheduler replay diverged at depth %d: a read had %d values to choose from, "
+            "expected %d", Depth, Count, ValueNode[Depth] ? Options[Depth] : 0);
+    }
+
+    return Choice[Depth++];
+}
+
+//
+// Whether the stale read the step just ended began with is one the
+// explorer reaches anyway. Newer writes to the location were made since
+// the reader's previous step. If the reader's step commutes with every
+// step from the first of those writes on, apart from the writes to the
+// location it read, the same execution with the reader's step moved
+// before them is an order of its own, explored separately: there the
+// value read is the newest, or stale with nothing written since the
+// reader's previous step, and the steps it moved past see none of it.
+// This run reaches nothing that one does not.
+//
+static int StaleReadRepeats(void)
+{
+    KM_FOOTPRINT own = Step;
+
+    for (int i = 0; i < own.Count; ++i)
+    {
+        if (own.Start[i] == StaleStart && own.End[i] == StaleEnd && !own.Write[i])
+        {
+            own.Count--;
+            own.Start[i] = own.Start[own.Count];
+            own.End[i] = own.End[own.Count];
+            own.Write[i] = own.Write[own.Count];
+            break;
+        }
+    }
+
+    for (int d = StaleNode; d < StepNode; ++d)
+    {
+        if (!ValueNode[d] && FootprintsConflict(&own, &StepFootprint[d][Picked[d]]))
+        {
+            return 0;
+        }
+    }
 
     return 1;
 }
@@ -1162,7 +1734,7 @@ static int ChooseNext(void)
             // replay to replay cannot be compared with anything.
             //
             if (StepNode < ReplayedDepth && !FootprintReported &&
-                !FootprintsEqual(&Step, recorded))
+                !FootprintMatches(&Step, recorded))
             {
                 FootprintReported = 1;
 
@@ -1171,14 +1743,33 @@ static int ChooseNext(void)
                     "when it was recorded (depth %d)", StepNode);
             }
 
-            *recorded = Step;
+            if (StepFresh[StepNode])
+            {
+                *recorded = Step;
+                recorded->Merged = (unsigned char)StepValues;
+                StepFresh[StepNode] = 0;
+            }
+            else if (recorded->Merged || StepValues)
+            {
+                FootprintMerge(recorded, &Step);
+            }
+            else
+            {
+                *recorded = Step;
+            }
+
+            if (StaleNode >= 0 && StaleReadRepeats())
+            {
+                Pruned = 1;
+            }
+
             StepNode = -1;
         }
         else if (SleeperCheck)
         {
             SleeperCheck = 0;
 
-            if (!FootprintReported && !FootprintsEqual(&Step, &SleeperFootprint))
+            if (!FootprintReported && !FootprintMatches(&Step, &SleeperFootprint))
             {
                 FootprintReported = 1;
 
@@ -1191,6 +1782,8 @@ static int ChooseNext(void)
 
         Step.Count = 0;
         Step.Overflow = 0;
+        StepValues = 0;
+        StaleNode = -1;
     }
 
     RefreshRunnable();
@@ -1362,9 +1955,10 @@ static int ChooseNext(void)
         Choice[Depth] = 0;
         Options[Depth] = count;
         StateSnapshot[Depth] = snapshot;
+        ValueNode[Depth] = 0;
         RecordedDepth = Depth + 1;
     }
-    else if (Options[Depth] != count || StateSnapshot[Depth] != snapshot)
+    else if (ValueNode[Depth] || Options[Depth] != count || StateSnapshot[Depth] != snapshot)
     {
         //
         // The per-thread STATE VECTOR must be a function of the schedule
@@ -1625,9 +2219,16 @@ static void RunOnce(KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context)
         ZeroMemory(Vc, sizeof(Vc));
         ZeroMemory(RaceTable, sizeof(RaceTable));
         ZeroMemory(LockClocks, sizeof(LockClocks));
+        ZeroMemory(WmFenceClock, sizeof(WmFenceClock));
+        ZeroMemory(WmFenced, sizeof(WmFenced));
+        ZeroMemory(WmPending, sizeof(WmPending));
         LastClockSlot = -1;
         RaceStateDirty = 0;
     }
+
+    WmLocationCount = 0;
+    StepValues = 0;
+    StaleNode = -1;
 
     Depth = 0;
     Truncated = 0;
@@ -1689,6 +2290,20 @@ static int NextSchedule(void)
 {
     for (int d = RecordedDepth - 1; d >= 0; --d)
     {
+        if (ValueNode[d])
+        {
+            if (Choice[d] + 1 < Options[d])
+            {
+                Choice[d]++;
+                RecordedDepth = d + 1;
+                ReplayedDepth = (ValueOwner[d] >= 0) ? ValueOwner[d] : d;
+                ShardNewGroup |= d < KM_SHARD_DEPTH;
+                return 1;
+            }
+
+            continue;
+        }
+
         if (Reduction)
         {
             const unsigned untried = RunnableSet[d] & ~Asleep[d] & ~Explored[d];
@@ -1699,6 +2314,7 @@ static int NextSchedule(void)
                 _BitScanForward(&next, untried);
 
                 Picked[d] = (unsigned char)next;
+                StepFresh[d] = 1;
                 RecordedDepth = d + 1;
                 ReplayedDepth = d;
                 return 1;
@@ -1740,6 +2356,7 @@ KM_SCHED_RESULT KmExploreInterleavings(
         Choice[d] = 0;
         Options[d] = 0;
         StateSnapshot[d] = 0;
+        ValueNode[d] = 0;
     }
 
     //
@@ -1863,107 +2480,213 @@ static void AtomicYield(void)
     }
 }
 
-long KmSchedInterlockedIncrement(long volatile* Target)
+long KmSchedInterlockedIncrement(long volatile* Target, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedIncrement(Target);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    long result = _InterlockedIncrement(Target);
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-long KmSchedInterlockedDecrement(long volatile* Target)
+long KmSchedInterlockedDecrement(long volatile* Target, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedDecrement(Target);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    long result = _InterlockedDecrement(Target);
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-long KmSchedInterlockedExchange(long volatile* Target, long Value)
+long KmSchedInterlockedExchange(long volatile* Target, long Value, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedExchange(Target, Value);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    long result = _InterlockedExchange(Target, Value);
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-long KmSchedInterlockedCompareExchange(long volatile* Target, long Exchange, long Comparand)
+long KmSchedInterlockedCompareExchange(long volatile* Target, long Exchange, long Comparand, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedCompareExchange(Target, Exchange, Comparand);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    long result = _InterlockedCompareExchange(Target, Exchange, Comparand);
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-__int64 KmSchedInterlockedIncrement64(__int64 volatile* Target)
+__int64 KmSchedInterlockedIncrement64(__int64 volatile* Target, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedIncrement64(Target);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    __int64 result = _InterlockedIncrement64(Target);
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-__int64 KmSchedInterlockedDecrement64(__int64 volatile* Target)
+__int64 KmSchedInterlockedDecrement64(__int64 volatile* Target, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedDecrement64(Target);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    __int64 result = _InterlockedDecrement64(Target);
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-long KmSchedInterlockedOr(long volatile* Target, long Value)
+long KmSchedInterlockedOr(long volatile* Target, long Value, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedOr(Target, Value);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    long result = _InterlockedOr(Target, Value);
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-__int64 KmSchedInterlockedAdd64(__int64 volatile* Target, __int64 Value)
+__int64 KmSchedInterlockedAdd64(__int64 volatile* Target, __int64 Value, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedExchangeAdd64(Target, Value) + Value;
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    __int64 result = _InterlockedExchangeAdd64(Target, Value) + Value;
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-__int64 KmSchedInterlockedExchangeAdd64(__int64 volatile* Target, __int64 Value)
+__int64 KmSchedInterlockedExchangeAdd64(__int64 volatile* Target, __int64 Value, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedExchangeAdd64(Target, Value);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    __int64 result = _InterlockedExchangeAdd64(Target, Value);
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-void* KmSchedInterlockedCompareExchangePointer(void* volatile* Target, void* Exchange, void* Comparand)
+void* KmSchedInterlockedCompareExchangePointer(void* volatile* Target, void* Exchange, void* Comparand, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
-    return _InterlockedCompareExchangePointer(Target, Exchange, Comparand);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBeginReadModifyWrite(Target, sizeof(*Target), Order, &slot);
+    void* result = _InterlockedCompareExchangePointer(Target, Exchange, Comparand);
+    WmEndReadModifyWrite(location, slot, Order);
+
+    return result;
 }
 
-long KmSchedReadLong(long volatile* Source)
+long KmSchedReadLong(long volatile* Source, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Source, sizeof(*Source), 0);
-    return *Source;
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBegin(Source, sizeof(*Source), &slot);
+
+    return location ? (long)WmRead(location, slot, Order) : *Source;
 }
 
-__int64 KmSchedReadLong64(__int64 volatile* Source)
+__int64 KmSchedReadLong64(__int64 volatile* Source, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Source, sizeof(*Source), 0);
-    return *Source;
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBegin(Source, sizeof(*Source), &slot);
+
+    return location ? (__int64)WmRead(location, slot, Order) : *Source;
 }
 
-void* KmSchedReadPointer(void* volatile* Source)
+void* KmSchedReadPointer(void* volatile* Source, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Source, sizeof(*Source), 0);
-    return *Source;
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBegin(Source, sizeof(*Source), &slot);
+
+    return location ? (void*)WmRead(location, slot, Order) : *Source;
 }
 
-void KmSchedWriteLong(long volatile* Target, long Value)
+void KmSchedWriteLong(long volatile* Target, long Value, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBegin(Target, sizeof(*Target), &slot);
     *Target = Value;
+
+    if (location)
+    {
+        WmWrite(location, slot, 0, Order);
+    }
 }
 
-void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value)
+void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value, int Order)
 {
     AtomicYield();
     KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
+
+    int slot = 0;
+    KM_WM_LOCATION* location = WmBegin(Target, sizeof(*Target), &slot);
     *Target = Value;
+
+    if (location)
+    {
+        WmWrite(location, slot, 0, Order);
+    }
+}
+
+//
+// A full fence with no access of its own: KeMemoryBarrier and
+// MemoryBarrier.
+//
+void KmSchedMemoryBarrier(void)
+{
+    AtomicYield();
+
+    if (WeakMemory && Current >= 0)
+    {
+        int slot = 0;
+
+        RaceStateDirty = 1;
+        RaceMyClock(&slot);
+        WmFullFence(slot);
+    }
 }
