@@ -43,6 +43,11 @@
 .PARAMETER Tier
     Build, Fast (default), Proof, Perf, or All.
 
+.PARAMETER CacheMutantsOnly
+    Rebuild DispatchSandbox with deliberate cache safeguards removed and
+    require the named regression to fail. Restore exact source bytes and
+    rebuild the fixed sandbox before returning. Does not measure coverage.
+
 .PARAMETER CoverageOnly
     Measure existing Debug x64 binaries with OpenCppCoverage after running
     the Fast gate. Does not build. Requires an empty CoverageDirectory.
@@ -89,6 +94,7 @@ param(
     [string]$PerfFile,
     [string]$BaselineDirectory,
     [switch]$UpdateBaseline,
+    [switch]$CacheMutantsOnly,
     [switch]$CoverageOnly,
     [string]$CoverageDirectory
 )
@@ -125,6 +131,75 @@ function Add-Result {
 # trusted PATH and simply failed outside a Developer PowerShell.
 #
 $msbuild = & (Join-Path $PSScriptRoot "Get-BlorgMSBuild.ps1")
+
+
+#
+# Mutate the real source and run the observing-layer regression, independently
+# in each process. Compilation failures and unrelated crashes are not kills.
+# Restore byte-for-byte originals even when a build or assertion fails.
+#
+if ($CacheMutantsOnly) {
+    if ($CoverageOnly) { throw 'Mutation and coverage modes must run separately' }
+    $project = Join-Path $repoRoot 'tests\sandbox\DispatchSandbox.vcxproj'
+    $outputDirectory = Join-Path $repoRoot "x64\$Configuration"
+    $exe = Join-Path $outputDirectory 'DispatchSandbox.exe'
+    $diskPath = Join-Path $repoRoot 'src\DiskCache.c'
+    $readPath = Join-Path $repoRoot 'src\Read.c'
+    $originals = @{}
+    foreach ($path in @($diskPath, $readPath)) { $originals[$path] = [IO.File]::ReadAllBytes($path) }
+    $encoding = [Text.UTF8Encoding]::new($false)
+    $disk = [IO.File]::ReadAllText($diskPath)
+    $read = [IO.File]::ReadAllText($readPath)
+    $fillTest = 'DiskCacheTest.FillAllocationFailuresCountTheRemainingBlocksAndRollBack'
+    $eofTest = 'DiskCacheTest.ValidBytesCannotExtendBeyondTheImmutableKey'
+    $snapshotTest = 'DiskCacheTest.PagingResourceKeepsTrimAndCacheKeyInOneVersion'
+    $revisionTest = 'DiskCacheTest.AFetchedRunIsCheckedAgainstTheVersionTheReadStartedWith'
+    $count = '(?s)BLORGFS_STAT_ADD\(DiskCacheDropped,\s*\(end >> DISK_CACHE_BLOCK_SHIFT\) - key.Block \+\s*\(\(end == key.Size && \(end & \(DISK_CACHE_BLOCK_SIZE - 1\)\)\) \? 1 : 0\)\);'
+    $snapshot = [regex]::Match($read, '(?s)static READ_FILE_VERSION ReadSnapshotFile\(.*?\n\}')
+    if (-not $snapshot.Success) { throw 'snapshot helper not found' }
+    $unlocked = $snapshot.Value.Replace('ExAcquireResourceSharedLite(Fcb->Header.PagingIoResource, TRUE);', '')
+    $unlocked = $unlocked.Replace('ExReleaseResourceLite(Fcb->Header.PagingIoResource);', '')
+    $variants = @(
+        @{ Name = 'weaken-cache-EOF'; Path = $diskPath; Text = $disk.Replace('Offset >= Key->Size || Valid > Key->Size - Offset', 'FALSE'); Test = $eofTest },
+        @{ Name = 'remove-snapshot-resource'; Path = $readPath; Text = $read.Replace($snapshot.Value, $unlocked); Test = $snapshotTest },
+        @{ Name = 'skip-fill-rollback'; Path = $diskPath; Text = $disk.Replace('BlorgDiskCacheIndexCommit(&DiskCache.Index, slot, FALSE);', ''); Test = $fillTest },
+        @{ Name = 'count-one-fill-drop'; Path = $diskPath; Text = [regex]::Replace($disk, $count, 'BLORGFS_STAT_INC(DiskCacheDropped);'); Test = $fillTest },
+        @{ Name = 'omit-partial-EOF-drop'; Path = $diskPath; Text = $disk.Replace('((end == key.Size && (end & (DISK_CACHE_BLOCK_SIZE - 1))) ? 1 : 0)', '0'); Test = $fillTest },
+        @{ Name = 'remove-response-version-check'; Path = $diskPath; Text = $disk.Replace('return FileBuffer->HasVersion && FileBuffer->VersionSize == Key->Size && FileBuffer->VersionTime == Key->ModifiedTime;', 'return TRUE;'); Test = $revisionTest }
+    )
+    try {
+        & $msbuild $project "/p:Configuration=$Configuration" '/p:Platform=x64' "/p:OutDir=$outputDirectory\" '/v:minimal' '/nologo'
+        if ($LASTEXITCODE -ne 0) { throw 'fixed sandbox build failed' }
+        foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest)) {
+            & $exe "--gtest_filter=$test"
+            if ($LASTEXITCODE -ne 0) { throw "fixed regression failed: $test" }
+        }
+        foreach ($variant in $variants) {
+            $original = [IO.File]::ReadAllText($variant.Path)
+            if ($variant.Text -eq $original) { throw "mutant did not change source: $($variant.Name)" }
+            [IO.File]::WriteAllText($variant.Path, $variant.Text, $encoding)
+            & $msbuild $project "/p:Configuration=$Configuration" '/p:Platform=x64' "/p:OutDir=$outputDirectory\" '/v:minimal' '/nologo'
+            if ($LASTEXITCODE -ne 0) { throw "mutant build failed: $($variant.Name)" }
+            $output = & $exe "--gtest_filter=$($variant.Test)" 2>&1
+            $exitCode = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            $killed = $exitCode -ne 0 -and ($output -match '\): error:') -and ($output -match [regex]::Escape($variant.Test))
+            $result = [ordered]@{ mutant = $variant.Name; test = $variant.Test; configuration = $Configuration; killed = [bool]$killed; exit_code = $exitCode }
+            Write-Host ('CACHE_MUTANT_RESULT ' + ($result | ConvertTo-Json -Compress))
+            [IO.File]::WriteAllBytes($variant.Path, $originals[$variant.Path])
+            if (-not $killed) { throw "mutant survived or failed without a named assertion: $($variant.Name)" }
+        }
+    } finally {
+        foreach ($path in $originals.Keys) { [IO.File]::WriteAllBytes($path, $originals[$path]) }
+        & $msbuild $project "/p:Configuration=$Configuration" '/p:Platform=x64' "/p:OutDir=$outputDirectory\" '/v:minimal' '/nologo'
+        if ($LASTEXITCODE -ne 0) { throw 'restored sandbox build failed' }
+    }
+    foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest)) {
+        & $exe "--gtest_filter=$test"
+        if ($LASTEXITCODE -ne 0) { throw "restored regression failed: $test" }
+    }
+    exit 0
+}
 
 function Invoke-Build {
     param([string]$Project, [string]$Label)

@@ -2010,3 +2010,18 @@ Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),
 [FSCTL_MARK_HANDLE](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ni-ntifs-fsctl_mark_handle),
 [Defragmenting Files](https://learn.microsoft.com/en-us/windows/win32/fileio/defragmenting-files).
 
+
+### Cache safeguard mutation checks
+
+`powershell -File tools/Invoke-BlorgChecks.ps1 -CacheMutantsOnly -Configuration Release`
+rebuilds the real dispatch sandbox with six deliberate source mutations: EOF
+bounds, snapshot resource acquisition, fill rollback, remaining drop counts,
+partial EOF drop counts and response-version validation. Each named regression
+must pass before mutation, fail with a gtest assertion under mutation, and pass
+after restoring the original source bytes. Compilation failures and crashes
+without a named assertion are not counted as kills. The command restores the
+sources and rebuilds the fixed sandbox in a `finally` block. Run it in an
+isolated clean checkout; its temporary builds are not performance samples or
+coverage measurements. The build workflow exposes `cache_mutants` for native
+Debug and Release checks. It does not establish actual Create-driven reopen
+interleavings or native Cache Manager semantics.

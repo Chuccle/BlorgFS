@@ -18,6 +18,11 @@ on:
         description: Any id, echoed into the run name so you can find the run
         required: false
         default: ''
+      cache_mutants:
+        description: Check real cache source mutants against named sandbox regressions
+        type: boolean
+        required: false
+        default: false
       coverage:
         description: Collect Debug x64 line coverage after the regression gate
         type: boolean
@@ -255,6 +260,11 @@ jobs:
         Write-Host "--- TlsFuzzTest ---"
         & "$exeDir\TlsFuzzTest.exe"
         if ($LASTEXITCODE -ne 0) { throw "TlsFuzzTest failed with exit code $LASTEXITCODE" }
+
+    - name: Check cache regression mutants
+      if: inputs.cache_mutants
+      shell: pwsh
+      run: ./tools/Invoke-BlorgChecks.ps1 -CacheMutantsOnly -Configuration ${{ matrix.config }}
 
     - name: Collect Debug line coverage
       if: inputs.coverage && matrix.config == 'Debug'
