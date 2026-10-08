@@ -303,6 +303,8 @@ void KmSchedNoteAccess(const void* Address, int IsWrite)
     unsigned long* myVc;
     int slot;
 
+    KmSchedNoteFootprint(Address, 1, IsWrite);
+
     if (!RaceDetection || !Address)
     {
         return;
@@ -359,6 +361,8 @@ void KmSchedNoteAcquire(const void* LockAddress)
     unsigned long* myVc;
     int slot;
 
+    KmSchedNoteFootprint(LockAddress, 1, 1);
+
     if (!RaceDetection || !LockAddress)
     {
         return;
@@ -392,6 +396,8 @@ void KmSchedNoteRelease(const void* LockAddress)
     KM_LOCK_CLOCK* clock;
     unsigned long* myVc;
     int slot;
+
+    KmSchedNoteFootprint(LockAddress, 1, 1);
 
     if (!RaceDetection || !LockAddress)
     {
@@ -445,6 +451,395 @@ static int RecordedDepth = 0;
 static int Truncated = 0;
 static int Deadlocked = 0;
 static int DeadlockReported = 0;
+
+//
+// ---- Partial-order reduction ------------------------------------------
+//
+// Sleep sets (Godefroid), opt-in per exploration. A step is everything one
+// thread does between two scheduling points, and its footprint is the
+// memory it was seen to touch: lock words and predicate contexts, the
+// targets of the interlocked and ReadNoFence-family shims, pool blocks,
+// the shim's own shared queues, and whatever a body registers. Two steps
+// of different threads whose footprints do not overlap on a write commute:
+// running them in either order reaches the same state.
+//
+// At each node the explorer keeps the threads whose next step is already
+// covered -- asleep. Picking thread t at a node puts every earlier sibling
+// to sleep for the subtrees that follow, and a sleeping thread stays
+// asleep down a branch for as long as the steps taken there commute with
+// its own. A node at which every runnable thread is asleep starts only
+// orders that were explored elsewhere; the run is finished, still checked,
+// and not branched from (KM_SCHED_RESULT.Pruned).
+//
+// The footprint a sleeping thread carries is the one it recorded when it
+// ran from that node in an earlier sibling. That is its next step exactly,
+// because nothing that ran since touched what it touches. What makes this
+// sound is that every way one thread affects another passes through
+// something recorded: lock-protected data is covered by the lock, and the
+// shared-without-a-lock accesses go through the shims. A plain racy
+// access the driver makes outside both is not seen, and is the boundary
+// of the reduction; the full search still explores every order of it.
+//
+// One symptom of an unrecorded access is checked on every pruned run. The
+// run goes on with a sleeping thread, whose step was recorded at the node
+// it was put to sleep at and should be repeated exactly: nothing since has
+// written what it touches. A step that touches something else instead
+// means one of the steps in between changed what it does without
+// recording the write, and is reported as a violation.
+//
+#define KM_FOOTPRINT_SLOTS 16
+
+typedef struct _KM_FOOTPRINT
+{
+    ULONG_PTR Start[KM_FOOTPRINT_SLOTS];
+    ULONG_PTR End[KM_FOOTPRINT_SLOTS];
+    unsigned char Write[KM_FOOTPRINT_SLOTS];
+    unsigned char Count;
+
+    //
+    // More distinct ranges than slots: treated as touching everything,
+    // which costs reduction and never coverage.
+    //
+    unsigned char Overflow;
+} KM_FOOTPRINT;
+
+static int Reduction = 0;
+
+//
+// Footprint of the step now running, and of each thread's step from each
+// recorded node: the one it took there, or carried down asleep.
+//
+static KM_FOOTPRINT Step;
+static KM_FOOTPRINT StepFootprint[KM_SCHED_MAX_DEPTH][KM_SCHED_MAX_THREADS];
+
+//
+// Per recorded node: the thread picked, the runnable set, the threads
+// asleep on arrival, and the threads already explored from it. Bit i is
+// slot i, which KM_SCHED_MAX_THREADS <= 8 keeps in a byte.
+//
+static unsigned char Picked[KM_SCHED_MAX_DEPTH];
+static unsigned char RunnableSet[KM_SCHED_MAX_DEPTH];
+static unsigned char Asleep[KM_SCHED_MAX_DEPTH];
+static unsigned char Explored[KM_SCHED_MAX_DEPTH];
+
+//
+// Depth of the recorded node whose step is running, or -1 when the step
+// belongs to no recorded node (truncated, abandoned or pruned).
+//
+static int StepNode = -1;
+static int Pruned = 0;
+
+//
+// The step a pruned run continues with, and the footprint it was recorded
+// with when it was put to sleep.
+//
+static int SleeperCheck = 0;
+static KM_FOOTPRINT SleeperFootprint;
+
+//
+// One footprint report per exploration: once one is known to be wrong,
+// every later pruning decision is suspect and the first report says all
+// there is to say.
+//
+static int FootprintReported = 0;
+
+//
+// Heap blocks allocated during the current replay, sorted by address.
+// A freed block stays, marked, until an allocation overlaps it: a step
+// that touches it is a use after free.
+// A footprint names memory inside one of them by the block's allocation
+// serial and an offset, not by its address: the allocator hands the same
+// replay prefix different addresses from one replay to the next, and a
+// footprint recorded in one replay is compared against steps taken in
+// later ones. The serial is stable, because the heap token puts every
+// allocating step in a fixed order.
+//
+#define KM_TRACKED_BLOCKS 4096
+
+typedef struct _KM_BLOCK
+{
+    ULONG_PTR Start;
+    ULONG_PTR End;
+    unsigned Serial;
+    int Freed;
+} KM_BLOCK;
+
+static KM_BLOCK Blocks[KM_TRACKED_BLOCKS];
+static int BlockCount = 0;
+static unsigned BlockSerial = 0;
+
+//
+// Set when a replay allocates more blocks than are tracked; memory in the
+// untracked ones cannot be named stably, so every footprint is treated as
+// touching everything until the next replay.
+//
+static int BlocksOverflowed = 0;
+
+//
+// An encoded range has the top bit set, which no user-mode address has,
+// then the serial and the offset into the block.
+//
+#define KM_BLOCK_TAG ((ULONG_PTR)1 << 63)
+
+C_ASSERT(sizeof(ULONG_PTR) == 8);
+
+//
+// Where a replay's footprints stop repeating the previous replay's: nodes
+// above this depth are replayed steps, whose footprints must come out
+// exactly as recorded.
+//
+static int ReplayedDepth = 0;
+
+//
+// Distinct outcomes the bodies reported this exploration, as an open-
+// addressed set of mixed signatures (zero marks an empty slot).
+//
+#define KM_OUTCOME_SLOTS 65536
+
+static unsigned __int64 OutcomeSet[KM_OUTCOME_SLOTS];
+static int OutcomeCount = 0;
+static unsigned __int64 OutcomeDigest = 0;
+
+void KmSchedNoteFootprint(const void* Address, size_t Length, int IsWrite)
+{
+    //
+    // Current is the running modelled thread only while one is running:
+    // Setup and Teardown run with it negative, and their accesses belong
+    // to no step.
+    //
+    if (Current < 0 || !Address)
+    {
+        return;
+    }
+
+    ULONG_PTR start = (ULONG_PTR)Address;
+    ULONG_PTR end = start + (Length ? Length : 1);
+    const KM_BLOCK* block = NULL;
+
+    int low = 0;
+    int high = BlockCount - 1;
+
+    while (low <= high)
+    {
+        const int middle = (low + high) / 2;
+
+        if (start < Blocks[middle].Start)
+        {
+            high = middle - 1;
+        }
+        else if (start >= Blocks[middle].End)
+        {
+            low = middle + 1;
+        }
+        else
+        {
+            block = &Blocks[middle];
+            break;
+        }
+    }
+
+    if (block && block->Freed)
+    {
+        KmReportViolation(KmViolationPool,
+            "thread %d touched a block freed earlier in this run, %zu bytes in (depth %d)",
+            Current, (size_t)(start - block->Start), Depth);
+    }
+
+    if (!Reduction || Step.Overflow)
+    {
+        return;
+    }
+
+    if (BlocksOverflowed)
+    {
+        Step.Overflow = 1;
+        return;
+    }
+
+    if (block)
+    {
+        const ULONG_PTR base = KM_BLOCK_TAG | ((ULONG_PTR)block->Serial << 32);
+
+        end = base + (end - block->Start);
+        start = base + (start - block->Start);
+    }
+
+    for (int i = 0; i < Step.Count; ++i)
+    {
+        if (Step.Start[i] == start && Step.End[i] == end)
+        {
+            Step.Write[i] |= (unsigned char)(IsWrite != 0);
+            return;
+        }
+    }
+
+    if (Step.Count == KM_FOOTPRINT_SLOTS)
+    {
+        Step.Overflow = 1;
+        return;
+    }
+
+    Step.Start[Step.Count] = start;
+    Step.End[Step.Count] = end;
+    Step.Write[Step.Count] = (unsigned char)(IsWrite != 0);
+    Step.Count++;
+}
+
+void KmSchedNoteAllocation(const void* Block, size_t Size)
+{
+    if (!Active || !Block)
+    {
+        return;
+    }
+
+    if (BlockCount == KM_TRACKED_BLOCKS)
+    {
+        BlocksOverflowed = 1;
+        return;
+    }
+
+    const ULONG_PTR start = (ULONG_PTR)Block;
+    const ULONG_PTR end = start + (Size ? Size : 1);
+    int at = 0;
+
+    while (at < BlockCount && Blocks[at].End <= start)
+    {
+        at++;
+    }
+
+    int past = at;
+
+    while (past < BlockCount && Blocks[past].Start < end)
+    {
+        past++;
+    }
+
+    memmove(&Blocks[at + 1], &Blocks[past], (BlockCount - past) * sizeof(Blocks[0]));
+    BlockCount += 1 - (past - at);
+
+    Blocks[at].Start = start;
+    Blocks[at].End = end;
+    Blocks[at].Serial = ++BlockSerial;
+    Blocks[at].Freed = 0;
+}
+
+void KmSchedNoteFree(const void* Block)
+{
+    if (!Active || !Block)
+    {
+        return;
+    }
+
+    for (int i = 0; i < BlockCount; ++i)
+    {
+        if (Blocks[i].Start == (ULONG_PTR)Block)
+        {
+            Blocks[i].Freed = 1;
+            return;
+        }
+    }
+}
+
+static int FootprintsConflict(const KM_FOOTPRINT* A, const KM_FOOTPRINT* B)
+{
+    if (A->Overflow || B->Overflow)
+    {
+        return 1;
+    }
+
+    for (int i = 0; i < A->Count; ++i)
+    {
+        for (int j = 0; j < B->Count; ++j)
+        {
+            if ((A->Write[i] | B->Write[j]) &&
+                A->Start[i] < B->End[j] && B->Start[j] < A->End[i])
+            {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int FootprintsEqual(const KM_FOOTPRINT* A, const KM_FOOTPRINT* B)
+{
+    if (A->Count != B->Count || A->Overflow != B->Overflow)
+    {
+        return 0;
+    }
+
+    for (int i = 0; i < A->Count; ++i)
+    {
+        if (A->Start[i] != B->Start[i] || A->End[i] != B->End[i] || A->Write[i] != B->Write[i])
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+void KmSchedSetReduction(int Enabled)
+{
+    Reduction = Enabled;
+}
+
+void KmSchedNoteOutcome(unsigned __int64 Outcome)
+{
+    //
+    // splitmix64 finaliser: spreads structured signatures over the table
+    // and makes the digest below a fair summary of the set.
+    //
+    unsigned __int64 mixed = Outcome + 0x9E3779B97F4A7C15ull;
+    mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ull;
+    mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBull;
+    mixed ^= mixed >> 31;
+
+    if (0 == mixed)
+    {
+        mixed = 1;
+    }
+
+    unsigned slot = (unsigned)mixed & (KM_OUTCOME_SLOTS - 1);
+
+    while (OutcomeSet[slot])
+    {
+        if (OutcomeSet[slot] == mixed)
+        {
+            return;
+        }
+
+        slot = (slot + 1) & (KM_OUTCOME_SLOTS - 1);
+    }
+
+    if (OutcomeCount == KM_OUTCOME_SLOTS / 2)
+    {
+        KmReportViolation(KmViolationLifetime,
+            "more than %d distinct outcomes in one exploration", KM_OUTCOME_SLOTS / 2);
+        return;
+    }
+
+    OutcomeSet[slot] = mixed;
+    OutcomeCount++;
+
+    //
+    // A sum is independent of the order outcomes were first seen in, so
+    // two explorations reaching the same set report the same digest.
+    //
+    OutcomeDigest += mixed;
+}
+
+static void ResetOutcomes(void)
+{
+    if (OutcomeCount)
+    {
+        ZeroMemory(OutcomeSet, sizeof(OutcomeSet));
+        OutcomeCount = 0;
+    }
+
+    OutcomeDigest = 0;
+}
 
 //
 // Set when a schedule deadlocks and never cleared until the next replay.
@@ -627,12 +1022,114 @@ static int RngNext(int Bound)
 }
 
 //
+// Sets up the sleep set of a node reached for the first time and picks
+// the first thread to explore from it. Returns 0 when every runnable
+// thread is asleep, which means the node is not worth recording.
+//
+static int ReduceFreshNode(const int* Runnable, int Count)
+{
+    unsigned char runnableSet = 0;
+    unsigned char asleep = 0;
+
+    for (int i = 0; i < Count; ++i)
+    {
+        runnableSet |= (unsigned char)(1u << Runnable[i]);
+    }
+
+    if (Depth > 0)
+    {
+        //
+        // Inherited from the parent: what was asleep there, and the
+        // siblings explored before the step just taken, stay asleep here
+        // when their next step commutes with it.
+        //
+        const int parent = Depth - 1;
+        const int ran = Picked[parent];
+        const KM_FOOTPRINT* taken = &StepFootprint[parent][ran];
+        const unsigned candidates = (Asleep[parent] | Explored[parent]) & ~(1u << ran);
+
+        for (int t = 0; t < ThreadCount; ++t)
+        {
+            if ((candidates & (1u << t)) &&
+                !FootprintsConflict(&StepFootprint[parent][t], taken))
+            {
+                asleep |= (unsigned char)(1u << t);
+                StepFootprint[Depth][t] = StepFootprint[parent][t];
+            }
+        }
+    }
+
+    const unsigned awake = runnableSet & ~asleep;
+
+    if (0 == awake)
+    {
+        return 0;
+    }
+
+    unsigned long first;
+    _BitScanForward(&first, awake);
+
+    RunnableSet[Depth] = runnableSet;
+    Asleep[Depth] = asleep;
+    Explored[Depth] = 0;
+    Picked[Depth] = (unsigned char)first;
+
+    return 1;
+}
+
+//
 // Picks the next thread to run from the schedule, extending the schedule
 // with choice 0 when this run has gone deeper than any before it.
 // Returns -1 when nothing can run.
 //
 static int ChooseNext(void)
 {
+    if (Reduction)
+    {
+        //
+        // The step that just ended belongs to the node it was picked at.
+        //
+        if (StepNode >= 0)
+        {
+            KM_FOOTPRINT* recorded = &StepFootprint[StepNode][Picked[StepNode]];
+
+            //
+            // A replayed step must touch what it touched last time. A
+            // footprint that names memory by something that changes from
+            // replay to replay cannot be compared with anything.
+            //
+            if (StepNode < ReplayedDepth && !FootprintReported &&
+                !FootprintsEqual(&Step, recorded))
+            {
+                FootprintReported = 1;
+
+                KmReportViolation(KmViolationLifetime,
+                    "partial-order reduction: a replayed step touched different memory than "
+                    "when it was recorded (depth %d)", StepNode);
+            }
+
+            *recorded = Step;
+            StepNode = -1;
+        }
+        else if (SleeperCheck)
+        {
+            SleeperCheck = 0;
+
+            if (!FootprintReported && !FootprintsEqual(&Step, &SleeperFootprint))
+            {
+                FootprintReported = 1;
+
+                KmReportViolation(KmViolationLifetime,
+                    "partial-order reduction: a sleeping thread's step changed under steps "
+                    "recorded as independent of it -- a shared access is missing from a "
+                    "footprint (depth %d)", Depth);
+            }
+        }
+
+        Step.Count = 0;
+        Step.Overflow = 0;
+    }
+
     RefreshRunnable();
 
     int runnable[KM_SCHED_MAX_THREADS];
@@ -771,8 +1268,29 @@ static int ChooseNext(void)
         return runnable[0];
     }
 
+    //
+    // A pruned run is finished the same way: it is a real execution and
+    // its checks still run, but every order it could branch into from
+    // here was explored elsewhere.
+    //
+    if (Pruned)
+    {
+        Depth++;
+        return runnable[0];
+    }
+
     if (Depth >= RecordedDepth)
     {
+        if (Reduction && !ReduceFreshNode(runnable, count))
+        {
+            Pruned = 1;
+            SleeperCheck = 1;
+            SleeperFootprint = StepFootprint[Depth][runnable[0]];
+            Depth++;
+
+            return runnable[0];
+        }
+
         Choice[Depth] = 0;
         Options[Depth] = count;
         StateSnapshot[Depth] = snapshot;
@@ -815,7 +1333,14 @@ static int ChooseNext(void)
             Depth, (unsigned)snapshot, (unsigned)StateSnapshot[Depth]);
     }
 
-    const int picked = runnable[Choice[Depth] % count];
+    const int picked = Reduction ? Picked[Depth] : runnable[Choice[Depth] % count];
+
+    if (Reduction)
+    {
+        Explored[Depth] |= (unsigned char)(1u << picked);
+        StepNode = Depth;
+    }
+
     Depth++;
 
     return picked;
@@ -899,6 +1424,13 @@ void KmSchedWaitUntilClaim(KM_SCHED_PREDICATE Predicate, void* PredicateContext,
         return;
     }
 
+    //
+    // The predicate reads the lock and the claim writes it. Each test
+    // starts a step once the thread has been parked, so the lock goes into
+    // the footprint again after every resume.
+    //
+    KmSchedNoteFootprint(PredicateContext, 1, 1);
+
     while (!Predicate(PredicateContext))
     {
         //
@@ -915,6 +1447,8 @@ void KmSchedWaitUntilClaim(KM_SCHED_PREDICATE Predicate, void* PredicateContext,
         }
 
         HandOff(1, Predicate, PredicateContext, What);
+
+        KmSchedNoteFootprint(PredicateContext, 1, 1);
     }
 
     //
@@ -1031,6 +1565,14 @@ static void RunOnce(KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context)
     Truncated = 0;
     Deadlocked = 0;
     Abandoned = 0;
+    Pruned = 0;
+    StepNode = -1;
+    SleeperCheck = 0;
+    BlockCount = 0;
+    BlockSerial = 0;
+    BlocksOverflowed = 0;
+    Step.Count = 0;
+    Step.Overflow = 0;
 
     Setup(Context);
 
@@ -1073,6 +1615,24 @@ static int NextSchedule(void)
 {
     for (int d = RecordedDepth - 1; d >= 0; --d)
     {
+        if (Reduction)
+        {
+            const unsigned untried = RunnableSet[d] & ~Asleep[d] & ~Explored[d];
+
+            if (untried)
+            {
+                unsigned long next;
+                _BitScanForward(&next, untried);
+
+                Picked[d] = (unsigned char)next;
+                RecordedDepth = d + 1;
+                ReplayedDepth = d;
+                return 1;
+            }
+
+            continue;
+        }
+
         if (Choice[d] + 1 < Options[d])
         {
             Choice[d]++;
@@ -1087,12 +1647,15 @@ static int NextSchedule(void)
 KM_SCHED_RESULT KmExploreInterleavings(
     KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context, int MaxSchedules)
 {
-    KM_SCHED_RESULT result = { 0, 0, 0, 0 };
+    KM_SCHED_RESULT result = { 0 };
 
     EnsureFibers();
 
     RecordedDepth = 0;
+    ReplayedDepth = 0;
     RacesReported = 0;
+    FootprintReported = 0;
+    ResetOutcomes();
 
     for (int d = 0; d < KM_SCHED_MAX_DEPTH; ++d)
     {
@@ -1123,6 +1686,7 @@ KM_SCHED_RESULT KmExploreInterleavings(
 
         result.Deadlocks += Deadlocked;
         result.Truncated += Truncated;
+        result.Pruned += Pruned;
 
         if (result.Schedules >= MaxSchedules)
         {
@@ -1134,6 +1698,9 @@ KM_SCHED_RESULT KmExploreInterleavings(
 
     KmSetLockIdRecycling(0);
 
+    result.Outcomes = OutcomeCount;
+    result.OutcomeDigest = OutcomeDigest;
+
     return result;
 }
 
@@ -1141,7 +1708,7 @@ KM_SCHED_RESULT KmExploreInterleavingsSeeded(
     KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context,
     int MaxSchedules, unsigned int Seed)
 {
-    KM_SCHED_RESULT result = { 0, 0, 0, 0 };
+    KM_SCHED_RESULT result = { 0 };
 
     EnsureFibers();
 
@@ -1155,7 +1722,10 @@ KM_SCHED_RESULT KmExploreInterleavingsSeeded(
 
     RandomMode = 1;
     RecordedDepth = 0;
+    ReplayedDepth = 0;
     RacesReported = 0;
+    FootprintReported = 0;
+    ResetOutcomes();
 
     KmSetLockIdRecycling(1);
 
@@ -1174,12 +1744,16 @@ KM_SCHED_RESULT KmExploreInterleavingsSeeded(
 
         result.Deadlocks += Deadlocked;
         result.Truncated += Truncated;
+        result.Pruned += Pruned;
     }
 
     Active = 0;
     RandomMode = 0;
 
     KmSetLockIdRecycling(0);
+
+    result.Outcomes = OutcomeCount;
+    result.OutcomeDigest = OutcomeDigest;
 
     return result;
 }
@@ -1209,89 +1783,104 @@ static void AtomicYield(void)
 long KmSchedInterlockedIncrement(long volatile* Target)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedIncrement(Target);
 }
 
 long KmSchedInterlockedDecrement(long volatile* Target)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedDecrement(Target);
 }
 
 long KmSchedInterlockedExchange(long volatile* Target, long Value)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedExchange(Target, Value);
 }
 
 long KmSchedInterlockedCompareExchange(long volatile* Target, long Exchange, long Comparand)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedCompareExchange(Target, Exchange, Comparand);
 }
 
 __int64 KmSchedInterlockedIncrement64(__int64 volatile* Target)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedIncrement64(Target);
 }
 
 __int64 KmSchedInterlockedDecrement64(__int64 volatile* Target)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedDecrement64(Target);
 }
 
 long KmSchedInterlockedOr(long volatile* Target, long Value)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedOr(Target, Value);
 }
 
 __int64 KmSchedInterlockedAdd64(__int64 volatile* Target, __int64 Value)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedExchangeAdd64(Target, Value) + Value;
 }
 
 __int64 KmSchedInterlockedExchangeAdd64(__int64 volatile* Target, __int64 Value)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedExchangeAdd64(Target, Value);
 }
 
 void* KmSchedInterlockedCompareExchangePointer(void* volatile* Target, void* Exchange, void* Comparand)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     return _InterlockedCompareExchangePointer(Target, Exchange, Comparand);
 }
 
 long KmSchedReadLong(long volatile* Source)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Source, sizeof(*Source), 0);
     return *Source;
 }
 
 __int64 KmSchedReadLong64(__int64 volatile* Source)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Source, sizeof(*Source), 0);
     return *Source;
 }
 
 void* KmSchedReadPointer(void* volatile* Source)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Source, sizeof(*Source), 0);
     return *Source;
 }
 
 void KmSchedWriteLong(long volatile* Target, long Value)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     *Target = Value;
 }
 
 void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value)
 {
     AtomicYield();
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
     *Target = Value;
 }
