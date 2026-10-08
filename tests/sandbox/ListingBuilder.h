@@ -21,9 +21,9 @@
 #include <string>
 
 //
-// Counted entries named "file<N>.bin" and "dir<N>", sized 1000+N. Caller
-// owns the result and frees it with BlorgFreeHttpDirectoryInfo (or lets the DCB
-// that adopts it do so).
+// Counted entries named "file<N>.bin" and "dir<N>", sized 1000+N. The result
+// carries one reference, as a deserialized listing does; the caller drops it
+// with BlorgReleaseDirectoryInfo once whatever it published into holds its own.
 //
 inline PDIRECTORY_INFO BuildSyntheticListing(int FileCount, int SubDirCount)
 {
@@ -38,6 +38,7 @@ inline PDIRECTORY_INFO BuildSyntheticListing(int FileCount, int SubDirCount)
         return nullptr;
     }
 
+    info->RefCount = 1;
     info->FilesOffset = sizeof(DIRECTORY_INFO);
     info->SubDirsOffset = C_CAST(ULONG, sizeof(DIRECTORY_INFO) +
         C_CAST(SIZE_T, FileCount) * sizeof(DIRECTORY_FILE_METADATA));

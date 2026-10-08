@@ -9,8 +9,21 @@
 //  O(1) generation-bump full flush. Occupancy is capped per bucket with
 //  FIFO eviction and opportunistic reaping of stale entries.
 //
+//  Beside it, keyed the same way, the listing cache: one immutable
+//  directory-listing snapshot per directory, so a listing outlives the DCB
+//  and handle that fetched it. Before this a listing died with its last
+//  handle, and every `dir` of the same directory paid a dirinfo GET (2.7-3.3
+//  ms on the reference link; a repeated `dir /s` of 121 directories paid all
+//  121). Its own sharding, sized for far fewer and far larger entries, and a
+//  global byte budget, since a 300-entry listing is ~170 KB.
+//
+//  Both caches share one invalidation sequence. Every result read from
+//  elsewhere is inserted with the ticket taken before the read, and refused
+//  if an invalidation ran in between; see BlorgPathCacheTakeTicket.
+//
 
-#define PATH_CACHE_BUCKETS         256u   // power of two
+#define PATH_CACHE_BUCKET_BITS     8u
+#define PATH_CACHE_BUCKETS         (1u << PATH_CACHE_BUCKET_BITS)
 #define PATH_CACHE_MAX_PER_BUCKET  16u
 #define PATH_CACHE_MAX_PATH_BYTES  4096u
 #define PATH_CACHE_TAG             'CPHT'
@@ -21,6 +34,24 @@
 // Most entries one listing may seed: a quarter of the cache's capacity (see
 // BlorgPathCacheSeedListing).
 #define PATH_CACHE_SEED_MAX        ((PATH_CACHE_BUCKETS * PATH_CACHE_MAX_PER_BUCKET) / 4u)
+
+#define LISTING_CACHE_BUCKET_BITS  8u
+#define LISTING_CACHE_BUCKETS      (1u << LISTING_CACHE_BUCKET_BITS)
+#define LISTING_CACHE_MAX_PER_BUCKET 8u
+#define LISTING_CACHE_MAX_BYTES    (32LL * 1024LL * 1024LL)
+#define LISTING_CACHE_TAG          'CLHT'
+
+//
+// A listing answers without a request for the path cache's own TTL, the
+// staleness the driver already accepts for every open. Past that, a
+// directory query is still answered from it at once, and one background
+// refetch replaces it (BlorgPathCacheLookupListing's RefreshOwed): a re-list
+// never waits on the wire, and what it shows is at most one refresh behind.
+// The stale window is bounded so a directory nobody has listed for a while
+// is fetched in the foreground rather than shown from long ago.
+//
+#define LISTING_FRESH_100NS        PATH_CACHE_TTL_100NS
+#define LISTING_STALE_MAX_100NS    (30LL * 10LL * 1000LL * 1000LL)
 
 //
 // One cached path-lookup result (exists+metadata, or not-found).
@@ -44,6 +75,32 @@ CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, Meta, Generation);
 CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, Generation, Exists);
 CHECK_PADDING_BETWEEN(PATH_CACHE_ENTRY, Exists, Reserved);
 CHECK_PADDING_END(PATH_CACHE_ENTRY, Reserved);
+
+//
+// One cached directory listing. The entry owns one reference to Listing;
+// every reader takes its own under the bucket lock before using it, so
+// eviction never frees a snapshot someone is enumerating.
+//
+typedef struct _LISTING_CACHE_ENTRY
+{
+    LIST_ENTRY      Link;           // bucket list linkage
+    UNICODE_STRING  Path;           // owned copy, PagedPool
+    PDIRECTORY_INFO Listing;        // one reference, owned by this entry
+    LONG64          Bytes;          // Listing's size, charged to PathCache.ListingBytes
+    ULONG64         IssueTime;      // when the fetch that produced Listing was issued
+    LONG64          Sequence;       // PathCache.Sequence when that fetch's ticket was taken
+    ULONG           Generation;     // snapshot of PathCache.Generation at insert
+    LONG            RefreshClaimed; // Interlocked: concurrent stale lookups race to owe the one refetch
+} LISTING_CACHE_ENTRY, * PLISTING_CACHE_ENTRY;
+
+CHECK_PADDING_BETWEEN(LISTING_CACHE_ENTRY, Link, Path);
+CHECK_PADDING_BETWEEN(LISTING_CACHE_ENTRY, Path, Listing);
+CHECK_PADDING_BETWEEN(LISTING_CACHE_ENTRY, Listing, Bytes);
+CHECK_PADDING_BETWEEN(LISTING_CACHE_ENTRY, Bytes, IssueTime);
+CHECK_PADDING_BETWEEN(LISTING_CACHE_ENTRY, IssueTime, Sequence);
+CHECK_PADDING_BETWEEN(LISTING_CACHE_ENTRY, Sequence, Generation);
+CHECK_PADDING_BETWEEN(LISTING_CACHE_ENTRY, Generation, RefreshClaimed);
+CHECK_PADDING_END(LISTING_CACHE_ENTRY, RefreshClaimed);
 
 //
 // One shard of the path cache: an independently locked bucket of entries.
@@ -71,6 +128,27 @@ C_ASSERT(sizeof(EX_PUSH_LOCK) != sizeof(PVOID) ||
 typedef struct _PATH_CACHE_STATE
 {
     PATH_CACHE_BUCKET Buckets[PATH_CACHE_BUCKETS];
+    PATH_CACHE_BUCKET ListingBuckets[LISTING_CACHE_BUCKETS];
+
+    //
+    // Advanced by every invalidation before it sweeps. Interlocked because
+    // invalidations on different buckets' paths run concurrently and none
+    // may be lost: a lost increment is an insert ticketed before an
+    // invalidation being accepted after it.
+    //
+    LONG64   Sequence;
+
+    //
+    // Bytes of listing held across all listing buckets, against
+    // LISTING_CACHE_MAX_BYTES. Interlocked because publishes and evictions
+    // in different buckets update it under different locks; it changes once
+    // per listing fetch, never per read. A publish charges its bytes and
+    // tests the sum in one interlocked add (ListingCacheCharge), since two
+    // publishes in different buckets could otherwise both pass the test
+    // before either added to it.
+    //
+    LONG64   ListingBytes;
+
     BOOLEAN           Ready;
 
     //
@@ -89,25 +167,100 @@ typedef struct _PATH_CACHE_STATE
 
 static PATH_CACHE_STATE PathCache;
 
-//
-// Hashes Path (case-insensitive) to a bucket index in [0, PATH_CACHE_BUCKETS).
-// Falls back to a manual case-insensitive hash on failure, which is
-// belt-and-braces since RtlHashUnicodeString only fails on bad args already
-// excluded above.
-//
-static ULONG PathCacheBucketIndex(const UNICODE_STRING* Path)
+static PATH_CACHE_BUCKET* PathCacheBucket(const UNICODE_STRING* Path)
 {
-    ULONG hash = 0;
+    return &PathCache.Buckets[BlorgHashPath(Path) >> (32u - PATH_CACHE_BUCKET_BITS)];
+}
 
-    if (!NT_SUCCESS(RtlHashUnicodeString(Path, TRUE, HASH_STRING_ALGORITHM_DEFAULT, &hash)))
+static PATH_CACHE_BUCKET* ListingCacheBucket(const UNICODE_STRING* Path)
+{
+    return &PathCache.ListingBuckets[BlorgHashPath(Path) >> (32u - LISTING_CACHE_BUCKET_BITS)];
+}
+
+//
+// A ticket is honoured only if no invalidation has run since it was taken.
+// Called under the bucket lock the insert is about to modify: an
+// invalidation advances the sequence before it takes any bucket lock, so
+// either this read sees the advance, or this insert lands first and the
+// invalidation's sweep removes it. NULL is an unconditional insert.
+//
+static BOOLEAN PathCacheTicketHonoured(_In_opt_ const PATH_CACHE_TICKET* Ticket)
+{
+    return !Ticket || (Ticket->Sequence == ReadNoFence64(&PathCache.Sequence));
+}
+
+//
+// Every invalidation calls this before it sweeps anything; see
+// PathCacheTicketHonoured for why the order matters.
+//
+static VOID PathCacheAdvanceSequence(VOID)
+{
+    InterlockedIncrement64(&PathCache.Sequence);
+}
+
+//
+// The bytes a listing occupies, as HttpDeserializeDirectoryInfo sized it.
+//
+static LONG64 ListingCacheSizeOf(const DIRECTORY_INFO* Listing)
+{
+    return C_CAST(LONG64, sizeof(DIRECTORY_INFO) +
+        (Listing->FileCount * sizeof(DIRECTORY_FILE_METADATA)) +
+        (Listing->SubDirCount * sizeof(DIRECTORY_SUBDIR_METADATA)));
+}
+
+//
+// Charges Bytes to the listing budget if they fit under
+// LISTING_CACHE_MAX_BYTES, and charges nothing otherwise. The bytes are
+// added first and taken back if the sum is over, so two publishes in
+// different buckets cannot both pass the test before either has charged;
+// the cost is that one may be refused while the other's charge is briefly
+// counted, which only leaves a listing uncached.
+//
+static BOOLEAN ListingCacheCharge(LONG64 Bytes)
+{
+    if (InterlockedExchangeAdd64(&PathCache.ListingBytes, Bytes) + Bytes <= LISTING_CACHE_MAX_BYTES)
     {
-        for (USHORT i = 0; i < Path->Length / sizeof(WCHAR); i++)
-        {
-            hash = (hash * 131u) + RtlUpcaseUnicodeChar(Path->Buffer[i]);
-        }
+        return TRUE;
     }
 
-    return hash & (PATH_CACHE_BUCKETS - 1u);
+    InterlockedExchangeAdd64(&PathCache.ListingBytes, -Bytes);
+    return FALSE;
+}
+
+//
+// Unlinks a listing entry, uncharges its bytes, and drops the entry's
+// reference; the snapshot itself survives while any handle still holds one.
+// Caller holds the bucket lock exclusive.
+//
+static VOID ListingCacheRemoveEntry(PATH_CACHE_BUCKET* Bucket, PLISTING_CACHE_ENTRY Entry)
+{
+    RemoveEntryList(&Entry->Link);
+    Bucket->Count--;
+    InterlockedExchangeAdd64(&PathCache.ListingBytes, -Entry->Bytes);
+    BlorgReleaseDirectoryInfo(Entry->Listing);
+    ExFreePool(Entry->Path.Buffer);
+    ExFreePool(Entry);
+}
+
+//
+// How long ago the fetch behind Entry was issued. Now is read before the
+// bucket lock, so an entry published meanwhile by a later-issued fetch can be
+// younger than Now; that counts as age zero, not as an unsigned wrap that
+// would make the newest listing look the oldest.
+//
+static ULONG64 ListingCacheAge(const LISTING_CACHE_ENTRY* Entry, ULONG64 Now)
+{
+    return (Now > Entry->IssueTime) ? (Now - Entry->IssueTime) : 0;
+}
+
+//
+// Live means minted under the current generation and young enough to be
+// served at all, stale or not.
+//
+static BOOLEAN ListingCacheEntryLive(const LISTING_CACHE_ENTRY* Entry, ULONG64 Now, LONG Generation)
+{
+    return (Entry->Generation == C_CAST(ULONG, Generation)) &&
+           (ListingCacheAge(Entry, Now) < C_CAST(ULONG64, LISTING_STALE_MAX_100NS));
 }
 
 //
@@ -157,8 +310,17 @@ VOID BlorgPathCacheInit(VOID)
         PathCache.Buckets[i].Count = 0;
     }
 
+    for (ULONG i = 0; i < LISTING_CACHE_BUCKETS; i++)
+    {
+        ExInitializePushLock(&PathCache.ListingBuckets[i].Lock);
+        InitializeListHead(&PathCache.ListingBuckets[i].List);
+        PathCache.ListingBuckets[i].Count = 0;
+    }
+
     PathCache.Generation = 0;
     PathCache.Count = 0;
+    PathCache.Sequence = 0;
+    PathCache.ListingBytes = 0;
     PathCache.Ready = TRUE;
 }
 
@@ -185,7 +347,44 @@ VOID BlorgPathCacheCleanup(VOID)
         PathCache.Buckets[i].Count = 0;
     }
 
+    for (ULONG i = 0; i < LISTING_CACHE_BUCKETS; i++)
+    {
+        PATH_CACHE_BUCKET* bucket = &PathCache.ListingBuckets[i];
+
+        while (!IsListEmpty(&bucket->List))
+        {
+            ListingCacheRemoveEntry(bucket, CONTAINING_RECORD(bucket->List.Flink, LISTING_CACHE_ENTRY, Link));
+        }
+    }
+
     PathCache.Count = 0;
+}
+
+//
+//  Takes the ticket a reader must hold before it reads anything it will
+//  insert: before issuing the request, or before reading a cached listing,
+//  which then replaces it with the ticket the listing was fetched under.
+//
+//  The argument below holds for what is read from the server after the
+//  ticket. What is read from a cache was read earlier, so it carries the
+//  ticket of its own read instead (BlorgPathCacheLookupListing).
+//
+//  The protocol, in full: an invalidation advances PathCache.Sequence and
+//  then sweeps, each bucket under its own lock. An insert compares its
+//  ticket's sequence with the current one under the lock of the bucket it is
+//  inserting into, and is refused on any difference. For one bucket, either
+//  the insert's critical section comes first -- and the sweep, which comes
+//  after the advance, removes what it inserted -- or the sweep's comes first,
+//  and the insert, ordered after it by the lock, sees the advance. So no
+//  result read before an invalidation survives it. The cost is that an
+//  invalidation of one path also refuses unrelated inserts in flight across
+//  it; invalidations are rare beside reads, and a refused insert only costs
+//  the next reader a request.
+//
+VOID BlorgPathCacheTakeTicket(PPATH_CACHE_TICKET Ticket)
+{
+    Ticket->Sequence = ReadNoFence64(&PathCache.Sequence);
+    Ticket->IssueTime = KeQueryInterruptTime();
 }
 
 //
@@ -208,7 +407,7 @@ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_EN
         return PathCacheMiss;
     }
 
-    PATH_CACHE_BUCKET* bucket = &PathCache.Buckets[PathCacheBucketIndex(Path)];
+    PATH_CACHE_BUCKET* bucket = PathCacheBucket(Path);
     ULONG64 now = KeQueryInterruptTime();
     LONG generation = ReadNoFence(&PathCache.Generation);
     PATH_CACHE_RESULT result = PathCacheMiss;
@@ -265,9 +464,10 @@ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_EN
 // entries while walking the bucket, and evicts the oldest entry (FIFO) if
 // the bucket is at capacity. If an existing entry is refreshed in place
 // instead, the prebuilt entry's ownership was never transferred to the
-// bucket, so it is freed before returning.
+// bucket, so it is freed before returning. A ticket an invalidation has
+// overtaken inserts nothing (see BlorgPathCacheTakeTicket).
 //
-static VOID PathCacheInsert(const UNICODE_STRING* Path, BOOLEAN Exists, const DIRECTORY_ENTRY_METADATA* Meta)
+static VOID PathCacheInsert(const UNICODE_STRING* Path, BOOLEAN Exists, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket)
 {
     BOOLEAN hasMeta = Exists && Meta;
 
@@ -305,15 +505,16 @@ static VOID PathCacheInsert(const UNICODE_STRING* Path, BOOLEAN Exists, const DI
     ULONG64 now = KeQueryInterruptTime();
     LONG generation = ReadNoFence(&PathCache.Generation);
     newEntry->Generation = C_CAST(ULONG, generation);
-    newEntry->ExpiryTime = now + PATH_CACHE_TTL_100NS;
+    newEntry->ExpiryTime = (Ticket ? Ticket->IssueTime : now) + PATH_CACHE_TTL_100NS;
 
-    PATH_CACHE_BUCKET* bucket = &PathCache.Buckets[PathCacheBucketIndex(Path)];
-    BOOLEAN inserted = FALSE;
+    PATH_CACHE_BUCKET* bucket = PathCacheBucket(Path);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&bucket->Lock);
 
-    PLIST_ENTRY e = bucket->List.Flink;
+    BOOLEAN honoured = PathCacheTicketHonoured(Ticket);
+    BOOLEAN inserted = !honoured;
+    PLIST_ENTRY e = honoured ? bucket->List.Flink : &bucket->List;
 
     while (e != &bucket->List)
     {
@@ -365,20 +566,85 @@ static VOID PathCacheInsert(const UNICODE_STRING* Path, BOOLEAN Exists, const DI
 }
 
 // Caches a successful path resolution with its metadata.
-VOID BlorgPathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta)
+VOID BlorgPathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket)
 {
-    PathCacheInsert(Path, TRUE, Meta);
+    PathCacheInsert(Path, TRUE, Meta, Ticket);
 }
 
 // Caches a failed (not-found) path resolution.
-VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path)
+VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path, _In_opt_ const PATH_CACHE_TICKET* Ticket)
 {
-    PathCacheInsert(Path, FALSE, NULL);
+    PathCacheInsert(Path, FALSE, NULL, Ticket);
 }
 
 //
-//  Drop one exact path. Cheap: hashes straight to the owning bucket and walks
-//  only that (short) chain. A no-op if the path is not cached.
+//  The directory a path sits in: everything before its last separator, or
+//  the root ("\") for a path directly beneath it. FALSE for the root
+//  itself, which has no parent. Parent aliases Path's buffer.
+//
+static BOOLEAN PathCacheParent(const UNICODE_STRING* Path, PUNICODE_STRING Parent)
+{
+    USHORT chars = Path->Length / sizeof(WCHAR);
+
+    while (chars > 0 && L'\\' != Path->Buffer[chars - 1])
+    {
+        chars--;
+    }
+
+    if (0 == chars || C_CAST(SIZE_T, chars) * sizeof(WCHAR) == C_CAST(SIZE_T, Path->Length))
+    {
+        return FALSE;
+    }
+
+    Parent->Buffer = Path->Buffer;
+    Parent->Length = C_CAST(USHORT, ((1 == chars) ? 1u : chars - 1u) * sizeof(WCHAR));
+    Parent->MaximumLength = Parent->Length;
+    return TRUE;
+}
+
+//
+//  Drops the cached listing of exactly Dir, if there is one.
+//
+static VOID ListingCacheDrop(const UNICODE_STRING* Dir)
+{
+    PATH_CACHE_BUCKET* bucket = ListingCacheBucket(Dir);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&bucket->Lock);
+
+    for (PLIST_ENTRY e = bucket->List.Flink; e != &bucket->List; e = e->Flink)
+    {
+        PLISTING_CACHE_ENTRY entry = CONTAINING_RECORD(e, LISTING_CACHE_ENTRY, Link);
+
+        if (RtlEqualUnicodeString(&entry->Path, Dir, TRUE))
+        {
+            ListingCacheRemoveEntry(bucket, entry);
+            break;
+        }
+    }
+
+    ExReleasePushLockExclusive(&bucket->Lock);
+    KeLeaveCriticalRegion();
+}
+
+//
+//  Drops the listing of the directory Path sits in: a change to Path is a
+//  change to that listing.
+//
+static VOID ListingCacheDropParent(const UNICODE_STRING* Path)
+{
+    UNICODE_STRING parent;
+
+    if (PathCacheParent(Path, &parent))
+    {
+        ListingCacheDrop(&parent);
+    }
+}
+
+//
+//  Drop one exact path, its listing if it is a directory, and its parent's
+//  listing. Cheap: hashes straight to the owning buckets and walks only
+//  those (short) chains. A no-op for whatever is not cached.
 //
 VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path)
 {
@@ -387,7 +653,9 @@ VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path)
         return;
     }
 
-    PATH_CACHE_BUCKET* bucket = &PathCache.Buckets[PathCacheBucketIndex(Path)];
+    PathCacheAdvanceSequence();
+
+    PATH_CACHE_BUCKET* bucket = PathCacheBucket(Path);
 
     KeEnterCriticalRegion();
     ExAcquirePushLockExclusive(&bucket->Lock);
@@ -405,6 +673,9 @@ VOID BlorgPathCacheInvalidate(const UNICODE_STRING* Path)
 
     ExReleasePushLockExclusive(&bucket->Lock);
     KeLeaveCriticalRegion();
+
+    ListingCacheDrop(Path);
+    ListingCacheDropParent(Path);
 }
 
 //
@@ -481,7 +752,41 @@ static VOID PathCacheInvalidateUnder(const UNICODE_STRING* Dir, BOOLEAN KeepDir)
 }
 
 //
-//  Drop a directory and its entire subtree, the directory itself included.
+//  Drops every cached listing of Dir or anything beneath it. Sweeps every
+//  listing bucket, one lock at a time.
+//
+static VOID ListingCacheDropUnder(_In_opt_ const UNICODE_STRING* Dir)
+{
+    for (ULONG i = 0; i < LISTING_CACHE_BUCKETS; i++)
+    {
+        PATH_CACHE_BUCKET* bucket = &PathCache.ListingBuckets[i];
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockExclusive(&bucket->Lock);
+
+        PLIST_ENTRY e = bucket->List.Flink;
+
+        while (e != &bucket->List)
+        {
+            PLISTING_CACHE_ENTRY entry = CONTAINING_RECORD(e, LISTING_CACHE_ENTRY, Link);
+            PLIST_ENTRY next = e->Flink;
+
+            if (!Dir || PathCacheIsUnder(Dir, &entry->Path))
+            {
+                ListingCacheRemoveEntry(bucket, entry);
+            }
+
+            e = next;
+        }
+
+        ExReleasePushLockExclusive(&bucket->Lock);
+        KeLeaveCriticalRegion();
+    }
+}
+
+//
+//  Drop a directory and its entire subtree, the directory itself included,
+//  with every listing in it and the listing of the directory it sits in.
 //
 VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
 {
@@ -490,7 +795,10 @@ VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
         return;
     }
 
+    PathCacheAdvanceSequence();
     PathCacheInvalidateUnder(Dir, FALSE);
+    ListingCacheDropUnder(Dir);
+    ListingCacheDropParent(Dir);
 }
 
 //
@@ -503,7 +811,7 @@ VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
 //  Linux host allows: it would cache an entry for a path a level deeper,
 //  through a directory that need not exist.
 //
-static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const WCHAR* Name, SIZE_T NameLength, const DIRECTORY_ENTRY_METADATA* Meta)
+static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const WCHAR* Name, SIZE_T NameLength, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket)
 {
     if (0 == NameLength || NameLength > MAX_NAME_LEN ||
         DirLength + (NameLength * sizeof(WCHAR)) > Scratch->MaximumLength)
@@ -522,7 +830,7 @@ static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const 
     RtlCopyMemory(C_CAST(PUCHAR, Scratch->Buffer) + DirLength, Name, NameLength * sizeof(WCHAR));
     Scratch->Length = C_CAST(USHORT, DirLength + (NameLength * sizeof(WCHAR)));
 
-    PathCacheInsert(Scratch, TRUE, Meta);
+    PathCacheInsert(Scratch, TRUE, Meta, Ticket);
 
     Scratch->Length = DirLength;
 }
@@ -555,11 +863,15 @@ static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const 
 //     would flush everything else for entries mostly never opened; the rest
 //     resolve the way they always did.
 //
+//  Every entry is inserted with the ticket the listing's fetch was issued
+//  under, so a seed that loses a race with an invalidation inserts nothing
+//  the invalidation would have removed.
+//
 //  Runs from DirCtrlComplete at PASSIVE_LEVEL, as every path-cache entry
 //  point does (PagedPool, push locks). One scratch path buffer for the whole
 //  listing, from pool rather than the stack.
 //
-VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing)
+VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing, _In_opt_ const PATH_CACHE_TICKET* Ticket)
 {
     if (!PathCache.Ready || !Dir || 0 == Dir->Length || !Dir->Buffer)
     {
@@ -609,7 +921,7 @@ VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listin
         meta.LastAccessedTime = sub->LastAccessedTime;
         meta.LastModifiedTime = sub->LastModifiedTime;
 
-        PathCacheSeedEntry(&scratch, dirLength, sub->Name, sub->NameLength, &meta);
+        PathCacheSeedEntry(&scratch, dirLength, sub->Name, sub->NameLength, &meta, Ticket);
     }
 
     meta.IsDirectory = FALSE;
@@ -623,19 +935,258 @@ VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listin
         meta.LastAccessedTime = file->LastAccessedTime;
         meta.LastModifiedTime = file->LastModifiedTime;
 
-        PathCacheSeedEntry(&scratch, dirLength, file->Name, file->NameLength, &meta);
+        PathCacheSeedEntry(&scratch, dirLength, file->Name, file->NameLength, &meta, Ticket);
     }
 
     ExFreePool(scratch.Buffer);
 }
 
 //
-//  Wholesale flush in O(1): bump the generation so every existing entry is
-//  now stale (a miss on lookup, a reap target on the next insert). Memory is
-//  reclaimed lazily rather than eagerly, which is fine -- the bucket cap still
-//  bounds it, and inserts sweep the dead entries as they go.
+//  Returns a referenced snapshot of Dir's listing, or NULL. Fresh within the
+//  path cache's TTL; with AllowStale, also within LISTING_STALE_MAX_100NS,
+//  reported through *Stale, and the first lookup to see a given snapshot
+//  stale is told through *RefreshOwed that it owes the one background
+//  refetch. That claim is an interlocked flag on the entry rather than an
+//  exclusive acquire, so stale lookups stay concurrent; the flag is never
+//  reset on the entry -- a successful refetch replaces the whole entry, and a
+//  failed one leaves this snapshot unrefreshed until it ages out and the
+//  next query fetches in the foreground.
+//
+//  Create.c passes AllowStale = FALSE: a listing it reads answers "not
+//  found" outright, and a snapshot older than the TTL must not hide a file
+//  the server has since gained. It passes Ticket too, which a hit replaces
+//  with the ticket of the fetch behind the snapshot: an entry seeded from it
+//  is as old as that fetch, not as the lookup. The sequence matters as much
+//  as the time. An invalidation advances the sequence before it sweeps, and
+//  this snapshot can still be here in between; a ticket taken now would
+//  then insert what the snapshot says under a sequence newer than the
+//  invalidation, and nothing would ever sweep it. The cost is that once any
+//  invalidation has run, what an open finds in an older snapshot is not
+//  added to the path cache until the directory is fetched again; the open
+//  still resolves from the snapshot without a request.
+//
+PDIRECTORY_INFO BlorgPathCacheLookupListing(const UNICODE_STRING* Dir, BOOLEAN AllowStale, _Out_opt_ PBOOLEAN Stale, _Out_opt_ PBOOLEAN RefreshOwed, _Inout_opt_ PPATH_CACHE_TICKET Ticket)
+{
+    BOOLEAN stale = FALSE;
+    BOOLEAN owed = FALSE;
+    PDIRECTORY_INFO listing = NULL;
+
+    if (PathCache.Ready && Dir && 0 < Dir->Length && Dir->Buffer)
+    {
+        PATH_CACHE_BUCKET* bucket = ListingCacheBucket(Dir);
+        ULONG64 now = KeQueryInterruptTime();
+        LONG generation = ReadNoFence(&PathCache.Generation);
+
+        KeEnterCriticalRegion();
+        ExAcquirePushLockShared(&bucket->Lock);
+
+        for (PLIST_ENTRY e = bucket->List.Flink; e != &bucket->List; e = e->Flink)
+        {
+            PLISTING_CACHE_ENTRY entry = CONTAINING_RECORD(e, LISTING_CACHE_ENTRY, Link);
+
+            if (!RtlEqualUnicodeString(&entry->Path, Dir, TRUE))
+            {
+                continue;
+            }
+
+            if (ListingCacheEntryLive(entry, now, generation))
+            {
+                stale = (ListingCacheAge(entry, now) >= C_CAST(ULONG64, LISTING_FRESH_100NS));
+
+                if (!stale || AllowStale)
+                {
+                    listing = entry->Listing;
+                    BlorgReferenceDirectoryInfo(listing);
+
+                    if (Ticket)
+                    {
+                        Ticket->IssueTime = entry->IssueTime;
+                        Ticket->Sequence = entry->Sequence;
+                    }
+
+                    owed = stale && (0 == InterlockedCompareExchange(&entry->RefreshClaimed, 1, 0));
+                }
+            }
+
+            break;
+        }
+
+        ExReleasePushLockShared(&bucket->Lock);
+        KeLeaveCriticalRegion();
+    }
+
+    if (Stale)
+    {
+        *Stale = stale && (NULL != listing);
+    }
+
+    if (RefreshOwed)
+    {
+        *RefreshOwed = owed;
+    }
+
+    return listing;
+}
+
+//
+//  Offers a freshly fetched listing to the cache. Refused outright when its
+//  ticket has been overtaken by an invalidation. Otherwise it replaces the
+//  cached snapshot of the same directory unless that one came from a fetch
+//  issued later -- two fetches of one directory can complete in either
+//  order, and the later-issued one is the newer truth. The returned
+//  BOOLEAN is that verdict: TRUE means the listing is the current truth for
+//  Dir, which is what licenses the caller to seed the path cache from it,
+//  whether or not the byte budget let the cache keep it.
+//
+//  Retention: dead entries are reaped from the bucket on the way through,
+//  the bucket is capped FIFO, and the oldest entries in this bucket are
+//  evicted while the global byte budget would be exceeded, unless evicting
+//  them all would still leave no room, which would lose live listings for
+//  nothing; a listing that does not fit is simply not kept (its caller
+//  still owns its own reference). The budget is soft across buckets in
+//  what it evicts -- it never evicts from a bucket it does not hold, which
+//  keeps every publish to one lock -- but it is never exceeded, since the
+//  bytes are charged and tested in one interlocked add.
+//
+//  The entry is built outside the lock, as PathCacheInsert's is.
+//
+BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listing, _In_opt_ const PATH_CACHE_TICKET* Ticket)
+{
+    if (!PathCache.Ready || !Dir || 0 == Dir->Length || !Dir->Buffer ||
+        Dir->Length > PATH_CACHE_MAX_PATH_BYTES || !Listing)
+    {
+        return FALSE;
+    }
+
+    PLISTING_CACHE_ENTRY newEntry = ExAllocatePoolZero(PagedPool, sizeof(LISTING_CACHE_ENTRY), LISTING_CACHE_TAG);
+
+    if (newEntry)
+    {
+        newEntry->Path.Buffer = ExAllocatePoolUninitialized(PagedPool, Dir->Length, LISTING_CACHE_TAG);
+
+        if (!newEntry->Path.Buffer)
+        {
+            ExFreePool(newEntry);
+            newEntry = NULL;
+        }
+    }
+
+    ULONG64 now = KeQueryInterruptTime();
+    ULONG64 issueTime = Ticket ? Ticket->IssueTime : now;
+    LONG generation = ReadNoFence(&PathCache.Generation);
+    LONG64 bytes = ListingCacheSizeOf(Listing);
+
+    if (newEntry)
+    {
+        RtlCopyMemory(newEntry->Path.Buffer, Dir->Buffer, Dir->Length);
+        newEntry->Path.Length = Dir->Length;
+        newEntry->Path.MaximumLength = Dir->Length;
+        newEntry->Listing = Listing;
+        newEntry->Bytes = bytes;
+        newEntry->IssueTime = issueTime;
+        newEntry->Generation = C_CAST(ULONG, generation);
+    }
+
+    PATH_CACHE_BUCKET* bucket = ListingCacheBucket(Dir);
+
+    KeEnterCriticalRegion();
+    ExAcquirePushLockExclusive(&bucket->Lock);
+
+    if (newEntry)
+    {
+        newEntry->Sequence = Ticket ? Ticket->Sequence : ReadNoFence64(&PathCache.Sequence);
+    }
+
+    BOOLEAN current = PathCacheTicketHonoured(Ticket);
+    PLISTING_CACHE_ENTRY existing = NULL;
+    PLIST_ENTRY e = current ? bucket->List.Flink : &bucket->List;
+
+    while (e != &bucket->List)
+    {
+        PLISTING_CACHE_ENTRY entry = CONTAINING_RECORD(e, LISTING_CACHE_ENTRY, Link);
+        PLIST_ENTRY next = e->Flink;
+
+        if (!ListingCacheEntryLive(entry, now, generation))
+        {
+            ListingCacheRemoveEntry(bucket, entry);
+        }
+        else if (RtlEqualUnicodeString(&entry->Path, Dir, TRUE))
+        {
+            existing = entry;
+        }
+
+        e = next;
+    }
+
+    if (existing && existing->IssueTime > issueTime)
+    {
+        current = FALSE;
+    }
+    else if (existing)
+    {
+        ListingCacheRemoveEntry(bucket, existing);
+    }
+
+    if (current && newEntry)
+    {
+        LONG64 bucketBytes = 0;
+
+        for (e = bucket->List.Flink; e != &bucket->List; e = e->Flink)
+        {
+            bucketBytes += CONTAINING_RECORD(e, LISTING_CACHE_ENTRY, Link)->Bytes;
+        }
+
+        if (ReadNoFence64(&PathCache.ListingBytes) - bucketBytes + bytes <= LISTING_CACHE_MAX_BYTES)
+        {
+            if (bucket->Count >= LISTING_CACHE_MAX_PER_BUCKET && !IsListEmpty(&bucket->List))
+            {
+                ListingCacheRemoveEntry(bucket, CONTAINING_RECORD(bucket->List.Flink, LISTING_CACHE_ENTRY, Link));
+            }
+
+            while (ReadNoFence64(&PathCache.ListingBytes) + bytes > LISTING_CACHE_MAX_BYTES &&
+                   !IsListEmpty(&bucket->List))
+            {
+                ListingCacheRemoveEntry(bucket, CONTAINING_RECORD(bucket->List.Flink, LISTING_CACHE_ENTRY, Link));
+            }
+        }
+
+        if (ListingCacheCharge(bytes))
+        {
+            BlorgReferenceDirectoryInfo(Listing);
+            InsertTailList(&bucket->List, &newEntry->Link);
+            bucket->Count++;
+            newEntry = NULL;
+        }
+    }
+
+    ExReleasePushLockExclusive(&bucket->Lock);
+    KeLeaveCriticalRegion();
+
+    if (newEntry)
+    {
+        ExFreePool(newEntry->Path.Buffer);
+        ExFreePool(newEntry);
+    }
+
+    return current;
+}
+
+//
+//  Wholesale flush in O(1) for the path cache: bump the generation so every
+//  existing entry is now stale (a miss on lookup, a reap target on the next
+//  insert). Memory is reclaimed lazily rather than eagerly, which is fine --
+//  the bucket cap still bounds it, and inserts sweep the dead entries as they
+//  go. Listings are swept eagerly instead: they are charged against one
+//  global byte budget, and a dead listing left charged in a quiet bucket
+//  would hold budget every other bucket needs.
 //
 VOID BlorgPathCacheInvalidateAll(VOID)
 {
+    PathCacheAdvanceSequence();
     InterlockedIncrement(&PathCache.Generation);
+
+    if (PathCache.Ready)
+    {
+        ListingCacheDropUnder(NULL);
+    }
 }

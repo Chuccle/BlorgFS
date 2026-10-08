@@ -263,9 +263,10 @@ while(0)
 // Tears down and frees an FCB/DCB/VCB/root-DCB/CCB node back to its
 // lookaside list, dispatching on node-type signature since the four
 // common-context kinds share teardown but differ in extra per-type state
-// (file locks, oplocks, cached listing, search pattern). For a CCB,
-// ccb->Entries is a borrowed pointer into the DCB's CachedListing (owned
-// and freed by the DCB), so it is NOT freed here.
+// (file locks, oplocks, search pattern, listing snapshot). For a CCB,
+// ccb->Entries is the handle's own reference to a listing snapshot, dropped
+// here; the snapshot is freed only if nothing else (the listing cache,
+// another handle) still holds it.
 //
 VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject)
 {
@@ -287,7 +288,6 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             PDCB dcb = Context;
             FsRtlUninitializeOplock(&dcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);
-            BlorgFreeHttpDirectoryInfo(dcb->CachedListing);
             ExFreePool(dcb->FullPath.Buffer);
             RemoveEntryList(&(dcb->Links));
             ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
@@ -307,7 +307,6 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             PDCB dcb = Context;
             FsRtlUninitializeOplock(&dcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);
-            BlorgFreeHttpDirectoryInfo(dcb->CachedListing);
             ExFreePool(dcb->FullPath.Buffer);
             ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
             break;
@@ -320,6 +319,7 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
                 RtlFreeUnicodeString(&ccb->SearchPattern);
                 RtlZeroMemory(&ccb->SearchPattern, sizeof(UNICODE_STRING));
             }
+            BlorgReleaseDirectoryInfo(ccb->Entries);
             ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->CcbLookasideList, ccb);
             break;
         }
@@ -386,7 +386,8 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
 //  locked section as its claim.
 //
 
-#define NODE_TABLE_BUCKETS 256u   // power of two
+#define NODE_TABLE_BUCKET_BITS 8u
+#define NODE_TABLE_BUCKETS     (1u << NODE_TABLE_BUCKET_BITS)
 
 //
 // One shard of the node table: an independently locked bucket of nodes.
@@ -446,15 +447,22 @@ static NODE_REAP_STATE NodeReap;
 static IO_WORKITEM_ROUTINE NodeReapWorker;
 
 //
-// Hashes Path (case-insensitive, matching BlorgArePathComponentsEqual's compare)
-// to its bucket index. Same construction as PathCacheBucketIndex, including
-// the manual fallback for RtlHashUnicodeString's argument-validation
-// failures. Run once per node at creation (the result is stamped into
-// COMMON_CONTEXT.TableBucketIndex) and once per by-path lookup
-// (BlorgNodeTableLookupPin); every other bucket access indexes off the
-// stamp instead of re-hashing.
+// Hashes Path case-insensitively, matching BlorgArePathComponentsEqual's
+// compare, mixed so the top bits pick a bucket: every table keyed by path
+// (the node table here, the path and listing caches) takes its index from
+// the high bits of this. Falls back to a manual hash on
+// RtlHashUnicodeString's argument-validation failures, which every caller
+// already excludes.
 //
-static ULONG NodeTableBucketIndexFor(const UNICODE_STRING* Path)
+// The mix is not optional. RtlHashUnicodeString's default is x65599, and
+// 65599 is -1 mod 64, so its low six bits are an alternating sum of the
+// characters: sibling paths that differ in a digit or two land in a handful
+// of buckets. Masked to 64 buckets, a 121-directory tree landed in 19 of
+// them, up to 12 deep against a cap of 8, and a repeat `dir /s` refetched
+// two thirds of it. Multiplying by 2^32/phi carries every input bit into
+// the high bits.
+//
+ULONG BlorgHashPath(const UNICODE_STRING* Path)
 {
     ULONG hash = 0;
 
@@ -466,7 +474,18 @@ static ULONG NodeTableBucketIndexFor(const UNICODE_STRING* Path)
         }
     }
 
-    return hash & (NODE_TABLE_BUCKETS - 1u);
+    return hash * 0x9E3779B1u;
+}
+
+//
+// Path's node table bucket. Run once per node at creation (the result is
+// stamped into COMMON_CONTEXT.TableBucketIndex) and once per by-path lookup
+// (BlorgNodeTableLookupPin); every other bucket access indexes off the
+// stamp instead of re-hashing.
+//
+static ULONG NodeTableBucketIndexFor(const UNICODE_STRING* Path)
+{
+    return BlorgHashPath(Path) >> (32u - NODE_TABLE_BUCKET_BITS);
 }
 
 //

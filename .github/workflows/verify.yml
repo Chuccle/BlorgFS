@@ -107,6 +107,56 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
 
+      # Client.c includes the generated flatbuffer reader, so every suite
+      # that compiles it needs the codegen build.yml does. Same steps, same
+      # cache key: a flatcc build either workflow made serves both.
+      - name: Get flatcc commit hash
+        id: flatcc_hash
+        shell: pwsh
+        run: |
+          $hash = git -C third_party/flatcc rev-parse HEAD
+          echo "flatcc_hash=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Cache Flatcc build
+        id: cache_flatcc
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/flatcc/bin/Release
+            third_party/flatcc/build/MSVC
+          key: ${{ runner.os }}-flatcc-${{ steps.flatcc_hash.outputs.flatcc_hash }}
+
+      - name: Install build tools
+        if: steps.cache_flatcc.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+
+      - name: Build flatcc compiler
+        if: steps.cache_flatcc.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path third_party\flatcc\build\MSVC | Out-Null
+          Push-Location third_party\flatcc\build\MSVC
+          try {
+            cmake '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' ..\..
+            if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with exit code $LASTEXITCODE" }
+
+            cmake --build . --config Release
+            if ($LASTEXITCODE -ne 0) { throw "cmake build failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Create generated flatbuffer files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path generated | Out-Null
+          & third_party\flatcc\bin\Release\flatcc.exe -rv --common_reader -o generated third_party\schemas\metadata_flatbuffer.fbs
+          if ($LASTEXITCODE -ne 0) { throw "flatcc codegen failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path generated\metadata_flatbuffer_reader.h)) { throw "flatcc did not produce the reader header" }
+
       - name: Build sandbox suites
         shell: pwsh
         run: |

@@ -72,7 +72,11 @@
 extern "C" {
 #include "..\..\src\Driver.h"
 #include "Scheduler.h"
+
+NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp);
 }
+
+#include "ListingBuilder.h"
 
 namespace
 {
@@ -350,6 +354,157 @@ TEST_F(DispatchSchedTest, NoInterleavingOfConcurrentOpensCorruptsShareState)
 // assertion after this one would run against corrupted state.
 //
 ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+
+    EXPECT_EQ(0, result.Truncated)
+        << "a schedule hit the depth cap, so the space was not fully explored";
+
+    EXPECT_LT(result.Schedules, 20000)
+        << "hit the schedule cap -- sampled, not exhausted";
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+}
+
+//
+// Two queries on one directory handle: a first query, and a restart scan
+// issued before the first one has set the handle's pattern. The restart
+// sees no pattern, so it takes the resource exclusive as an initial query
+// would, and when the first query gets in ahead of it, finds the pattern
+// set on taking it. It must still replace the handle's snapshot under the
+// resource exclusive: converting to shared there, as it once did, let a
+// query holding the resource shared enumerate a snapshot the restart was
+// freeing. DirCtrl.c asserts the exclusive hold before any replace, and
+// the model's conversion is real under the scheduler, so the interleaving
+// that converts fails that assertion.
+//
+// The directory's listing is cached, so neither query reaches the network.
+// Both carry IN_FSP and WAIT, as DirCtrlTest's do, so a query that sets
+// the pattern runs inline rather than posting to an FSP queue that is not
+// running here. The restart always enumerates from the start; the first
+// query finds nothing left when the restart ran ahead of it and took every
+// entry, which is the one other answer either order allows.
+//
+struct QueryState
+{
+    FILE_OBJECT FileObject;
+    IO_STACK_LOCATION Stack;
+    IRP Irp;
+    unsigned char Buffer[512];
+    NTSTATUS Status;
+};
+
+struct DirCtrlProof
+{
+    PDEVICE_OBJECT Volume;
+    PDCB Dcb;
+    PCCB Ccb;
+
+    QueryState First;
+    QueryState Restart;
+
+    volatile long Violations;
+};
+
+void PrepareQuery(QueryState* query, DirCtrlProof* proof, UCHAR slFlags)
+{
+    memset(query, 0, sizeof(*query));
+
+    query->FileObject.FsContext = proof->Dcb;
+    query->FileObject.FsContext2 = proof->Ccb;
+    query->FileObject.DeviceObject = proof->Volume;
+
+    query->Stack.MajorFunction = IRP_MJ_DIRECTORY_CONTROL;
+    query->Stack.MinorFunction = IRP_MN_QUERY_DIRECTORY;
+    query->Stack.FileObject = &query->FileObject;
+    query->Stack.DeviceObject = proof->Volume;
+    query->Stack.Flags = slFlags;
+    query->Stack.Parameters.QueryDirectory.FileInformationClass = FileBothDirectoryInformation;
+    query->Stack.Parameters.QueryDirectory.Length = sizeof(query->Buffer);
+
+    query->Irp.StackLocation = &query->Stack;
+    query->Irp.UserBuffer = query->Buffer;
+    query->Irp.RequestorMode = KernelMode;
+    query->Irp.Tail.Overlay.DriverContext[0] =
+        (PVOID)(ULONG_PTR)(IRP_CONTEXT_FLAG_IN_FSP | IRP_CONTEXT_FLAG_WAIT);
+}
+
+void FirstQueryThread(void* Parameter)
+{
+    DirCtrlProof* proof = (DirCtrlProof*)Parameter;
+
+    proof->First.Status = BlorgVolumeDirectoryControl(&proof->First.Irp, &proof->First.Stack);
+}
+
+void RestartScanThread(void* Parameter)
+{
+    DirCtrlProof* proof = (DirCtrlProof*)Parameter;
+
+    proof->Restart.Status = BlorgVolumeDirectoryControl(&proof->Restart.Irp, &proof->Restart.Stack);
+}
+
+void DirCtrlProofSetup(void* Parameter)
+{
+    DirCtrlProof* proof = (DirCtrlProof*)Parameter;
+
+    ShimReset();
+
+    proof->Volume = StructsModelCreateVolume();
+    global.VolumeDeviceObject = proof->Volume;
+
+    UNICODE_STRING dirName;
+    dirName.Buffer = const_cast<PWSTR>(L"\\media");
+    dirName.Length = (USHORT)(wcslen(dirName.Buffer) * sizeof(WCHAR));
+    dirName.MaximumLength = dirName.Length;
+
+    BlorgCreateDCB(&proof->Dcb, (CSHORT)BLORGFS_DCB_SIGNATURE, &dirName, proof->Volume);
+    InitializeListHead(&proof->Dcb->Links);
+    BlorgCreateCCB(&proof->Ccb, proof->Volume);
+
+    PDIRECTORY_INFO listing = BuildSyntheticListing(2, 1);
+    BlorgPathCachePublishListing(&proof->Dcb->FullPath, listing, nullptr);
+    BlorgReleaseDirectoryInfo(listing);
+
+    PrepareQuery(&proof->First, proof, 0);
+    PrepareQuery(&proof->Restart, proof, SL_RESTART_SCAN);
+
+    KmSchedSpawn(FirstQueryThread, proof);
+    KmSchedSpawn(RestartScanThread, proof);
+}
+
+void DirCtrlProofTeardown(void* Parameter)
+{
+    DirCtrlProof* proof = (DirCtrlProof*)Parameter;
+
+    if ((STATUS_SUCCESS != proof->First.Status && STATUS_NO_MORE_FILES != proof->First.Status) ||
+        STATUS_SUCCESS != proof->Restart.Status)
+    {
+        InterlockedIncrement(&proof->Violations);
+    }
+
+    BlorgPathCacheInvalidatePrefix(&proof->Dcb->FullPath);
+
+    BlorgFreeFileContext(proof->Ccb, proof->Volume);
+    BlorgFreeFileContext(proof->Dcb, proof->Volume);
+    StructsModelDestroyVolume(proof->Volume);
+    global.VolumeDeviceObject = nullptr;
+
+    proof->Ccb = nullptr;
+    proof->Dcb = nullptr;
+    proof->Volume = nullptr;
+}
+
+TEST_F(DispatchSchedTest, RestartScanReplacesTheHandlesSnapshotOnlyWhileExclusive)
+{
+    static DirCtrlProof proof;
+
+    proof = {};
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(DirCtrlProofSetup, DirCtrlProofTeardown, &proof, 20000);
+
+    EXPECT_EQ(0, proof.Violations)
+        << "a query on the shared handle did not enumerate the cached listing";
+
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
