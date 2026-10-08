@@ -978,7 +978,7 @@ TEST_F(NodeTableSchedTest, NoAtomicInterleavingRetiresAPinnedNode)
     KmSchedSetWeakMemory(1);
 
     KM_SCHED_RESULT result =
-        ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 1000000);
+        ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 2000000000);
 
     KmSchedSetWeakMemory(0);
     KmSchedSetAtomicYields(0);
@@ -995,7 +995,7 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes in the table";
     EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the pin body";
     EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
-    EXPECT_LT(result.Schedules, 1000000)
+    EXPECT_LT(result.Schedules, 2000000000)
         << "hit the schedule cap -- the space was sampled, not exhausted";
 
     EXPECT_GT(proof.PinsObserved, 0);
@@ -1236,7 +1236,7 @@ TEST_F(NodeTableRevivalSchedTest, NoAtomicInterleavingFreesARevivedNode)
     KmSchedSetWeakMemory(1);
 
     KM_SCHED_RESULT result =
-        ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 1000000);
+        ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000000);
 
     KmSchedSetWeakMemory(0);
     KmSchedSetAtomicYields(0);
@@ -1253,7 +1253,7 @@ TEST_F(NodeTableRevivalSchedTest, NoAtomicInterleavingFreesARevivedNode)
     EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes linked under the root";
     EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the revival body";
     EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
-    EXPECT_LT(result.Schedules, 1000000)
+    EXPECT_LT(result.Schedules, 2000000000)
         << "hit the schedule cap -- the space was sampled, not exhausted";
 
     EXPECT_GT(proof.RevivalsObserved, 0);

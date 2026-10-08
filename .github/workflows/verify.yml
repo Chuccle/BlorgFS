@@ -80,7 +80,7 @@ jobs:
   interleavings:
     runs-on: windows-latest
     name: ${{ matrix.shard.name }}
-    timeout-minutes: 30
+    timeout-minutes: 355
 
     # Exactly what the PR gate excludes.
     #
@@ -127,7 +127,9 @@ jobs:
           - { name: 'Pin proof 4/4', project: NodeTableSandbox, filter: 'NodeTableSchedTest.NoInterleavingRetiresAPinnedNode', split: '3/4' }
           - name: Node table proofs
             project: NodeTableSandbox
-            filter: '*SchedTest.*:*StressTest.*-NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode:NodeTableSchedTest.NoInterleavingRetiresAPinnedNode'
+            filter: '*SchedTest.*:*StressTest.*-NodeTableRevivalSchedTest.NoInterleavingFreesARevivedNode:NodeTableSchedTest.NoInterleavingRetiresAPinnedNode:NodeTableSchedTest.NoAtomicInterleavingRetiresAPinnedNode:NodeTableRevivalSchedTest.NoAtomicInterleavingFreesARevivedNode'
+          - { name: 'Atomic pin WM', project: NodeTableSandbox, filter: 'NodeTableSchedTest.NoAtomicInterleavingRetiresAPinnedNode' }
+          - { name: 'Atomic revival WM', project: NodeTableSandbox, filter: 'NodeTableRevivalSchedTest.NoAtomicInterleavingFreesARevivedNode' }
           - name: Dispatch proofs
             project: DispatchSandbox
             filter: '*SchedTest.*:*StressTest.*'
