@@ -462,21 +462,59 @@ static void KmPushHeld(int Id)
     state->HeldCount++;
 }
 
+//
+// Removes the most recent hold of Id, not whatever is on top. Locks are not
+// always released in reverse order of acquisition, and popping the top on
+// an out-of-order release would leave the released lock on the stack and
+// drop the one still held: later acquisitions would then record edges from
+// a lock nobody holds and miss edges from one that is held, which is an
+// AB/BA deadlock the model never reports. Past KM_MAX_HELD the entries are
+// not stored, so the top is all there is to drop.
+//
 static void KmPopHeld(int Id)
 {
     KM_THREAD_STATE* state = KmThreadState();
 
-    if (state->HeldCount > 0)
+    if (state->HeldCount <= 0)
     {
-        state->HeldCount--;
+        return;
     }
 
-    (void)Id;
+    if (state->HeldCount <= KM_MAX_HELD)
+    {
+        for (int i = state->HeldCount - 1; i >= 0; --i)
+        {
+            if (state->HeldLocks[i] == Id)
+            {
+                memmove(&state->HeldLocks[i], &state->HeldLocks[i + 1],
+                    (size_t)(state->HeldCount - 1 - i) * sizeof(state->HeldLocks[0]));
+                break;
+            }
+        }
+    }
+
+    state->HeldCount--;
 }
 
 int KmLocksHeld(void)
 {
     return KmThreadState()->HeldCount;
+}
+
+int KmHoldsLock(int Id)
+{
+    KM_THREAD_STATE* state = KmThreadState();
+    const int stored = (state->HeldCount < KM_MAX_HELD) ? state->HeldCount : KM_MAX_HELD;
+
+    for (int i = 0; i < stored; ++i)
+    {
+        if (state->HeldLocks[i] == Id)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 //

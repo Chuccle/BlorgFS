@@ -159,10 +159,13 @@ static int BlockedCount = 0;
 // acquire joins it. Two accesses to the same address race when neither
 // is covered by the other's clock.
 //
-// Addresses are REGISTERED, not inferred: interlocked targets and lock
-// words are hooked in the shims, and bodies may register their own via
-// KmSchedNoteAccess. Unregistered memory is not checked -- a stated
-// boundary, not a hidden one. The detector is opt-in per exploration
+// Addresses are REGISTERED, not inferred: bodies register their own via
+// KmSchedNoteAccess, and nothing else does. Lock words stay out for the
+// reason given at KmSchedNoteAccess, and interlocked targets and the
+// ReadNoFence family are atomic accesses, which cannot race. Driver memory
+// is therefore not checked -- the plain accesses that could race are not
+// visible without compiler instrumentation. A stated boundary, not a
+// hidden one. The detector is opt-in per exploration
 // (KmSchedSetRaceDetection) so existing proofs pay nothing for it.
 //
 #define KM_RACE_SLOTS 512
@@ -1237,4 +1240,58 @@ __int64 KmSchedInterlockedDecrement64(__int64 volatile* Target)
 {
     AtomicYield();
     return _InterlockedDecrement64(Target);
+}
+
+long KmSchedInterlockedOr(long volatile* Target, long Value)
+{
+    AtomicYield();
+    return _InterlockedOr(Target, Value);
+}
+
+__int64 KmSchedInterlockedAdd64(__int64 volatile* Target, __int64 Value)
+{
+    AtomicYield();
+    return _InterlockedExchangeAdd64(Target, Value) + Value;
+}
+
+__int64 KmSchedInterlockedExchangeAdd64(__int64 volatile* Target, __int64 Value)
+{
+    AtomicYield();
+    return _InterlockedExchangeAdd64(Target, Value);
+}
+
+void* KmSchedInterlockedCompareExchangePointer(void* volatile* Target, void* Exchange, void* Comparand)
+{
+    AtomicYield();
+    return _InterlockedCompareExchangePointer(Target, Exchange, Comparand);
+}
+
+long KmSchedReadLong(long volatile* Source)
+{
+    AtomicYield();
+    return *Source;
+}
+
+__int64 KmSchedReadLong64(__int64 volatile* Source)
+{
+    AtomicYield();
+    return *Source;
+}
+
+void* KmSchedReadPointer(void* volatile* Source)
+{
+    AtomicYield();
+    return *Source;
+}
+
+void KmSchedWriteLong(long volatile* Target, long Value)
+{
+    AtomicYield();
+    *Target = Value;
+}
+
+void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value)
+{
+    AtomicYield();
+    *Target = Value;
 }

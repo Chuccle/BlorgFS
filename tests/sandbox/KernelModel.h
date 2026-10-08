@@ -169,6 +169,9 @@ void KmReleaseLockShared(KM_LOCK* Lock);
 // Number of locks held by the calling thread, for invariant assertions.
 int KmLocksHeld(void);
 
+// Whether the calling thread holds the lock with this id, in any mode.
+int KmHoldsLock(int Id);
+
 //
 // Order tracking for locks the model does not own -- push locks and
 // ERESOURCEs, whose mutual exclusion comes from an SRWLOCK rather than a

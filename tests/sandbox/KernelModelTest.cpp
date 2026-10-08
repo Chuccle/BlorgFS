@@ -183,6 +183,43 @@ TEST_F(KernelModelTest, ConsistentLockOrderIsNotFlagged)
 }
 
 //
+// Releasing out of acquisition order must drop the lock released, not the
+// one on top. Holding B after releasing A, taking C records B -> C, and
+// taking them C -> B afterwards is an inversion the model has to see.
+//
+TEST_F(KernelModelTest, OutOfOrderReleaseKeepsTheStillHeldLock)
+{
+    EX_PUSH_LOCK a = {};
+    EX_PUSH_LOCK b = {};
+    EX_PUSH_LOCK c = {};
+
+    ExInitializePushLock(&a);
+    ExInitializePushLock(&b);
+    ExInitializePushLock(&c);
+
+    ExAcquirePushLockExclusive(&a);
+    ExAcquirePushLockExclusive(&b);
+    ExReleasePushLockExclusive(&a);
+
+    ExAcquirePushLockExclusive(&c);
+    ExReleasePushLockExclusive(&c);
+    ExReleasePushLockExclusive(&b);
+
+    ExAcquirePushLockExclusive(&c);
+
+    KmExpectViolation(KmViolationLockOrder);
+    ExAcquirePushLockExclusive(&b);
+
+    EXPECT_EQ(KmViolationLockOrder, KmTakeViolation())
+        << "the B -> C edge was recorded against A, which was no longer held";
+
+    ExReleasePushLockExclusive(&b);
+    ExReleasePushLockExclusive(&c);
+
+    EXPECT_EQ(0, KmLocksHeld());
+}
+
+//
 // A recycled id is a new lock. It must not inherit the edges of the lock
 // that held the id before it, or the model reports inversions between
 // locks that never coexisted (an unexpected violation aborts the run) --
