@@ -357,6 +357,70 @@ void PinProofTeardown(void* Parameter)
     proof->Node = nullptr;
 }
 
+//
+// The synchronous retire. A create that fails part-way walks back up its
+// path freeing each directory it left empty (BlorgReapEmptyAncestorDcbs),
+// under the VCB resource exclusive and without the reap queue, so what
+// keeps it off a pinned directory is NodeTableTryRetire's own count check
+// rather than the worker's.
+//
+void AncestorRetiringThread(void* Parameter)
+{
+    PinProof* proof = (PinProof*)Parameter;
+
+    FsRtlEnterFileSystem();
+    ExAcquireResourceExclusiveLite(proof->Vcb->Header.Resource, TRUE);
+
+    BlorgReapEmptyAncestorDcbs(C_CAST(PDCB, proof->Node), proof->Volume);
+
+    ExReleaseResourceLite(proof->Vcb->Header.Resource);
+    FsRtlExitFileSystem();
+
+    if (ReadNoFence(&proof->Freed))
+    {
+        InterlockedIncrement(&proof->RetiresObserved);
+
+        if (ReadNoFence(&proof->PinHeld))
+        {
+            InterlockedIncrement(&proof->Violations);
+        }
+    }
+}
+
+//
+// PinProofSetup with an empty directory in place of the file, which is the
+// only kind of node the ancestor walk retires.
+//
+void DirectoryPinProofSetup(void* Parameter)
+{
+    PinProof* proof = (PinProof*)Parameter;
+
+    proof->PinHeld = 0;
+    proof->Freed = 0;
+    proof->PinsBefore = proof->PinsObserved;
+    proof->RetiresBefore = proof->RetiresObserved;
+    proof->ViolationsBefore = proof->Violations;
+
+    DIRECTORY_ENTRY_METADATA meta = {};
+    meta.IsDirectory = TRUE;
+
+    PCOMMON_CONTEXT node = nullptr;
+
+    if (!NT_SUCCESS(BlorgInsertByPath(proof->Root, &proof->Path, &meta, proof->Volume, &node)) || !node)
+    {
+        return;
+    }
+
+    BlorgNodeTablePublish(node);
+
+    proof->Node = node;
+
+    ShimWatchFree(node, &proof->Freed);
+
+    KmSchedSpawn(PinningThread, proof);
+    KmSchedSpawn(AncestorRetiringThread, proof);
+}
+
 class NodeTableSchedTest : public ::testing::Test
 {
 protected:
@@ -939,6 +1003,65 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
            "%ld pins, %ld retires\n",
         result.Schedules, result.Pruned, result.MaxDepth,
         proof.PinsObserved, proof.RetiresObserved);
+}
+
+//
+// The pin proof against the synchronous retire path instead of the reap
+// worker: a directory pinned by a warm open while a failed create's
+// ancestor walk tries to free it. Lock granularity with the full search,
+// checked against the reduction, then atomic granularity reduced.
+//
+TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedDirectory)
+{
+    PinProof proof = {};
+    proof.Volume = Volume;
+    proof.Root = Root;
+    proof.Vcb = Vcb;
+    proof.Path = MakePath(L"\\media");
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(DirectoryPinProofSetup, PinProofTeardown, &proof, 1000000);
+
+    EXPECT_EQ(0, proof.Violations)
+        << "an interleaving exists in which a pinned directory was retired";
+
+    //
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
+    EXPECT_LT(result.Schedules, 1000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+
+    ExpectReductionReachesFullOutcomes(DirectoryPinProofSetup, PinProofTeardown, &proof, result, 1);
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetRaceDetection(1);
+
+    const KM_SCHED_RESULT atomic =
+        ExploreReduced(DirectoryPinProofSetup, PinProofTeardown, &proof, 1000000);
+
+    KmSchedSetAtomicYields(0);
+    KmSchedSetRaceDetection(0);
+
+    EXPECT_EQ(0, proof.Violations)
+        << "an atomic interleaving exists in which a pinned directory was retired";
+    ASSERT_EQ(0, atomic.Deadlocks) << "an atomic schedule deadlocked;";
+    EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the directory body";
+    EXPECT_EQ(0, atomic.Truncated) << "an atomic schedule hit the depth cap";
+    EXPECT_LT(atomic.Schedules, 1000000)
+        << "hit the schedule cap -- the atomic space was sampled, not exhausted";
+
+    EXPECT_GT(proof.PinsObserved, 0) << "no schedule ever pinned the directory";
+    EXPECT_GT(proof.RetiresObserved, 0) << "no schedule ever retired the directory";
+    EXPECT_EQ(0, proof.LeftBehind)
+        << "replays left nodes in the table; the next replay is a different program";
+
+    printf("[  sched   ] atomic: %d runs, %d pruned, max depth %d, %ld pins, %ld retires\n",
+        atomic.Schedules, atomic.Pruned, atomic.MaxDepth, proof.PinsObserved, proof.RetiresObserved);
 }
 
 //
