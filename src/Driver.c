@@ -726,7 +726,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     global.CacheManagerCallbacks.ReleaseFromReadAhead = BlorgReleaseNodeFromReadAhead;
 
     BlorgFsFastDispatch.SizeOfFastIoDispatch = sizeof(FAST_IO_DISPATCH);
-    BlorgFsFastDispatch.FastIoCheckIfPossible = FastIoCheckIfPossible;
+    BlorgFsFastDispatch.FastIoCheckIfPossible = BlorgFastIoCheckIfPossible;
     BlorgFsFastDispatch.FastIoRead = BlorgFastIoRead;
     BlorgFsFastDispatch.MdlRead = FsRtlMdlReadDev;
     BlorgFsFastDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;

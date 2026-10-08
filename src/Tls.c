@@ -1354,12 +1354,9 @@ NTSTATUS BlorgTlsExtractSpkiFromCertificate(
 
     tbsEnd = p + len;
 
-    if (p < tbsEnd && 0xA0 == *p)
+    if (p < tbsEnd && 0xA0 == *p && !TlsDerSkipTlv(&p, tbsEnd))
     {
-        if (!TlsDerSkipTlv(&p, tbsEnd))
-        {
-            return STATUS_INVALID_PARAMETER;
-        }
+        return STATUS_INVALID_PARAMETER;
     }
 
     if (!TlsDerSkipTlv(&p, tbsEnd) ||

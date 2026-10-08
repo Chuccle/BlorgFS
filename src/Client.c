@@ -2319,13 +2319,10 @@ static VOID HttpOnReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID Com
         return;
     }
 
-    if (0 == BytesTransferred)
+    if (0 == BytesTransferred && (0 == ctx->BodyOffset || ctx->Length < ctx->BodyEndOffset))
     {
-        if (0 == ctx->BodyOffset || ctx->Length < ctx->BodyEndOffset)
-        {
-            HttpFailOrRetryReusedConnection(ctx, STATUS_CONNECTION_DISCONNECTED);
-            return;
-        }
+        HttpFailOrRetryReusedConnection(ctx, STATUS_CONNECTION_DISCONNECTED);
+        return;
     }
 
     ctx->Length += C_CAST(ULONG, BytesTransferred);

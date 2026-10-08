@@ -1139,4 +1139,46 @@ TEST_F(ReadFairTest, WaitingDemandGoesAheadOfHeldReadAhead)
     EXPECT_EQ(STATUS_SUCCESS, readAhead->Irp.IoStatus.Status);
 }
 
+
+//
+// Exercise the actual fast-I/O gate for both node kinds and both operation
+// kinds. A dispatch read succeeding does not show that this gate rejects
+// directories or writes before asking FsRtl about byte-range locks.
+//
+TEST_F(ReadTest, FastIoGateAllowsOnlyFileReads)
+{
+    FILE_OBJECT file = {};
+    LARGE_INTEGER offset = {};
+    IO_STATUS_BLOCK status = {};
+    file.FsContext = Fcb;
+    EXPECT_TRUE(BlorgFastIoCheckIfPossible(&file, &offset, 4, TRUE, 0, TRUE, &status, Volume));
+    EXPECT_FALSE(BlorgFastIoCheckIfPossible(&file, &offset, 4, TRUE, 0, FALSE, &status, Volume));
+    file.FsContext = VcbNode;
+    EXPECT_FALSE(BlorgFastIoCheckIfPossible(&file, &offset, 4, TRUE, 0, TRUE, &status, Volume));
+    EXPECT_FALSE(BlorgFastIoCheckIfPossible(&file, &offset, 4, TRUE, 0, FALSE, &status, Volume));
+}
+
+//
+// Cc calls these callbacks directly, so driving a cached read through the
+// copy stub cannot catch an omitted top-level-IRP reset or resource release.
+// The real callbacks also enter the kernel model's lock-order checks here.
+//
+TEST_F(ReadTest, CacheManagerCallbacksBalanceResourcesAndTopLevelIrp)
+{
+    const PVOID lazyWriter = global.LazyWriteThread;
+    KeEnterCriticalRegion();
+    EXPECT_TRUE(BlorgAcquireNodeForLazyWrite(Fcb, TRUE));
+    EXPECT_EQ(PsGetCurrentThread(), Fcb->LazyWriteThread);
+    EXPECT_EQ(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP), IoGetTopLevelIrp());
+    BlorgReleaseNodeFromLazyWrite(Fcb);
+    EXPECT_EQ(nullptr, Fcb->LazyWriteThread);
+    EXPECT_EQ(nullptr, IoGetTopLevelIrp());
+    EXPECT_TRUE(BlorgAcquireNodeForReadAhead(Fcb, TRUE));
+    EXPECT_EQ(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP), IoGetTopLevelIrp());
+    BlorgReleaseNodeFromReadAhead(Fcb);
+    EXPECT_EQ(nullptr, IoGetTopLevelIrp());
+    KeLeaveCriticalRegion();
+    global.LazyWriteThread = lazyWriter;
+}
+
 } // namespace
