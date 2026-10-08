@@ -2,6 +2,10 @@
 
 #include <stddef.h>
 
+#ifndef C_CAST
+#define C_CAST(T, Expr) ((T)(Expr))
+#endif
+
 //
 // Systematic interleaving exploration: run a concurrent body under EVERY
 // thread schedule rather than under whichever one the OS happens to pick.
@@ -36,11 +40,10 @@
 // allow, which reaches what ARM64 and the compiler do to the counters and
 // flags shared through ReadNoFence, ReadAcquire, WriteRelease and the
 // weaker Interlocked forms. Store buffering and message passing are
-// covered. Load buffering is not: a read returns a write already made, so
-// no thread ever reads a value another thread writes later in its own
-// program order, which ARM64 allows for a relaxed read followed by an
-// independent relaxed write. Plain accesses outside the shims are
-// sequentially consistent in either mode.
+// covered. Load buffering is represented only by explicitly declared
+// independent relaxed load/store pairs (KmSchedIndependentRelaxedLoadStore).
+// Ordinary C operations and dependency inference remain outside this model.
+// Plain accesses outside the shims are sequentially consistent in either mode.
 //
 
 #ifdef __cplusplus
@@ -390,6 +393,15 @@ void* KmSchedReadPointer(void* volatile* Source, int Order);
 void KmSchedWriteLong(long volatile* Target, long Value, int Order);
 void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value, int Order);
 void KmSchedMemoryBarrier(void);
+
+//
+// Declare a relaxed read followed by an independent relaxed write. Source
+// and Target must not overlap, and neither Target nor Value may depend on
+// the read. Returns the load's value. Weak mode also explores executing
+// the store before the load; SC mode keeps their declared order. This is
+// an explicit litmus operation, not automatic dependency analysis of C.
+//
+long KmSchedIndependentRelaxedLoadStore(long volatile* Source, long volatile* Target, long Value);
 
 //
 // Weak memory, opt-in per exploration: a read may return an older write

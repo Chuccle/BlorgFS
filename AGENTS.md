@@ -372,6 +372,18 @@ The sandbox projects put their own directory on the include path so
 `src/Driver.h` can pull in `SandboxPrelude.h` without the driver naming a
 test directory.
 
+### Weak-memory pair exploration
+
+`KmSchedIndependentRelaxedLoadStore` declares one relaxed load followed by an
+independent relaxed store to a different non-overlapping location. Weak mode
+explores both orders; SC mode keeps load before store. The caller must supply
+independent addresses and a store value that does not depend on the load. This
+does not infer dependencies or reorder ordinary C statements. Load-buffering
+audits assert exact sets `{0,1,16}` in SC and `{0,1,16,17}` in weak mode for
+both full and reduced searches, and reject null/overlapping pair arguments.
+The executor runs fibers serially on one host thread; it does not rely on
+SwitchToFiber entering the kernel or supplying a hardware fence.
+
 ### Registry configuration tests
 
 `Registry.c` is compiled into both the driver and DispatchSandbox.

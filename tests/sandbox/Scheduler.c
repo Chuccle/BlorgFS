@@ -19,11 +19,10 @@
 //    relaxed read anywhere in this file that is not separated from the
 //    corresponding write by such a call in both directions.
 //
-// 2. Hardware/OS side. SwitchToFiber enters the kernel's context-switch
-//    path, which issues full barriers on every architecture Windows
-//    ships on (x86/x64 get TSO from the hardware itself; ARM64 gets
-//    explicit barriers in KiSwapContext). Successor sees predecessor's
-//    stores; nothing weaker is relied on.
+// 2. Execution side. All fibers execute serially on one OS thread. These
+//    accesses therefore belong to one host thread, regardless of which
+//    modeled thread the current fiber represents. SwitchToFiber is a
+//    usermode switch; no kernel transition or hardware fence is assumed.
 //
 // What this forbids, and what the primitives therefore never do: reaching
 // for OS identity (TLS, GetCurrentThreadId -- shared by all fibers of the
@@ -75,10 +74,9 @@
 // primitives the driver itself uses. Their architecture story lives at
 // those wrappers, not repeated at each use. Every other static in this
 // file is reached only across SwitchToFiber boundaries, and that
-// executor argument is architecture-neutral too: SwitchToFiber is an
-// opaque externally-linked call, so a compiler barrier on any target,
-// and the kernel context-switch path it enters issues full barriers on
-// every architecture Windows ships.
+// executor argument is architecture-neutral too: the opaque external
+// switch preserves the escaped state on this single host thread. Weak
+// visibility between modeled threads is represented by WmLocations.
 //
 
 // Generous: atomic-granularity exploration reaches a few hundred scheduling
@@ -594,14 +592,15 @@ static int FootprintReported = 0;
 // may return an older value than the last one written, as long as the
 // orderings in the program allow it.
 //
-// The model is the C++ one less load buffering, over the happens-before
+// The model tracks instrumented accesses over the happens-before
 // clocks the race detector keeps. Every location the shims touch keeps its
 // writes in the order they happened. A read may return the newest write,
 // or any older one down to the newest write that happens-before the
 // reader, and never older than one the same thread already read or wrote
-// there. It never returns a write not yet made, which is the load
-// buffering left out (Scheduler.h). Each value it may return is a branch
-// the explorer takes, recorded in the schedule like a choice of thread.
+// there. It never invents a write not yet made. An explicitly declared
+// independent relaxed load/store pair may instead execute its store first,
+// reaching load buffering with real writes and no speculative values.
+// Each permitted order/value is a branch recorded in the schedule.
 //
 // The orderings (KM_ORDER_*):
 //
@@ -2671,6 +2670,39 @@ void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value, int Order)
     {
         WmWrite(location, slot, 0, Order);
     }
+}
+
+//
+// The caller declares independence: no value/address/control dependency
+// may connect this load to the store. Track both locations before choosing
+// an order, so the reduction cannot commute the choice past a conflicting
+// access. Both component accesses retain their usual scheduling points.
+//
+long KmSchedIndependentRelaxedLoadStore(long volatile* Source, long volatile* Target, long Value)
+{
+    const ULONG_PTR source = C_CAST(ULONG_PTR, Source);
+    const ULONG_PTR target = C_CAST(ULONG_PTR, Target);
+
+    if (!Source || !Target ||
+        (source <= target ? target - source : source - target) < sizeof(*Source))
+    {
+        KmReportViolation(KmViolationLifetime, "independent relaxed pair has overlapping locations");
+        return 0;
+    }
+
+    AtomicYield();
+    KmSchedNoteFootprint(C_CAST(const void*, Source), sizeof(*Source), 0);
+    KmSchedNoteFootprint(C_CAST(const void*, Target), sizeof(*Target), 1);
+
+    if (WeakMemory && Current >= 0 && ChooseValue(2))
+    {
+        KmSchedWriteLong(Target, Value, KM_ORDER_RELAXED);
+        return KmSchedReadLong(Source, KM_ORDER_RELAXED);
+    }
+
+    const long value = KmSchedReadLong(Source, KM_ORDER_RELAXED);
+    KmSchedWriteLong(Target, Value, KM_ORDER_RELAXED);
+    return value;
 }
 
 //

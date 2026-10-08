@@ -2486,6 +2486,7 @@ struct LitmusAudit
     volatile long Y;
     long Seen0;
     long Seen1;
+    unsigned int SeenPairs;
 };
 
 static void LitmusSetup(void* Parameter)
@@ -2530,6 +2531,111 @@ static int LitmusOutcomes(KM_SCHED_BODY Left, KM_SCHED_BODY Right, int Weak)
         << "the reduced exploration reached a different set of outcomes";
 
     return full.Outcomes;
+}
+
+//
+// Both loads may see one only when the independent stores move before
+// them. Historical-value reads alone cannot produce that outcome. The
+// helper audits full/reduced outcome agreement and search exhaustion.
+//
+static void IndependentLoadStoreX(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    audit->Seen0 = KmSchedIndependentRelaxedLoadStore(&audit->Y, &audit->X, 1);
+}
+
+static void IndependentLoadStoreY(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    audit->Seen1 = KmSchedIndependentRelaxedLoadStore(&audit->X, &audit->Y, 1);
+}
+
+static void LoadBufferingTeardown(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    EXPECT_TRUE(0 == audit->Seen0 || 1 == audit->Seen0);
+    EXPECT_TRUE(0 == audit->Seen1 || 1 == audit->Seen1);
+    audit->SeenPairs |= 1u << (audit->Seen0 + 2 * audit->Seen1);
+    LitmusTeardown(Parameter);
+}
+
+//
+// Compare exact raw sets as well as the scheduler's digest. Bits name
+// {0, 1, 16, 17}; counting three/four alone could miss a forbidden value
+// that replaced an allowed outcome in both full and reduced searches.
+//
+static void LoadBufferingOutcomes(int Weak, unsigned int Expected)
+{
+    static LitmusAudit audit;
+    audit.Left = IndependentLoadStoreX;
+    audit.Right = IndependentLoadStoreY;
+    audit.SeenPairs = 0;
+    KmSchedSetAtomicYields(1);
+    KmSchedSetWeakMemory(Weak);
+    KmSchedSetReduction(0);
+    const KM_SCHED_RESULT full = KmExploreInterleavings(LitmusSetup, LoadBufferingTeardown,
+        &audit, 100000);
+    EXPECT_EQ(Expected, audit.SeenPairs);
+    audit.SeenPairs = 0;
+    const KM_SCHED_RESULT reduced = ExploreReduced(LitmusSetup, LoadBufferingTeardown,
+        &audit, 100000);
+    EXPECT_EQ(Expected, audit.SeenPairs);
+    EXPECT_LT(full.Schedules, 100000);
+    EXPECT_LT(reduced.Schedules, 100000);
+    EXPECT_EQ(0, full.Truncated + reduced.Truncated);
+    EXPECT_EQ(0, full.Deadlocks + reduced.Deadlocks);
+    EXPECT_EQ(full.Outcomes, reduced.Outcomes);
+    EXPECT_EQ(full.OutcomeDigest, reduced.OutcomeDigest);
+    KmSchedSetWeakMemory(0);
+    KmSchedSetAtomicYields(0);
+}
+
+TEST(SchedulerAudit, SequentialConsistencyKeepsIndependentLoadsBeforeStores)
+{
+    LoadBufferingOutcomes(0, 0x7);
+}
+
+TEST(SchedulerAudit, WeakMemoryReordersExplicitIndependentLoadStorePairs)
+{
+    LoadBufferingOutcomes(1, 0xF);
+}
+
+//
+// Null or overlapping locations cannot describe independent operations.
+// Rejection must happen before either access, including outside a search.
+//
+TEST(SchedulerAudit, IndependentPairsRejectNullAndOverlappingLocations)
+{
+    volatile long value = 0;
+    volatile long* overlap = C_CAST(volatile long*, C_CAST(volatile char*, &value) + 1);
+    volatile long* sources[] = {nullptr, &value, &value, &value};
+    volatile long* targets[] = {&value, nullptr, &value, overlap};
+    for (int i = 0; i < 4; ++i)
+    {
+        KmExpectViolation(KmViolationLifetime);
+        KmSchedIndependentRelaxedLoadStore(sources[i], targets[i], 1);
+        EXPECT_EQ(KmViolationLifetime, KmTakeViolation());
+        EXPECT_EQ(0, value);
+    }
+}
+
+static void OrderedLoadStoreX(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    audit->Seen0 = KmSchedReadLong(&audit->Y, KM_ORDER_ACQUIRE);
+    KmSchedWriteLong(&audit->X, 1, KM_ORDER_RELEASE);
+}
+
+static void OrderedLoadStoreY(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    audit->Seen1 = KmSchedReadLong(&audit->X, KM_ORDER_ACQUIRE);
+    KmSchedWriteLong(&audit->Y, 1, KM_ORDER_RELEASE);
+}
+
+TEST(SchedulerAudit, OrderedLoadStoreOperationsDoNotUseTheIndependentPairModel)
+{
+    EXPECT_EQ(3, LitmusOutcomes(OrderedLoadStoreX, OrderedLoadStoreY, 1));
 }
 
 //
