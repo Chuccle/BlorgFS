@@ -172,6 +172,7 @@ if ($CacheMutantsOnly) {
     $variants = @(
         @{ Name = 'skip-subtree-publication'; Path = $dirPath; Text = $dir.Replace('const SIZE_T published = BlorgPathCachePublishDescendants(Dir, DirInfo, descendants, count, Ticket);', 'const SIZE_T published = 0;'); Test = $subtreeTest },
         @{ Name = 'seed-root-after-descendants'; ExpectedKilled = $false; Path = $dirPath; Text = $lateSeed; Test = $subtreeTest },
+        @{ Name = 'remove-cache-EOF-offset-guard'; Path = $diskPath; Text = $disk.Replace('Offset >= Key->Size || ', ''); Test = $eofTest },
         @{ Name = 'weaken-cache-EOF'; Path = $diskPath; Text = $disk.Replace('Offset >= Key->Size || Valid > Key->Size - Offset', 'FALSE'); Test = $eofTest },
         @{ Name = 'remove-snapshot-resource'; Path = $readPath; Text = $read.Replace($snapshot.Value, $unlocked); Test = $snapshotTest },
         @{ Name = 'skip-fill-rollback'; Path = $diskPath; Text = $disk.Replace('BlorgDiskCacheIndexCommit(&DiskCache.Index, slot, FALSE);', ''); Test = $fillTest },

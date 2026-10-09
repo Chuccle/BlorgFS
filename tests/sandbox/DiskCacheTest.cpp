@@ -1160,6 +1160,11 @@ TEST_F(DiskCacheTest, ValidBytesCannotExtendBeyondTheImmutableKey)
     EXPECT_FALSE(BlorgDiskCacheRead(&irp, &key, &Fcb->FullPath, 0, kBlock, kBlock,
         &fetches, DirectComplete));
     EXPECT_EQ(reads, DiskCacheModelIrps(IRP_MJ_READ));
+    EXPECT_EQ(0u, fetches);
+    EXPECT_FALSE(BlorgDiskCacheRead(&irp, &key, &Fcb->FullPath, key.Size + 1, kBlock, 1,
+        &fetches, DirectComplete));
+    EXPECT_EQ(0u, fetches) << "an offset past immutable EOF must not plan a network fetch";
+    EXPECT_EQ(reads, DiskCacheModelIrps(IRP_MJ_READ));
     DirectStatus = STATUS_PENDING;
     ASSERT_TRUE(BlorgDiskCacheRead(&irp, &key, &Fcb->FullPath, 0, kBlock, kBlock - 1,
         &fetches, DirectComplete));

@@ -2014,8 +2014,8 @@ Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),
 ### Cache safeguard mutation checks
 
 `powershell -File tools/Invoke-BlorgChecks.ps1 -CacheMutantsOnly -Configuration Release`
-rebuilds the real dispatch sandbox with seven safeguard mutations and an exploratory root-seed reordering: subtree publication, EOF
-bounds, snapshot resource acquisition, fill rollback, remaining drop counts,
+rebuilds the real dispatch sandbox with eight safeguard mutations and an exploratory root-seed reordering: subtree publication, EOF
+bounds and the independent offset guard, snapshot resource acquisition, fill rollback, remaining drop counts,
 partial EOF drop counts and response-version validation. Each named regression
 must pass before mutation, fail with a gtest assertion when its safeguard is removed, and pass
 after restoring the original source bytes. Compilation failures and crashes
