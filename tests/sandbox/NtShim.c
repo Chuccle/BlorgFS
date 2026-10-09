@@ -1308,15 +1308,18 @@ NTSTATUS IoCsqInitialize(
 // IoMarkIrpPending around this is double-marking -- which is why the model
 // does it rather than leaving it to the caller to imitate.
 //
+// DriverContext[3] is the queue's while the IRP is in it, as the kernel's
+// is: it holds the context, or the queue itself, and removal clears it.
+// Anything a driver keeps there is gone by the time a worker dequeues it.
+//
 VOID IoCsqInsertIrp(PIO_CSQ Csq, PIRP Irp, PIO_CSQ_IRP_CONTEXT Context)
 {
     KIRQL irql = 0;
 
-    (void)Context;
-
     Csq->CsqAcquireLock(Csq, &irql);
 
     IoMarkIrpPending(Irp);
+    Irp->Tail.Overlay.DriverContext[3] = Context ? (PVOID)Context : (PVOID)Csq;
     Csq->CsqInsertIrp(Csq, Irp);
 
     Csq->CsqReleaseLock(Csq, irql);
@@ -1333,6 +1336,7 @@ PIRP IoCsqRemoveNextIrp(PIO_CSQ Csq, PVOID PeekContext)
     if (irp)
     {
         Csq->CsqRemoveIrp(Csq, irp);
+        irp->Tail.Overlay.DriverContext[3] = NULL;
     }
 
     Csq->CsqReleaseLock(Csq, irql);

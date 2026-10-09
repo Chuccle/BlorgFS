@@ -53,7 +53,7 @@
 
 NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject);
 NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp);
-NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp);
+NTSTATUS BlorgFspRead(PIRP Irp, PIO_STACK_LOCATION IrpSp);
 
 //
 // Global state for the FSP worker pool: worker thread handles, the pending
@@ -280,7 +280,10 @@ Return Value:
                 }
                 case IRP_MJ_READ:
                 {
-                    result = BlorgVolumeRead(irp, irpSp);
+                    irp->Tail.Overlay.DriverContext[3] = irp->Tail.Overlay.DriverContext[1];
+                    irp->Tail.Overlay.DriverContext[1] = NULL;
+
+                    result = BlorgFspRead(irp, irpSp);
                     break;
                 }
                 case IRP_MJ_DIRECTORY_CONTROL:
@@ -315,11 +318,23 @@ Return Value:
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
+//
+// The queue owns DriverContext[3] while an IRP is in it: the CSQ keeps its
+// own pointer there and clears it on removal. A read carries its arrival
+// stamp there (BlorgRead), so across the queue the stamp rides in
+// DriverContext[1], which a read does not use until it is issued, and the
+// worker puts it back.
+//
 static VOID FspAddToWorkQueue(
     PIRP Irp
 )
 {
     NT_ASSERT(NULL != IoGetCurrentIrpStackLocation(Irp)->FileObject);
+
+    if (IRP_MJ_READ == IoGetCurrentIrpStackLocation(Irp)->MajorFunction)
+    {
+        Irp->Tail.Overlay.DriverContext[1] = Irp->Tail.Overlay.DriverContext[3];
+    }
 
     IoCsqInsertIrp(&FspQueue.Csq, Irp, NULL);
     KeSetEvent(&FspQueue.WorkEvent, EVENT_INCREMENT, FALSE);

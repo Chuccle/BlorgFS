@@ -412,7 +412,8 @@ static BOOLEAN ReadFairMustHold(PNON_PAGED_NODE Node, BOOLEAN MayHold)
 // STATUS_INSUFFICIENT_RESOURCES. The work item lives in DriverContext[2]
 // until the read is released -- the slot ReadIssueFetch stamps with the
 // issue time, which a held IRP has not reached. Its start tag waits in
-// DriverContext[1], which only the create path otherwise uses.
+// DriverContext[1], which a read otherwise uses only to carry its arrival
+// stamp across the FSP queue, before it gets here.
 //
 // PASSIVE_LEVEL: BlorgVolumeRead's inline path.
 //
@@ -989,9 +990,9 @@ static VOID ReadSucceeded(PIRP Irp, LONG64 ArrivedQpc)
 //  site in BlorgVolumeRead and measures what the driver waited on the
 //  network; DriverContext[3] carries the arrival stamp set in BlorgRead
 //  and measures what the application waited on the driver. Only READ IRPs
-//  use these two slots -- [1] belongs to the CREATE path's stash. Nothing
-//  here formats a %wZ/%Z: this runs at <= DISPATCH on the WSK completion
-//  chain, where that would touch paged code and bugcheck.
+//  use these two slots. Nothing here formats a %wZ/%Z: this runs at
+//  <= DISPATCH on the WSK completion chain, where that would touch paged
+//  code and bugcheck.
 //
 //  What arrived is offered to the disk cache before the IRP is completed,
 //  while its pages are still this read's (BlorgDiskCacheAdmit).
@@ -1752,11 +1753,6 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
         BLORGFS_PRINT("Cached read.\n");
 
-        BLORGFS_STAT_INC(ReadsCached);
-
-        fcb->ReadAheadConsumedBytes += realLength;
-        ReadAdaptGranularity(fcb, IrpSp->FileObject);
-
         if (!FlagOn(IrpSp->MinorFunction, IRP_MN_MDL))
         {
             PVOID systemBuffer = (!Irp->MdlAddress) ? Irp->UserBuffer : MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
@@ -1812,6 +1808,11 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             result = Irp->IoStatus.Status;
             NT_ASSERT(NT_SUCCESS(result));
         }
+
+        BLORGFS_STAT_INC(ReadsCached);
+
+        fcb->ReadAheadConsumedBytes += realLength;
+        ReadAdaptGranularity(fcb, IrpSp->FileObject);
     }
 
     if (!BooleanFlagOn(Irp->Flags, IRP_PAGING_IO))
@@ -1834,14 +1835,52 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 }
 
 //
+// The FCB a read's file object names, or NULL when it names anything else,
+// for the idle half of ReadRecordUserLatency.
+//
+static PFCB ReadFileFcb(PIO_STACK_LOCATION IrpSp)
+{
+    PFCB fcb = IrpSp->FileObject ? IrpSp->FileObject->FsContext : NULL;
+
+    if (fcb && BLORGFS_FCB_SIGNATURE != GET_NODE_TYPE(fcb))
+    {
+        fcb = NULL;
+    }
+
+    return fcb;
+}
+
+//
+// A posted read's pass on an FSP worker. The worker has put the arrival
+// stamp BlorgRead took back in DriverContext[3] (see FspAddToWorkQueue), and
+// a read the worker finishes closes its span here, as BlorgRead does for one
+// it finishes: a cached read that could not wait in the FSD arrives here,
+// and its stall is the one the application felt.
+//
+NTSTATUS BlorgFspRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+{
+    const LONG64 arrivedQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[3]));
+
+    NTSTATUS result = BlorgVolumeRead(Irp, IrpSp);
+
+    if (STATUS_PENDING != result)
+    {
+        ReadRecordUserLatency(ReadFileFcb(IrpSp), arrivedQpc);
+    }
+
+    return result;
+}
+
+//
 // IRP_MJ_READ dispatch entry point: sets up the IRP context and file-system
 // entry/exit bracketing, then routes to BlorgVolumeRead for the volume
 // device object (disk/FS-control device objects have no read support yet).
 //
 // A non-paging read is stamped on arrival into DriverContext[3], which
-// READ IRPs otherwise leave unused. DriverContext[2] already carries the
-// fetch issue stamp and is a different span: that one starts when the
-// driver asks the network, this one when the application asks the driver.
+// READ IRPs otherwise leave unused outside the FSP queue. DriverContext[2]
+// already carries the fetch issue stamp and is a different span: that one
+// starts when the driver asks the network, this one when the application
+// asks the driver.
 //
 // The synchronous return is where that span is closed, rather than in
 // BlorgCompleteRequest, because it is the interesting case: a cached read
@@ -1893,14 +1932,7 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
             if (STATUS_PENDING != result)
             {
-                PFCB fcb = irpSp->FileObject ? irpSp->FileObject->FsContext : NULL;
-
-                if (fcb && BLORGFS_FCB_SIGNATURE != GET_NODE_TYPE(fcb))
-                {
-                    fcb = NULL;
-                }
-
-                ReadRecordUserLatency(fcb, arrivedQpc);
+                ReadRecordUserLatency(ReadFileFcb(irpSp), arrivedQpc);
                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
 

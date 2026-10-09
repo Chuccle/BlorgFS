@@ -36,6 +36,10 @@ VOID ShimForceNextCcCopyReadMiss(VOID);
 // itself. See NonPagingDirectFetchAdvancesFileOffsetAndSetsFastIoOnCompletion
 // for why this test needs to call it directly.
 NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp);
+
+// Not declared in any header either; FspWorkQueueStressTest.cpp runs it the
+// same way, on a thread of its own.
+VOID BlorgFspDispatch(PVOID StartContext);
 }
 
 #include "DeviceKindScope.h"
@@ -558,6 +562,55 @@ TEST_F(ReadTest, CachedReadMissWithWaitReachesFsdPostRequest)
         << "a cache-miss repost must not have gone anywhere near the network";
 
     ShimDrainWorkItems();
+}
+
+//
+// The same miss with the queue running: the FSD pass posts, and a worker
+// serves the read. Each pass used to count the read's bytes toward the
+// read-ahead window, and the worker's pass recorded no latency, because the
+// queue had cleared the arrival stamp. The idle gap that decides whether a
+// reader is greedy then included the whole stall, so an overlapped copy
+// never grew its granule. Counted once, after the copy, and timed by the
+// worker, the read looks the same as one served without a post.
+//
+TEST_F(ReadTest, APostedCachedReadIsCountedOnceAndTimedByTheWorker)
+{
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
+
+    HANDLE worker = CreateThread(NULL, 0, [](LPVOID) -> DWORD { BlorgFspDispatch(NULL); return 0; }, NULL, 0, NULL);
+    ASSERT_NE((HANDLE)NULL, worker);
+
+    const ULONG length = 4096;
+    const ULONG64 consumed = Fcb->ReadAheadConsumedBytes;
+    const ULONG64 samples = BlorgStatisticsForCurrentProcessor()->UserReadSamples;
+
+    ShimForceNextCcCopyReadMiss();
+    ShimSetNextCcCopyReadInformation(length);
+
+    ReadRequest* req = PrepareRead(Fcb, 0, length, 0, 0, NewBuffer(length));
+    req->FileObject.Flags = FO_SYNCHRONOUS_IO;
+    req->Irp.Flags |= IRP_SYNCHRONOUS_API;
+
+    EXPECT_EQ(STATUS_PENDING, BlorgRead(Volume, &req->Irp));
+
+    const DWORD start = GetTickCount();
+
+    while (0 == ReadNoFence(&req->Irp.CompletionCount) && GetTickCount() - start < 30000)
+    {
+        SwitchToThread();
+    }
+
+    BlorgDestroyWorkQueue();
+    EXPECT_EQ(WAIT_OBJECT_0, WaitForSingleObject(worker, 30000));
+    CloseHandle(worker);
+
+    ASSERT_EQ(1u, req->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, req->Irp.IoStatus.Status);
+    EXPECT_EQ(consumed + length, Fcb->ReadAheadConsumedBytes)
+        << "a posted read counted toward the read-ahead window once per pass";
+    EXPECT_EQ(samples + 1, BlorgStatisticsForCurrentProcessor()->UserReadSamples)
+        << "the worker's completion recorded no latency: the arrival stamp did not survive the queue";
+    EXPECT_NE(0, Fcb->ReadIdleLastEndQpc);
 }
 
 //
