@@ -41,7 +41,18 @@
     output.
 
 .PARAMETER Tier
-    Build, Fast (default), Perf, or All.
+    Build, Fast (default), Proof, Perf, or All.
+
+.PARAMETER CoverageOnly
+    Run the Fast test set under OpenCppCoverage against the Debug x64
+    binaries already built, together with the socket and dispatch
+    scheduling tests and 2,000 client-fuzz iterations. Does not build.
+    Requires -Tier Fast, -Configuration Debug and an empty
+    CoverageDirectory.
+
+.PARAMETER CoverageDirectory
+    Where each suite's coverage, the merged Cobertura and HTML reports and
+    a manifest naming the head, the pins and the test profile are written.
 
 .PARAMETER Configuration
     Debug (default) or Release.
@@ -80,13 +91,27 @@ param(
     [string]$PerfDrive = 'B',
     [string]$PerfFile,
     [string]$BaselineDirectory,
-    [switch]$UpdateBaseline
+    [switch]$UpdateBaseline,
+    [switch]$CoverageOnly,
+    [string]$CoverageDirectory
 )
 
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $BaselineDirectory) { $BaselineDirectory = Join-Path $PSScriptRoot 'baselines' }
+
+if ($CoverageOnly) {
+    if ($Tier -ne 'Fast' -or $Configuration -ne 'Debug' -or -not $CoverageDirectory) {
+        throw '-CoverageOnly requires -Tier Fast -Configuration Debug -CoverageDirectory <empty directory>'
+    }
+    $coverageTool = (Get-Command OpenCppCoverage.exe -ErrorAction Stop).Source
+    $CoverageDirectory = [IO.Path]::GetFullPath($CoverageDirectory)
+    if ((Test-Path $CoverageDirectory) -and (Get-ChildItem $CoverageDirectory -Force)) {
+        throw 'CoverageDirectory must be empty; never merge coverage from an earlier head'
+    }
+    New-Item -ItemType Directory -Force $CoverageDirectory | Out-Null
+}
 
 $results = New-Object System.Collections.Generic.List[object]
 
@@ -199,6 +224,12 @@ function Invoke-TestExe {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe.FullName
     if ($Arguments) { $psi.Arguments = $Arguments }
+    if ($CoverageOnly) {
+        $coveragePath = Join-Path $CoverageDirectory "$($Label -replace ':', '-').cov"
+        Write-Host "==> $Label ($Pattern $Arguments)"
+        $psi.FileName = $coverageTool
+        $psi.Arguments = "--quiet --sources `"$repoRoot\src`" --export_type=binary:`"$coveragePath`" -- `"$($exe.FullName)`" $Arguments"
+    }
     $psi.WorkingDirectory = Split-Path -Parent $exe.FullName
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
@@ -219,10 +250,15 @@ function Invoke-TestExe {
     $errorOutput = $stderr.Result
 
     Set-Content -Encoding utf8 -Path (Join-Path $env:TEMP "$($Label -replace ':', '-').out") -Value $output
+    if ($CoverageOnly) {
+        Set-Content -Encoding utf8 -Path (Join-Path $CoverageDirectory "$($Label -replace ':', '-').out") -Value $output
+        Set-Content -Encoding utf8 -Path (Join-Path $CoverageDirectory "$($Label -replace ':', '-').err") -Value $errorOutput
+    }
 
     if ($proc.ExitCode -ne 0) {
         $tail = ($output -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 3) -join ' | '
-        if (-not $tail) { $tail = $errorOutput }
+        $errorTail = ($errorOutput -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 3) -join ' | '
+        if ($errorTail) { $tail = "$tail | $errorTail" }
         Add-Result $Label 'FAIL' "exit $($proc.ExitCode): $tail"
         return $false
     }
@@ -235,8 +271,8 @@ function Invoke-TestExe {
 
 $ok = $true
 
-$runsBuild = $Tier -in @('Build', 'Fast', 'Proof', 'All')
-$runsTests = $Tier -in @('Fast', 'All')
+$runsBuild = -not $CoverageOnly -and $Tier -in @('Build', 'Fast', 'Proof', 'All')
+$runsTests = -not $CoverageOnly -and $Tier -in @('Fast', 'All')
 
 #
 # The exhaustive interleaving explorations and the fuzzers are verification
@@ -249,7 +285,7 @@ $runsTests = $Tier -in @('Fast', 'All')
 # Nothing is deleted. -Tier Proof runs exactly what Fast excludes, so the
 # proofs stay one command away and CI can run both.
 #
-$runsProofs = $Tier -in @('Proof', 'All')
+$runsProofs = -not $CoverageOnly -and $Tier -in @('Proof', 'All')
 
 #
 # gtest filter applied in Fast. *SchedTest.* is every systematic
@@ -388,6 +424,47 @@ if ($runsProofs) {
     # The full corpus rather than the 500-iteration smoke Fast runs.
     #
     $ok = (Invoke-TestExe 'ClientFuzz.exe' 'proof:client-fuzz' 900 '50000' 'build:ClientFuzz') -and $ok
+}
+
+#
+# Coverage runs the scheduling suites in processes of their own, as the
+# Fast and Proof tiers do. Driver.c is linked into none of these binaries,
+# and the node-table explorations are left to the Proof tier.
+#
+if ($CoverageOnly) {
+    foreach ($test in @(
+        @('TlsTest.exe', 'coverage:tls', 300, ''),
+        @('TlsFuzzTest.exe', 'coverage:tls-fuzz', 300, ''),
+        @('ClientSandbox.exe', 'coverage:client', 600, $FastFilter),
+        @('ClientFuzz.exe', 'coverage:client-fuzz', 600, "2000 $FastFilter"),
+        @('SocketSandbox.exe', 'coverage:socket', 900, $FastFilter),
+        @('NodeTableSandbox.exe', 'coverage:nodes', 600, $FastFilter),
+        @('DispatchSandbox.exe', 'coverage:dispatch', 900, $FastFilter),
+        @('SocketSandbox.exe', 'coverage:socket-proofs', 900, '--gtest_filter=*SchedTest.*:*StressTest.*'),
+        @('DispatchSandbox.exe', 'coverage:dispatch-proofs', 1800, '--gtest_filter=*SchedTest.*:*StressTest.*'),
+        @('TlsHandshakeSandbox.exe', 'coverage:handshake', 600, ''))) {
+        $ok = (Invoke-TestExe $test[0] $test[1] $test[2] $test[3]) -and $ok
+    }
+    if ($ok) {
+        $mergeArguments = @(Get-ChildItem $CoverageDirectory -Filter '*.cov' |
+            ForEach-Object { "--input_coverage=$($_.FullName)" })
+        $mergeArguments += @("--export_type=cobertura:$(Join-Path $CoverageDirectory 'coverage.xml')",
+            "--export_type=html:$(Join-Path $CoverageDirectory 'html')")
+        & $coverageTool @mergeArguments
+        if ($LASTEXITCODE -ne 0) {
+            Add-Result 'coverage:merge' 'FAIL' "OpenCppCoverage exited $LASTEXITCODE"
+            $ok = $false
+        }
+        $manifest = @{
+            Head = (& git -C $repoRoot rev-parse HEAD)
+            Configuration = $Configuration
+            CoverageToolVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($coverageTool).FileVersion
+            Scope = 'src files linked into sandbox and TLS binaries; Driver.c excluded'
+            Profile = 'Fast plus dispatch/socket Sched/Stress; ClientFuzz 2000; node-table Sched/Stress excluded'
+            Pins = @(& git -C $repoRoot submodule status)
+        }
+        $manifest | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $CoverageDirectory 'manifest.json')
+    }
 }
 
 # ------------------------------------------------------------------- Perf
