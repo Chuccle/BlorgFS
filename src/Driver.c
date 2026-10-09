@@ -729,7 +729,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     BlorgFsFastDispatch.FastIoRead = BlorgFastIoRead;
     BlorgFsFastDispatch.MdlRead = FsRtlMdlReadDev;
     BlorgFsFastDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;
-    
 
     NTSTATUS result = BlorgInitialiseHttpClient();
 

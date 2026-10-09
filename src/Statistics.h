@@ -318,7 +318,6 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ReadAdaptWindowConsumed;
     ULONG64 ReadAdaptWindowFetched;
 
-
     ULONG64 SpeculativeLatencySumUs;
     ULONG64 SpeculativeLatencyMaxUs;
     ULONG64 DemandLatencySumUs;
@@ -513,7 +512,6 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 FetchBodyMaxUs;
     ULONG64 FetchSplitSamples;
 
-
     //
     // Everything from here down is per-processor diagnostic state rather
     // than a counter, and must not be summed across processors.
@@ -548,7 +546,6 @@ typedef struct _BLORGFS_STATISTICS
 // the same workload hits far more often with the feed than without.
 //
 #define BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE 0x00000002
-
 
 #define BLORGFS_STATISTICS_VERSION 21
 

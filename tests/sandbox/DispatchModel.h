@@ -183,7 +183,6 @@ VOID IoRemoveShareAccess(PFILE_OBJECT FileObject, PSHARE_ACCESS ShareAccess);
 BOOLEAN IoIsOperationSynchronous(PIRP Irp);
 PEPROCESS IoGetRequestorProcess(PIRP Irp);
 
-
 #ifdef __cplusplus
 }
 #endif

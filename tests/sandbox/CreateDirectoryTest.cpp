@@ -943,7 +943,6 @@ TEST_F(CreateDirectoryTest, FailedColdOpenDefersItsInsertedNodeForReap)
         << "the resolved node was never reaped after its open failed";
 }
 
-
 ///////////////////////////////////////////////////////////////////////////
 // Reopening a resident file -- CreateFcbIsCurrent / CreateFcbRefresh
 ///////////////////////////////////////////////////////////////////////////

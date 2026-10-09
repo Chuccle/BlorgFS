@@ -308,7 +308,6 @@ NTSTATUS BlorgQueryInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return result;
 }
 
-
 //
 // IRP_MJ_SET_INFORMATION dispatch entry point: stubbed out for every
 // device type (every branch is a no-op), so this always completes with

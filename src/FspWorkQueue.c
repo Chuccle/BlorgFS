@@ -324,7 +324,6 @@ static VOID FspAddToWorkQueue(
     IoCsqInsertIrp(&FspQueue.Csq, Irp, NULL);
     KeSetEvent(&FspQueue.WorkEvent, EVENT_INCREMENT, FALSE);
 
-
     BLORGFS_STAT_INC(FspPosts);
 
 }
@@ -447,7 +446,6 @@ Arguments:
 Return Value:
 
     STATUS_PENDING
-
 
 --*/
 

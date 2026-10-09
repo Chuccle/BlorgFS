@@ -550,10 +550,10 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
         << "an interleaving exists in which a pinned node was retired";
 
     //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
@@ -908,10 +908,10 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
         << "an interleaving exists in which a revived node was freed under its opener";
 
     //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
@@ -988,10 +988,10 @@ TEST_F(NodeTableSchedTest, NoAtomicInterleavingRetiresAPinnedNode)
         << "an interleaving exists in which a pinned node was retired";
 
     //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes in the table";
     EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the pin body";
     EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
@@ -1217,92 +1217,48 @@ TEST_F(NodeTableSchedTest, NoInterleavingStrandsAnIdleNode)
 }
 
 //
-
 // Positive control for the happens-before race detector. Two threads
-
 // increment a plain long with no lock and no interlocked op, registering
-
 // the accesses manually; the detector must flag the overlap. Without
-
 // this test, silence elsewhere proves nothing -- a detector that never
-
 // fires is indistinguishable from one that never works.
-
 //
-
 namespace {
 
-
-
 struct RaceControlProof
-
 {
-
     long Value;
-
 };
 
-
-
 void RacyWriter(void* Parameter)
-
 {
-
     RaceControlProof* proof = (RaceControlProof*)Parameter;
 
-
-
     for (int i = 0; i < 3; ++i)
-
     {
-
         KmSchedNoteAccess(&proof->Value, 1);
-
         proof->Value++;
-
         KmSchedYield();
-
     }
-
 }
-
-
 
 void RaceControlSetup(void* Parameter)
-
 {
-
     KmSchedSpawn(RacyWriter, Parameter);
-
     KmSchedSpawn(RacyWriter, Parameter);
-
 }
-
-
 
 void RaceControlTeardown(void* Parameter)
-
 {
-
     (void)Parameter;
-
 }
-
-
 
 }  // namespace
 
-
-
 TEST(SchedulerAudit, RaceDetectorFlagsUnsynchronizedAccess)
-
 {
-
     RaceControlProof proof = {};
-
     proof.Value = 0;
-
-
 
     KmSchedSetRaceDetection(1);
     KmExpectViolation(KmViolationLifetime);
@@ -1311,26 +1267,20 @@ TEST(SchedulerAudit, RaceDetectorFlagsUnsynchronizedAccess)
 
     KmSchedSetRaceDetection(0);
 
-
-
     EXPECT_GT(KmSchedRaceCount(), 0)
-
         << "the race detector never fired on a deliberately racy body";
     EXPECT_EQ(KmViolationLifetime, KmTakeViolation())
         << "the detector fired but the model did not record the violation";
-
 }
-
-
 
 //
 // A random sample through the atomic-granularity space of the pin body.
 // NoAtomicInterleavingRetiresAPinnedNode enumerates that space with the
 // partial-order reduction on; this one samples it with the reduction off,
-// and a few seconds of breadth catches gross granularity regressions -- a shim atomic silently ceasing to be a scheduling
-// point, say -- without paying for enumeration. Seeded, so a failure
-// reproduces exactly; on a hit, raise the count and re-run before
-// believing the seed was lucky.
+// and a few seconds of breadth catches gross granularity regressions -- a
+// shim atomic silently ceasing to be a scheduling point, say -- without
+// paying for enumeration. Seeded, so a failure reproduces exactly; on a
+// hit, raise the count and re-run before believing the seed was lucky.
 //
 TEST_F(NodeTableSchedTest, RandomAtomicPinSmoke)
 {

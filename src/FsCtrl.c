@@ -213,7 +213,6 @@ static NTSTATUS FsCtrlMountVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
     return STATUS_SUCCESS;
 }
 
-
 //
 // IRP_MJ_FILE_SYSTEM_CONTROL dispatch entry point: for the volume/FSDO
 // devices, routes IRP_MN_USER_FS_REQUEST to FsCtrlUser (oplock

@@ -27,7 +27,6 @@
 
 BOOLEAN ShimTraceEnabled = FALSE;
 
-
 VOID KeEnterCriticalRegion(VOID)
 {
     KmRequireIrqlAtMost(APC_LEVEL, "KeEnterCriticalRegion");

@@ -411,7 +411,6 @@ typedef struct _SINGLE_LIST_ENTRY_SHIM
 #define SINGLE_LIST_ENTRY  SINGLE_LIST_ENTRY_SHIM
 #define PSINGLE_LIST_ENTRY PSINGLE_LIST_ENTRY_SHIM
 
-
 static __inline void PushEntryList(PSINGLE_LIST_ENTRY Head, PSINGLE_LIST_ENTRY Entry)
 {
     Entry->Next = Head->Next;
@@ -484,7 +483,6 @@ NTSTATUS RtlHashUnicodeString(const UNICODE_STRING* String, BOOLEAN CaseInSensit
 WCHAR RtlUpcaseUnicodeChar(WCHAR Source);
 BOOLEAN RtlEqualUnicodeString(const UNICODE_STRING* String1, const UNICODE_STRING* String2, BOOLEAN CaseInSensitive);
 VOID RtlFreeUnicodeString(PUNICODE_STRING String);
-
 
 #define ReadAcquire(p)        (*(volatile LONG*)(p))
 #define WriteRelease(p, v)    (*(volatile LONG*)(p) = (v))

@@ -599,7 +599,6 @@ NTSTATUS BlorgInitialiseWskClient(VOID)
 
     SocketTlsRecvCapacity = tlsRecvRecords * SOCKET_TLS_RECORD_MAX_BYTES;
 
-
     return STATUS_SUCCESS;
 }
 

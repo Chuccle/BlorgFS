@@ -459,7 +459,6 @@ CHECK_PADDING_BETWEEN(COMMON_CONTEXT, RefCount, OnReapList);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, OnReapList, TableBucketIndex);
 CHECK_PADDING_END(COMMON_CONTEXT, TableBucketIndex);
 
-
 //
 // One concurrent reader position on a file: where its last read ended and
 // how many contiguous reads in a row it has issued. An FCB carries a small

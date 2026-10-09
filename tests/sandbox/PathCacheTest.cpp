@@ -1086,7 +1086,6 @@ TEST_F(PathCacheFeedTest, GoingLiveDropsWhatWasReadBeforeIt)
         << "a read ticketed before the feed came up was cached under it";
 }
 
-
 //
 // With the feed live, a listing keeps what is cached below its children:
 // the feed reports a child directory that is replaced or removed and drops

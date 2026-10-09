@@ -468,7 +468,6 @@ extern struct GLOBAL
     //
     ULONG DiskCacheMb;
 
-
 #ifdef DBG
     ULONG LogLevel;  // BLORGFS_PRINT verbosity; see macro above
 #endif

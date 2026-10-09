@@ -569,7 +569,6 @@ static VOID TlsHandshakeOnBulkReceive(NTSTATUS Status, ULONG_PTR BytesTransferre
     TlsHandshakeIssueReceiveRecordHeader(ctx);
 }
 
-
 //
 // PASSIVE_LEVEL work-item callback that re-enters
 // TlsHandshakeOnReceiveRecordPayload with the status stashed by the
