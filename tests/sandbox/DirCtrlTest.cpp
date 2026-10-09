@@ -542,6 +542,8 @@ TEST_F(DirCtrlTest, SecondQueryWhileFirstFetchIsOutstandingDoesNotReportNoMoreFi
 // A real network listing must seed its descendants after the root seed,
 // which discards older listings beneath it. Observe all three descendant
 // cache answers and the handle snapshot, not only the client's decoder.
+// This fixture has no FSP workers: completion publishes the snapshot, then
+// its requeue fails with STATUS_DEVICE_REMOVED and completes the query.
 //
 TEST_F(DirCtrlTest, NetworkSubtreePublishesDescendantsAfterSeedingTheRoot)
 {
@@ -561,7 +563,7 @@ TEST_F(DirCtrlTest, NetworkSubtreePublishesDescendantsAfterSeedingTheRoot)
     ASSERT_EQ(STATUS_PENDING, BlorgVolumeDirectoryControl(&query->Irp, &query->Stack));
     Drain();
     ASSERT_EQ(1, query->Irp.CompletionCount);
-    ASSERT_EQ(STATUS_SUCCESS, query->Irp.IoStatus.Status);
+    ASSERT_EQ(STATUS_DEVICE_REMOVED, query->Irp.IoStatus.Status);
     ASSERT_NE(nullptr, Ccb->Entries);
     EXPECT_EQ(0u, Ccb->Entries->DescendantCount);
     EXPECT_EQ(nullptr, Ccb->Entries->Descendants);
