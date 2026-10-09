@@ -21,8 +21,8 @@
 // These are neither -- they are this module's private state, and leaving
 // them external published two symbols nobody was allowed to use.
 //
-static WSK_REGISTRATION WskRegistration;
-static WSK_PROVIDER_NPI WskProviderNpi;
+static WSK_REGISTRATION SocketWskRegistration;
+static WSK_PROVIDER_NPI SocketWskProviderNpi;
 
 typedef struct _SOCKET_POOL_STATE
 {
@@ -98,7 +98,7 @@ ULONG SocketTlsRecvCapacity = SOCKET_TLS_RECV_RECORDS_LARGE * SOCKET_TLS_RECORD_
 // out with every field explicitly initialized (SocketAllocateAsyncContext
 // / SocketArmTimeout), so no zeroing is needed on reuse.
 //
-static NPAGED_LOOKASIDE_LIST AsyncContextLookaside;
+static NPAGED_LOOKASIDE_LIST SocketAsyncContextLookaside;
 
 static IO_COMPLETION_ROUTINE SocketContextCompletionRoutine;
 static IO_COMPLETION_ROUTINE SocketAsyncCompletionRoutine;
@@ -157,9 +157,14 @@ static LONG SocketPrewarmShuttingDown;
 static PIO_WORKITEM SocketPrewarmWorkItem;
 
 //
-// Pump-loop liveness flags -- declared with the rest of the pump's state
-// because BlorgInitialiseWskClient resets them; see their full comment at
-// SocketPrewarmPump.
+// Pump-loop liveness flags, both owned by SocketPool.Lock -- which is what
+// lets them be plain BOOLEANs rather than interlocked LONGs: every writer
+// holds the lock, so plain accesses are exact inside it and no fence
+// argument is needed anywhere. Running says an issue loop is live; Pending
+// records that a completion published a step while one was. The old
+// PumpGate/PumpWanted pair carried this same protocol on bare atomics with
+// a barrier-recheck tail -- the shape that hides exactly the weak-memory
+// window the reap gate's rework removed.
 //
 static BOOLEAN SocketPrewarmPumpRunning;
 static BOOLEAN SocketPrewarmPumpPending;
@@ -419,7 +424,7 @@ static PKSOCKET_ASYNC_CONTEXT SocketAllocateAsyncContext(
     PVOID CompletionContext
 )
 {
-    PKSOCKET_ASYNC_CONTEXT asyncContext = ExAllocateFromNPagedLookasideList(&AsyncContextLookaside);
+    PKSOCKET_ASYNC_CONTEXT asyncContext = ExAllocateFromNPagedLookasideList(&SocketAsyncContextLookaside);
 
     if (!asyncContext)
     {
@@ -430,7 +435,7 @@ static PKSOCKET_ASYNC_CONTEXT SocketAllocateAsyncContext(
 
     if (!asyncContext->Irp)
     {
-        ExFreeToNPagedLookasideList(&AsyncContextLookaside, asyncContext);
+        ExFreeToNPagedLookasideList(&SocketAsyncContextLookaside, asyncContext);
         return NULL;
     }
 
@@ -477,7 +482,7 @@ static VOID SocketAsyncTimeoutDpc(PKDPC Dpc, PVOID Context, PVOID SystemArgument
     if (SocketReleaseTimeoutRef(&asyncContext->Timeout))
     {
         IoFreeIrp(asyncContext->Irp);
-        ExFreeToNPagedLookasideList(&AsyncContextLookaside, asyncContext);
+        ExFreeToNPagedLookasideList(&SocketAsyncContextLookaside, asyncContext);
     }
 }
 
@@ -518,7 +523,7 @@ static NTSTATUS SocketAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP I
     if (SocketReleaseTimeoutRef(&asyncContext->Timeout))
     {
         IoFreeIrp(asyncContext->Irp);
-        ExFreeToNPagedLookasideList(&AsyncContextLookaside, asyncContext);
+        ExFreeToNPagedLookasideList(&SocketAsyncContextLookaside, asyncContext);
     }
 
     return STATUS_MORE_PROCESSING_REQUIRED;
@@ -542,7 +547,7 @@ NTSTATUS BlorgInitialiseWskClient(VOID)
         .Dispatch = &WskAppDispatch
     };
 
-    NTSTATUS result = WskRegister(&wskClientNpi, &WskRegistration);
+    NTSTATUS result = WskRegister(&wskClientNpi, &SocketWskRegistration);
 
     if (!NT_SUCCESS(result))
     {
@@ -550,11 +555,11 @@ NTSTATUS BlorgInitialiseWskClient(VOID)
         return result;
     }
 
-    result = WskCaptureProviderNPI(&WskRegistration, WSK_INFINITE_WAIT, &WskProviderNpi);
+    result = WskCaptureProviderNPI(&SocketWskRegistration, WSK_INFINITE_WAIT, &SocketWskProviderNpi);
 
     if (!NT_SUCCESS(result))
     {
-        WskDeregister(&WskRegistration);
+        WskDeregister(&SocketWskRegistration);
         BLORGFS_PRINT("WSK Provider Capture Failed: 0x%X\n", result);
         return result;
     }
@@ -562,7 +567,7 @@ NTSTATUS BlorgInitialiseWskClient(VOID)
     InitializeListHead(&SocketPool.List);
     SocketPool.Count = 0;
 
-    ExInitializeNPagedLookasideList(&AsyncContextLookaside, NULL, NULL, POOL_NX_ALLOCATION, sizeof(KSOCKET_ASYNC_CONTEXT), SOCKET_TAG, 0);
+    ExInitializeNPagedLookasideList(&SocketAsyncContextLookaside, NULL, NULL, POOL_NX_ALLOCATION, sizeof(KSOCKET_ASYNC_CONTEXT), SOCKET_TAG, 0);
 
     SocketPrewarmRemaining = 0;
     SocketPrewarmInFlight = 0;
@@ -606,9 +611,9 @@ NTSTATUS BlorgInitialiseWskClient(VOID)
 VOID BlorgCleanupWskClient(VOID)
 {
     BlorgCleanupWskSocketPool();
-    WskReleaseProviderNPI(&WskRegistration);
-    WskDeregister(&WskRegistration);
-    ExDeleteNPagedLookasideList(&AsyncContextLookaside);
+    WskReleaseProviderNPI(&SocketWskRegistration);
+    WskDeregister(&SocketWskRegistration);
+    ExDeleteNPagedLookasideList(&SocketAsyncContextLookaside);
 }
 
 //
@@ -706,8 +711,8 @@ NTSTATUS BlorgGetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRIN
         return result;
     }
 
-    result = WskProviderNpi.Dispatch->WskGetAddressInfo(
-        WskProviderNpi.Client,
+    result = SocketWskProviderNpi.Dispatch->WskGetAddressInfo(
+        SocketWskProviderNpi.Client,
         C_CAST(PUNICODE_STRING, NodeName),
         C_CAST(PUNICODE_STRING, ServiceName),
         0,
@@ -729,8 +734,8 @@ NTSTATUS BlorgGetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRIN
 // Frees an ADDRINFOEXW chain returned by BlorgGetWskAddrInfo.
 VOID BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo)
 {
-    WskProviderNpi.Dispatch->WskFreeAddressInfo(
-        WskProviderNpi.Client,
+    SocketWskProviderNpi.Dispatch->WskFreeAddressInfo(
+        SocketWskProviderNpi.Client,
         AddrInfo
     );
 }
@@ -948,24 +953,6 @@ static VOID SocketPrewarmComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reus
 // the behaviour that existed before pre-warming.
 //
 static VOID SocketPrewarmPump(VOID);
-
-//
-// Steps still owed by a fill -- declared with the rest of the pump's
-// teardown state above, which Initialise and Cleanup both touch.
-//
-
-//
-// Pump-loop liveness flags, both owned by SocketPool.Lock -- which is what
-// lets them be plain BOOLEANs rather than interlocked LONGs: every writer
-// holds the lock, so plain accesses are exact inside it and no fence
-// argument is needed anywhere. Running says an issue loop is live; Pending
-// records that a completion published a step while one was. The old
-// PumpGate/PumpWanted pair carried this same protocol on bare atomics with
-// a barrier-recheck tail -- the shape that hides exactly the weak-memory
-// window the reap gate's rework removed.
-//
-static BOOLEAN SocketPrewarmPumpRunning;
-static BOOLEAN SocketPrewarmPumpPending;
 
 static SOCKADDR_STORAGE SocketPrewarmAddress;
 
@@ -1436,7 +1423,7 @@ NTSTATUS BlorgSendRecvWskAsync(
     if (!asyncContext->Mdl)
     {
         IoFreeIrp(asyncContext->Irp);
-        ExFreeToNPagedLookasideList(&AsyncContextLookaside, asyncContext);
+        ExFreeToNPagedLookasideList(&SocketAsyncContextLookaside, asyncContext);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -1449,7 +1436,7 @@ NTSTATUS BlorgSendRecvWskAsync(
         NTSTATUS exceptionCode = GetExceptionCode();
         IoFreeMdl(asyncContext->Mdl);
         IoFreeIrp(asyncContext->Irp);
-        ExFreeToNPagedLookasideList(&AsyncContextLookaside, asyncContext);
+        ExFreeToNPagedLookasideList(&SocketAsyncContextLookaside, asyncContext);
         return exceptionCode;
     }
 
@@ -1719,8 +1706,8 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
         connectCtx,
         SOCKET_CONNECT_TIMEOUT_MS);
 
-    WskProviderNpi.Dispatch->WskSocketConnect(
-        WskProviderNpi.Client,
+    SocketWskProviderNpi.Dispatch->WskSocketConnect(
+        SocketWskProviderNpi.Client,
         SOCK_STREAM,
         IPPROTO_TCP,
         C_CAST(PSOCKADDR, &localAddress),
