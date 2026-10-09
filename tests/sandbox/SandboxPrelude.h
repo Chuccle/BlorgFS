@@ -65,6 +65,7 @@
 #include "FileInfoShim.h"
 #include "DispatchModel.h"
 #include "DiskCacheModel.h"
+#include "RegistryModel.h"
 #include "WskModel.h"
 
 //

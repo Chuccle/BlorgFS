@@ -111,6 +111,9 @@
     <ClCompile Include="DispatchTest.cpp" />
     <ClCompile Include="CreateDirectoryTest.cpp" />
     <ClCompile Include="ReadTest.cpp" />
+    <ClCompile Include="RegistryTest.cpp" />
+    <ClCompile Include="RegistryModel.c" />
+    <ClCompile Include="..\..\src\Registry.c" />
     <ClCompile Include="FileInfoTest.cpp" />
     <ClCompile Include="DirCtrlTest.cpp" />
     <ClCompile Include="DevIoCtrlTest.cpp" />

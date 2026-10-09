@@ -31,6 +31,8 @@
 #include <limits.h>
 #define C_CAST(T, expr) ((T)(expr))
 
+#define BLORGFS_REG_TAG 'GRBT'
+
 //
 // An unnamed member of named struct type is an MSVC extension to C that
 // C++ does not have, so nodes embed COMMON_CONTEXT one way when this
@@ -382,8 +384,8 @@ extern struct GLOBAL
     //
     //  Settable two ways, which interact --
     //
-    //    * Registry, read once at DriverEntry (DriverReadRegistryConfig
-    //      in Driver.c): HKLM\<service key>\Parameters\TlsEnabled
+    //    * Registry, read once at DriverEntry (BlorgReadRegistryConfig
+    //      in Registry.c): HKLM\<service key>\Parameters\TlsEnabled
     //      (REG_DWORD). This also picks the default remote port (443 if
     //      TRUE, 8080 if FALSE, unless Parameters\RemotePort explicitly
     //      overrides it) -- the port is resolved once, at load time, via
