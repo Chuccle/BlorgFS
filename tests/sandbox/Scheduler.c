@@ -63,6 +63,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <intrin.h>
 
 //
@@ -2723,4 +2724,132 @@ void KmSchedMemoryBarrier(void)
         RaceMyClock(&slot);
         WmFullFence(slot);
     }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Ordering mutants
+///////////////////////////////////////////////////////////////////////////
+
+#define KM_ORDER_MAX_SITES 512
+
+typedef struct _KM_ORDER_SITE
+{
+    const char* File;
+    int Line;
+} KM_ORDER_SITE;
+
+//
+// The environment is read once. Only the proof runs verify.yml makes set
+// either variable, and those run on the exploring thread alone, so the
+// site table is reached from one OS thread and needs nothing more than
+// plain statics. Every other process only reads the flag.
+//
+static long OrderEnvironmentRead = 0;
+static int OrderSitesTracked = 0;
+static int OrderSitesPrinted = 0;
+static int OrderMutant = -1;
+static KM_ORDER_SITE OrderSites[KM_ORDER_MAX_SITES];
+static int OrderSiteCount = 0;
+
+static void OrderReadEnvironment(void)
+{
+    if (0 != KmAtomicGet(&OrderEnvironmentRead))
+    {
+        return;
+    }
+
+    const char* mutant = getenv("KM_ORDER_MUTANT");
+    const char* sites = getenv("KM_ORDER_SITES");
+
+    OrderMutant = mutant ? atoi(mutant) : -1;
+    OrderSitesPrinted = sites && '1' == sites[0];
+    OrderSitesTracked = OrderMutant >= 0 || OrderSitesPrinted;
+
+    KmAtomicExchange(&OrderEnvironmentRead, 1);
+}
+
+//
+// A site is in the driver when its file is under src. The shims use the
+// same macros for their own locks and lists, and weakening those would
+// test the model rather than the driver.
+//
+static int OrderSiteInDriver(const char* File)
+{
+    return NULL != strstr(File, "\\src\\") || NULL != strstr(File, "/src/");
+}
+
+static int OrderSiteIndex(const char* What, const char* File, int Line)
+{
+    for (int i = 0; i < OrderSiteCount; i++)
+    {
+        if (Line == OrderSites[i].Line && 0 == strcmp(File, OrderSites[i].File))
+        {
+            return i;
+        }
+    }
+
+    if (KM_ORDER_MAX_SITES == OrderSiteCount)
+    {
+        fprintf(stderr, "\n[ordering] more than %d sites\n", KM_ORDER_MAX_SITES);
+        fflush(stderr);
+        abort();
+    }
+
+    OrderSites[OrderSiteCount].File = File;
+    OrderSites[OrderSiteCount].Line = Line;
+
+    if (OrderSitesPrinted)
+    {
+        printf("[ ordering ] site %d: %s:%d %s\n", OrderSiteCount, File, Line, What);
+        fflush(stdout);
+    }
+
+    return OrderSiteCount++;
+}
+
+static const char* OrderName(int Order)
+{
+    switch (Order)
+    {
+        case KM_ORDER_ACQUIRE:
+        {
+            return "acquire";
+        }
+        case KM_ORDER_RELEASE:
+        {
+            return "release";
+        }
+        case KM_ORDER_ACQ_REL:
+        {
+            return "acq_rel";
+        }
+        default:
+        {
+            return "seq_cst";
+        }
+    }
+}
+
+int KmSchedOrderAt(int Order, const char* File, int Line)
+{
+    OrderReadEnvironment();
+
+    if (!OrderSitesTracked || KM_ORDER_RELAXED == Order || !OrderSiteInDriver(File))
+    {
+        return Order;
+    }
+
+    return (OrderMutant == OrderSiteIndex(OrderName(Order), File, Line)) ? KM_ORDER_RELAXED : Order;
+}
+
+int KmSchedFenceAt(const char* File, int Line)
+{
+    OrderReadEnvironment();
+
+    if (!OrderSitesTracked || !OrderSiteInDriver(File))
+    {
+        return 1;
+    }
+
+    return OrderMutant != OrderSiteIndex("fence", File, Line);
 }

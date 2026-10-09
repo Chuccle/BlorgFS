@@ -382,6 +382,16 @@ first, which is the load-buffering outcome ARM64 allows. The
 `SchedulerAudit` load-buffering tests pin its outcome sets with and
 without the reduction. No driver code goes through it.
 
+### Ordering mutants
+
+Every access or fence a driver file asks for with an ordering stronger
+than relaxed is a site (`KmSchedOrderAt`, `KmSchedFenceAt`, through the
+`NtShim.h` macros). `KM_ORDER_SITES=1` prints each site a run reaches, and
+`KM_ORDER_MUTANT=n` weakens site n to relaxed, or drops it if it is a
+fence. verify.yml's Ordering mutants job runs the weak-memory proofs once
+per site and fails if they pass with any one weakened, so every ordering
+the proofs reach is one they show the driver needs.
+
 ### Registry configuration tests
 
 `Registry.c` is compiled into both the driver and DispatchSandbox.

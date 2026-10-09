@@ -393,6 +393,20 @@ void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value, int Order);
 void KmSchedMemoryBarrier(void);
 
 //
+// Ordering mutants. Every access or fence a driver source file asks for
+// with an ordering stronger than relaxed is a site, numbered in the order
+// the process first reaches it. KM_ORDER_MUTANT=n in the environment
+// weakens site n to relaxed for the whole process, or drops it if it is
+// a fence, and KM_ORDER_SITES=1 prints each site as it is first reached.
+// A proof that still passes with a site weakened does not depend on that
+// ordering; verify.yml runs the weak-memory proofs once per site and
+// fails on a site no proof depends on. Without either variable these
+// return at once.
+//
+int KmSchedOrderAt(int Order, const char* File, int Line);
+int KmSchedFenceAt(const char* File, int Line);
+
+//
 // A relaxed read of Source, then a relaxed write of Value to Target, which
 // the caller promises are independent: neither Target nor Value comes from
 // the read, and the two locations do not overlap (one that does is

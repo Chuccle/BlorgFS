@@ -134,6 +134,9 @@ jobs:
           - name: Socket proofs
             project: SocketSandbox
             filter: '*SchedTest.*:*StressTest.*'
+          - name: Ordering mutants
+            project: NodeTableSandbox
+            mutants: 'NodeTableSchedTest.NoAtomicInterleavingRetiresAPinnedNode:NodeTableSchedTest.NoInterleavingRetiresAPinnedDirectory:NodeTableSchedTest.NoInterleavingStrandsAnIdleNode:NodeTableRevivalSchedTest.NoAtomicInterleavingFreesARevivedNode'
           - name: Full fuzz corpus
             project: ClientFuzz
 
@@ -224,6 +227,53 @@ jobs:
           # reduction against it.
           & $path '--gtest_filter=${{ matrix.shard.filter }}'
           if ($LASTEXITCODE -ne 0) { throw "interleaving proofs failed with exit code $LASTEXITCODE" }
+
+      - name: Run ordering mutants
+        if: matrix.shard.mutants
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = @('x64\Release', 'tests\sandbox\x64\Release') |
+                  ForEach-Object { Join-Path $_ '${{ matrix.shard.project }}.exe' } |
+                  Where-Object { Test-Path $_ } |
+                  Select-Object -First 1
+          if (-not $path) { throw "${{ matrix.shard.project }}.exe was not built" }
+
+          # The weak-memory proofs, once to list every ordering they reach in
+          # driver code (KM_ORDER_SITES), then once per ordering with that one
+          # weakened to relaxed or, for a fence, dropped (KM_ORDER_MUTANT). A
+          # weakened ordering the proofs still pass with is one they do not
+          # depend on: either the driver does not need it or no proof reaches
+          # the execution that does. A run that fails, aborts or outlives its
+          # timeout has caught the mutant.
+          $filter = '--gtest_filter=${{ matrix.shard.mutants }}'
+          $out = Join-Path $env:RUNNER_TEMP 'ordering.txt'
+
+          $env:KM_ORDER_SITES = '1'
+          & $path $filter | Tee-Object -FilePath $out | Out-Null
+          if ($LASTEXITCODE -ne 0) { Get-Content $out; throw "the proofs failed with no ordering weakened" }
+          Remove-Item Env:KM_ORDER_SITES
+
+          $sites = @(Select-String -Path $out -Pattern '^\[ ordering \] site (\d+): (.+)$' |
+                     ForEach-Object { $_.Matches[0] })
+          if ($sites.Count -eq 0) { throw "the proofs reached no ordering in driver code" }
+
+          $survivors = @()
+          foreach ($site in $sites) {
+            $env:KM_ORDER_MUTANT = $site.Groups[1].Value
+            $run = Start-Process -FilePath $path -ArgumentList $filter -NoNewWindow -PassThru `
+                     -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+            if (-not $run.WaitForExit(300000)) {
+              $run.Kill()
+              continue
+            }
+            if (0 -eq $run.ExitCode) { $survivors += $site.Groups[2].Value }
+          }
+          Remove-Item Env:KM_ORDER_MUTANT
+
+          "$($sites.Count - $survivors.Count) of $($sites.Count) weakened orderings fail a proof"
+          $survivors | ForEach-Object { "survived: $_" }
+          if ($survivors.Count -ne 0) { throw "the proofs pass with $($survivors.Count) orderings weakened" }
 
       - name: Run the full fuzz corpus
         if: matrix.shard.project == 'ClientFuzz'
