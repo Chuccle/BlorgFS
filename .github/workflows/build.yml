@@ -18,6 +18,11 @@ on:
         description: Any id, echoed into the run name so you can find the run
         required: false
         default: ''
+      coverage:
+        description: Collect Debug x64 line coverage after the regression gate
+        type: boolean
+        required: false
+        default: false
 
 run-name: ${{ github.event_name == 'workflow_dispatch' && format('Build BlorgFS {0} {1}', github.ref_name, inputs.correlation_id) || github.event.pull_request.title || github.event.head_commit.message || github.workflow }}
 
@@ -250,6 +255,24 @@ jobs:
         Write-Host "--- TlsFuzzTest ---"
         & "$exeDir\TlsFuzzTest.exe"
         if ($LASTEXITCODE -ne 0) { throw "TlsFuzzTest failed with exit code $LASTEXITCODE" }
+
+    - name: Collect Debug line coverage
+      if: inputs.coverage && matrix.config == 'Debug'
+      shell: pwsh
+      run: |
+        choco install opencppcoverage -y --no-progress
+        if ($LASTEXITCODE -ne 0) { throw 'OpenCppCoverage installation failed' }
+        $env:Path += ";$env:ProgramFiles\OpenCppCoverage"
+        & tools\Invoke-BlorgChecks.ps1 -Tier Fast -Configuration Debug -CoverageOnly -CoverageDirectory "$env:RUNNER_TEMP\blorg-coverage"
+        if ($LASTEXITCODE -ne 0) { throw 'Coverage run failed' }
+
+    - name: Upload Debug coverage
+      if: always() && inputs.coverage && matrix.config == 'Debug'
+      uses: actions/upload-artifact@v7
+      with:
+        name: blorg-coverage-debug-x64
+        path: ${{ runner.temp }}/blorg-coverage
+        if-no-files-found: error
 
     # Only run once (Release leg) since it needs openssl installed and a live
     # s_server -- TlsTest/TlsFuzzTest above already run for every matrix leg.

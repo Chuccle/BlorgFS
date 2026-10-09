@@ -26,9 +26,9 @@ typedef NTSTATUS(*PFILL_ROUTINE)(
 // Rounds a directory-entry size up to the next 8-byte boundary, as
 // required for NextEntryOffset alignment in FILE_*_DIR_INFORMATION buffers.
 //
-static inline ULONG AlignEntrySize(ULONG size)
+static inline ULONG DirCtrlAlignEntrySize(ULONG Size)
 {
-    return (size + 7u) & ~7u;
+    return (Size + 7u) & ~7u;
 }
 
 //
@@ -66,7 +66,7 @@ static inline ULONG AlignEntrySize(ULONG size)
 // __try since FsRtlIsNameInExpression can raise STATUS_NO_MEMORY under
 // low resources.
 //
-static inline BOOLEAN MatchPattern(const PUNICODE_STRING EntryName, const PUNICODE_STRING SearchPattern, ULONGLONG Flags)
+static inline BOOLEAN DirCtrlMatchPattern(const PUNICODE_STRING EntryName, const PUNICODE_STRING SearchPattern, ULONGLONG Flags)
 {
     if (FlagOn(Flags, CCB_FLAG_MATCH_ALL))
     {
@@ -131,7 +131,7 @@ static inline BOOLEAN MatchPattern(const PUNICODE_STRING EntryName, const PUNICO
 // restrict-qualified parameter as incompatible with PFILL_ROUTINE's
 // unqualified one.
 //
-static inline NTSTATUS FillFileIdBothDirInfo(
+static inline NTSTATUS DirCtrlFillFileIdBothDirInfo(
     PFILE_ID_BOTH_DIR_INFORMATION Out,
     ULONG RemainingLength,
     ULONG Index,
@@ -147,7 +147,7 @@ static inline NTSTATUS FillFileIdBothDirInfo(
 )
 {
     ULONG rawSize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + Name->Length;
-    ULONG alignedSize = AlignEntrySize(rawSize);
+    ULONG alignedSize = DirCtrlAlignEntrySize(rawSize);
 
     if (RemainingLength < alignedSize)
     {
@@ -166,7 +166,7 @@ static inline NTSTATUS FillFileIdBothDirInfo(
     return STATUS_SUCCESS;
 }
 
-static inline NTSTATUS FillFileFullDirInfo(
+static inline NTSTATUS DirCtrlFillFileFullDirInfo(
     PFILE_FULL_DIR_INFORMATION Out,
     ULONG RemainingLength,
     ULONG Index,
@@ -182,7 +182,7 @@ static inline NTSTATUS FillFileFullDirInfo(
 )
 {
     ULONG rawSize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + Name->Length;
-    ULONG alignedSize = AlignEntrySize(rawSize);
+    ULONG alignedSize = DirCtrlAlignEntrySize(rawSize);
 
     if (RemainingLength < alignedSize)
     {
@@ -199,7 +199,7 @@ static inline NTSTATUS FillFileFullDirInfo(
     return STATUS_SUCCESS;
 }
 
-static inline NTSTATUS FillFileBothDirInfo(
+static inline NTSTATUS DirCtrlFillFileBothDirInfo(
     PFILE_BOTH_DIR_INFORMATION Out,
     ULONG RemainingLength,
     ULONG Index,
@@ -215,7 +215,7 @@ static inline NTSTATUS FillFileBothDirInfo(
 )
 {
     ULONG rawSize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + Name->Length;
-    ULONG alignedSize = AlignEntrySize(rawSize);
+    ULONG alignedSize = DirCtrlAlignEntrySize(rawSize);
 
     if (RemainingLength < alignedSize)
     {
@@ -256,7 +256,7 @@ static inline NTSTATUS FillFileBothDirInfo(
 // walking that chain would otherwise read past the last written entry
 // into an unwritten slot.
 //
-static NTSTATUS EnumerateDirectoryEntries(
+static NTSTATUS DirCtrlEnumerateDirectoryEntries(
     const PCCB Ccb,
     ULONG StartIndex,
     ULONG TotalEntries,
@@ -316,7 +316,7 @@ static NTSTATUS EnumerateDirectoryEntries(
             attrs = FILE_ATTRIBUTE_NORMAL;
         }
 
-        if (MatchPattern(&name, Pattern, Flags))
+        if (DirCtrlMatchPattern(&name, Pattern, Flags))
         {
             SIZE_T written = 0;
             NTSTATUS st = FillFn(
@@ -746,25 +746,33 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 }
             }
 
-            if ((IrpSp->Parameters.QueryDirectory.FileName) && (IrpSp->Parameters.QueryDirectory.FileName->Buffer) && (0 < IrpSp->Parameters.QueryDirectory.FileName->Length))
+            PUNICODE_STRING pattern = IrpSp->Parameters.QueryDirectory.FileName;
+            BOOLEAN hasPattern = pattern && pattern->Buffer && (0 < pattern->Length);
+
+            if ((initialQuery || restartScan) && !netDone)
             {
-                if ((initialQuery || restartScan) && !netDone)
+                if (!BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_IN_FSP))
                 {
-                    if (!BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_IN_FSP))
-                    {
-                        BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                        ExReleaseResourceLite(dcb->Header.Resource);
-                        return BlorgFsdPostRequest(Irp, IrpSp);
-                    }
+                    BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
+                    ExReleaseResourceLite(dcb->Header.Resource);
+                    return BlorgFsdPostRequest(Irp, IrpSp);
+                }
 
-                    RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
+                RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
 
-                    if (ccb->SearchPattern.Buffer)
-                    {
-                        RtlFreeUnicodeString(&ccb->SearchPattern);
-                    }
+                if (ccb->SearchPattern.Buffer)
+                {
+                    RtlFreeUnicodeString(&ccb->SearchPattern);
+                    RtlZeroMemory(&ccb->SearchPattern, sizeof(UNICODE_STRING));
+                }
 
-                    result = RtlUpcaseUnicodeString(&ccb->SearchPattern, IrpSp->Parameters.QueryDirectory.FileName, TRUE);
+                if (!hasPattern)
+                {
+                    SetFlag(ccb->Flags, CCB_FLAG_MATCH_ALL);
+                }
+                else
+                {
+                    result = RtlUpcaseUnicodeString(&ccb->SearchPattern, pattern, TRUE);
 
                     if (!NT_SUCCESS(result))
                     {
@@ -776,28 +784,6 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     {
                         SetFlag(ccb->Flags, CCB_FLAG_MATCH_ALL);
                     }
-                }
-            }
-            else
-            {
-                if ((initialQuery || restartScan) && !netDone)
-                {
-                    if (!BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_IN_FSP))
-                    {
-                        BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                        ExReleaseResourceLite(dcb->Header.Resource);
-                        return BlorgFsdPostRequest(Irp, IrpSp);
-                    }
-
-                    RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
-
-                    if (ccb->SearchPattern.Buffer)
-                    {
-                        RtlFreeUnicodeString(&ccb->SearchPattern);
-                        RtlZeroMemory(&ccb->SearchPattern, sizeof(UNICODE_STRING));
-                    }
-
-                    SetFlag(ccb->Flags, CCB_FLAG_MATCH_ALL);
                 }
             }
 
@@ -855,153 +841,85 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             ULONG totalEntries = C_CAST(ULONG, ccb->Entries->FileCount + ccb->Entries->SubDirCount);
 
-            __try
+            PFILL_ROUTINE fill = NULL;
+
+            switch (IrpSp->Parameters.QueryDirectory.FileInformationClass)
             {
-                switch (IrpSp->Parameters.QueryDirectory.FileInformationClass)
+                case FileIdBothDirectoryInformation:
                 {
-                    case FileIdBothDirectoryInformation:
-                    {
-                        PFILE_ID_BOTH_DIR_INFORMATION dirInfo = (!Irp->MdlAddress) ?
-                            Irp->UserBuffer :
-                            MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
-
-                        if (!dirInfo)
-                        {
-                            result = STATUS_INSUFFICIENT_RESOURCES;
-                            break;
-                        }
-
-                        if (!Irp->MdlAddress && UserMode == Irp->RequestorMode)
-                        {
-                            ProbeForRead(Irp->UserBuffer, IrpSp->Parameters.QueryDirectory.Length, sizeof(UCHAR));
-                        }
-
-                        SIZE_T used = 0;
-                        result = EnumerateDirectoryEntries(
-                            ccb,
-                            index,
-                            totalEntries,
-                            &ccb->SearchPattern,
-                            ccb->Flags,
-                            returnSingleEntry,
-                            dirInfo,
-                            remainingLength,
-                            FillFileIdBothDirInfo,
-                            &used,
-                            &index
-                        );
-
-                        if (NT_SUCCESS(result))
-                        {
-                            Irp->IoStatus.Information = used;
-                        }
-
-                        updateCcb = !indexSpecified;
-                        break;
-                    }
-                    case FileDirectoryInformation:
-                    {
-                        result = STATUS_NOT_IMPLEMENTED;
-                        break;
-                    }
-                    case FileFullDirectoryInformation:
-                    {
-                        PFILE_FULL_DIR_INFORMATION dirInfo = (!Irp->MdlAddress) ? Irp->UserBuffer : MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
-
-                        if (!dirInfo)
-                        {
-                            result = STATUS_INSUFFICIENT_RESOURCES;
-                            break;
-                        }
-
-                        if (!Irp->MdlAddress && UserMode == Irp->RequestorMode)
-                        {
-                            ProbeForRead(Irp->UserBuffer, IrpSp->Parameters.QueryDirectory.Length, sizeof(UCHAR));
-                        }
-
-                        SIZE_T used = 0;
-                        result = EnumerateDirectoryEntries(
-                            ccb,
-                            index,
-                            totalEntries,
-                            &ccb->SearchPattern,
-                            ccb->Flags,
-                            returnSingleEntry,
-                            dirInfo,
-                            remainingLength,
-                            FillFileFullDirInfo,
-                            &used,
-                            &index
-                        );
-
-                        if (NT_SUCCESS(result))
-                        {
-                            Irp->IoStatus.Information = used;
-                        }
-
-                        updateCcb = !indexSpecified;
-                        break;
-                    }
-                    case FileIdFullDirectoryInformation:
-                    {
-                        result = STATUS_NOT_IMPLEMENTED;
-                        break;
-                    }
-                    case FileNamesInformation:
-                    {
-                        result = STATUS_NOT_IMPLEMENTED;
-                        break;
-                    }
-                    case FileBothDirectoryInformation:
-                    {
-                        PFILE_BOTH_DIR_INFORMATION dirInfo = (!Irp->MdlAddress) ?
-                            Irp->UserBuffer :
-                            MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
-
-                        if (!dirInfo)
-                        {
-                            result = STATUS_INSUFFICIENT_RESOURCES;
-                            break;
-                        }
-
-                        if (!Irp->MdlAddress && UserMode == Irp->RequestorMode)
-                        {
-                            ProbeForRead(Irp->UserBuffer, IrpSp->Parameters.QueryDirectory.Length, sizeof(UCHAR));
-                        }
-
-                        SIZE_T used = 0;
-                        result = EnumerateDirectoryEntries(
-                            ccb,
-                            index,
-                            totalEntries,
-                            &ccb->SearchPattern,
-                            ccb->Flags,
-                            returnSingleEntry,
-                            dirInfo,
-                            remainingLength,
-                            FillFileBothDirInfo,
-                            &used,
-                            &index
-                        );
-
-                        if (NT_SUCCESS(result))
-                        {
-                            Irp->IoStatus.Information = used;
-                        }
-
-                        updateCcb = !indexSpecified;
-                        break;
-                    }
-                    default:
-                    {
-                        result = STATUS_INVALID_INFO_CLASS;
-                    }
+                    fill = DirCtrlFillFileIdBothDirInfo;
+                    break;
+                }
+                case FileFullDirectoryInformation:
+                {
+                    fill = DirCtrlFillFileFullDirInfo;
+                    break;
+                }
+                case FileBothDirectoryInformation:
+                {
+                    fill = DirCtrlFillFileBothDirInfo;
+                    break;
+                }
+                case FileDirectoryInformation:
+                case FileIdFullDirectoryInformation:
+                case FileNamesInformation:
+                {
+                    result = STATUS_NOT_IMPLEMENTED;
+                    break;
+                }
+                default:
+                {
+                    result = STATUS_INVALID_INFO_CLASS;
                 }
             }
-            __except (EXCEPTION_EXECUTE_HANDLER)
+
+            if (fill)
             {
-                updateCcb = FALSE;
-                result = GetExceptionCode();
+                __try
+                {
+                    PVOID buffer = (!Irp->MdlAddress) ?
+                        Irp->UserBuffer :
+                        MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
+
+                    if (!buffer)
+                    {
+                        result = STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    else
+                    {
+                        if (!Irp->MdlAddress && UserMode == Irp->RequestorMode)
+                        {
+                            ProbeForWrite(Irp->UserBuffer, IrpSp->Parameters.QueryDirectory.Length, sizeof(UCHAR));
+                        }
+
+                        SIZE_T used = 0;
+                        result = DirCtrlEnumerateDirectoryEntries(
+                            ccb,
+                            index,
+                            totalEntries,
+                            &ccb->SearchPattern,
+                            ccb->Flags,
+                            returnSingleEntry,
+                            buffer,
+                            remainingLength,
+                            fill,
+                            &used,
+                            &index
+                        );
+
+                        if (NT_SUCCESS(result))
+                        {
+                            Irp->IoStatus.Information = used;
+                        }
+
+                        updateCcb = !indexSpecified;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                    updateCcb = FALSE;
+                    result = GetExceptionCode();
+                }
             }
 
             if (updateCcb)

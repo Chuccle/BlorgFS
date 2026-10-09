@@ -80,6 +80,12 @@ VOID BlorgFreeSecurityDescriptor(VOID)
 // SeQuerySecurityDescriptorInfo, guarded by SEH since the buffer is
 // user-supplied.
 //
+// A buffer too small for them is answered with the warning
+// STATUS_BUFFER_OVERFLOW and the length needed, as fastfat does. The I/O
+// manager passes Information back for a warning but not for the error
+// SeQuerySecurityDescriptorInfo returns, so NtQuerySecurityObject's
+// caller would otherwise never learn the length to retry with.
+//
 static NTSTATUS SecurityQueryVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     SECURITY_INFORMATION securityInformation = IrpSp->Parameters.QuerySecurity.SecurityInformation;
@@ -100,6 +106,11 @@ static NTSTATUS SecurityQueryVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp)
     {
         status = GetExceptionCode();
         length = 0;
+    }
+
+    if (STATUS_BUFFER_TOO_SMALL == status)
+    {
+        status = STATUS_BUFFER_OVERFLOW;
     }
 
     Irp->IoStatus.Information = length;

@@ -31,6 +31,8 @@
 #include <limits.h>
 #define C_CAST(T, expr) ((T)(expr))
 
+#define BLORGFS_REG_TAG 'GRBT'
+
 //
 // An unnamed member of named struct type is an MSVC extension to C that
 // C++ does not have, so nodes embed COMMON_CONTEXT one way when this
@@ -310,7 +312,7 @@ extern struct GLOBAL
     //  ANSI hostname (no port) for the ClientHello SNI extension, built in
     //  DriverEntry alongside RemoteHostAnsi. NULL when TLS is disabled at
     //  load, when the configured host is an IPv4/IPv6 literal (RFC 6066
-    //  forbids literals in SNI -- see HostStringIsIpLiteral, Driver.c), or
+    //  forbids literals in SNI -- see DriverHostStringIsIpLiteral, Driver.c), or
     //  on allocation failure; BlorgTlsStartHandshakeAsync omits the extension
     //  in all three cases. NUL-terminated (pool-zero allocated), bounded
     //  by BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES like RemoteHostAnsi.
@@ -382,8 +384,8 @@ extern struct GLOBAL
     //
     //  Settable two ways, which interact --
     //
-    //    * Registry, read once at DriverEntry (DriverReadRegistryConfig
-    //      in Driver.c): HKLM\<service key>\Parameters\TlsEnabled
+    //    * Registry, read once at DriverEntry (BlorgReadRegistryConfig
+    //      in Registry.c): HKLM\<service key>\Parameters\TlsEnabled
     //      (REG_DWORD). This also picks the default remote port (443 if
     //      TRUE, 8080 if FALSE, unless Parameters\RemotePort explicitly
     //      overrides it) -- the port is resolved once, at load time, via
@@ -438,7 +440,7 @@ extern struct GLOBAL
     //  requested portions) for every IRP_MJ_QUERY_SECURITY. BlorgFS does not
     //  store per-file security -- the volume is a read-only public share --
     //  so one permissive descriptor serves all nodes. Built once in
-    //  DriverEntry, freed in DriverUnload.
+    //  DriverEntry, freed in BlorgDriverUnload.
     //
     PSECURITY_DESCRIPTOR FileSecurityDescriptor;
 
@@ -465,7 +467,6 @@ extern struct GLOBAL
     // from DiskCachePath, read alongside it (DISK_CACHE_DEFAULT_PATH).
     //
     ULONG DiskCacheMb;
-
 
 #ifdef DBG
     ULONG LogLevel;  // BLORGFS_PRINT verbosity; see macro above

@@ -19,11 +19,11 @@
 //    relaxed read anywhere in this file that is not separated from the
 //    corresponding write by such a call in both directions.
 //
-// 2. Hardware/OS side. SwitchToFiber enters the kernel's context-switch
-//    path, which issues full barriers on every architecture Windows
-//    ships on (x86/x64 get TSO from the hardware itself; ARM64 gets
-//    explicit barriers in KiSwapContext). Successor sees predecessor's
-//    stores; nothing weaker is relied on.
+// 2. Execution side. Every fiber runs on the one OS thread that called
+//    KmExploreInterleavings, so these accesses are that thread's, whichever
+//    modeled thread the running fiber stands for. SwitchToFiber is a
+//    user-mode switch: it enters no kernel path and issues no fence, and
+//    nothing here needs one.
 //
 // What this forbids, and what the primitives therefore never do: reaching
 // for OS identity (TLS, GetCurrentThreadId -- shared by all fibers of the
@@ -63,6 +63,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <intrin.h>
 
 //
@@ -76,9 +77,9 @@
 // those wrappers, not repeated at each use. Every other static in this
 // file is reached only across SwitchToFiber boundaries, and that
 // executor argument is architecture-neutral too: SwitchToFiber is an
-// opaque externally-linked call, so a compiler barrier on any target,
-// and the kernel context-switch path it enters issues full barriers on
-// every architecture Windows ships.
+// opaque externally-linked call, so a compiler barrier on any target, and
+// everything runs on one OS thread. What one modeled thread may not yet
+// see of another's writes is the weak-memory model's (WmLocations).
 //
 
 // Generous: atomic-granularity exploration reaches a few hundred scheduling
@@ -594,14 +595,16 @@ static int FootprintReported = 0;
 // may return an older value than the last one written, as long as the
 // orderings in the program allow it.
 //
-// The model is the C++ one less load buffering, over the happens-before
-// clocks the race detector keeps. Every location the shims touch keeps its
-// writes in the order they happened. A read may return the newest write,
-// or any older one down to the newest write that happens-before the
-// reader, and never older than one the same thread already read or wrote
-// there. It never returns a write not yet made, which is the load
-// buffering left out (Scheduler.h). Each value it may return is a branch
-// the explorer takes, recorded in the schedule like a choice of thread.
+// The model is the C++ one, over the happens-before clocks the race
+// detector keeps. Every location the shims touch keeps its writes in the
+// order they happened. A read may return the newest write, or any older
+// one down to the newest write that happens-before the reader, and never
+// older than one the same thread already read or wrote there. It never
+// returns a write not yet made, so load buffering is reached only through
+// a read and write a test declares independent
+// (KmSchedIndependentRelaxedLoadStore), whose write may go first. Each
+// value a read may return, and each order of such a pair, is a branch the
+// explorer takes, recorded in the schedule like a choice of thread.
 //
 // The orderings (KM_ORDER_*):
 //
@@ -2674,6 +2677,38 @@ void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value, int Order)
 }
 
 //
+// See Scheduler.h. Both footprints are noted before the order is chosen,
+// so the reduction cannot commute the choice past a conflicting access;
+// each access keeps its own scheduling point.
+//
+long KmSchedIndependentRelaxedLoadStore(long volatile* Source, long volatile* Target, long Value)
+{
+    const ULONG_PTR source = (ULONG_PTR)Source;
+    const ULONG_PTR target = (ULONG_PTR)Target;
+
+    if (!Source || !Target ||
+        (source <= target ? target - source : source - target) < sizeof(*Source))
+    {
+        KmReportViolation(KmViolationLifetime, "independent relaxed pair has overlapping locations");
+        return 0;
+    }
+
+    AtomicYield();
+    KmSchedNoteFootprint((const void*)Source, sizeof(*Source), 0);
+    KmSchedNoteFootprint((const void*)Target, sizeof(*Target), 1);
+
+    if (WeakMemory && Current >= 0 && ChooseValue(2))
+    {
+        KmSchedWriteLong(Target, Value, KM_ORDER_RELAXED);
+        return KmSchedReadLong(Source, KM_ORDER_RELAXED);
+    }
+
+    const long value = KmSchedReadLong(Source, KM_ORDER_RELAXED);
+    KmSchedWriteLong(Target, Value, KM_ORDER_RELAXED);
+    return value;
+}
+
+//
 // A full fence with no access of its own: KeMemoryBarrier and
 // MemoryBarrier.
 //
@@ -2689,4 +2724,132 @@ void KmSchedMemoryBarrier(void)
         RaceMyClock(&slot);
         WmFullFence(slot);
     }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Ordering mutants
+///////////////////////////////////////////////////////////////////////////
+
+#define KM_ORDER_MAX_SITES 512
+
+typedef struct _KM_ORDER_SITE
+{
+    const char* File;
+    int Line;
+} KM_ORDER_SITE;
+
+//
+// The environment is read once. Only the proof runs verify.yml makes set
+// either variable, and those run on the exploring thread alone, so the
+// site table is reached from one OS thread and needs nothing more than
+// plain statics. Every other process only reads the flag.
+//
+static long OrderEnvironmentRead = 0;
+static int OrderSitesTracked = 0;
+static int OrderSitesPrinted = 0;
+static int OrderMutant = -1;
+static KM_ORDER_SITE OrderSites[KM_ORDER_MAX_SITES];
+static int OrderSiteCount = 0;
+
+static void OrderReadEnvironment(void)
+{
+    if (0 != KmAtomicGet(&OrderEnvironmentRead))
+    {
+        return;
+    }
+
+    const char* mutant = getenv("KM_ORDER_MUTANT");
+    const char* sites = getenv("KM_ORDER_SITES");
+
+    OrderMutant = mutant ? atoi(mutant) : -1;
+    OrderSitesPrinted = sites && '1' == sites[0];
+    OrderSitesTracked = OrderMutant >= 0 || OrderSitesPrinted;
+
+    KmAtomicExchange(&OrderEnvironmentRead, 1);
+}
+
+//
+// A site is in the driver when its file is under src. The shims use the
+// same macros for their own locks and lists, and weakening those would
+// test the model rather than the driver.
+//
+static int OrderSiteInDriver(const char* File)
+{
+    return NULL != strstr(File, "\\src\\") || NULL != strstr(File, "/src/");
+}
+
+static int OrderSiteIndex(const char* What, const char* File, int Line)
+{
+    for (int i = 0; i < OrderSiteCount; i++)
+    {
+        if (Line == OrderSites[i].Line && 0 == strcmp(File, OrderSites[i].File))
+        {
+            return i;
+        }
+    }
+
+    if (KM_ORDER_MAX_SITES == OrderSiteCount)
+    {
+        fprintf(stderr, "\n[ordering] more than %d sites\n", KM_ORDER_MAX_SITES);
+        fflush(stderr);
+        abort();
+    }
+
+    OrderSites[OrderSiteCount].File = File;
+    OrderSites[OrderSiteCount].Line = Line;
+
+    if (OrderSitesPrinted)
+    {
+        printf("[ ordering ] site %d: %s:%d %s\n", OrderSiteCount, File, Line, What);
+        fflush(stdout);
+    }
+
+    return OrderSiteCount++;
+}
+
+static const char* OrderName(int Order)
+{
+    switch (Order)
+    {
+        case KM_ORDER_ACQUIRE:
+        {
+            return "acquire";
+        }
+        case KM_ORDER_RELEASE:
+        {
+            return "release";
+        }
+        case KM_ORDER_ACQ_REL:
+        {
+            return "acq_rel";
+        }
+        default:
+        {
+            return "seq_cst";
+        }
+    }
+}
+
+int KmSchedOrderAt(int Order, const char* File, int Line)
+{
+    OrderReadEnvironment();
+
+    if (!OrderSitesTracked || KM_ORDER_RELAXED == Order || !OrderSiteInDriver(File))
+    {
+        return Order;
+    }
+
+    return (OrderMutant == OrderSiteIndex(OrderName(Order), File, Line)) ? KM_ORDER_RELAXED : Order;
+}
+
+int KmSchedFenceAt(const char* File, int Line)
+{
+    OrderReadEnvironment();
+
+    if (!OrderSitesTracked || !OrderSiteInDriver(File))
+    {
+        return 1;
+    }
+
+    return OrderMutant != OrderSiteIndex("fence", File, Line);
 }

@@ -85,8 +85,8 @@ protected:
 
     //
     // Leaf-first teardown of whatever the test left behind, mirroring
-    // Driver.c's FreeFileContextTree -- which is static there, so it is not
-    // one of the translation units under test.
+    // Driver.c's DriverFreeFileContextTree -- which is static there, so it is
+    // not one of the translation units under test.
     //
     void FreeTree()
     {

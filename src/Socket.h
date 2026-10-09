@@ -113,7 +113,7 @@ typedef struct _KSOCKET
     // context and desyncing the connection's read sequence. Lazily
     // allocated by the HTTP client on the first TLS receive
     // (NonPagedPoolNx -- the drain loop reads it at <= DISPATCH_LEVEL);
-    // freed with the socket (FreeKSocket, Socket.c). Zeroed at socket
+    // freed with the socket (SocketFreeKSocket, Socket.c). Zeroed at socket
     // creation, so a plain (non-TLS) connection never allocates any of
     // it. TlsRecvLength counts buffered ciphertext bytes; TlsRecvOffset
     // is the first unconsumed byte within them.

@@ -2,7 +2,7 @@
 
 //
 //  Cache manager callbacks (acquire/release for lazy write and read-ahead)
-//  and the FastIoCheckIfPossible fast-I/O entry point.
+//  and the BlorgFastIoCheckIfPossible fast-I/O entry point.
 //
 
 _Requires_lock_held_(_Global_critical_region_)
@@ -70,7 +70,7 @@ Notes:
     NT_ASSERT(NULL != PsGetCurrentThread());
     NT_ASSERT(NULL == C_CAST(PFCB, Context)->LazyWriteThread);
 
-    (C_CAST(PFCB, Context))->LazyWriteThread = PsGetCurrentThread();
+    C_CAST(PFCB, Context)->LazyWriteThread = PsGetCurrentThread();
 
     InterlockedCompareExchangePointer(&global.LazyWriteThread, PsGetCurrentThread(), NULL);
 
@@ -111,7 +111,7 @@ Return Value:
     NT_ASSERT(NULL != PsGetCurrentThread());
     NT_ASSERT(PsGetCurrentThread() == C_CAST(PFCB, Context)->LazyWriteThread);
 
-    (C_CAST(PFCB, Context))->LazyWriteThread = NULL;
+    C_CAST(PFCB, Context)->LazyWriteThread = NULL;
 
     ExReleaseResourceLite(C_CAST(PFCB, Context)->Header.PagingIoResource);
 
@@ -162,7 +162,6 @@ Notes:
     if (!ExAcquireResourceSharedLite(C_CAST(PFCB, Context)->Header.Resource,
         Wait))
     {
-
         return FALSE;
     }
 
@@ -208,7 +207,7 @@ Return Value:
 
 _Function_class_(FAST_IO_CHECK_IF_POSSIBLE)
 BOOLEAN
-FastIoCheckIfPossible(
+BlorgFastIoCheckIfPossible(
     PFILE_OBJECT FileObject,
     PLARGE_INTEGER FileOffset,
     ULONG Length,
@@ -272,20 +271,16 @@ Notes:
         .QuadPart = Length
     };
 
-    if (CheckForReadOperation)
-    {
-
-        if (FsRtlFastCheckLockForRead(&fcb->FileLock,
+    if (CheckForReadOperation &&
+        FsRtlFastCheckLockForRead(&fcb->FileLock,
             FileOffset,
             &largeLength,
             LockKey,
             FileObject,
             PsGetCurrentProcess()))
-        {
-            return TRUE;
-        }
-
+    {
+        return TRUE;
     }
 
-   return FALSE;
+    return FALSE;
 }

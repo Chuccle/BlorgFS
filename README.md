@@ -39,13 +39,27 @@ powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Fast
 | Tier | What it does | Needs |
 |---|---|---|
 | `Build` | Compile + link everything with PREfast | nothing |
-| `Fast` (default) | Build, plus RFC 8448 crypto vectors and the fuzz corpus | nothing |
+| `Fast` (default) | Build, sandbox regression suites, RFC 8448 vectors and fuzz smoke tests | nothing |
+| `Proof` | Build, exhaustive interleaving tests and the full client fuzz corpus | nothing |
 | `Perf` | Fast, plus PerfHarness workloads compared against a stored baseline | driver loaded, backend reachable |
 | `All` | every tier | as above |
 
 Exit code is 0 only if everything in the tier passed. Run `-Tier Fast` before
 calling any change done — cheaper tiers don't run the crypto tests that catch
 a `Tls.c` regression.
+
+After a Debug Fast run, collect line coverage with OpenCppCoverage installed:
+
+```powershell
+powershell -File tools/Invoke-BlorgChecks.ps1 -Tier Fast -Configuration Debug -CoverageOnly -CoverageDirectory C:\Temp\blorg-coverage
+```
+
+The output directory must be empty, and the manifest beside the report names
+the head and the submodule pins it measured. Coverage counts the `src` files
+linked into the sandbox and TLS binaries, so `Driver.c` and anything only the
+guest reaches are not in it. Besides the Fast tests it runs the socket and
+dispatch scheduling tests and 2,000 client-fuzz iterations. A `build.yml` run
+dispatched with `coverage` set uploads the same report.
 
 GitHub Actions covers the rest: `build.yml` gates every push and PR to
 `master` at the Fast tier, builds the package and tests it in a Windows

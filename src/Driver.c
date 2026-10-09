@@ -6,13 +6,14 @@
 //
 
 #include "Driver.h"
+#include "Registry.h"
 #include "Socket.h"
 #include "TlsHandshake.h"
 #include <mountmgr.h>
 
 FAST_IO_DISPATCH  BlorgFsFastDispatch;
 DRIVER_INITIALIZE DriverEntry;
-DRIVER_UNLOAD     DriverUnload;
+DRIVER_UNLOAD     BlorgDriverUnload;
 
 struct GLOBAL global;
 
@@ -277,7 +278,7 @@ NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
 // locking is needed. Without this walk, any nodes still cached in the
 // tree would outlive the lookaside lists they were allocated from.
 //
-static VOID FreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
+static VOID DriverFreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
 {
     while (!IsListEmpty(&RootDcb->ChildrenList))
     {
@@ -326,7 +327,7 @@ static VOID DriverDeleteVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
         BlorgDestroyWorkQueue();
         BlorgNodeTableTeardown();
         BlorgFreeFileContext(pDevExt->Vcb, VolumeDeviceObject);
-        FreeFileContextTree(pDevExt->RootDcb, VolumeDeviceObject);
+        DriverFreeFileContextTree(pDevExt->RootDcb, VolumeDeviceObject);
         BlorgFreeFileContext(pDevExt->RootDcb, VolumeDeviceObject);
         ExDeleteNPagedLookasideList(&pDevExt->NonPagedNodeLookasideList);
         ExDeletePagedLookasideList(&pDevExt->FcbLookasideList);
@@ -375,7 +376,7 @@ static NTSTATUS DriverCreateFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, 
 
     UNICODE_STRING symlinkString = RTL_CONSTANT_STRING(BLORGFS_FSDO_SYMLINK_STRING);
 
-    (VOID)IoCreateSymbolicLink(&symlinkString, &fsdoString);
+    C_CAST(VOID, IoCreateSymbolicLink(&symlinkString, &fsdoString));
 
     IoRegisterFileSystem(fileSystemDeviceObject);
 
@@ -398,7 +399,7 @@ static VOID DriverDeleteFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceOb
     {
         UNICODE_STRING symlinkString = RTL_CONSTANT_STRING(BLORGFS_FSDO_SYMLINK_STRING);
 
-        (VOID)IoDeleteSymbolicLink(&symlinkString);
+        C_CAST(VOID, IoDeleteSymbolicLink(&symlinkString));
 
         PDEVICE_OBJECT volumeDeviceObject = global.VolumeDeviceObject;
 
@@ -441,7 +442,7 @@ static VOID DriverDeleteFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceOb
 // a live prefetch ring would otherwise keep issuing into a drained client.
 // With the ring gone there is one issuer and one gate.
 //
-VOID DriverUnload(PDRIVER_OBJECT DriverObject)
+VOID BlorgDriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
     BlorgDrainHttpClient();
@@ -482,21 +483,6 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 }
 
 //
-//  Reads TLS config from <services key>\Parameters at
-//  DriverEntry, so the backend's cert pin (and, if the operator wants,
-//  the remote port) never needs a rebuild to update -- only PortOut is
-//  actually mutated by a missing/absent RemotePort value; TlsEnabledOut
-//  and the pin (via BlorgTlsSetPin) simply keep their existing defaults
-//  (FALSE / unconfigured) when their registry values are absent.
-//
-//  Every failure path here is silently tolerated (missing Parameters
-//  key entirely, individual values missing or the wrong type/size) --
-//  this must never fail driver load, matching BlorgTlsGlobalInit's own
-//  "TLS is opt-in" policy elsewhere in this same function.
-//
-#define BLORGFS_REG_TAG 'GRBT'
-#define BLORGFS_REG_PORT_MAX_CHARS 8 // "65535" + NUL, with headroom
-//
 //  Kept identical to DefaultRemoteHost in BlorgFS.inf, which seeds
 //  Parameters\RemoteHost with the same string at install time. If the two
 //  drift, an INF install and a bare driver load reach different backends
@@ -505,296 +491,17 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 #define BLORGFS_DEFAULT_REMOTE_HOST L"10.0.50.17"
 
 //
-// BuildRemoteHostAnsiString's worst case is exactly these two caps
+// DriverBuildRemoteHostAnsiString's worst case is exactly these two caps
 // combined: BLORGFS_REG_HOST_MAX_CHARS covers the host's characters plus
 // the trailing NUL, and BLORGFS_REG_PORT_MAX_CHARS covers the ':'
 // separator plus the port's characters. Client.c sizes its Host-header
 // reads against BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES (Driver.h), so a bump
-// to either cap here must be reflected there -- this assert is what makes
+// to either registry cap must be reflected there -- this assert is what makes
 // that drift a build break instead of a free-build NT_ASSERT no-op.
 //
 static_assert(
     BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES == BLORGFS_REG_HOST_MAX_CHARS + BLORGFS_REG_PORT_MAX_CHARS,
     "BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES must track the registry host and port caps");
-
-//
-// Reads a single registry value of the expected type into Buffer, failing
-// if the stored value doesn't match ExpectedType or exceeds BufferSize.
-// infoBuffer's headroom over KEY_VALUE_PARTIAL_INFORMATION's own header is
-// the largest value this driver reads, a BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS
-// path, and covers the rest (a DWORD, a 32-byte pin, a short port string,
-// or a BLORGFS_REG_HOST_MAX_CHARS hostname) -- not a general-purpose
-// arbitrarily-sized read.
-//
-static NTSTATUS DriverReadRegistryValue(
-    HANDLE ParametersKey,
-    PCWSTR ValueName,
-    ULONG ExpectedType,
-    PVOID Buffer,
-    ULONG BufferSize,
-    PULONG ActualSize)
-{
-    UNICODE_STRING valueName;
-    RtlInitUnicodeString(&valueName, ValueName);
-
-    UCHAR infoBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS * sizeof(WCHAR)];
-    ULONG resultLength = 0;
-
-    NTSTATUS status = ZwQueryValueKey(
-        ParametersKey,
-        &valueName,
-        KeyValuePartialInformation,
-        infoBuffer,
-        sizeof(infoBuffer),
-        &resultLength);
-
-    if (!NT_SUCCESS(status))
-    {
-        return status;
-    }
-
-    PKEY_VALUE_PARTIAL_INFORMATION info = C_CAST(PKEY_VALUE_PARTIAL_INFORMATION, infoBuffer);
-
-    if (info->Type != ExpectedType || info->DataLength > BufferSize)
-    {
-        return STATUS_OBJECT_TYPE_MISMATCH;
-    }
-
-    RtlCopyMemory(Buffer, info->Data, info->DataLength);
-    *ActualSize = info->DataLength;
-
-    return STATUS_SUCCESS;
-}
-
-//
-// Accepts a registry-supplied RemotePort only if it is all digits and
-// parses to 1..65535. Anything else -- empty, non-numeric, too long, out
-// of range -- is rejected so the caller keeps the scheme-default port: a
-// garbage port fed to BlorgGetHttpAddrInfo would otherwise surface only as an
-// opaque resolve/connect failure at driver load. The 5-character cap is
-// "65535"'s length, which also keeps the accumulator far from overflow.
-//
-static BOOLEAN IsValidPortString(const WCHAR* Port, USHORT PortChars)
-{
-    if (0 == PortChars || PortChars > 5)
-    {
-        return FALSE;
-    }
-
-    ULONG value = 0;
-
-    for (USHORT i = 0; i < PortChars; ++i)
-    {
-        if (Port[i] < L'0' || Port[i] > L'9')
-        {
-            return FALSE;
-        }
-
-        value = (value * 10) + (Port[i] - L'0');
-    }
-
-    return (value >= 1) && (value <= 65535);
-}
-
-//
-// Opens <ServiceRegistryPath>\Parameters and reads TlsEnabled, TlsPin,
-// RemotePort, and RemoteHost into the corresponding globals/PortOut/HostOut,
-// tolerating any missing key or value per the policy described above.
-// PortOut->Length/HostOut->Length are set to actualSize minus one WCHAR to
-// exclude the registry REG_SZ value's terminating NUL. RemotePort is
-// additionally validated as a real port number (IsValidPortString); an
-// invalid value is logged and ignored, keeping the scheme default.
-//
-// ReadAheadGranularityKb is read here too, in kilobytes, so Cc's read-ahead
-// granularity can be swept without a rebuild and redeploy per point. The
-// committed default was measured on eight concurrent streams -- a
-// throughput workload -- and never against a latency-shaped one, and
-// nothing below 256 KB was ever tried, where FastFat uses 64 KB and Cc's
-// own default is a page. Zero means do not call CcSetReadAheadGranularity
-// at all, which is the "leave it default" case and cannot be expressed by
-// any other value -- and note that Cc's default is PAGE_SIZE, a constant,
-// not an adaptive policy, so zero is the smallest setting rather than the
-// absence of one.
-//
-// Anything else is rejected unless it is a power of two of at least
-// PAGE_SIZE, which is what ntifs.h states the granularity must be. The
-// value reaches Cc unexamined otherwise, and a plausible-looking 100 KB
-// would hand it a number it does not accept; a sweep is exactly where
-// someone types one.
-//
-// DiskCacheMb sizes the disk cache and DiskCachePath, an NT path, names its
-// file; DiskCachePathOut is left empty without one, which means the default.
-// Its REG_SZ data is taken with or without a terminating NUL, since
-// RegSetValueEx stores whatever it is given.
-//
-static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRING PortOut, PUNICODE_STRING HostOut, PUNICODE_STRING DiskCachePathOut)
-{
-    UNICODE_STRING parametersSuffix = RTL_CONSTANT_STRING(L"\\Parameters");
-
-    UNICODE_STRING parametersPath;
-    parametersPath.Length = 0;
-    parametersPath.MaximumLength = ServiceRegistryPath->Length + parametersSuffix.Length + sizeof(WCHAR);
-    parametersPath.Buffer = ExAllocatePoolZero(NonPagedPoolNx, parametersPath.MaximumLength, BLORGFS_REG_TAG);
-
-    if (!parametersPath.Buffer)
-    {
-        return;
-    }
-
-    RtlAppendUnicodeStringToString(&parametersPath, ServiceRegistryPath);
-    RtlAppendUnicodeStringToString(&parametersPath, &parametersSuffix);
-
-    OBJECT_ATTRIBUTES objectAttributes;
-    InitializeObjectAttributes(&objectAttributes, &parametersPath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-    HANDLE parametersKey;
-    NTSTATUS status = ZwOpenKey(&parametersKey, KEY_READ, &objectAttributes);
-
-    ExFreePool(parametersPath.Buffer);
-
-    if (!NT_SUCCESS(status))
-    {
-        return;
-    }
-
-    ULONG tlsEnabledValue = 0;
-    ULONG actualSize = 0;
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"TlsEnabled", REG_DWORD, &tlsEnabledValue, sizeof(tlsEnabledValue), &actualSize)))
-    {
-        global.TlsEnabled = (0 != tlsEnabledValue);
-    }
-
-    ULONG granularityKb = 0;
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadGranularityKb", REG_DWORD, &granularityKb, sizeof(granularityKb), &actualSize)))
-    {
-        const ULONG granularity = granularityKb * 1024;
-
-        if (0 == granularity ||
-            (granularity >= PAGE_SIZE && 0 == (granularity & (granularity - 1))))
-        {
-            global.ReadAheadGranularity = granularity;
-            BLORGFS_LOG("DriverReadRegistryConfig() - read-ahead granularity override: %lu KB\n", granularityKb);
-        }
-        else
-        {
-            BLORGFS_LOG("DriverReadRegistryConfig() - ignoring ReadAheadGranularityKb=%lu: "
-                "granularity must be zero or a power of two at least PAGE_SIZE\n", granularityKb);
-        }
-    }
-
-    ULONG maxGranularityKb = 0;
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadMaxGranularityKb", REG_DWORD, &maxGranularityKb, sizeof(maxGranularityKb), &actualSize)))
-    {
-        const ULONG maxGranularity = maxGranularityKb * 1024;
-
-        if (maxGranularity >= PAGE_SIZE && 0 == (maxGranularity & (maxGranularity - 1)))
-        {
-            global.ReadAheadMaxGranularity = maxGranularity;
-        }
-    }
-
-    ULONG fairBudgetKb = 0;
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadFairBudgetKb", REG_DWORD, &fairBudgetKb, sizeof(fairBudgetKb), &actualSize)))
-    {
-        if (fairBudgetKb <= MAXULONG / 1024)
-        {
-            global.ReadFairBudget = fairBudgetKb * 1024;
-        }
-    }
-
-    ULONG adaptValue = 0;
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadAdapt", REG_DWORD, &adaptValue, sizeof(adaptValue), &actualSize)))
-    {
-        global.ReadAheadAdapt = (0 != adaptValue);
-    }
-
-    ULONG changeFeedValue = 0;
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ChangeFeed", REG_DWORD, &changeFeedValue, sizeof(changeFeedValue), &actualSize)))
-    {
-        global.ChangeFeed = (0 != changeFeedValue);
-    }
-
-    ULONG subtreeEntries = 0;
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"SubtreeEntries", REG_DWORD, &subtreeEntries, sizeof(subtreeEntries), &actualSize)))
-    {
-        global.SubtreeEntries = subtreeEntries;
-    }
-
-    ULONG diskCacheMb = 0;
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"DiskCacheMb", REG_DWORD, &diskCacheMb, sizeof(diskCacheMb), &actualSize)))
-    {
-        global.DiskCacheMb = diskCacheMb;
-    }
-
-    WCHAR diskCachePathValue[BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS];
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"DiskCachePath", REG_SZ, diskCachePathValue, sizeof(diskCachePathValue), &actualSize))
-        && actualSize >= sizeof(WCHAR))
-    {
-        USHORT pathChars = C_CAST(USHORT, actualSize / sizeof(WCHAR));
-
-        if (L'\0' == diskCachePathValue[pathChars - 1])
-        {
-            pathChars--;
-        }
-
-        DiskCachePathOut->Length = pathChars * sizeof(WCHAR);
-        RtlCopyMemory(DiskCachePathOut->Buffer, diskCachePathValue, DiskCachePathOut->Length);
-    }
-
-    ULONG slackGrowthValue = 0;
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"ReadAheadSlackGrowth", REG_DWORD, &slackGrowthValue, sizeof(slackGrowthValue), &actualSize)))
-    {
-        global.ReadAheadSlackGrowth = (0 != slackGrowthValue);
-        BLORGFS_LOG("DriverReadRegistryConfig() - slack-driven growth: %lu\n", slackGrowthValue);
-    }
-
-    UCHAR pinValue[TLS_HASH_LEN];
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"TlsPin", REG_BINARY, pinValue, sizeof(pinValue), &actualSize))
-        && TLS_HASH_LEN == actualSize)
-    {
-        BlorgTlsSetPin(pinValue);
-    }
-
-    WCHAR portValue[BLORGFS_REG_PORT_MAX_CHARS];
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"RemotePort", REG_SZ, portValue, sizeof(portValue), &actualSize))
-        && actualSize >= sizeof(WCHAR))
-    {
-        USHORT portChars = C_CAST(USHORT, (actualSize - sizeof(WCHAR)) / sizeof(WCHAR));
-
-        if (IsValidPortString(portValue, portChars))
-        {
-            PortOut->Length = portChars * sizeof(WCHAR);
-            RtlCopyMemory(PortOut->Buffer, portValue, PortOut->Length);
-        }
-        else
-        {
-            BLORGFS_LOG("DriverReadRegistryConfig() - ignoring invalid RemotePort registry value, using scheme default\n");
-        }
-    }
-
-    WCHAR hostValue[BLORGFS_REG_HOST_MAX_CHARS];
-
-    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"RemoteHost", REG_SZ, hostValue, sizeof(hostValue), &actualSize))
-        && actualSize >= sizeof(WCHAR))
-    {
-        HostOut->Length = C_CAST(USHORT, actualSize) - sizeof(WCHAR);
-        RtlCopyMemory(HostOut->Buffer, hostValue, HostOut->Length);
-    }
-
-    ZwClose(parametersKey);
-}
 
 //
 // Builds "global.RemoteHostAnsi" -- the ANSI "host" or "host:port"
@@ -809,7 +516,7 @@ static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICO
 // are ASCII-only by definition. Total size is bounded by
 // BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES (Driver.h), which Client.c relies on.
 //
-static PSTR BuildRemoteHostAnsiString(PCUNICODE_STRING HostString, PCUNICODE_STRING PortString)
+static PSTR DriverBuildRemoteHostAnsiString(PCUNICODE_STRING HostString, PCUNICODE_STRING PortString)
 {
     USHORT hostChars = HostString->Length / sizeof(WCHAR);
     USHORT portChars = PortString ? PortString->Length / sizeof(WCHAR) : 0;
@@ -855,7 +562,7 @@ static PSTR BuildRemoteHostAnsiString(PCUNICODE_STRING HostString, PCUNICODE_STR
 // since the failure modes are asymmetric -- omitting SNI is always legal,
 // sending a literal in it never is.
 //
-static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
+static BOOLEAN DriverHostStringIsIpLiteral(PCUNICODE_STRING HostString)
 {
     BOOLEAN digitsAndDotsOnly = TRUE;
 
@@ -897,7 +604,7 @@ static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
 // TLS/port config (TlsEnabled, TlsPin, an optional RemotePort override)
 // is read from the registry before resolving the backend address, so the
 // default port can depend on whatever TlsEnabled ends up being -- see
-// DriverReadRegistryConfig. With no explicit RemotePort override, the
+// BlorgReadRegistryConfig. With no explicit RemotePort override, the
 // default port tracks TlsEnabled exactly (a plaintext server can't parse
 // a ClientHello, and a TLS-speaking one won't understand plaintext HTTP):
 // 443 if TRUE, 8080 if FALSE. RTL_CONSTANT_STRING only expands to a valid
@@ -905,11 +612,11 @@ static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
 // ternary for picking the default. RemoteHost works the same way --
 // Parameters\RemoteHost if present, else BLORGFS_DEFAULT_REMOTE_HOST --
 // and the same resolved UNICODE_STRING both drives BlorgGetHttpAddrInfo and
-// (via BuildRemoteHostAnsiString) becomes global.RemoteHostAnsi, so the
+// (via DriverBuildRemoteHostAnsiString) becomes global.RemoteHostAnsi, so the
 // Host header always names whatever address the driver actually
 // resolved/connected to, never a stale literal. The Host header carries
 // an explicit :port whenever the resolved port isn't the scheme default
-// (80 plaintext / 443 TLS) -- see BuildRemoteHostAnsiString.
+// (80 plaintext / 443 TLS) -- see DriverBuildRemoteHostAnsiString.
 //
 // The mount-manager volume-arrival notification runs last, only once the
 // FS is registered, the disk device + B: symlink are up, and the HTTP
@@ -986,7 +693,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     global.DriverObject = DriverObject;
 
-    DriverObject->DriverUnload = DriverUnload;
+    DriverObject->DriverUnload = BlorgDriverUnload;
     DriverObject->MajorFunction[IRP_MJ_CREATE] = BlorgCreate;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = BlorgClose;
     DriverObject->MajorFunction[IRP_MJ_READ] = BlorgRead;
@@ -1018,11 +725,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     global.CacheManagerCallbacks.ReleaseFromReadAhead = BlorgReleaseNodeFromReadAhead;
 
     BlorgFsFastDispatch.SizeOfFastIoDispatch = sizeof(FAST_IO_DISPATCH);
-    BlorgFsFastDispatch.FastIoCheckIfPossible = FastIoCheckIfPossible;
+    BlorgFsFastDispatch.FastIoCheckIfPossible = BlorgFastIoCheckIfPossible;
     BlorgFsFastDispatch.FastIoRead = BlorgFastIoRead;
     BlorgFsFastDispatch.MdlRead = FsRtlMdlReadDev;
     BlorgFsFastDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;
-    
 
     NTSTATUS result = BlorgInitialiseHttpClient();
 
@@ -1103,7 +809,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     diskCachePath.MaximumLength = sizeof(diskCachePathBuffer);
     diskCachePath.Buffer = diskCachePathBuffer;
 
-    DriverReadRegistryConfig(RegistryPath, &portString, &hostString, &diskCachePath);
+    BlorgReadRegistryConfig(RegistryPath, &portString, &hostString, &diskCachePath);
 
     if (0 == diskCachePath.Length)
     {
@@ -1165,7 +871,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     BOOLEAN portIsSchemeDefault = RtlEqualUnicodeString(&portString, &schemeDefaultPort, FALSE);
 
-    global.RemoteHostAnsi = BuildRemoteHostAnsiString(&hostString, portIsSchemeDefault ? NULL : &portString);
+    global.RemoteHostAnsi = DriverBuildRemoteHostAnsiString(&hostString, portIsSchemeDefault ? NULL : &portString);
 
     if (!global.RemoteHostAnsi)
     {
@@ -1183,9 +889,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
-    if (global.TlsEnabled && !HostStringIsIpLiteral(&hostString))
+    if (global.TlsEnabled && !DriverHostStringIsIpLiteral(&hostString))
     {
-        global.RemoteHostSniAnsi = BuildRemoteHostAnsiString(&hostString, NULL);
+        global.RemoteHostSniAnsi = DriverBuildRemoteHostAnsiString(&hostString, NULL);
 
         if (!global.RemoteHostSniAnsi)
         {

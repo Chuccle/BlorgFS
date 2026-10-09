@@ -37,6 +37,7 @@ VOID KdBreakPoint(VOID);
 //
 VOID ShimForceNextOplockCheck(NTSTATUS Status);
 VOID ShimForceNextCcCopyReadMiss(VOID);
+VOID ShimSetNextCcCopyReadInformation(ULONG Information);
 
 //
 // What a reopened FCB's refresh asked of Cc and Mm (Create.c
@@ -65,6 +66,13 @@ ULONG64 KeQueryInterruptTime(VOID);
 VOID ShimAdvanceInterruptTime(ULONG64 Ticks100ns);
 
 VOID ProbeForRead(PVOID Address, SIZE_T Length, ULONG Alignment);
+VOID ProbeForWrite(PVOID Address, SIZE_T Length, ULONG Alignment);
+
+//
+// How many user buffers ProbeForWrite has checked, so a test can tell an
+// output buffer was probed for writing rather than only for reading.
+//
+ULONG ShimProbesForWrite(VOID);
 
 NTSTATUS KeWaitForMultipleObjects(
     ULONG Count, PVOID Object[], WAIT_TYPE WaitType, KWAIT_REASON WaitReason,
@@ -114,6 +122,7 @@ NTSTATUS RtlSetOwnerSecurityDescriptor(PVOID Descriptor, PSID Owner, BOOLEAN Def
 NTSTATUS RtlSetGroupSecurityDescriptor(PVOID Descriptor, PSID Group, BOOLEAN Defaulted);
 NTSTATUS RtlAbsoluteToSelfRelativeSD(PVOID Absolute, PVOID SelfRelative, PULONG Length);
 NTSTATUS SeQuerySecurityDescriptorInfo(PULONG Information, PVOID Descriptor, PULONG Length, PVOID* ObjectsSecurityDescriptor);
+VOID ShimSetSecurityDescriptorLength(ULONG Length);
 
 VOID RtlInitUnicodeString(PUNICODE_STRING Destination, PCWSTR Source);
 BOOLEAN RtlPrefixUnicodeString(PCUNICODE_STRING Prefix, PCUNICODE_STRING String, BOOLEAN IgnoreCase);
@@ -173,7 +182,6 @@ NTSTATUS IoCheckShareAccess(ACCESS_MASK Desired, ULONG Share, PFILE_OBJECT FileO
 VOID IoRemoveShareAccess(PFILE_OBJECT FileObject, PSHARE_ACCESS ShareAccess);
 BOOLEAN IoIsOperationSynchronous(PIRP Irp);
 PEPROCESS IoGetRequestorProcess(PIRP Irp);
-
 
 #ifdef __cplusplus
 }

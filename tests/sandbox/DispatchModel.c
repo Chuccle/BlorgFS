@@ -89,13 +89,27 @@ VOID CcSetAdditionalCacheAttributes(PFILE_OBJECT F, BOOLEAN NoRa, BOOLEAN NoWb) 
 // stub makes that branch structurally unreachable: no dispatch test could
 // ever exercise it, whatever it wrote, because the driver would never see
 // the FALSE that triggers it. ShimForceNextCcCopyReadMiss makes it
-// reachable on demand instead of leaving it permanently dead.
+// reachable on demand instead of leaving it permanently dead. It answers
+// the next Wait=TRUE copy, the one a synchronous file object's read makes,
+// since that is the call a test can drive without a worker thread.
 //
 static volatile LONG CcCopyReadForceMiss = 0;
+
+//
+// The byte count the next successful copy reports. Nothing is copied: the
+// model holds no file data, and the tests that set it check only what the
+// driver does with the count.
+//
+static volatile LONG CcCopyReadInformation = 0;
 
 VOID ShimForceNextCcCopyReadMiss(VOID)
 {
     InterlockedExchange(&CcCopyReadForceMiss, 1);
+}
+
+VOID ShimSetNextCcCopyReadInformation(ULONG Information)
+{
+    InterlockedExchange(&CcCopyReadInformation, (LONG)Information);
 }
 
 BOOLEAN CcCopyReadEx(PFILE_OBJECT F, PLARGE_INTEGER O, ULONG L, BOOLEAN W, PVOID B, PIO_STATUS_BLOCK S, PETHREAD T)
@@ -110,7 +124,7 @@ BOOLEAN CcCopyReadEx(PFILE_OBJECT F, PLARGE_INTEGER O, ULONG L, BOOLEAN W, PVOID
     if (S)
     {
         S->Status = STATUS_SUCCESS;
-        S->Information = 0;
+        S->Information = (ULONG)InterlockedExchange(&CcCopyReadInformation, 0);
     }
 
     return TRUE;
@@ -238,7 +252,7 @@ VOID IoRemoveShareAccess(PFILE_OBJECT FileObject, PSHARE_ACCESS ShareAccess)
 // STATUS_PENDING here means the oplock package took ownership of the IRP
 // and will re-drive the caller from BlorgOplockComplete -- the single most
 // dangerous status this file returns, per Create.c's own comment above
-// OpenExistingFcb. An always-SUCCESS stub makes every oplock-pending path
+// CreateOpenExistingFcb. An always-SUCCESS stub makes every oplock-pending path
 // in Create.c (three call sites) and Read.c permanently unreachable: not
 // merely untested today, but incapable of ever being tested against this
 // stub. ShimForceNextOplockCheck makes the branch reachable.
@@ -454,7 +468,7 @@ NTSTATUS ObReferenceObjectByHandle(HANDLE H, ACCESS_MASK A, POBJECT_TYPE T, KPRO
 
     //
     // A NULL handle must fail, matching real Windows -- callers (e.g.
-    // FspWorkQueue.c's StopWorkQueueThreads, when PsCreateSystemThread's
+    // FspWorkQueue.c's FspStopWorkQueueThreads, when PsCreateSystemThread's
     // own no-op stub leaves ThreadHandle[i] NULL) rely on the failure to
     // skip a wait on an object that was never created. An unconditional
     // success here previously produced a NULL PVOID* that
@@ -588,6 +602,28 @@ VOID ProbeForRead(PVOID Address, SIZE_T Length, ULONG Alignment)
     }
 }
 
+static ULONG ProbesForWrite;
+
+VOID ProbeForWrite(PVOID Address, SIZE_T Length, ULONG Alignment)
+{
+    ProbesForWrite++;
+
+    if (0 == Length)
+    {
+        return;
+    }
+
+    if (!Address || (Alignment && (((ULONG_PTR)Address) & (Alignment - 1))))
+    {
+        KmReportViolation(KmViolationLifetime, "ProbeForWrite on a misaligned or null user buffer");
+    }
+}
+
+ULONG ShimProbesForWrite(VOID)
+{
+    return ProbesForWrite;
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Rtl
 ///////////////////////////////////////////////////////////////////////////
@@ -709,14 +745,25 @@ NTSTATUS RtlAbsoluteToSelfRelativeSD(PVOID A, PVOID S, PULONG L)
     return STATUS_SUCCESS;
 }
 
+//
+// The length of the descriptor SeQuerySecurityDescriptorInfo reports, so a
+// test can ask with a buffer too small for it. Zero, the default, fits any
+// buffer.
+//
+static ULONG SecurityDescriptorLength = 0;
+
+VOID ShimSetSecurityDescriptorLength(ULONG Length)
+{
+    SecurityDescriptorLength = Length;
+}
+
 NTSTATUS SeQuerySecurityDescriptorInfo(PULONG I, PVOID D, PULONG L, PVOID* O)
 {
     (void)I; (void)D; (void)O;
 
-    if (L)
-    {
-        *L = 0;
-    }
+    const ULONG available = *L;
 
-    return STATUS_SUCCESS;
+    *L = SecurityDescriptorLength;
+
+    return (available < SecurityDescriptorLength) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
 }

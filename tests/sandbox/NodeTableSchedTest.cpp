@@ -550,10 +550,10 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
         << "an interleaving exists in which a pinned node was retired";
 
     //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
@@ -908,10 +908,10 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
         << "an interleaving exists in which a revived node was freed under its opener";
 
     //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
@@ -988,10 +988,10 @@ TEST_F(NodeTableSchedTest, NoAtomicInterleavingRetiresAPinnedNode)
         << "an interleaving exists in which a pinned node was retired";
 
     //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes in the table";
     EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the pin body";
     EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
@@ -1217,92 +1217,48 @@ TEST_F(NodeTableSchedTest, NoInterleavingStrandsAnIdleNode)
 }
 
 //
-
 // Positive control for the happens-before race detector. Two threads
-
 // increment a plain long with no lock and no interlocked op, registering
-
 // the accesses manually; the detector must flag the overlap. Without
-
 // this test, silence elsewhere proves nothing -- a detector that never
-
 // fires is indistinguishable from one that never works.
-
 //
-
 namespace {
 
-
-
 struct RaceControlProof
-
 {
-
     long Value;
-
 };
 
-
-
 void RacyWriter(void* Parameter)
-
 {
-
     RaceControlProof* proof = (RaceControlProof*)Parameter;
 
-
-
     for (int i = 0; i < 3; ++i)
-
     {
-
         KmSchedNoteAccess(&proof->Value, 1);
-
         proof->Value++;
-
         KmSchedYield();
-
     }
-
 }
-
-
 
 void RaceControlSetup(void* Parameter)
-
 {
-
     KmSchedSpawn(RacyWriter, Parameter);
-
     KmSchedSpawn(RacyWriter, Parameter);
-
 }
-
-
 
 void RaceControlTeardown(void* Parameter)
-
 {
-
     (void)Parameter;
-
 }
-
-
 
 }  // namespace
 
-
-
 TEST(SchedulerAudit, RaceDetectorFlagsUnsynchronizedAccess)
-
 {
-
     RaceControlProof proof = {};
-
     proof.Value = 0;
-
-
 
     KmSchedSetRaceDetection(1);
     KmExpectViolation(KmViolationLifetime);
@@ -1311,26 +1267,20 @@ TEST(SchedulerAudit, RaceDetectorFlagsUnsynchronizedAccess)
 
     KmSchedSetRaceDetection(0);
 
-
-
     EXPECT_GT(KmSchedRaceCount(), 0)
-
         << "the race detector never fired on a deliberately racy body";
     EXPECT_EQ(KmViolationLifetime, KmTakeViolation())
         << "the detector fired but the model did not record the violation";
-
 }
-
-
 
 //
 // A random sample through the atomic-granularity space of the pin body.
 // NoAtomicInterleavingRetiresAPinnedNode enumerates that space with the
 // partial-order reduction on; this one samples it with the reduction off,
-// and a few seconds of breadth catches gross granularity regressions -- a shim atomic silently ceasing to be a scheduling
-// point, say -- without paying for enumeration. Seeded, so a failure
-// reproduces exactly; on a hit, raise the count and re-run before
-// believing the seed was lucky.
+// and a few seconds of breadth catches gross granularity regressions -- a
+// shim atomic silently ceasing to be a scheduling point, say -- without
+// paying for enumeration. Seeded, so a failure reproduces exactly; on a
+// hit, raise the count and re-run before believing the seed was lucky.
 //
 TEST_F(NodeTableSchedTest, RandomAtomicPinSmoke)
 {
@@ -2486,6 +2436,7 @@ struct LitmusAudit
     volatile long Y;
     long Seen0;
     long Seen1;
+    unsigned int SeenPairs;
 };
 
 static void LitmusSetup(void* Parameter)
@@ -2530,6 +2481,112 @@ static int LitmusOutcomes(KM_SCHED_BODY Left, KM_SCHED_BODY Right, int Weak)
         << "the reduced exploration reached a different set of outcomes";
 
     return full.Outcomes;
+}
+
+//
+// Load buffering: each thread reads one location and then writes the
+// other. Both reads can see 1 only if a write takes effect before the read
+// ahead of it in its own thread, which no choice among writes already made
+// can produce.
+//
+static void IndependentLoadStoreX(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    audit->Seen0 = KmSchedIndependentRelaxedLoadStore(&audit->Y, &audit->X, 1);
+}
+
+static void IndependentLoadStoreY(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    audit->Seen1 = KmSchedIndependentRelaxedLoadStore(&audit->X, &audit->Y, 1);
+}
+
+static void LoadBufferingTeardown(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    EXPECT_TRUE(0 == audit->Seen0 || 1 == audit->Seen0);
+    EXPECT_TRUE(0 == audit->Seen1 || 1 == audit->Seen1);
+    audit->SeenPairs |= 1u << (audit->Seen0 + 2 * audit->Seen1);
+    LitmusTeardown(Parameter);
+}
+
+//
+// Each outcome sets bit Seen0 + 2 * Seen1, so the full and the reduced
+// search are each checked for exactly the expected outcomes, not only for
+// how many there were.
+//
+static void LoadBufferingOutcomes(int Weak, unsigned int Expected)
+{
+    static LitmusAudit audit;
+    audit.Left = IndependentLoadStoreX;
+    audit.Right = IndependentLoadStoreY;
+    audit.SeenPairs = 0;
+    KmSchedSetAtomicYields(1);
+    KmSchedSetWeakMemory(Weak);
+    KmSchedSetReduction(0);
+    const KM_SCHED_RESULT full = KmExploreInterleavings(LitmusSetup, LoadBufferingTeardown,
+        &audit, 100000);
+    EXPECT_EQ(Expected, audit.SeenPairs);
+    audit.SeenPairs = 0;
+    const KM_SCHED_RESULT reduced = ExploreReduced(LitmusSetup, LoadBufferingTeardown,
+        &audit, 100000);
+    EXPECT_EQ(Expected, audit.SeenPairs);
+    EXPECT_LT(full.Schedules, 100000);
+    EXPECT_LT(reduced.Schedules, 100000);
+    EXPECT_EQ(0, full.Truncated + reduced.Truncated);
+    EXPECT_EQ(0, full.Deadlocks + reduced.Deadlocks);
+    EXPECT_EQ(full.Outcomes, reduced.Outcomes);
+    EXPECT_EQ(full.OutcomeDigest, reduced.OutcomeDigest);
+    KmSchedSetWeakMemory(0);
+    KmSchedSetAtomicYields(0);
+}
+
+TEST(SchedulerAudit, SequentialConsistencyKeepsIndependentLoadsBeforeStores)
+{
+    LoadBufferingOutcomes(0, 0x7);
+}
+
+TEST(SchedulerAudit, WeakMemoryReordersExplicitIndependentLoadStorePairs)
+{
+    LoadBufferingOutcomes(1, 0xF);
+}
+
+//
+// A null or overlapping pair is not independent: it is reported, and
+// neither location is touched, outside a search as well.
+//
+TEST(SchedulerAudit, IndependentPairsRejectNullAndOverlappingLocations)
+{
+    volatile long value = 0;
+    volatile long* overlap = C_CAST(volatile long*, C_CAST(volatile char*, &value) + 1);
+    volatile long* sources[] = {nullptr, &value, &value, &value};
+    volatile long* targets[] = {&value, nullptr, &value, overlap};
+    for (int i = 0; i < 4; ++i)
+    {
+        KmExpectViolation(KmViolationLifetime);
+        KmSchedIndependentRelaxedLoadStore(sources[i], targets[i], 1);
+        EXPECT_EQ(KmViolationLifetime, KmTakeViolation());
+        EXPECT_EQ(0, value);
+    }
+}
+
+static void OrderedLoadStoreX(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    audit->Seen0 = KmSchedReadLong(&audit->Y, KM_ORDER_ACQUIRE);
+    KmSchedWriteLong(&audit->X, 1, KM_ORDER_RELEASE);
+}
+
+static void OrderedLoadStoreY(void* Parameter)
+{
+    LitmusAudit* audit = C_CAST(LitmusAudit*, Parameter);
+    audit->Seen1 = KmSchedReadLong(&audit->X, KM_ORDER_ACQUIRE);
+    KmSchedWriteLong(&audit->Y, 1, KM_ORDER_RELEASE);
+}
+
+TEST(SchedulerAudit, OrderedLoadStoreOperationsDoNotUseTheIndependentPairModel)
+{
+    EXPECT_EQ(3, LitmusOutcomes(OrderedLoadStoreX, OrderedLoadStoreY, 1));
 }
 
 //

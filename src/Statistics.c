@@ -517,7 +517,6 @@ VOID BlorgStatisticsRecordSlowFetch(
     slot->FetchesActive = BlorgStatisticsFetchesActive();
     slot->ConnectionReused = ConnectionReused ? 1u : 0u;
 
-
     WriteRelease64(C_CAST(LONG64 volatile*, &slot->Sequence), C_CAST(LONG64, sequence));
 }
 

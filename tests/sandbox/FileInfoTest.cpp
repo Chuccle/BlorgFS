@@ -2,7 +2,8 @@
 // Coverage for the real FileInfo.c and VolumeInfo.c: every FILE_XXX_INFORMATION
 // and FILE_FS_XXX_INFORMATION class the driver fills from the in-memory
 // FCB/DCB or reports statically, plus the dispatch-entry device-type
-// routing and buffer-size validation shared across them. Both files were
+// routing and buffer-size validation shared across them, and Security.c's
+// answer to a security query. Both files were
 // previously 0% -- unlike Create.c/Read.c, neither touches the network,
 // or the cache manager, so these tests build a bare FCB/DCB
 // and drive the real dispatch entry points directly.
@@ -143,6 +144,28 @@ protected:
         return req;
     }
 
+    //
+    // IRP_MJ_QUERY_SECURITY is always neither I/O, so the descriptor goes
+    // to Irp->UserBuffer.
+    //
+    QueryRequest* PrepareSecurityQuery(PVOID buffer, ULONG length)
+    {
+        Requests.push_back(std::make_unique<QueryRequest>());
+        QueryRequest* req = Requests.back().get();
+        memset(req, 0, sizeof(*req));
+
+        req->FileObject.FsContext = Fcb;
+        req->FileObject.DeviceObject = Volume;
+        req->Stack.MajorFunction = IRP_MJ_QUERY_SECURITY;
+        req->Stack.FileObject = &req->FileObject;
+        req->Stack.DeviceObject = Volume;
+        req->Stack.Parameters.QuerySecurity.SecurityInformation = DACL_SECURITY_INFORMATION;
+        req->Stack.Parameters.QuerySecurity.Length = length;
+        req->Irp.StackLocation = &req->Stack;
+        req->Irp.UserBuffer = buffer;
+        return req;
+    }
+
     PDEVICE_OBJECT Volume = nullptr;
     PFCB Fcb = nullptr;
     PDCB Dcb = nullptr;
@@ -189,10 +212,14 @@ TEST_F(FileInfoTest, NameInformationTooSmallForTheNameOverflows)
     unsigned char storage[sizeof(FILE_NAME_INFORMATION)] = {};
     auto* buffer = reinterpret_cast<PFILE_NAME_INFORMATION>(storage);
     QueryRequest* req = PrepareFileQuery(Fcb, FileNameInformation, buffer, sizeof(storage));
+    ULONG nameRoom = sizeof(storage) - UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName);
+    ASSERT_LT(nameRoom, Fcb->FullPath.Length);
 
     EXPECT_EQ(STATUS_BUFFER_OVERFLOW, BlorgQueryInformation(Volume, &req->Irp));
-    EXPECT_EQ(0u, req->Irp.IoStatus.Information)
-        << "an overflowing name must report zero bytes written, not a partial copy";
+    EXPECT_EQ(Fcb->FullPath.Length, buffer->FileNameLength)
+        << "the caller sizes its retry from the full name length";
+    EXPECT_EQ(0, memcmp(buffer->FileName, Fcb->FullPath.Buffer, nameRoom));
+    EXPECT_EQ(UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) + nameRoom, req->Irp.IoStatus.Information);
 }
 
 TEST_F(FileInfoTest, BasicInformationReportsFileAttributesForAFile)
@@ -422,8 +449,13 @@ TEST_F(FileInfoTest, FsVolumeInformationTooSmallForLabelOverflows)
     auto* buffer = reinterpret_cast<PFILE_FS_VOLUME_INFORMATION>(storage);
     QueryRequest* req = PrepareVolumeQuery(FileFsVolumeInformation, buffer, sizeof(storage));
 
+    ULONG labelRoom = sizeof(storage) - FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
+
     EXPECT_EQ(STATUS_BUFFER_OVERFLOW, BlorgQueryVolumeInformation(Volume, &req->Irp));
-    EXPECT_EQ(0u, req->Irp.IoStatus.Information);
+    EXPECT_EQ(sizeof(L"BLORGDRIVE") - sizeof(WCHAR), buffer->VolumeLabelLength)
+        << "the caller sizes its retry from the full label length";
+    EXPECT_EQ(0, memcmp(buffer->VolumeLabel, L"BLORGDRIVE", labelRoom));
+    EXPECT_EQ(FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel) + labelRoom, req->Irp.IoStatus.Information);
 }
 
 TEST_F(FileInfoTest, FsSizeInformationReportsZeroedCapacity)
@@ -493,8 +525,13 @@ TEST_F(FileInfoTest, FsAttributeInformationTooSmallForNameOverflows)
     unsigned char storage[sizeof(FILE_FS_ATTRIBUTE_INFORMATION)] = {};
     auto* buffer = reinterpret_cast<PFILE_FS_ATTRIBUTE_INFORMATION>(storage);
     QueryRequest* req = PrepareVolumeQuery(FileFsAttributeInformation, buffer, sizeof(storage));
+    ULONG nameRoom = sizeof(storage) - FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
 
     EXPECT_EQ(STATUS_BUFFER_OVERFLOW, BlorgQueryVolumeInformation(Volume, &req->Irp));
+    EXPECT_EQ(sizeof(L"BLORGFS") - sizeof(WCHAR), buffer->FileSystemNameLength)
+        << "the caller sizes its retry from the full name length";
+    EXPECT_EQ(0, memcmp(buffer->FileSystemName, L"BLORGFS", nameRoom));
+    EXPECT_EQ(FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) + nameRoom, req->Irp.IoStatus.Information);
 }
 
 TEST_F(FileInfoTest, FsFullSizeInformationReportsZeroedCapacity)
@@ -572,6 +609,41 @@ TEST_F(FileInfoTest, SetVolumeInformationIsAlwaysUnsupported)
 
     EXPECT_EQ(STATUS_INVALID_DEVICE_REQUEST, BlorgSetVolumeInformation(Volume, &irp))
         << "the volume is read-only -- FILE_READ_ONLY_VOLUME is reported honestly";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// BlorgQuerySecurity / SecurityQueryVolume
+///////////////////////////////////////////////////////////////////////////
+
+TEST_F(FileInfoTest, SecurityQueryReturnsTheDescriptorItsBufferHolds)
+{
+    unsigned char buffer[64] = {};
+    ShimSetSecurityDescriptorLength(48);
+    QueryRequest* req = PrepareSecurityQuery(buffer, sizeof(buffer));
+
+    EXPECT_EQ(STATUS_SUCCESS, BlorgQuerySecurity(Volume, &req->Irp));
+    EXPECT_EQ((ULONG_PTR)48, req->Irp.IoStatus.Information);
+
+    ShimSetSecurityDescriptorLength(0);
+}
+
+//
+// A buffer too small for the descriptor is a warning carrying the length
+// needed, not an error: the I/O manager drops Information on an error, and
+// a caller sizing its buffer from the first query would have nothing to
+// retry with.
+//
+TEST_F(FileInfoTest, SecurityQueryTooSmallBufferReportsTheLengthNeeded)
+{
+    unsigned char buffer[16] = {};
+    ShimSetSecurityDescriptorLength(48);
+    QueryRequest* req = PrepareSecurityQuery(buffer, sizeof(buffer));
+
+    EXPECT_EQ(STATUS_BUFFER_OVERFLOW, BlorgQuerySecurity(Volume, &req->Irp));
+    EXPECT_EQ(STATUS_BUFFER_OVERFLOW, req->Irp.IoStatus.Status);
+    EXPECT_EQ((ULONG_PTR)48, req->Irp.IoStatus.Information);
+
+    ShimSetSecurityDescriptorLength(0);
 }
 
 } // namespace

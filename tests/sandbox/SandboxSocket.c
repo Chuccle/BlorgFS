@@ -721,7 +721,6 @@ void BlorgCleanupWskClient(void)
     }
 }
 
-
 //
 // Address resolution is DNS, not driver logic, and the sandbox hands the
 // client a fixed loopback address at init instead.

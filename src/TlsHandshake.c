@@ -130,6 +130,8 @@ typedef enum _TLS_HS_STAGE
 } TLS_HS_STAGE;
 
 // Per-handshake state carried across the async WSK completion chain.
+// Fields are ordered by alignment: pointers and 64-bit values, then the
+// 32-bit values, then the byte buffers.
 typedef struct _TLS_HANDSHAKE_CONTEXT
 {
     PKSOCKET Socket;                                    // socket the handshake runs over
@@ -145,7 +147,6 @@ typedef struct _TLS_HANDSHAKE_CONTEXT
     LONG64 IssueQpc;
     PBLORG_TLS_HANDSHAKE_COMPLETION CompletionRoutine;   // called when the handshake finishes/fails
     PVOID CallerContext;                                 // opaque context passed to CompletionRoutine
-    TLS_HS_STAGE Stage;                                  // current wait state in the handshake
 
     //
     // Preallocated so the PASSIVE bounce in
@@ -156,14 +157,18 @@ typedef struct _TLS_HANDSHAKE_CONTEXT
     // the bounce (IoQueueWorkItem's worker signature has no room for it).
     //
     PIO_WORKITEM WorkItem;           // preallocated work item for the PASSIVE bounce
+    ULONGLONG ServerSeq;             // server record sequence number during handshake
     NTSTATUS PendingBounceStatus;    // Status value carried across the bounce
+    TLS_HS_STAGE Stage;              // current wait state in the handshake
+    ULONG TranscriptLen;             // bytes currently in Transcript
+    ULONG RecordPayloadLen;          // declared length of RecordPayload
+    ULONG FlightLen;                 // bytes currently in Flight
 
     UCHAR ClientPrivate[TLS_ECC_COORD_LEN];   // our ephemeral ECDHE private scalar
     UCHAR ClientPublic[TLS_ECC_PUBKEY_LEN];   // our ephemeral ECDHE public point
     UCHAR ServerPublic[TLS_ECC_PUBKEY_LEN];   // server's ECDHE public point from ServerHello
 
     UCHAR Transcript[TLS_HS_TRANSCRIPT_MAX];  // running handshake transcript for hashing
-    ULONG TranscriptLen;                      // bytes currently in Transcript
 
     UCHAR HandshakeSecret[TLS_HASH_LEN];    // HKDF handshake secret
     UCHAR ClientHsTraffic[TLS_HASH_LEN];    // client handshake traffic secret
@@ -173,7 +178,6 @@ typedef struct _TLS_HANDSHAKE_CONTEXT
     UCHAR ClientHsIv[TLS_IV_LEN];     // derived client handshake static IV
     UCHAR ServerHsKey[TLS_KEY_LEN];   // derived server handshake AEAD key
     UCHAR ServerHsIv[TLS_IV_LEN];     // derived server handshake static IV
-    ULONGLONG ServerSeq;              // server record sequence number during handshake
 
     UCHAR ServerLongTermKey[TLS_ECC_PUBKEY_LEN];           // server's certificate public key
     UCHAR TranscriptHashThroughCert[TLS_HASH_LEN];         // transcript hash up to Certificate
@@ -191,7 +195,6 @@ typedef struct _TLS_HANDSHAKE_CONTEXT
     //
     UCHAR RecordHeader[5];                        // current record's 5-byte header
     UCHAR RecordPayload[TLS_RECORD_CIPHERTEXT_MAX];  // current record's payload
-    ULONG RecordPayloadLen;                        // declared length of RecordPayload
 
     //
     // Decrypted handshake bytes not yet fully message-parsed (a record's
@@ -199,7 +202,6 @@ typedef struct _TLS_HANDSHAKE_CONTEXT
     // large Certificate across multiple records).
     //
     UCHAR Flight[TLS_HS_FLIGHT_MAX];   // decrypted, not-yet-parsed handshake bytes
-    ULONG FlightLen;                   // bytes currently in Flight
 
     //
     // On-wire buffers for the two outgoing messages -- must stay valid
@@ -209,6 +211,18 @@ typedef struct _TLS_HANDSHAKE_CONTEXT
     UCHAR ClientHelloRecord[5 + TLS_CLIENT_HELLO_MAX_LEN];               // outgoing ClientHello record
     UCHAR ClientFinishedRecord[5 + 4 + TLS_HASH_LEN + 1 + TLS_TAG_LEN];  // outgoing client Finished record
 } TLS_HANDSHAKE_CONTEXT, *PTLS_HANDSHAKE_CONTEXT;
+
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, CallerContext, WorkItem);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, WorkItem, ServerSeq);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, ServerSeq, PendingBounceStatus);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, PendingBounceStatus, Stage);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, Stage, TranscriptLen);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, TranscriptLen, RecordPayloadLen);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, RecordPayloadLen, FlightLen);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, FlightLen, ClientPrivate);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, ServerHsIv, ServerLongTermKey);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, Transcript, HandshakeSecret);
+CHECK_PADDING_BETWEEN(TLS_HANDSHAKE_CONTEXT, RecordPayload, Flight);
 
 static VOID TlsHandshakeFail(PTLS_HANDSHAKE_CONTEXT Ctx, NTSTATUS Status);
 
@@ -554,7 +568,6 @@ static VOID TlsHandshakeOnBulkReceive(NTSTATUS Status, ULONG_PTR BytesTransferre
 
     TlsHandshakeIssueReceiveRecordHeader(ctx);
 }
-
 
 //
 // PASSIVE_LEVEL work-item callback that re-enters

@@ -506,7 +506,6 @@ TEST_F(PathCacheSchedTest, ConcurrentStaleLookupsOweExactlyOneRefresh)
     printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
 }
 
-
 //
 // The same window for a resident FCB, which is stamped with the ticket of
 // the lookup that resolved its open (Create.c) and trusted while that
@@ -612,7 +611,6 @@ TEST_F(PathCacheSchedTest, NoInterleavingStampsAnFcbCurrentWithWhatAnInvalidatio
 
     printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
 }
-
 
 //
 // The listing budget is one counter shared by every listing bucket, and two

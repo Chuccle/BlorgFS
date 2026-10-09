@@ -374,16 +374,21 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
 //  itself; it comes from the context each call site states: the bucket
 //  lock exclusive (excludes all droppers), the VCB resource exclusive
 //  (excludes the worker), or the reader's own immediately preceding
-//  interlocked op (full barrier).
+//  interlocked op (full barrier). Only the drops need that barrier, since
+//  their readers hold no lock; the pin and the OnReapList claim and its
+//  release take the NoFence forms, because a lock orders each of them
+//  before the reader that acts on it (the bucket lock for the pin, the VCB
+//  resource or bucket lock for the claim).
 //
 //  NodeReap.Queued/ShuttingDown are the opposite case, and are plain:
 //  NodeReap.Lock owns every write to both (kick claim/rollback, worker
 //  gate-clear, teardown latch), so atomics would only misstate that
 //  ownership. Their check-and-act pairs live inside single locked
 //  sections; the two accesses outside the lock are safe by direction --
-//  teardown's ReadAcquire poll of Queued (a missed clear delays its exit,
-//  never shortens it) and kick's latch read, which sits inside the same
-//  locked section as its claim.
+//  teardown's ReadNoFence poll of Queued (a missed clear delays its exit,
+//  never shortens it, and the reap-list lock teardown takes next orders
+//  the worker's pass before what follows) and kick's latch read, which
+//  sits inside the same locked section as its claim.
 //
 
 #define NODE_TABLE_BUCKET_BITS 8u
@@ -447,7 +452,7 @@ static NODE_REAP_STATE NodeReap;
 static IO_WORKITEM_ROUTINE NodeReapWorker;
 
 //
-// Hashes Path case-insensitively, matching BlorgArePathComponentsEqual's
+// Hashes Path case-insensitively, matching NodeArePathComponentsEqual's
 // compare, mixed so the top bits pick a bucket: every table keyed by path
 // (the node table here, the path and listing caches) takes its index from
 // the high bits of this. Falls back to a manual hash on
@@ -547,7 +552,7 @@ static VOID NodeReapKick(VOID)
 //
 VOID BlorgNodeDeferReap(PCOMMON_CONTEXT Node)
 {
-    if (InterlockedCompareExchange(&Node->OnReapList, TRUE, FALSE))
+    if (InterlockedCompareExchangeNoFence(&Node->OnReapList, TRUE, FALSE))
     {
         return;
     }
@@ -615,7 +620,7 @@ static BOOLEAN NodeTableTryRetire(PCOMMON_CONTEXT Node)
 
     if (0 == ReadNoFence64(&Node->RefCount) &&
         0 == ReadNoFence(&Node->PinCount) &&
-        !InterlockedCompareExchange(&Node->OnReapList, TRUE, FALSE))
+        !InterlockedCompareExchangeNoFence(&Node->OnReapList, TRUE, FALSE))
     {
         if (Node->TableLink.Flink)
         {
@@ -671,7 +676,7 @@ PCOMMON_CONTEXT BlorgNodeTableLookupPin(const UNICODE_STRING* Path)
         if (node->FullPath.Length == Path->Length &&
             RtlEqualUnicodeString(&node->FullPath, Path, TRUE))
         {
-            InterlockedIncrement(&node->PinCount);
+            InterlockedIncrementNoFence(&node->PinCount);
             found = node;
             break;
         }
@@ -750,7 +755,7 @@ NTSTATUS BlorgNodeTableInit(PDEVICE_OBJECT VolumeDeviceObject)
 //
 // Volume teardown: suppresses further kicks, waits out an in-flight
 // worker pass, then discards the queue (the nodes themselves are freed by
-// FreeFileContextTree immediately after) and resets the buckets. Runs at
+// DriverFreeFileContextTree immediately after) and resets the buckets. Runs at
 // PASSIVE after the FSP queue is drained, so no new pushes can race it.
 //
 // Teardown latches under the same lock the kicks claim through, so a kick
@@ -774,7 +779,7 @@ VOID BlorgNodeTableTeardown(VOID)
 
     LARGE_INTEGER interval = { .QuadPart = -10LL * 10 * 1000 };
 
-    while (ReadAcquire(&NodeReap.Queued))
+    while (ReadNoFence(&NodeReap.Queued))
     {
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
     }
@@ -790,7 +795,7 @@ VOID BlorgNodeTableTeardown(VOID)
     {
         PCOMMON_CONTEXT node = CONTAINING_RECORD(entry, COMMON_CONTEXT, ReapLink);
         entry = entry->Next;
-        InterlockedExchange(&node->OnReapList, FALSE);
+        InterlockedExchangeNoFence(&node->OnReapList, FALSE);
     }
 
     if (NodeReap.WorkItem)
@@ -907,7 +912,7 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
             }
             else
             {
-                InterlockedExchange(&node->OnReapList, FALSE);
+                InterlockedExchangeNoFence(&node->OnReapList, FALSE);
             }
 
             ExReleasePushLockExclusive(&bucket->Lock);
@@ -944,7 +949,7 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // Returns the final path component (substring, not a copy) of Path,
 // skipping one trailing separator if present.
 //
-static UNICODE_STRING GetLastComponent(const UNICODE_STRING* Path)
+static UNICODE_STRING NodeGetLastComponent(const UNICODE_STRING* Path)
 {
     UNICODE_STRING lastComponent = { 0 };
 
@@ -989,7 +994,7 @@ static UNICODE_STRING GetLastComponent(const UNICODE_STRING* Path)
 // Case-insensitive equality check for a single path component. Length
 // check first as a cheap short-circuit before the NT string compare.
 //
-inline static BOOLEAN BlorgArePathComponentsEqual(const UNICODE_STRING* Component1, const UNICODE_STRING* Component2)
+inline static BOOLEAN NodeArePathComponentsEqual(const UNICODE_STRING* Component1, const UNICODE_STRING* Component2)
 {
     if (Component1->Length != Component2->Length)
     {
@@ -1003,7 +1008,7 @@ inline static BOOLEAN BlorgArePathComponentsEqual(const UNICODE_STRING* Componen
 // Linear scan of ParentDcb's immediate children for one whose last path
 // component matches Name.
 //
-inline static PCOMMON_CONTEXT BlorgSearchByName(const DCB* ParentDcb, const UNICODE_STRING* Name)
+inline static PCOMMON_CONTEXT NodeSearchByName(const DCB* ParentDcb, const UNICODE_STRING* Name)
 {
     PCOMMON_CONTEXT child = NULL;
     UNICODE_STRING lastComponent;
@@ -1013,9 +1018,9 @@ inline static PCOMMON_CONTEXT BlorgSearchByName(const DCB* ParentDcb, const UNIC
         entry = entry->Flink)
     {
         child = CONTAINING_RECORD(entry, COMMON_CONTEXT, Links);
-        lastComponent = GetLastComponent(&child->FullPath);
+        lastComponent = NodeGetLastComponent(&child->FullPath);
 
-        if (BlorgArePathComponentsEqual(Name, &lastComponent))
+        if (NodeArePathComponentsEqual(Name, &lastComponent))
         {
             return child;
         }
@@ -1051,9 +1056,9 @@ PCOMMON_CONTEXT BlorgSearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Pa
             ASSERT(entry);
 
             child = CONTAINING_RECORD(entry, COMMON_CONTEXT, Links);
-            lastComponent = GetLastComponent(&child->FullPath);
+            lastComponent = NodeGetLastComponent(&child->FullPath);
 
-            if (BlorgArePathComponentsEqual(&component, &lastComponent))
+            if (NodeArePathComponentsEqual(&component, &lastComponent))
             {
                 matchingChild = child;
                 break;
@@ -1123,7 +1128,7 @@ NTSTATUS BlorgInsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIR
         FsRtlDissectName(remainingPath, &firstPart, &remainingPart);
 
         BOOLEAN isLastComponent = (0 == remainingPart.Length);
-        PCOMMON_CONTEXT existing = BlorgSearchByName(currentDcb, &firstPart);
+        PCOMMON_CONTEXT existing = NodeSearchByName(currentDcb, &firstPart);
 
         if (existing)
         {

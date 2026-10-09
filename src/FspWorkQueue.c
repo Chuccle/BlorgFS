@@ -315,7 +315,7 @@ Return Value:
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
-static VOID AddToWorkqueue(
+static VOID FspAddToWorkQueue(
     PIRP Irp
 )
 {
@@ -323,7 +323,6 @@ static VOID AddToWorkqueue(
 
     IoCsqInsertIrp(&FspQueue.Csq, Irp, NULL);
     KeSetEvent(&FspQueue.WorkEvent, EVENT_INCREMENT, FALSE);
-
 
     BLORGFS_STAT_INC(FspPosts);
 
@@ -433,7 +432,7 @@ Routine Description:
 
     The ThreadsActive gate is an advisory read (ReadAcquire, no interlocked
     op): it only rejects posts that arrive after teardown has begun, and the
-    driver lifecycle guarantees no post can race StopWorkQueueThreads, so
+    driver lifecycle guarantees no post can race FspStopWorkQueueThreads, so
     the gate needs no atomicity with the queue insert that follows it.
 
 Arguments:
@@ -447,7 +446,6 @@ Arguments:
 Return Value:
 
     STATUS_PENDING
-
 
 --*/
 
@@ -467,7 +465,7 @@ Return Value:
         return prePostStatus;
     }
 
-    AddToWorkqueue(Irp);
+    FspAddToWorkQueue(Irp);
 
     return STATUS_PENDING;
 }
@@ -508,7 +506,7 @@ Return Value:
         return STATUS_DEVICE_REMOVED;
     }
 
-    AddToWorkqueue(Irp);
+    FspAddToWorkQueue(Irp);
 
     return STATUS_PENDING;
 }
@@ -538,7 +536,7 @@ VOID BlorgOplockComplete(PVOID Context, PIRP Irp)
 
     if (STATUS_SUCCESS == Irp->IoStatus.Status && ReadAcquire(&FspQueue.ThreadsActive))
     {
-        AddToWorkqueue(Irp);
+        FspAddToWorkQueue(Irp);
         return;
     }
 
@@ -564,7 +562,7 @@ VOID BlorgOplockComplete(PVOID Context, PIRP Irp)
 // by the driver load/unload path, but if that changes we internally
 // synchronise.
 //
-static VOID StopWorkQueueThreads(ULONG ThreadCount)
+static VOID FspStopWorkQueueThreads(ULONG ThreadCount)
 {
     if (!InterlockedCompareExchange(&FspQueue.ThreadsActive, FALSE, TRUE))
     {
@@ -592,7 +590,7 @@ static VOID StopWorkQueueThreads(ULONG ThreadCount)
 // Initializes the FSP queue state (CSQ, events, spin lock) and spins up
 // the core-scaled worker count (see the FSP_THREAD_COUNT note above).
 // Called at volume creation. A failure part-way through thread creation
-// unwinds the threads already started via StopWorkQueueThreads and fails
+// unwinds the threads already started via FspStopWorkQueueThreads and fails
 // the whole call -- the pool either comes up complete or not at all.
 // Without that unwind, a partial pool reported as success would leave
 // BlorgDestroyWorkQueue trying to reap a NULL handle (early-out, threads
@@ -657,7 +655,7 @@ NTSTATUS BlorgCreateWorkQueue(VOID)
         if (!NT_SUCCESS(result))
         {
             BLORGFS_PRINT("BlorgCreateWorkQueue: PsCreateSystemThread failed for worker %lu: %8lx\n", i, result);
-            StopWorkQueueThreads(i);
+            FspStopWorkQueueThreads(i);
             return result;
         }
     }
@@ -677,7 +675,7 @@ NTSTATUS BlorgCreateWorkQueue(VOID)
 //
 VOID BlorgDestroyWorkQueue(VOID)
 {
-    StopWorkQueueThreads(FspQueue.ThreadCount);
+    FspStopWorkQueueThreads(FspQueue.ThreadCount);
 
     PIRP irp = IoCsqRemoveNextIrp(&FspQueue.Csq, NULL);
 

@@ -148,7 +148,7 @@ NTSTATUS BlorgTlsAeadDecrypt(
 // BCRYPT_PROV_DISPATCH -- that flag makes subsequent operations on handles
 // derived from it (BCryptGenerateSymmetricKey, BCryptEncrypt, BCryptDecrypt,
 // BCryptDestroyKey) usable at DISPATCH_LEVEL. BlorgTlsGlobalInit/BlorgTlsGlobalCleanup
-// own that handle (called from DriverEntry/DriverUnload, always PASSIVE);
+// own that handle (called from DriverEntry/BlorgDriverUnload, always PASSIVE);
 // BlorgTlsImportKeyHandle mints a per-connection, DISPATCH-usable
 // BCRYPT_KEY_HANDLE from it once the handshake derives application traffic
 // keys (TlsHandshakeSendClientFinished, already at PASSIVE);

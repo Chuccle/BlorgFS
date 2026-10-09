@@ -29,7 +29,7 @@ VOID BlorgReleaseNodeFromReadAhead(
 
 _Function_class_(FAST_IO_CHECK_IF_POSSIBLE)
 BOOLEAN
-FastIoCheckIfPossible(
+BlorgFastIoCheckIfPossible(
     PFILE_OBJECT FileObject,
     PLARGE_INTEGER FileOffset,
     ULONG Length,

@@ -5,7 +5,7 @@
 // The systematic scheduler proves "no interleaving of the synchronization
 // primitives the code actually calls corrupts state" -- and, by mutation,
 // proved it does NOT prove "the code calls the primitives it needs to":
-// deleting Header.Resource's acquire/release from OpenExistingFcb passed
+// deleting Header.Resource's acquire/release from CreateOpenExistingFcb passed
 // the scheduler proof at 252 schedules, because a missing lock leaves no
 // scheduling point for the explorer to preempt at.
 //
