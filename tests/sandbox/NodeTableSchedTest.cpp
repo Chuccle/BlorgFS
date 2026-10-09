@@ -22,6 +22,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 extern "C" {
 #include "..\..\src\Driver.h"
 #include "Scheduler.h"
@@ -52,6 +54,14 @@ struct PinProof
     volatile long RetiresObserved;
     volatile long LeftBehind;
     volatile long PoolAtSetup;
+
+    //
+    // The counters as Setup found them, so Teardown can tell what this one
+    // run did.
+    //
+    long PinsBefore;
+    long RetiresBefore;
+    long ViolationsBefore;
 };
 
 UNICODE_STRING MakePath(const wchar_t* text)
@@ -61,6 +71,91 @@ UNICODE_STRING MakePath(const wchar_t* text)
     name.Length = (USHORT)(wcslen(text) * sizeof(wchar_t));
     name.MaximumLength = name.Length;
     return name;
+}
+
+//
+// The same exploration with partial-order reduction on. On a space the
+// full search exhausts, both must report the same set of outcomes.
+//
+static KM_SCHED_RESULT ExploreReduced(
+    KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context, int MaxSchedules)
+{
+    KmSchedSetReduction(1);
+
+    KM_SCHED_RESULT result = KmExploreInterleavings(Setup, Teardown, Context, MaxSchedules);
+
+    KmSchedSetReduction(0);
+
+    return result;
+}
+
+//
+// The shard of the full search this process runs, from KM_SCHED_SHARD
+// ("index/count"), which verify.yml sets to split the long proofs between
+// runners. Unset or empty, the whole search runs. Returns the shard count, or 0 for
+// a value that does not parse.
+//
+static int ShardFromEnvironment()
+{
+    const char* shard = getenv("KM_SCHED_SHARD");
+    int index = 0;
+    int count = 1;
+
+    if (shard && *shard &&
+        (2 != sscanf(shard, "%d/%d", &index, &count) || count < 1 || index < 0 || index >= count))
+    {
+        return 0;
+    }
+
+    KmSchedSetShard(index, count);
+
+    return count;
+}
+
+//
+// The reduction's gate on real driver code. Every outcome the full search
+// reached, or this shard of it, must be one the reduced search reaches.
+// The converse holds by construction, since each reduced run is also a run
+// of the full search, so an unsharded search must match it exactly.
+//
+static void ExpectReductionReachesFullOutcomes(
+    KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context,
+    const KM_SCHED_RESULT& Full, int Shards)
+{
+    static unsigned __int64 full[65536];
+    static unsigned __int64 reduced[65536];
+
+    const int fullCount = KmSchedCopyOutcomes(full, 65536);
+    const KM_SCHED_RESULT result = ExploreReduced(Setup, Teardown, Context, 1000000);
+    const int reducedCount = KmSchedCopyOutcomes(reduced, 65536);
+
+    EXPECT_EQ(0, result.Deadlocks);
+    EXPECT_LT(result.Schedules, 1000000) << "the reduced search hit its schedule cap";
+
+    std::sort(reduced, reduced + reducedCount);
+
+    int missing = 0;
+
+    for (int i = 0; i < fullCount; ++i)
+    {
+        if (!std::binary_search(reduced, reduced + reducedCount, full[i]))
+        {
+            missing++;
+        }
+    }
+
+    EXPECT_EQ(0, missing) << "the full search reached outcomes the reduced search did not";
+
+    if (1 == Shards)
+    {
+        EXPECT_EQ(Full.Outcomes, result.Outcomes)
+            << "the reduced search reached a different number of outcomes";
+        EXPECT_EQ(Full.OutcomeDigest, result.OutcomeDigest)
+            << "the reduced search reached a different set of outcomes";
+    }
+
+    printf("[  sched   ] reduced: %d runs, %d pruned, %d outcomes; full: %d outcomes\n",
+        result.Schedules, result.Pruned, result.Outcomes, Full.Outcomes);
 }
 
 //
@@ -102,6 +197,8 @@ void PinningThread(void* Parameter)
     // Read through the pin. A freed node reads back the guarded pool's
     // poison, 0xDDDDDDDD, which is negative.
     //
+    KmSchedNoteFootprint(&found->PinCount, sizeof(found->PinCount), 0);
+
     if (found->PinCount <= 0)
     {
         InterlockedIncrement(&proof->Violations);
@@ -161,6 +258,9 @@ void PinProofSetup(void* Parameter)
 
     proof->PinHeld = 0;
     proof->Freed = 0;
+    proof->PinsBefore = proof->PinsObserved;
+    proof->RetiresBefore = proof->RetiresObserved;
+    proof->ViolationsBefore = proof->Violations;
 
     DIRECTORY_ENTRY_METADATA meta = {};
     meta.Size = 4096;
@@ -183,6 +283,29 @@ void PinProofSetup(void* Parameter)
 }
 
 //
+// What one run ended in: which of the two threads got through, whether the
+// node was freed, and, when it was not, the counts it was left with.
+//
+unsigned __int64 PinOutcome(const PinProof* proof)
+{
+    unsigned __int64 outcome =
+        (unsigned __int64)(proof->PinsObserved - proof->PinsBefore) |
+        ((unsigned __int64)(proof->RetiresObserved - proof->RetiresBefore) << 2) |
+        ((unsigned __int64)(proof->Violations - proof->ViolationsBefore) << 4) |
+        ((unsigned __int64)(proof->Freed != 0) << 6) |
+        ((unsigned __int64)(proof->PinHeld != 0) << 7);
+
+    if (!proof->Freed)
+    {
+        outcome |= ((unsigned __int64)(proof->Node->PinCount & 0xFF) << 8) |
+            ((unsigned __int64)(proof->Node->RefCount & 0xFF) << 16) |
+            ((unsigned __int64)(proof->Node->OnReapList != 0) << 24);
+    }
+
+    return outcome;
+}
+
+//
 // A schedule in which the reap declined leaves the node published and
 // alive. It has to go before the next replay, or the table accumulates one
 // node per interleaving and the pool never balances.
@@ -197,6 +320,8 @@ void PinProofTeardown(void* Parameter)
     {
         return;
     }
+
+    KmSchedNoteOutcome(PinOutcome(proof));
 
     if (!proof->Freed)
     {
@@ -230,6 +355,70 @@ void PinProofTeardown(void* Parameter)
     }
 
     proof->Node = nullptr;
+}
+
+//
+// The synchronous retire. A create that fails part-way walks back up its
+// path freeing each directory it left empty (BlorgReapEmptyAncestorDcbs),
+// under the VCB resource exclusive and without the reap queue, so what
+// keeps it off a pinned directory is NodeTableTryRetire's own count check
+// rather than the worker's.
+//
+void AncestorRetiringThread(void* Parameter)
+{
+    PinProof* proof = (PinProof*)Parameter;
+
+    FsRtlEnterFileSystem();
+    ExAcquireResourceExclusiveLite(proof->Vcb->Header.Resource, TRUE);
+
+    BlorgReapEmptyAncestorDcbs(C_CAST(PDCB, proof->Node), proof->Volume);
+
+    ExReleaseResourceLite(proof->Vcb->Header.Resource);
+    FsRtlExitFileSystem();
+
+    if (ReadNoFence(&proof->Freed))
+    {
+        InterlockedIncrement(&proof->RetiresObserved);
+
+        if (ReadNoFence(&proof->PinHeld))
+        {
+            InterlockedIncrement(&proof->Violations);
+        }
+    }
+}
+
+//
+// PinProofSetup with an empty directory in place of the file, which is the
+// only kind of node the ancestor walk retires.
+//
+void DirectoryPinProofSetup(void* Parameter)
+{
+    PinProof* proof = (PinProof*)Parameter;
+
+    proof->PinHeld = 0;
+    proof->Freed = 0;
+    proof->PinsBefore = proof->PinsObserved;
+    proof->RetiresBefore = proof->RetiresObserved;
+    proof->ViolationsBefore = proof->Violations;
+
+    DIRECTORY_ENTRY_METADATA meta = {};
+    meta.IsDirectory = TRUE;
+
+    PCOMMON_CONTEXT node = nullptr;
+
+    if (!NT_SUCCESS(BlorgInsertByPath(proof->Root, &proof->Path, &meta, proof->Volume, &node)) || !node)
+    {
+        return;
+    }
+
+    BlorgNodeTablePublish(node);
+
+    proof->Node = node;
+
+    ShimWatchFree(node, &proof->Freed);
+
+    KmSchedSpawn(PinningThread, proof);
+    KmSchedSpawn(AncestorRetiringThread, proof);
 }
 
 class NodeTableSchedTest : public ::testing::Test
@@ -302,11 +491,10 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
 
     //
     // Lock granularity, deliberately: threads interleave at push-lock
-    // acquire/release and explicit yields, not at every interlocked op. At
-    // that granularity the pin/retire arbitration is fully bounded and
-    // exhausts in low thousands of schedules -- see
-    // NoInterleavingRetiresAPinnedNodeAtomicSample below for why atomic
-    // granularity, though strictly stronger, does not run here.
+    // acquire/release and explicit yields, not at every interlocked op.
+    // This is the space the full search can still exhaust, which makes it
+    // the space the partial-order reduction is checked against below.
+    // NoAtomicInterleavingRetiresAPinnedNode covers atomic granularity.
     //
     //
     // 100000, not 20000: raised 2026-08-20 when making ERESOURCE
@@ -341,9 +529,22 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
 // both proofs remain exhaustive under their caps with zero divergence,
 // deadlock and violation, and SchedulerAudit pins the underlying
 // invariants directly.
+//
+// Corrected a fourth time, 2026-10-08: 41330 to 4,531,882 here,
+// 149769 to 25,847,776 for the revival proof. Both spaces had outgrown
+// their caps, and a run that hit the cap printed a note and passed. With
+// the lock-id release made proportional to its own edges the full spaces
+// finish (82 s and about 25 min in Release), so the caps leave headroom
+// and hitting one is a failure again. verify.yml splits both between
+// runners with KM_SCHED_SHARD; the caps are per shard.
     //
+    const int shards = ShardFromEnvironment();
+    ASSERT_NE(0, shards) << "KM_SCHED_SHARD is not index/count";
+
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 100000);
+        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 10000000);
+
+    KmSchedSetShard(0, 1);
 
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a pinned node was retired";
@@ -357,16 +558,15 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
 
-    if (result.Schedules >= 100000)
-    {
-        printf("[  sched   ] hit the schedule cap -- proof is statistical, not exhaustive\n");
-    }
-    else
-    {
-        EXPECT_LT(result.Schedules, 100000)
-            << "hit the schedule cap -- the space was sampled, not exhausted, "
-               "so this proves nothing stronger than the stress test does";
-    }
+    EXPECT_LT(result.Schedules, 10000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted, "
+           "so this proves nothing stronger than the stress test does";
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+
+    ExpectReductionReachesFullOutcomes(PinProofSetup, PinProofTeardown, &proof, result, shards);
+
+    EXPECT_EQ(0, proof.Violations);
 
     //
     // Coverage, not behaviour. If the lookup never succeeded or the retire
@@ -380,71 +580,6 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind)
         << "replays left nodes in the table; the next replay is a different program";
 
-    printf("[  sched   ] %d interleavings, max depth %d, %ld pins, %ld retires\n",
-        result.Schedules, result.MaxDepth, proof.PinsObserved, proof.RetiresObserved);
-}
-
-//
-// Atomic-granularity sample. Not run in the default gate.
-//
-// Turning on KmSchedSetAtomicYields widens the proof to interleavings
-// inside BlorgNodeTableLookupPin/BlorgNodeUnpin/BlorgNodeDeferReap/
-// NodeReapWorker's own interlocked operations, not just around the push
-// lock -- strictly stronger than the test above. It is also strictly more
-// expensive: this protocol has roughly a dozen interlocked call sites
-// across the two thread bodies, and the number of DISTINCT interleavings
-// of that many events grows combinatorially (binomial, not exponential in
-// the branching factor, but still large enough that a first attempt at
-// 200,000 schedules ran over twenty minutes without reaching either the
-// cap or exhaustion).
-//
-// So this runs as a bounded SAMPLE -- 200 schedules, not a proof. The cap
-// is small on purpose and the smallness is itself the finding: growth is
-// not the roughly-linear cost a schedule count alone would suggest (200
-// finishes in well under a second) -- pushing the cap to 4,000 was tried
-// and did not finish in three minutes. This scheduler does no partial-
-// order reduction, so depth-first enumeration keeps replaying longer and
-// longer shared prefixes to reach each remaining fresh choice as the
-// cheap shallow branches are exhausted first; a real POR-based tool
-// (dynamic partial-order reduction) would collapse the many equivalent
-// orderings of independent events instead of enumerating each one. This
-// scheduler does not have that, and pretending a bigger cap would finish
-// "soon" would be the same kind of overclaim the vacuous proofs earlier
-// in this project turned out to be.
-//
-TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNodeAtomicSample)
-{
-    const wchar_t* path = L"\\media\\contended.bin";
-
-    PinProof proof = {};
-    proof.Volume = Volume;
-    proof.Root = Root;
-    proof.Vcb = Vcb;
-    proof.Path = MakePath(path);
-
-    KmSchedSetAtomicYields(1);
-    KmSchedSetRaceDetection(1);
-
-    KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 200);
-
-    KmSchedSetAtomicYields(0);
-    KmSchedSetRaceDetection(0);
-
-    EXPECT_EQ(0, proof.Violations)
-        << "an interleaving exists in which a pinned node was retired";
-
-    //
-// ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
-// assertion after this one would run against corrupted state.
-//
-ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
-
-    EXPECT_GT(proof.PinsObserved, 0);
-    EXPECT_GT(proof.RetiresObserved, 0);
-
-    printf("[  sched   ] (atomic sample, NOT exhaustive) %d interleavings, max depth %d\n",
-        result.Schedules, result.MaxDepth);
 }
 
 //
@@ -483,6 +618,11 @@ struct RevivalProof
     volatile long RevivedWhileQueued;
     volatile long RetiresObserved;
     volatile long LeftBehind;
+
+    long RevivalsBefore;
+    long QueuedBefore;
+    long RetiresBefore;
+    long ViolationsBefore;
 };
 
 //
@@ -547,6 +687,8 @@ void RevivingThread(void* Parameter)
     // Read through the reference. A freed node reads back the guarded
     // pool's poison, which is negative.
     //
+    KmSchedNoteFootprint(&found->RefCount, sizeof(found->RefCount), 0);
+
     if (found->RefCount <= 0)
     {
         InterlockedIncrement(&proof->Violations);
@@ -601,6 +743,10 @@ void RevivalProofSetup(void* Parameter)
 
     proof->HandleHeld = 0;
     proof->Freed = 0;
+    proof->RevivalsBefore = proof->RevivalsObserved;
+    proof->QueuedBefore = proof->RevivedWhileQueued;
+    proof->RetiresBefore = proof->RetiresObserved;
+    proof->ViolationsBefore = proof->Violations;
 
     proof->Volume = StructsModelCreateVolume();
 
@@ -642,11 +788,36 @@ void RevivalProofSetup(void* Parameter)
     KmSchedSpawn(RevivalRetiringThread, proof);
 }
 
+unsigned __int64 RevivalOutcome(const RevivalProof* proof)
+{
+    unsigned __int64 outcome =
+        (unsigned __int64)(proof->RevivalsObserved - proof->RevivalsBefore) |
+        ((unsigned __int64)(proof->RevivedWhileQueued - proof->QueuedBefore) << 2) |
+        ((unsigned __int64)(proof->RetiresObserved - proof->RetiresBefore) << 4) |
+        ((unsigned __int64)(proof->Violations - proof->ViolationsBefore) << 6) |
+        ((unsigned __int64)(proof->Freed != 0) << 8) |
+        ((unsigned __int64)(proof->HandleHeld != 0) << 9);
+
+    if (!proof->Freed)
+    {
+        outcome |= ((unsigned __int64)(proof->Node->PinCount & 0xFF) << 16) |
+            ((unsigned __int64)(proof->Node->RefCount & 0xFF) << 24) |
+            ((unsigned __int64)(proof->Node->OnReapList != 0) << 32);
+    }
+
+    return outcome;
+}
+
 void RevivalProofTeardown(void* Parameter)
 {
     RevivalProof* proof = (RevivalProof*)Parameter;
 
     ShimWatchFree(nullptr, nullptr);
+
+    if (proof->Node)
+    {
+        KmSchedNoteOutcome(RevivalOutcome(proof));
+    }
 
     if (proof->Node && !proof->Freed)
     {
@@ -725,8 +896,13 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
     proof = {};
     proof.Path = MakePath(path);
 
+    const int shards = ShardFromEnvironment();
+    ASSERT_NE(0, shards) << "KM_SCHED_SHARD is not index/count";
+
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 200000);
+        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 50000000);
+
+    KmSchedSetShard(0, 1);
 
     EXPECT_EQ(0, proof.Violations)
         << "an interleaving exists in which a revived node was freed under its opener";
@@ -740,25 +916,14 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, result.Truncated)
         << "a schedule hit the depth cap, so the space was not fully explored";
 
-    //
-    // The push-lock redesign of the reap gate serializes the list push
-    // and the Queued latch more tightly than the original interlocked
-    // pair, which narrows the interleaving window the explorer can
-    // observe. This can push the schedule count to the cap without
-    // finding the revived-while-queued interleaving. An exhaustive
-    // proof would require a deeper budget; the 200K schedules below
-    // still provide strong statistical coverage -- no violations were
-    // found across that many diverse interleavings.
-    //
-    if (result.Schedules >= 200000)
-    {
-        printf("[  sched   ] hit the schedule cap -- proof is statistical, not exhaustive\n");
-    }
-    else
-    {
-        EXPECT_LT(result.Schedules, 200000)
-            << "hit the schedule cap -- the space was sampled, not exhausted";
-    }
+    EXPECT_LT(result.Schedules, 50000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+
+    ExpectReductionReachesFullOutcomes(RevivalProofSetup, RevivalProofTeardown, &proof, result, shards);
+
+    EXPECT_EQ(0, proof.Violations);
 
     EXPECT_GT(proof.RevivalsObserved, 0) << "no schedule ever revived the node";
     EXPECT_GT(proof.RetiresObserved, 0) << "no schedule ever retired the node";
@@ -768,32 +933,16 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     // been caught by twice: every schedule could have revived a node the
     // reap worker had never been told about, which is not the race.
     //
-    // Gated on space exhaustion: when the schedule cap is hit the space
-    // was sampled, not exhausted, so a zero count is inconclusive --
-    // the interleaving may exist beyond the budget. The push-lock
-    // redesign of the reap gate (NodeReap.Lock serializes the list
-    // push and the Queued latch) narrows the window the explorer can
-    // observe, which may require a larger budget on future hardware or
-    // model changes.
-    //
-    if (result.Schedules < 200000)
-    {
-        EXPECT_GT(proof.RevivedWhileQueued, 0)
-            << "no schedule revived a node that was already claimed for reap";
-    }
+    EXPECT_GT(proof.RevivedWhileQueued, 0)
+        << "no schedule revived a node that was already claimed for reap";
 
     EXPECT_EQ(0, proof.LeftBehind)
         << "replays left nodes in the table; the next replay is a different program";
 
-    printf("[  sched   ] %d interleavings, max depth %d, %ld revivals (%ld while queued), %ld retires\n",
-        result.Schedules, result.MaxDepth, proof.RevivalsObserved,
-        proof.RevivedWhileQueued, proof.RetiresObserved);
 }
 
 //
-// Atomic-granularity soaks. DISABLED_, so they are run deliberately
-// (--gtest_also_run_disabled_tests) and never by the gate: these take
-// tens of minutes, where the lock-granularity proofs above take seconds.
+// Atomic-granularity proofs.
 //
 // What they add over those proofs is scheduling points at every
 // interlocked operation, not just around locks. That is strictly stronger
@@ -802,18 +951,19 @@ ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
 // that matters, because the thing being revived is an InterlockedIncrement64
 // on a counter the worker reads to decide whether to free.
 //
-// They are SAMPLES unless the schedule count comes back under the cap.
-// This scheduler does no partial-order reduction, so depth-first
-// enumeration replays ever-longer shared prefixes as the cheap shallow
-// branches are exhausted, and the atomic space for a two-thread body is
-// large. Read the printed count before calling either of these a proof.
+// The full atomic space does not finish: the pin body ran 140 million
+// schedules in an hour without exhausting it. These run with
+// partial-order reduction, which explores one order of each run of
+// independent steps and exhausts both spaces in a few thousand runs. The
+// lock-granularity proofs above are where that reduction is checked
+// against the full search.
 //
 // Scheduler.h records that atomic granularity on the node-table proof
 // reported replay divergence at depth 17, and that it had not been tracked
 // down. These runs are what re-tests that claim now that the model's
 // ERESOURCE no longer hands two threads the same exclusive hold.
 //
-TEST_F(NodeTableSchedTest, DISABLED_AtomicPinSoak)
+TEST_F(NodeTableSchedTest, NoAtomicInterleavingRetiresAPinnedNode)
 {
     const wchar_t* path = L"\\media\\contended.bin";
 
@@ -825,10 +975,12 @@ TEST_F(NodeTableSchedTest, DISABLED_AtomicPinSoak)
 
     KmSchedSetAtomicYields(1);
     KmSchedSetRaceDetection(1);
+    KmSchedSetWeakMemory(1);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(PinProofSetup, PinProofTeardown, &proof, 2000000);
+        ExploreReduced(PinProofSetup, PinProofTeardown, &proof, 1000000);
 
+    KmSchedSetWeakMemory(0);
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
 
@@ -841,14 +993,227 @@ TEST_F(NodeTableSchedTest, DISABLED_AtomicPinSoak)
 //
 ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes in the table";
+    EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the pin body";
+    EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
+    EXPECT_LT(result.Schedules, 1000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
 
     EXPECT_GT(proof.PinsObserved, 0);
     EXPECT_GT(proof.RetiresObserved, 0);
 
-    printf("[  sched   ] atomic pin soak: %d interleavings, max depth %d, "
-           "%ld pins, %ld retires, exhausted=%s\n",
-        result.Schedules, result.MaxDepth, proof.PinsObserved, proof.RetiresObserved,
-        (result.Schedules < 2000000) ? "YES" : "NO (sampled)");
+    printf("[  sched   ] atomic pin proof: %d runs, %d pruned, max depth %d, "
+           "%ld pins, %ld retires\n",
+        result.Schedules, result.Pruned, result.MaxDepth,
+        proof.PinsObserved, proof.RetiresObserved);
+}
+
+//
+// The pin proof against the synchronous retire path instead of the reap
+// worker: a directory pinned by a warm open while a failed create's
+// ancestor walk tries to free it. Lock granularity with the full search,
+// checked against the reduction, then atomic granularity reduced.
+//
+TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedDirectory)
+{
+    PinProof proof = {};
+    proof.Volume = Volume;
+    proof.Root = Root;
+    proof.Vcb = Vcb;
+    proof.Path = MakePath(L"\\media");
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(DirectoryPinProofSetup, PinProofTeardown, &proof, 1000000);
+
+    EXPECT_EQ(0, proof.Violations)
+        << "an interleaving exists in which a pinned directory was retired";
+
+    //
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
+    EXPECT_LT(result.Schedules, 1000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+
+    printf("[  sched   ] %d interleavings, max depth %d\n", result.Schedules, result.MaxDepth);
+
+    ExpectReductionReachesFullOutcomes(DirectoryPinProofSetup, PinProofTeardown, &proof, result, 1);
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetRaceDetection(1);
+    KmSchedSetWeakMemory(1);
+
+    const KM_SCHED_RESULT atomic =
+        ExploreReduced(DirectoryPinProofSetup, PinProofTeardown, &proof, 1000000);
+
+    KmSchedSetWeakMemory(0);
+    KmSchedSetAtomicYields(0);
+    KmSchedSetRaceDetection(0);
+
+    EXPECT_EQ(0, proof.Violations)
+        << "an atomic interleaving exists in which a pinned directory was retired";
+    ASSERT_EQ(0, atomic.Deadlocks) << "an atomic schedule deadlocked;";
+    EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the directory body";
+    EXPECT_EQ(0, atomic.Truncated) << "an atomic schedule hit the depth cap";
+    EXPECT_LT(atomic.Schedules, 1000000)
+        << "hit the schedule cap -- the atomic space was sampled, not exhausted";
+
+    EXPECT_GT(proof.PinsObserved, 0) << "no schedule ever pinned the directory";
+    EXPECT_GT(proof.RetiresObserved, 0) << "no schedule ever retired the directory";
+    EXPECT_EQ(0, proof.LeftBehind)
+        << "replays left nodes in the table; the next replay is a different program";
+
+    printf("[  sched   ] atomic: %d runs, %d pruned, max depth %d, %ld pins, %ld retires\n",
+        atomic.Schedules, atomic.Pruned, atomic.MaxDepth, proof.PinsObserved, proof.RetiresObserved);
+}
+
+//
+// The last unpin and the last close race to notice the node is idle. Each
+// drops its own count and reads the other's, under the bucket lock shared,
+// which orders neither against the other: the shape of store buffering.
+// What keeps both from reading the other's count from before its drop is
+// the full barrier of the interlocked drop, and nothing else. Lose it and
+// in some execution neither defers the node, which then stays idle and
+// published with nothing left to reap it. Atomic granularity under weak
+// memory, the full search checked against the reduction.
+//
+struct DropProof
+{
+    PDEVICE_OBJECT Volume;
+    PCOMMON_CONTEXT Node;
+    UNICODE_STRING Path;
+
+    volatile LONG Freed;
+    long Stranded;
+    long Reaped;
+};
+
+void UnpinningThread(void* Parameter)
+{
+    BlorgNodeUnpin(((DropProof*)Parameter)->Node);
+}
+
+void ClosingThread(void* Parameter)
+{
+    BlorgNodeDereference(((DropProof*)Parameter)->Node);
+}
+
+//
+// A node opened once and pinned once, both through the driver.
+//
+void DropProofSetup(void* Parameter)
+{
+    DropProof* proof = (DropProof*)Parameter;
+
+    proof->Freed = 0;
+    proof->Node = nullptr;
+
+    DIRECTORY_ENTRY_METADATA meta = {};
+    meta.Size = 4096;
+
+    PDCB root = BlorgGetVolumeDeviceExtension(proof->Volume)->RootDcb;
+    PCOMMON_CONTEXT node = nullptr;
+
+    if (!NT_SUCCESS(BlorgInsertByPath(root, &proof->Path, &meta, proof->Volume, &node)) || !node)
+    {
+        return;
+    }
+
+    BlorgNodeTablePublish(node);
+
+    if (node != BlorgNodeTableLookupPin(&proof->Path))
+    {
+        return;
+    }
+
+    InterlockedIncrement64(&node->RefCount);
+
+    proof->Node = node;
+
+    ShimWatchFree(node, &proof->Freed);
+
+    KmSchedSpawn(UnpinningThread, proof);
+    KmSchedSpawn(ClosingThread, proof);
+}
+
+//
+// Runs the reap worker for whatever the two queued. A node it did not
+// free was never deferred: count it, and reap it here so the next replay
+// starts from an empty table.
+//
+void DropProofTeardown(void* Parameter)
+{
+    DropProof* proof = (DropProof*)Parameter;
+
+    if (!proof->Node)
+    {
+        ShimWatchFree(nullptr, nullptr);
+        return;
+    }
+
+    while (ShimDrainWorkItems() > 0)
+    {
+    }
+
+    const bool freed = 0 != proof->Freed;
+
+    ShimWatchFree(nullptr, nullptr);
+    KmSchedNoteOutcome(freed);
+
+    if (freed)
+    {
+        proof->Reaped++;
+    }
+    else
+    {
+        proof->Stranded++;
+
+        BlorgNodeDeferReap(proof->Node);
+
+        while (ShimDrainWorkItems() > 0)
+        {
+        }
+    }
+
+    proof->Node = nullptr;
+}
+
+TEST_F(NodeTableSchedTest, NoInterleavingStrandsAnIdleNode)
+{
+    DropProof proof = {};
+    proof.Volume = Volume;
+    proof.Path = MakePath(L"\\dropped.bin");
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetRaceDetection(1);
+    KmSchedSetWeakMemory(1);
+
+    const KM_SCHED_RESULT result =
+        KmExploreInterleavings(DropProofSetup, DropProofTeardown, &proof, 1000000);
+
+    ExpectReductionReachesFullOutcomes(DropProofSetup, DropProofTeardown, &proof, result, 1);
+
+    KmSchedSetWeakMemory(0);
+    KmSchedSetAtomicYields(0);
+    KmSchedSetRaceDetection(0);
+
+    EXPECT_EQ(0, proof.Stranded)
+        << "an execution left the node idle and unreaped: each dropper read the other's "
+           "count from before its drop";
+
+    //
+    // ASSERT, not EXPECT: a deadlocked schedule abandons its replay, so any
+    // assertion after this one would run against corrupted state.
+    //
+    ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
+    EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the drop body";
+    EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
+    EXPECT_LT(result.Schedules, 1000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+    EXPECT_GT(proof.Reaped, 0) << "no execution reaped the node";
+
+    printf("[  sched   ] drop proof: %d runs, max depth %d\n", result.Schedules, result.MaxDepth);
 }
 
 //
@@ -960,9 +1325,9 @@ TEST(SchedulerAudit, RaceDetectorFlagsUnsynchronizedAccess)
 
 //
 // A random sample through the atomic-granularity space of the pin body.
-// The DISABLED_ soak below enumerates that space; this one exists for the
-// gate, where a few seconds of breadth catches gross granularity
-// regressions -- a shim atomic silently ceasing to be a scheduling
+// NoAtomicInterleavingRetiresAPinnedNode enumerates that space with the
+// partial-order reduction on; this one samples it with the reduction off,
+// and a few seconds of breadth catches gross granularity regressions -- a shim atomic silently ceasing to be a scheduling
 // point, say -- without paying for enumeration. Seeded, so a failure
 // reproduces exactly; on a hit, raise the count and re-run before
 // believing the seed was lucky.
@@ -1005,7 +1370,7 @@ TEST_F(NodeTableSchedTest, RandomAtomicPinSmoke)
         result.Schedules, result.MaxDepth);
 }
 
-TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
+TEST_F(NodeTableRevivalSchedTest, NoAtomicInterleavingFreesARevivedNode)
 {
     const wchar_t* path = L"\\revived.bin";
 
@@ -1016,10 +1381,12 @@ TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
 
     KmSchedSetAtomicYields(1);
     KmSchedSetRaceDetection(1);
+    KmSchedSetWeakMemory(1);
 
     KM_SCHED_RESULT result =
-        KmExploreInterleavings(RevivalProofSetup, RevivalProofTeardown, &proof, 2000000);
+        ExploreReduced(RevivalProofSetup, RevivalProofTeardown, &proof, 1000000);
 
+    KmSchedSetWeakMemory(0);
     KmSchedSetAtomicYields(0);
     KmSchedSetRaceDetection(0);
 
@@ -1032,28 +1399,20 @@ TEST_F(NodeTableRevivalSchedTest, DISABLED_AtomicRevivalSoak)
     //
     ASSERT_EQ(0, result.Deadlocks) << "a schedule deadlocked;";
     EXPECT_EQ(0, proof.LeftBehind) << "replays left nodes linked under the root";
+    EXPECT_EQ((long)0, KmSchedRaceCount()) << "the race detector fired on the revival body";
+    EXPECT_EQ(0, result.Truncated) << "a schedule hit the depth cap";
+    EXPECT_LT(result.Schedules, 1000000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
 
     EXPECT_GT(proof.RevivalsObserved, 0);
     EXPECT_GT(proof.RetiresObserved, 0);
+    EXPECT_GT(proof.RevivedWhileQueued, 0)
+        << "no schedule revived a node that was already claimed for reap";
 
-    //
-    // Gated on exhaustion, as in NoInterleavingFreesARevivedNode and for
-    // the same reason: a depth-first walk that hits the cap has varied only
-    // its late choices, and the reap claim is taken early, so a sampled run
-    // can miss the revived-while-queued schedule without that saying
-    // anything about whether it exists.
-    //
-    if (result.Schedules < 2000000)
-    {
-        EXPECT_GT(proof.RevivedWhileQueued, 0)
-            << "no schedule revived a node that was already claimed for reap";
-    }
-
-    printf("[  sched   ] atomic revival soak: %d interleavings, max depth %d, "
-           "%ld revivals (%ld while queued), %ld retires, exhausted=%s\n",
-        result.Schedules, result.MaxDepth, proof.RevivalsObserved,
-        proof.RevivedWhileQueued, proof.RetiresObserved,
-        (result.Schedules < 2000000) ? "YES" : "NO (sampled)");
+    printf("[  sched   ] atomic revival proof: %d runs, %d pruned, max depth %d, "
+           "%ld revivals (%ld while queued), %ld retires\n",
+        result.Schedules, result.Pruned, result.MaxDepth, proof.RevivalsObserved,
+        proof.RevivedWhileQueued, proof.RetiresObserved);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -1225,6 +1584,59 @@ TEST(SchedulerAudit, DeadlockedScheduleUnwindsPromptly)
 
     printf("[  sched   ] unwind liveness: %d schedules, %d deadlocks, %llu ms\n",
         result.Schedules, result.Deadlocks, elapsedMs);
+}
+
+//
+// One injected work-item failure and two threads allocating: which one
+// fails depends on the order, so the failure's consumption is a shared
+// access. Unreported, the reduced search treats the two allocations as
+// independent and reports a sleeping step that changed under it.
+//
+struct WorkItemFailureAudit
+{
+    PIO_WORKITEM Items[2];
+};
+
+void WorkItemFailureAllocate(void* Parameter)
+{
+    PIO_WORKITEM* item = (PIO_WORKITEM*)Parameter;
+
+    *item = IoAllocateWorkItem(nullptr);
+}
+
+void WorkItemFailureSetup(void* Parameter)
+{
+    WorkItemFailureAudit* audit = (WorkItemFailureAudit*)Parameter;
+
+    audit->Items[0] = nullptr;
+    audit->Items[1] = nullptr;
+    ShimFailNextWorkItem();
+
+    KmSchedSpawn(WorkItemFailureAllocate, &audit->Items[0]);
+    KmSchedSpawn(WorkItemFailureAllocate, &audit->Items[1]);
+}
+
+void WorkItemFailureTeardown(void* Parameter)
+{
+    WorkItemFailureAudit* audit = (WorkItemFailureAudit*)Parameter;
+
+    KmSchedNoteOutcome((nullptr == audit->Items[0]) | ((nullptr == audit->Items[1]) << 1));
+
+    IoFreeWorkItem(audit->Items[0]);
+    IoFreeWorkItem(audit->Items[1]);
+}
+
+TEST(SchedulerAudit, AnInjectedWorkItemFailureOrdersTheAllocators)
+{
+    static WorkItemFailureAudit audit;
+
+    KM_SCHED_RESULT full =
+        KmExploreInterleavings(WorkItemFailureSetup, WorkItemFailureTeardown, &audit, 1000);
+    KM_SCHED_RESULT reduced =
+        ExploreReduced(WorkItemFailureSetup, WorkItemFailureTeardown, &audit, 1000);
+
+    EXPECT_EQ(2, full.Outcomes) << "each allocator should be the one that fails in some order";
+    EXPECT_EQ(full.Outcomes, reduced.Outcomes);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -1571,6 +1983,962 @@ TEST(SchedulerAudit, ReplayDivergenceInThreadStateIsCaught)
         << "the diverging replay never ran -- the repro proves nothing";
     EXPECT_LT(result.Schedules, 5000)
         << "hit the schedule cap before exhausting the space";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Under atomic yields, every unlocked shared access is a scheduling point:
+// the interlocked operations, and the ReadNoFence family the driver uses
+// to read what they write.
+//
+// Two droppers each decrement their own counter and read the other's --
+// the shape of BlorgNodeUnpin racing BlorgNodeDereference over a node's
+// PinCount and RefCount. When the read is not a scheduling point, each
+// drop runs together with its read and the schedule in which both see the
+// other at zero is never explored. When an operation is not a scheduling
+// point, a two-thread body using only that operation has exactly the two
+// schedules that pick which thread starts.
+///////////////////////////////////////////////////////////////////////////
+
+struct UnlockedReadAudit
+{
+    volatile long Left;
+    volatile long Right;
+    volatile long SawLeft;
+    volatile long SawRight;
+    volatile long BothSawZero;
+};
+
+static void LeftDropper(void* Parameter)
+{
+    UnlockedReadAudit* audit = (UnlockedReadAudit*)Parameter;
+
+    InterlockedDecrement(&audit->Left);
+    audit->SawRight = ReadNoFence(&audit->Right);
+}
+
+static void RightDropper(void* Parameter)
+{
+    UnlockedReadAudit* audit = (UnlockedReadAudit*)Parameter;
+
+    InterlockedDecrement(&audit->Right);
+    audit->SawLeft = ReadNoFence(&audit->Left);
+}
+
+static void UnlockedReadSetup(void* Parameter)
+{
+    UnlockedReadAudit* audit = (UnlockedReadAudit*)Parameter;
+
+    audit->Left = 1;
+    audit->Right = 1;
+    audit->SawLeft = -1;
+    audit->SawRight = -1;
+
+    KmSchedSpawn(LeftDropper, audit);
+    KmSchedSpawn(RightDropper, audit);
+}
+
+static void UnlockedReadTeardown(void* Parameter)
+{
+    UnlockedReadAudit* audit = (UnlockedReadAudit*)Parameter;
+
+    if (0 == audit->SawLeft && 0 == audit->SawRight)
+    {
+        audit->BothSawZero++;
+    }
+}
+
+TEST(SchedulerAudit, UnlockedReadsAreSchedulingPointsUnderAtomicYields)
+{
+    static UnlockedReadAudit audit;
+
+    audit = {};
+
+    KmSchedSetAtomicYields(1);
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(UnlockedReadSetup, UnlockedReadTeardown, &audit, 20000);
+
+    KmSchedSetAtomicYields(0);
+
+    EXPECT_LT(result.Schedules, 20000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+
+    EXPECT_GT(audit.BothSawZero, 0)
+        << "no schedule had both drops before both reads -- ReadNoFence is "
+           "not a scheduling point";
+}
+
+enum class SharedAccess
+{
+    Or,
+    Add64,
+    ExchangeAdd64,
+    CompareExchangePointer,
+    ReadNoFence,
+    ReadNoFence64,
+    ReadAcquire,
+    ReadAcquire64,
+    ReadPointerAcquire,
+    WriteRelease,
+    WriteRelease64,
+};
+
+struct SharedAccessAudit
+{
+    SharedAccess Access;
+    volatile long Value;
+    volatile LONG64 Value64;
+    PVOID volatile Pointer;
+};
+
+static void SharedAccessThread(void* Parameter)
+{
+    SharedAccessAudit* audit = (SharedAccessAudit*)Parameter;
+
+    switch (audit->Access)
+    {
+    case SharedAccess::Or:
+        InterlockedOr(&audit->Value, 1);
+        break;
+    case SharedAccess::Add64:
+        InterlockedAdd64(&audit->Value64, 1);
+        break;
+    case SharedAccess::ExchangeAdd64:
+        InterlockedExchangeAdd64(&audit->Value64, 1);
+        break;
+    case SharedAccess::CompareExchangePointer:
+        InterlockedCompareExchangePointer(&audit->Pointer, audit, nullptr);
+        break;
+    case SharedAccess::ReadNoFence:
+        (void)ReadNoFence(&audit->Value);
+        break;
+    case SharedAccess::ReadNoFence64:
+        (void)ReadNoFence64(&audit->Value64);
+        break;
+    case SharedAccess::ReadAcquire:
+        (void)ReadAcquire(&audit->Value);
+        break;
+    case SharedAccess::ReadAcquire64:
+        (void)ReadAcquire64(&audit->Value64);
+        break;
+    case SharedAccess::ReadPointerAcquire:
+        (void)ReadPointerAcquire(&audit->Pointer);
+        break;
+    case SharedAccess::WriteRelease:
+        WriteRelease(&audit->Value, 1);
+        break;
+    case SharedAccess::WriteRelease64:
+        WriteRelease64(&audit->Value64, 1);
+        break;
+    }
+}
+
+static void SharedAccessSetup(void* Parameter)
+{
+    SharedAccessAudit* audit = (SharedAccessAudit*)Parameter;
+
+    audit->Value = 0;
+    audit->Value64 = 0;
+    audit->Pointer = nullptr;
+
+    KmSchedSpawn(SharedAccessThread, audit);
+    KmSchedSpawn(SharedAccessThread, audit);
+}
+
+TEST(SchedulerAudit, EveryUnlockedSharedAccessIsASchedulingPoint)
+{
+    static SharedAccessAudit audit;
+
+    const SharedAccess accesses[] = {
+        SharedAccess::Or,
+        SharedAccess::Add64,
+        SharedAccess::ExchangeAdd64,
+        SharedAccess::CompareExchangePointer,
+        SharedAccess::ReadNoFence,
+        SharedAccess::ReadNoFence64,
+        SharedAccess::ReadAcquire,
+        SharedAccess::ReadAcquire64,
+        SharedAccess::ReadPointerAcquire,
+        SharedAccess::WriteRelease,
+        SharedAccess::WriteRelease64,
+    };
+
+    KmSchedSetAtomicYields(1);
+
+    for (SharedAccess access : accesses)
+    {
+        audit.Access = access;
+
+        KM_SCHED_RESULT result =
+            KmExploreInterleavings(SharedAccessSetup, nullptr, &audit, 100);
+
+        EXPECT_GT(result.Schedules, 2)
+            << "access " << (int)access << " is not a scheduling point";
+    }
+
+    KmSchedSetAtomicYields(0);
+}
+
+///////////////////////////////////////////////////////////////////////////
+// A queued writer holds back new readers. In the kernel, an exclusive
+// acquirer waiting on a shared-held push lock makes every later shared
+// acquire wait too, so a reader that re-takes the lock shared while a
+// writer is queued deadlocks against it. An ERESOURCE grants the re-take,
+// because the reader already owns the resource. The model has to make
+// both calls the way the kernel does, or that whole class of deadlock is
+// invisible to every proof.
+///////////////////////////////////////////////////////////////////////////
+
+struct QueuedWriterAudit
+{
+    EX_PUSH_LOCK PushLock;
+    ERESOURCE Resource;
+    int UseResource;
+};
+
+static void RecursiveReader(void* Parameter)
+{
+    QueuedWriterAudit* audit = (QueuedWriterAudit*)Parameter;
+
+    if (audit->UseResource)
+    {
+        ExAcquireResourceSharedLite(&audit->Resource, TRUE);
+        KmSchedYield();
+        ExAcquireResourceSharedLite(&audit->Resource, TRUE);
+        ExReleaseResourceLite(&audit->Resource);
+        ExReleaseResourceLite(&audit->Resource);
+        return;
+    }
+
+    ExAcquirePushLockShared(&audit->PushLock);
+    KmSchedYield();
+    ExAcquirePushLockShared(&audit->PushLock);
+    ExReleasePushLockShared(&audit->PushLock);
+    ExReleasePushLockShared(&audit->PushLock);
+}
+
+static void QueuedWriter(void* Parameter)
+{
+    QueuedWriterAudit* audit = (QueuedWriterAudit*)Parameter;
+
+    if (audit->UseResource)
+    {
+        ExAcquireResourceExclusiveLite(&audit->Resource, TRUE);
+        ExReleaseResourceLite(&audit->Resource);
+        return;
+    }
+
+    ExAcquirePushLockExclusive(&audit->PushLock);
+    ExReleasePushLockExclusive(&audit->PushLock);
+}
+
+static void QueuedWriterSetup(void* Parameter)
+{
+    QueuedWriterAudit* audit = (QueuedWriterAudit*)Parameter;
+
+    ExInitializePushLock(&audit->PushLock);
+    ExInitializeResourceLite(&audit->Resource);
+
+    KmSchedSpawn(RecursiveReader, audit);
+    KmSchedSpawn(QueuedWriter, audit);
+}
+
+TEST(SchedulerAudit, QueuedWriterHoldsBackANewPushLockReader)
+{
+    static QueuedWriterAudit audit;
+
+    audit.UseResource = 0;
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(QueuedWriterSetup, nullptr, &audit, 1000);
+
+    EXPECT_GT(result.Deadlocks, 0)
+        << "a shared re-take overtook a queued writer -- the kernel blocks it";
+}
+
+TEST(SchedulerAudit, QueuedWriterDoesNotHoldBackAnEresourceOwner)
+{
+    static QueuedWriterAudit audit;
+
+    audit.UseResource = 1;
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(QueuedWriterSetup, nullptr, &audit, 1000);
+
+    EXPECT_EQ(0, result.Deadlocks)
+        << "a shared re-take by an owner waited behind a queued writer";
+    EXPECT_LT(result.Schedules, 1000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// An acquire that may not wait fails when the resource is unavailable,
+// and the driver posts the request instead. The model used to block
+// regardless, so only the waiting path was ever explored.
+///////////////////////////////////////////////////////////////////////////
+
+struct NoWaitAudit
+{
+    ERESOURCE Resource;
+    volatile long Refused;
+    volatile long Granted;
+};
+
+static void NoWaitHolder(void* Parameter)
+{
+    NoWaitAudit* audit = (NoWaitAudit*)Parameter;
+
+    ExAcquireResourceExclusiveLite(&audit->Resource, TRUE);
+    KmSchedYield();
+    ExReleaseResourceLite(&audit->Resource);
+}
+
+static void NoWaitTrier(void* Parameter)
+{
+    NoWaitAudit* audit = (NoWaitAudit*)Parameter;
+
+    if (!ExAcquireResourceSharedLite(&audit->Resource, FALSE))
+    {
+        audit->Refused++;
+        return;
+    }
+
+    audit->Granted++;
+    ExReleaseResourceLite(&audit->Resource);
+}
+
+static void NoWaitSetup(void* Parameter)
+{
+    NoWaitAudit* audit = (NoWaitAudit*)Parameter;
+
+    ExInitializeResourceLite(&audit->Resource);
+
+    KmSchedSpawn(NoWaitHolder, audit);
+    KmSchedSpawn(NoWaitTrier, audit);
+}
+
+TEST(SchedulerAudit, AcquireThatMayNotWaitFailsWhileHeld)
+{
+    static NoWaitAudit audit;
+
+    audit.Refused = 0;
+    audit.Granted = 0;
+
+    KM_SCHED_RESULT result =
+        KmExploreInterleavings(NoWaitSetup, nullptr, &audit, 1000);
+
+    EXPECT_EQ(0, result.Deadlocks);
+    EXPECT_LT(result.Schedules, 1000)
+        << "hit the schedule cap -- the space was sampled, not exhausted";
+    EXPECT_GT(audit.Refused, 0) << "no schedule refused the acquire while it was held";
+    EXPECT_GT(audit.Granted, 0) << "no schedule granted the acquire while it was free";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Partial-order reduction. A reduced exploration skips orders of steps
+// that touch nothing in common, so it must reach exactly the outcomes the
+// full one does -- the same final states, the same deadlocks -- in fewer
+// schedules. Each body here is explored both ways and the outcome sets
+// compared; the bodies are the shapes a reduction gets wrong when its
+// footprints are: a lost update through unlocked accesses, a deadlock
+// that needs one particular order, and steps that are truly independent.
+///////////////////////////////////////////////////////////////////////////
+
+struct LostUpdateAudit
+{
+    volatile long Counter;
+};
+
+static void UnlockedIncrementer(void* Parameter)
+{
+    LostUpdateAudit* audit = (LostUpdateAudit*)Parameter;
+
+    const long seen = ReadNoFence(&audit->Counter);
+    WriteRelease(&audit->Counter, seen + 1);
+}
+
+static void LostUpdateSetup(void* Parameter)
+{
+    LostUpdateAudit* audit = (LostUpdateAudit*)Parameter;
+
+    audit->Counter = 0;
+
+    KmSchedSpawn(UnlockedIncrementer, audit);
+    KmSchedSpawn(UnlockedIncrementer, audit);
+    KmSchedSpawn(UnlockedIncrementer, audit);
+}
+
+static void LostUpdateTeardown(void* Parameter)
+{
+    KmSchedNoteOutcome((unsigned __int64)((LostUpdateAudit*)Parameter)->Counter);
+}
+
+TEST(SchedulerAudit, ReductionReachesEveryOutcomeOfALostUpdate)
+{
+    static LostUpdateAudit audit;
+
+    KmSchedSetAtomicYields(1);
+
+    const KM_SCHED_RESULT full =
+        KmExploreInterleavings(LostUpdateSetup, LostUpdateTeardown, &audit, 100000);
+    const KM_SCHED_RESULT reduced =
+        ExploreReduced(LostUpdateSetup, LostUpdateTeardown, &audit, 100000);
+
+    KmSchedSetAtomicYields(0);
+
+    ASSERT_LT(full.Schedules, 100000) << "the full space was sampled, not exhausted";
+    EXPECT_EQ(3, full.Outcomes) << "three incrementers end on 1, 2 or 3";
+    EXPECT_EQ(full.Outcomes, reduced.Outcomes);
+    EXPECT_EQ(full.OutcomeDigest, reduced.OutcomeDigest)
+        << "the reduced exploration reached a different set of outcomes";
+    EXPECT_LT(reduced.Schedules, full.Schedules);
+}
+
+//
+// Sharding: the shards' runs together must be the unsharded search's, no
+// run lost and none counted twice. Two threads of four unlocked
+// increments run deeper than the shard depth, so runs are dealt out by
+// their prefix rather than one by one.
+//
+static void RepeatedIncrementer(void* Parameter)
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        UnlockedIncrementer(Parameter);
+    }
+}
+
+static void RepeatedIncrementSetup(void* Parameter)
+{
+    LostUpdateAudit* audit = (LostUpdateAudit*)Parameter;
+
+    audit->Counter = 0;
+
+    KmSchedSpawn(RepeatedIncrementer, audit);
+    KmSchedSpawn(RepeatedIncrementer, audit);
+}
+
+TEST(SchedulerAudit, ShardsTogetherRunTheWholeSearch)
+{
+    static LostUpdateAudit audit;
+    static unsigned __int64 whole[64];
+    static unsigned __int64 combined[64];
+
+    KmSchedSetAtomicYields(1);
+
+    const KM_SCHED_RESULT full =
+        KmExploreInterleavings(RepeatedIncrementSetup, LostUpdateTeardown, &audit, 100000);
+    const int wholeCount = KmSchedCopyOutcomes(whole, 64);
+
+    int schedules = 0;
+    int unionCount = 0;
+
+    for (int shard = 0; shard < 3; ++shard)
+    {
+        KmSchedSetShard(shard, 3);
+
+        const KM_SCHED_RESULT part =
+            KmExploreInterleavings(RepeatedIncrementSetup, LostUpdateTeardown, &audit, 100000);
+
+        EXPECT_GT(part.Schedules, 0) << "shard " << shard << " ran nothing";
+        schedules += part.Schedules;
+
+        unsigned __int64 outcomes[64];
+        const int count = KmSchedCopyOutcomes(outcomes, 64);
+
+        for (int i = 0; i < count; ++i)
+        {
+            if (std::find(combined, combined + unionCount, outcomes[i]) == combined + unionCount)
+            {
+                combined[unionCount++] = outcomes[i];
+            }
+        }
+    }
+
+    KmSchedSetShard(0, 1);
+    KmSchedSetAtomicYields(0);
+
+    ASSERT_LT(full.Schedules, 100000) << "the full space was sampled, not exhausted";
+    EXPECT_GT(full.MaxDepth, 12) << "no run reached the shard depth";
+    EXPECT_EQ(full.Schedules, schedules) << "the shards ran a different number of schedules";
+
+    std::sort(whole, whole + wholeCount);
+    std::sort(combined, combined + unionCount);
+
+    EXPECT_TRUE(std::equal(whole, whole + wholeCount, combined, combined + unionCount))
+        << "the shards reached a different set of outcomes";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Weak memory. The classic litmus shapes, each explored with and without
+// the reduction, across the orderings: what relaxed accesses may return,
+// and what release, acquire, an acquire or release read-modify-write, a
+// full fence, or the coherence of one location rule out. Outcome counts
+// pin the allowed sets: each shape has exactly one outcome that only an
+// unordered pair reaches.
+///////////////////////////////////////////////////////////////////////////
+
+struct LitmusAudit
+{
+    KM_SCHED_BODY Left;
+    KM_SCHED_BODY Right;
+    volatile long X;
+    volatile long Y;
+    long Seen0;
+    long Seen1;
+};
+
+static void LitmusSetup(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->X = 0;
+    audit->Y = 0;
+    audit->Seen0 = 0;
+    audit->Seen1 = 0;
+
+    KmSchedSpawn(audit->Left, audit);
+    KmSchedSpawn(audit->Right, audit);
+}
+
+static void LitmusTeardown(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    KmSchedNoteOutcome((unsigned __int64)(audit->Seen0 | (audit->Seen1 << 4)));
+}
+
+static int LitmusOutcomes(KM_SCHED_BODY Left, KM_SCHED_BODY Right, int Weak)
+{
+    static LitmusAudit audit;
+
+    audit.Left = Left;
+    audit.Right = Right;
+
+    KmSchedSetAtomicYields(1);
+    KmSchedSetWeakMemory(Weak);
+
+    const KM_SCHED_RESULT full = KmExploreInterleavings(LitmusSetup, LitmusTeardown, &audit, 100000);
+    const KM_SCHED_RESULT reduced = ExploreReduced(LitmusSetup, LitmusTeardown, &audit, 100000);
+
+    KmSchedSetWeakMemory(0);
+    KmSchedSetAtomicYields(0);
+
+    EXPECT_LT(full.Schedules, 100000) << "the full space was sampled, not exhausted";
+    EXPECT_EQ(full.Outcomes, reduced.Outcomes);
+    EXPECT_EQ(full.OutcomeDigest, reduced.OutcomeDigest)
+        << "the reduced exploration reached a different set of outcomes";
+
+    return full.Outcomes;
+}
+
+//
+// Store buffering: each thread writes one location and reads the other.
+// Only a full fence between the two keeps both reads from missing.
+//
+static void StoreReleaseLoadY(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteRelease(&audit->X, 1);
+    audit->Seen0 = ReadNoFence(&audit->Y);
+}
+
+static void StoreReleaseLoadX(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteRelease(&audit->Y, 1);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryLetsBothStoresBeBuffered)
+{
+    EXPECT_EQ(3, LitmusOutcomes(StoreReleaseLoadY, StoreReleaseLoadX, 0))
+        << "sequential consistency has one thread see the other's store";
+    EXPECT_EQ(4, LitmusOutcomes(StoreReleaseLoadY, StoreReleaseLoadX, 1))
+        << "neither thread saw the other's store in no schedule";
+}
+
+static void ExchangeLoadY(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    InterlockedExchange(&audit->X, 1);
+    audit->Seen0 = ReadNoFence(&audit->Y);
+}
+
+static void ExchangeLoadX(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    InterlockedExchange(&audit->Y, 1);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryKeepsInterlockedStoresOrdered)
+{
+    EXPECT_EQ(3, LitmusOutcomes(ExchangeLoadY, ExchangeLoadX, 1))
+        << "the full fences of two interlocked operations let both loads miss";
+}
+
+static void ExchangeAcquireLoadY(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    InterlockedExchangeAcquire(&audit->X, 1);
+    audit->Seen0 = ReadNoFence(&audit->Y);
+}
+
+static void ExchangeAcquireLoadX(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    InterlockedExchangeAcquire(&audit->Y, 1);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryLetsAcquireExchangesBeBuffered)
+{
+    EXPECT_EQ(4, LitmusOutcomes(ExchangeAcquireLoadY, ExchangeAcquireLoadX, 1))
+        << "an acquire exchange ordered the load after it as a full fence would";
+}
+
+static void StoreFenceLoadY(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    KeMemoryBarrier();
+    audit->Seen0 = ReadNoFence(&audit->Y);
+}
+
+static void StoreFenceLoadX(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->Y, 1);
+    KeMemoryBarrier();
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryKeepsFencedStoresOrdered)
+{
+    EXPECT_EQ(3, LitmusOutcomes(StoreFenceLoadY, StoreFenceLoadX, 1))
+        << "two full fences let both loads miss";
+}
+
+//
+// Message passing: one thread writes data then a flag, the other reads
+// the flag then the data. Seeing the flag without the data needs the
+// writer or the reader to leave its pair unordered.
+//
+static void PublishDataThenFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteRelease(&audit->X, 1);
+    WriteRelease(&audit->Y, 1);
+}
+
+static void StoreDataThenFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    WriteNoFence(&audit->Y, 1);
+}
+
+static void StoreDataFenceFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    KeMemoryBarrier();
+    WriteNoFence(&audit->Y, 1);
+}
+
+static void StoreDataReleaseFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    InterlockedIncrementRelease(&audit->Y);
+}
+
+static void StoreDataUnfencedFlag(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    InterlockedIncrementNoFence(&audit->Y);
+}
+
+static void ReadFlagThenData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = ReadNoFence(&audit->Y);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+static void AcquireFlagThenData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = ReadAcquire(&audit->Y);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+static void ReadFlagFenceData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = ReadNoFence(&audit->Y);
+    KeMemoryBarrier();
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+static void OrAcquireFlagThenData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = InterlockedOrAcquire(&audit->Y, 0);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+static void OrUnfencedFlagThenData(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = InterlockedOrNoFence(&audit->Y, 0);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryLetsAnUnfencedReaderSeeTheFlagBeforeTheData)
+{
+    EXPECT_EQ(4, LitmusOutcomes(PublishDataThenFlag, ReadFlagThenData, 1))
+        << "no schedule read the flag set and the data unset";
+    EXPECT_EQ(4, LitmusOutcomes(PublishDataThenFlag, OrUnfencedFlagThenData, 1))
+        << "an unfenced read-modify-write of the flag ordered the data read after it";
+}
+
+TEST(SchedulerAudit, WeakMemoryLetsAnUnfencedWriterPublishTheFlagBeforeTheData)
+{
+    EXPECT_EQ(4, LitmusOutcomes(StoreDataThenFlag, AcquireFlagThenData, 1))
+        << "an unfenced flag write released the data written before it";
+    EXPECT_EQ(4, LitmusOutcomes(StoreDataUnfencedFlag, AcquireFlagThenData, 1))
+        << "an unfenced read-modify-write of the flag released the data written before it";
+}
+
+TEST(SchedulerAudit, WeakMemoryKeepsAnAcquiringReaderAfterTheData)
+{
+    EXPECT_EQ(3, LitmusOutcomes(PublishDataThenFlag, AcquireFlagThenData, 1))
+        << "an acquire that read the flag still missed the data released before it";
+    EXPECT_EQ(3, LitmusOutcomes(PublishDataThenFlag, OrAcquireFlagThenData, 1))
+        << "an acquire read-modify-write of the flag still missed the data";
+    EXPECT_EQ(3, LitmusOutcomes(PublishDataThenFlag, ReadFlagFenceData, 1))
+        << "a full fence after reading the flag still missed the data";
+}
+
+TEST(SchedulerAudit, WeakMemoryKeepsAReleasingWriterBeforeTheFlag)
+{
+    EXPECT_EQ(3, LitmusOutcomes(StoreDataFenceFlag, AcquireFlagThenData, 1))
+        << "a full fence before writing the flag did not release the data";
+    EXPECT_EQ(3, LitmusOutcomes(StoreDataReleaseFlag, AcquireFlagThenData, 1))
+        << "a release read-modify-write of the flag did not release the data";
+}
+
+static void StoreOneThenTwo(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    WriteNoFence(&audit->X, 1);
+    WriteNoFence(&audit->X, 2);
+}
+
+static void ReadTwice(void* Parameter)
+{
+    LitmusAudit* audit = (LitmusAudit*)Parameter;
+
+    audit->Seen0 = ReadNoFence(&audit->X);
+    audit->Seen1 = ReadNoFence(&audit->X);
+}
+
+TEST(SchedulerAudit, WeakMemoryNeverReadsALocationBackwards)
+{
+    EXPECT_EQ(6, LitmusOutcomes(StoreOneThenTwo, ReadTwice, 1))
+        << "two reads of one location saw its writes out of order, or missed an order";
+}
+
+TEST(SchedulerAudit, ReductionStillFindsADeadlockThatNeedsOneOrder)
+{
+    static QueuedWriterAudit audit;
+
+    audit.UseResource = 0;
+
+    const KM_SCHED_RESULT full =
+        KmExploreInterleavings(QueuedWriterSetup, nullptr, &audit, 1000);
+    const KM_SCHED_RESULT reduced =
+        ExploreReduced(QueuedWriterSetup, nullptr, &audit, 1000);
+
+    ASSERT_GT(full.Deadlocks, 0);
+    EXPECT_GT(reduced.Deadlocks, 0)
+        << "the reduction skipped the only order in which a queued writer "
+           "holds back a reader's re-take";
+}
+
+struct IndependentAudit
+{
+    volatile long Own[3];
+};
+
+static void OwnCounterWorker(void* Parameter)
+{
+    volatile long* own = (volatile long*)Parameter;
+
+    InterlockedIncrement(own);
+    InterlockedIncrement(own);
+    InterlockedIncrement(own);
+}
+
+static void IndependentSetup(void* Parameter)
+{
+    IndependentAudit* audit = (IndependentAudit*)Parameter;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        audit->Own[i] = 0;
+        KmSchedSpawn(OwnCounterWorker, (void*)&audit->Own[i]);
+    }
+}
+
+static void IndependentTeardown(void* Parameter)
+{
+    IndependentAudit* audit = (IndependentAudit*)Parameter;
+
+    KmSchedNoteOutcome(((unsigned __int64)audit->Own[0] << 32) |
+        ((unsigned __int64)audit->Own[1] << 16) | (unsigned __int64)audit->Own[2]);
+}
+
+TEST(SchedulerAudit, ReductionRunsIndependentStepsInOneOrder)
+{
+    static IndependentAudit audit;
+
+    KmSchedSetAtomicYields(1);
+
+    const KM_SCHED_RESULT full =
+        KmExploreInterleavings(IndependentSetup, IndependentTeardown, &audit, 100000);
+    const KM_SCHED_RESULT reduced =
+        ExploreReduced(IndependentSetup, IndependentTeardown, &audit, 100000);
+
+    KmSchedSetAtomicYields(0);
+
+    ASSERT_LT(full.Schedules, 100000) << "the full space was sampled, not exhausted";
+    EXPECT_EQ(1, full.Outcomes);
+    EXPECT_EQ(full.OutcomeDigest, reduced.OutcomeDigest);
+
+    //
+    // Three threads touching only their own counter commute everywhere:
+    // one order is explored, and every other run stops at its first
+    // branch.
+    //
+    EXPECT_EQ(1, reduced.Schedules - reduced.Pruned)
+        << "the reduction explored more than one order of steps that commute";
+}
+
+//
+// The reduction's own check on its footprints. The writer changes a flag
+// without recording it, and the flag decides what the reader's next step
+// touches. The reduction takes the two first steps as independent and
+// puts the reader to sleep across the write; when a pruned run later
+// resumes the reader, its step no longer matches the footprint it was
+// put to sleep with, which is what an unrecorded shared access looks like.
+//
+struct UnrecordedWriteAudit
+{
+    long Flag;
+    volatile long Left;
+    volatile long Right;
+};
+
+static void FlagDependentReader(void* Parameter)
+{
+    UnrecordedWriteAudit* audit = (UnrecordedWriteAudit*)Parameter;
+
+    (void)ReadNoFence(audit->Flag ? &audit->Left : &audit->Right);
+}
+
+static void UnrecordedFlagWriter(void* Parameter)
+{
+    UnrecordedWriteAudit* audit = (UnrecordedWriteAudit*)Parameter;
+
+    audit->Flag = 1;
+    KmSchedYield();
+}
+
+static void UnrecordedWriteSetup(void* Parameter)
+{
+    UnrecordedWriteAudit* audit = (UnrecordedWriteAudit*)Parameter;
+
+    audit->Flag = 0;
+
+    KmSchedSpawn(FlagDependentReader, audit);
+    KmSchedSpawn(UnrecordedFlagWriter, audit);
+}
+
+TEST(SchedulerAudit, ReductionReportsAnUnrecordedSharedWrite)
+{
+    static UnrecordedWriteAudit audit;
+
+    KmExpectViolation(KmViolationLifetime);
+
+    ExploreReduced(UnrecordedWriteSetup, nullptr, &audit, 1000);
+
+    EXPECT_EQ(KmViolationLifetime, KmTakeViolation())
+        << "a step whose footprint changed under an unrecorded write went unreported";
+}
+
+//
+// A pool block freed by one thread and read by another. The quarantine
+// keeps the memory mapped, so the read itself returns poison rather than
+// faulting; the scheduler is what has to notice it.
+//
+struct FreedBlockAudit
+{
+    volatile long* Block;
+};
+
+static void BlockFreer(void* Parameter)
+{
+    ExFreePool((PVOID)((FreedBlockAudit*)Parameter)->Block);
+}
+
+static void BlockReader(void* Parameter)
+{
+    (void)ReadNoFence(((FreedBlockAudit*)Parameter)->Block);
+}
+
+static void FreedBlockSetup(void* Parameter)
+{
+    FreedBlockAudit* audit = (FreedBlockAudit*)Parameter;
+
+    audit->Block = (volatile long*)ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(long), 'tduA');
+
+    KmSchedSpawn(BlockFreer, audit);
+    KmSchedSpawn(BlockReader, audit);
+}
+
+TEST(SchedulerAudit, ReadOfAFreedPoolBlockIsReported)
+{
+    static FreedBlockAudit audit;
+
+    KmExpectViolation(KmViolationPool);
+
+    KmExploreInterleavings(FreedBlockSetup, nullptr, &audit, 1000);
+
+    EXPECT_EQ(KmViolationPool, KmTakeViolation())
+        << "a read of a freed pool block went unreported";
 }
 
 } // namespace

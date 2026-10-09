@@ -224,6 +224,21 @@ static const char* LockNames[KM_MAX_LOCKS];
 static long NextLockId = 0;
 
 //
+// The ids each id shares an edge with, in either direction, so clearing an
+// id's edges touches only the edges it has. Clearing a full row and column
+// instead walks a 2 KB-strided column through all 4 MB of LockOrder, and an
+// exploration whose Setup re-initialises a 256-bucket table does that 256
+// times per replay -- 2 ms of every replay spent zeroing entries that were
+// already zero. An id with more partners than fit is marked overflowed and
+// cleared the full way, so a short list costs speed, never an edge.
+//
+#define KM_MAX_LOCK_PARTNERS 32
+
+static unsigned short LockPartners[KM_MAX_LOCKS][KM_MAX_LOCK_PARTNERS];
+static unsigned char LockPartnerCount[KM_MAX_LOCKS];
+static unsigned char LockPartnerOverflow[KM_MAX_LOCKS];
+
+//
 // Ids returned by KmReleaseLockId, reused before any new one is minted.
 //
 static int FreeLockIds[KM_MAX_LOCKS];
@@ -255,6 +270,68 @@ void KmSetLockIdRecycling(int Enabled)
     LeaveCriticalSection(&OrderCs);
 }
 
+static void KmAddLockPartner(int Id, int Partner)
+{
+    if (LockPartnerOverflow[Id])
+    {
+        return;
+    }
+
+    if (LockPartnerCount[Id] == KM_MAX_LOCK_PARTNERS)
+    {
+        LockPartnerOverflow[Id] = 1;
+        return;
+    }
+
+    LockPartners[Id][LockPartnerCount[Id]++] = (unsigned short)Partner;
+}
+
+static void KmRemoveLockPartner(int Id, int Partner)
+{
+    for (int i = 0; i < LockPartnerCount[Id]; ++i)
+    {
+        if (LockPartners[Id][i] == Partner)
+        {
+            LockPartners[Id][i] = LockPartners[Id][--LockPartnerCount[Id]];
+            return;
+        }
+    }
+}
+
+//
+// Removes every edge into and out of Id. Called under OrderCs.
+//
+static void KmClearLockEdges(int Id)
+{
+    if (LockPartnerOverflow[Id])
+    {
+        for (int i = 0; i < KM_MAX_LOCKS; ++i)
+        {
+            if (LockOrder[Id][i] || LockOrder[i][Id])
+            {
+                LockOrder[Id][i] = 0;
+                LockOrder[i][Id] = 0;
+                KmRemoveLockPartner(i, Id);
+            }
+        }
+
+        LockPartnerOverflow[Id] = 0;
+    }
+    else
+    {
+        for (int i = 0; i < LockPartnerCount[Id]; ++i)
+        {
+            const int partner = LockPartners[Id][i];
+
+            LockOrder[Id][partner] = 0;
+            LockOrder[partner][Id] = 0;
+            KmRemoveLockPartner(partner, Id);
+        }
+    }
+
+    LockPartnerCount[Id] = 0;
+}
+
 //
 // Clears the observed-order edges. Deliberately does NOT reset the id
 // counter: locks created by an earlier test are still live and still hold
@@ -266,12 +343,25 @@ void KmResetLockOrder(void)
 {
     KmEnsureOrderCs();
     EnterCriticalSection(&OrderCs);
-    memset(LockOrder, 0, sizeof(LockOrder));
+
+    //
+    // Every id with an edge was handed out by KmAllocateLockId, which
+    // never returns one above NextLockId, so that bound covers the graph.
+    //
+    const long minted = (NextLockId < KM_MAX_LOCKS) ? NextLockId : KM_MAX_LOCKS - 1;
+
+    for (int id = 1; id <= minted; ++id)
+    {
+        KmClearLockEdges(id);
+    }
+
     LeaveCriticalSection(&OrderCs);
 }
 
 void KmInitializeLock(KM_LOCK* Lock, const char* Name)
 {
+    KmSchedNoteFootprint(Lock, 1, 1);
+
     if (Lock->Initialized)
     {
         KmReleaseLockId(Lock->Id);
@@ -342,7 +432,21 @@ static void KmRecordOrder(int AcquiringId)
             EnterCriticalSection(&OrderCs);
         }
 
-        LockOrder[heldId][AcquiringId] = 1;
+        if (!LockOrder[heldId][AcquiringId])
+        {
+            LockOrder[heldId][AcquiringId] = 1;
+
+            //
+            // Both ends record the edge, so it goes when either id does.
+            // An edge already recorded the other way round is already in
+            // both lists.
+            //
+            if (!LockOrder[AcquiringId][heldId])
+            {
+                KmAddLockPartner(heldId, AcquiringId);
+                KmAddLockPartner(AcquiringId, heldId);
+            }
+        }
     }
 
     LeaveCriticalSection(&OrderCs);
@@ -360,21 +464,59 @@ static void KmPushHeld(int Id)
     state->HeldCount++;
 }
 
+//
+// Removes the most recent hold of Id, not whatever is on top. Locks are not
+// always released in reverse order of acquisition, and popping the top on
+// an out-of-order release would leave the released lock on the stack and
+// drop the one still held: later acquisitions would then record edges from
+// a lock nobody holds and miss edges from one that is held, which is an
+// AB/BA deadlock the model never reports. Past KM_MAX_HELD the entries are
+// not stored, so the top is all there is to drop.
+//
 static void KmPopHeld(int Id)
 {
     KM_THREAD_STATE* state = KmThreadState();
 
-    if (state->HeldCount > 0)
+    if (state->HeldCount <= 0)
     {
-        state->HeldCount--;
+        return;
     }
 
-    (void)Id;
+    if (state->HeldCount <= KM_MAX_HELD)
+    {
+        for (int i = state->HeldCount - 1; i >= 0; --i)
+        {
+            if (state->HeldLocks[i] == Id)
+            {
+                memmove(&state->HeldLocks[i], &state->HeldLocks[i + 1],
+                    (size_t)(state->HeldCount - 1 - i) * sizeof(state->HeldLocks[0]));
+                break;
+            }
+        }
+    }
+
+    state->HeldCount--;
 }
 
 int KmLocksHeld(void)
 {
     return KmThreadState()->HeldCount;
+}
+
+int KmHoldsLock(int Id)
+{
+    KM_THREAD_STATE* state = KmThreadState();
+    const int stored = (state->HeldCount < KM_MAX_HELD) ? state->HeldCount : KM_MAX_HELD;
+
+    for (int i = 0; i < stored; ++i)
+    {
+        if (state->HeldLocks[i] == Id)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 //
@@ -410,6 +552,8 @@ void KmReleaseLockId(int Id)
         return;
     }
 
+    KmSchedNoteFootprint(&NextLockId, sizeof(NextLockId), 1);
+
     KmEnsureOrderCs();
     EnterCriticalSection(&OrderCs);
 
@@ -418,11 +562,7 @@ void KmReleaseLockId(int Id)
     // lock's edges would invent inversions between locks that never
     // coexisted.
     //
-    for (int i = 0; i < KM_MAX_LOCKS; ++i)
-    {
-        LockOrder[Id][i] = 0;
-        LockOrder[i][Id] = 0;
-    }
+    KmClearLockEdges(Id);
 
     LockNames[Id] = NULL;
 
@@ -436,6 +576,12 @@ void KmReleaseLockId(int Id)
 
 int KmAllocateLockId(void)
 {
+    //
+    // Which id a lock gets depends on the order locks were minted and
+    // retired in, so the steps that do either do not commute.
+    //
+    KmSchedNoteFootprint(&NextLockId, sizeof(NextLockId), 1);
+
     KmEnsureOrderCs();
     EnterCriticalSection(&OrderCs);
 
@@ -480,6 +626,8 @@ static void KmSpinLockClaim(void* Context)
 {
     KM_LOCK* lock = (KM_LOCK*)Context;
 
+    KmSchedNoteAcquire(lock);
+
     lock->SchedState = 1;
     lock->OwnerThread = KmSchedThreadId();
 }
@@ -493,6 +641,8 @@ static void KmSpinLockClaim(void* Context)
 //
 static void KmSpinLockSharedClaim(void* Context)
 {
+    KmSchedNoteAcquire(Context);
+
     ((KM_LOCK*)Context)->SchedState++;
 }
 
@@ -566,6 +716,7 @@ void KmReleaseLock(KM_LOCK* Lock, unsigned char OldIrql)
     if (KmSchedActive())
     {
         Lock->SchedState = 0;
+        KmSchedNoteRelease(Lock);
         KmSchedYield();
         return;
     }
@@ -611,6 +762,7 @@ void KmReleaseLockShared(KM_LOCK* Lock)
         }
 
         Lock->SchedState--;
+        KmSchedNoteRelease(Lock);
         KmSchedYield();
         return;
     }
@@ -1048,6 +1200,7 @@ void KmInitializeBarrier(KM_BARRIER* Barrier, long Target)
 
 void KmBarrierWait(KM_BARRIER* Barrier)
 {
+    KmSchedNoteFootprint(&Barrier->Count, sizeof(Barrier->Count), 1);
     InterlockedIncrement(&Barrier->Count);
 
     while (Barrier->Count < Barrier->Target)
@@ -1057,9 +1210,10 @@ void KmBarrierWait(KM_BARRIER* Barrier)
             //
             // A spinning fiber never yields the host thread, so the
             // thread being waited for could never run; wait
-            // cooperatively instead.
+            // cooperatively instead. The re-read starts a new step.
             //
             KmSchedYield();
+            KmSchedNoteFootprint(&Barrier->Count, sizeof(Barrier->Count), 0);
         }
         else
         {

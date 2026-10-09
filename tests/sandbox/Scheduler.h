@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 //
 // Systematic interleaving exploration: run a concurrent body under EVERY
 // thread schedule rather than under whichever one the OS happens to pick.
@@ -26,11 +28,19 @@
 // over schedules, not over input data -- the complement of what CBMC
 // gives, which is why both are worth having.
 //
-// What it does not model: weak memory. Every thread sees every write
-// immediately, so this finds ordering bugs and missing mutual exclusion,
-// not missing barriers. BlorgFS uses interlocked operations and push locks
-// (both full fences) for everything cross-thread, so that gap is narrow --
-// but it is a gap, and ReadNoFence is where it would hide.
+// Memory is sequentially consistent by default: every thread sees every
+// write as soon as it is made, so an exploration finds ordering bugs and
+// missing mutual exclusion, not missing barriers. Weak memory is opt-in
+// (KmSchedSetWeakMemory): a read through the shims may then return an
+// older write than the last, as far as the orderings the driver asked for
+// allow, which reaches what ARM64 and the compiler do to the counters and
+// flags shared through ReadNoFence, ReadAcquire, WriteRelease and the
+// weaker Interlocked forms. Store buffering and message passing are
+// covered. Load buffering is not: a read returns a write already made, so
+// no thread ever reads a value another thread writes later in its own
+// program order, which ARM64 allows for a relaxed read followed by an
+// independent relaxed write. Plain accesses outside the shims are
+// sequentially consistent in either mode.
 //
 
 #ifdef __cplusplus
@@ -54,10 +64,13 @@ typedef void (*KM_SCHED_BODY)(void* Context);
 
 typedef struct _KM_SCHED_RESULT
 {
+    unsigned __int64 OutcomeDigest; // order-independent summary of the outcome set
     int Schedules;       // distinct interleavings actually executed
     int MaxDepth;        // most scheduling points seen in any one run
     int Deadlocks;       // runs where every thread was blocked
     int Truncated;       // runs cut off at KM_SCHED_MAX_DEPTH
+    int Pruned;          // runs the reduction stopped branching from
+    int Outcomes;        // distinct KmSchedNoteOutcome values reported
 } KM_SCHED_RESULT;
 
 //
@@ -117,16 +130,69 @@ void KmSchedNoteAcquire(const void* LockAddress);
 void KmSchedNoteRelease(const void* LockAddress);
 
 //
-// The next lever, deliberately not pulled yet: partial-order reduction.
-// Depth-first enumeration replays ever-longer shared prefixes and
-// explores interleavings that differ only in the order of independent
-// operations. Sleep sets or happens-before pruning would cut these
-// spaces by orders of magnitude -- but SOUND reduction needs to know
-// which memory each scheduling point's step actually touched, and
-// nothing records that today. Guessing conflicts would silently shrink
-// coverage, which is the one failure mode worse than slowness. If this
-// is ever built: instrument the primitives' reads and writes first, and
-// let the reduction derive from what was really accessed.
+// Partial-order reduction, opt-in per exploration. Depth-first enumeration
+// otherwise explores every order of steps that touch nothing in common,
+// and those orders all end in the same state. With the reduction on, the
+// explorer records which memory each step touched and skips an order once
+// one equivalent to it has run (sleep sets; see Scheduler.c). Every
+// reachable outcome, deadlock and violation is still reached.
+//
+// The footprints come from the primitives: lock operations, the
+// interlocked and ReadNoFence-family shims, pool allocation and free, and
+// the shim's shared queues. Memory a body shares without going through
+// one of those must be registered with KmSchedNoteAccess or
+// KmSchedNoteFootprint, or the reduction treats the steps touching it as
+// independent. The driver's own plain accesses are not recorded: the
+// reduction relies on them being protected by something that is.
+//
+void KmSchedSetReduction(int Enabled);
+
+//
+// Adds a range to the footprint of the calling thread's current step.
+// Called by the primitives; a body calls it for shared memory it touches
+// with plain accesses.
+//
+void KmSchedNoteFootprint(const void* Address, size_t Length, int IsWrite);
+
+//
+// Heap blocks allocated while an exploration runs, from the shim's
+// allocators. Footprints name memory inside them by allocation order
+// rather than address, which is what lets a footprint recorded in one
+// replay be compared with steps taken in the next. Pool blocks are also
+// reported when freed: their memory sits in the shim's quarantine rather
+// than going back to the heap, and a step whose footprint lands in one is
+// reported as a use after free, with or without the reduction.
+//
+void KmSchedNoteAllocation(const void* Block, size_t Size);
+void KmSchedNoteFree(const void* Block);
+
+//
+// Reports what one run ended in, from Teardown. The explorer keeps the
+// set of distinct values and returns its size and digest, which is how a
+// reduced exploration is checked against the full one: on any space both
+// can finish, the outcome sets must be identical.
+//
+void KmSchedNoteOutcome(unsigned __int64 Outcome);
+
+//
+// Copies the last exploration's outcome set, as the explorer stores it,
+// and returns its size. A sharded search is checked one shard at a time:
+// every outcome a shard reaches must also be one the reduced search
+// reaches, and the reduced search reaches nothing the full one cannot,
+// since each of its runs is a run of the full search.
+//
+int KmSchedCopyOutcomes(unsigned __int64* Outcomes, int Capacity);
+
+//
+// Splits the full search between Count processes; this one explores the
+// runs of shard Index. Runs are grouped by their first few choices and the
+// groups dealt out in turn, so the shards' runs together are exactly the
+// unsharded search's. A run in another shard's group is still executed
+// once, unrecorded, to find where the next group starts; its outcome is
+// not reported and it is not counted. Ignored with the reduction on;
+// KmSchedSetShard(0, 1) turns it off.
+//
+void KmSchedSetShard(int Index, int Count);
 
 //
 // Starts a thread that participates in the exploration. Only valid inside
@@ -271,20 +337,67 @@ void KmSchedWaitUntilClaim(KM_SCHED_PREDICATE Predicate, void* PredicateContext,
 // That is a sample rather than a proof -- it hit the cap -- but it is
 // three orders of magnitude past where the divergence used to appear.
 //
-// Cost is no longer the reason the gated proofs run at lock granularity:
-// under the fiber executor the exhaustive lock-granularity proofs take
-// seconds and the two-million-schedule soak about two minutes. They stay
-// DISABLED_ tests in NodeTableSchedTest.cpp purely to keep the default
-// gate fast; run them on demand.
+// With partial-order reduction on (KmSchedSetReduction) both node-table
+// bodies exhaust their atomic-granularity spaces in a few thousand runs:
+// NodeTableSchedTest.NoAtomicInterleavingRetiresAPinnedNode and
+// NodeTableRevivalSchedTest.NoAtomicInterleavingFreesARevivedNode.
 //
 void KmSchedSetAtomicYields(int Enabled);
 
-long KmSchedInterlockedIncrement(long volatile* Target);
-long KmSchedInterlockedDecrement(long volatile* Target);
-long KmSchedInterlockedExchange(long volatile* Target, long Value);
-long KmSchedInterlockedCompareExchange(long volatile* Target, long Exchange, long Comparand);
-__int64 KmSchedInterlockedIncrement64(__int64 volatile* Target);
-__int64 KmSchedInterlockedDecrement64(__int64 volatile* Target);
+//
+// The ordering each shim below is asked for, as bits: an acquire joins
+// what the write it reads released, a release publishes the writer's
+// clock with its write, and a full fence also orders the access against
+// every other full fence. The unsuffixed Interlocked operations are full
+// fences; their Acquire, Release and NoFence forms are the weaker orders.
+// They differ only under weak memory (KmSchedSetWeakMemory).
+//
+#define KM_ORDER_RELAXED  0
+#define KM_ORDER_ACQUIRE  1
+#define KM_ORDER_RELEASE  2
+#define KM_ORDER_ACQ_REL  (KM_ORDER_ACQUIRE | KM_ORDER_RELEASE)
+#define KM_ORDER_SEQ_CST  (KM_ORDER_ACQ_REL | 4)
+
+long KmSchedInterlockedIncrement(long volatile* Target, int Order);
+long KmSchedInterlockedDecrement(long volatile* Target, int Order);
+long KmSchedInterlockedExchange(long volatile* Target, long Value, int Order);
+long KmSchedInterlockedCompareExchange(long volatile* Target, long Exchange, long Comparand, int Order);
+__int64 KmSchedInterlockedIncrement64(__int64 volatile* Target, int Order);
+__int64 KmSchedInterlockedDecrement64(__int64 volatile* Target, int Order);
+long KmSchedInterlockedOr(long volatile* Target, long Value, int Order);
+__int64 KmSchedInterlockedAdd64(__int64 volatile* Target, __int64 Value, int Order);
+__int64 KmSchedInterlockedExchangeAdd64(__int64 volatile* Target, __int64 Value, int Order);
+void* KmSchedInterlockedCompareExchangePointer(void* volatile* Target, void* Exchange, void* Comparand, int Order);
+
+//
+// The unlocked reads and writes the driver makes of memory other threads
+// change: ReadNoFence, ReadAcquire, WriteRelease and their 64-bit and
+// pointer forms. They are scheduling points under atomic yields for the
+// same reason the interlocked operations are.
+//
+// Yielding only at locks and interlocked operations covers every
+// interleaving only when nothing else is shared without a lock -- and
+// these accesses exist precisely because something is. A node's RefCount
+// and PinCount are dropped by interlocked operations under different
+// locks and read back with ReadNoFence to decide whether the node is
+// idle. Without a scheduling point at the read, the explorer runs each
+// drop and its read as one step, and never reaches the schedule in which
+// both droppers drop first and then both read.
+//
+long KmSchedReadLong(long volatile* Source, int Order);
+__int64 KmSchedReadLong64(__int64 volatile* Source, int Order);
+void* KmSchedReadPointer(void* volatile* Source, int Order);
+void KmSchedWriteLong(long volatile* Target, long Value, int Order);
+void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value, int Order);
+void KmSchedMemoryBarrier(void);
+
+//
+// Weak memory, opt-in per exploration: a read may return an older write
+// than the last, as far as the orderings and full fences in the program
+// allow, and each value it may return is a branch of the search. See the
+// weak memory section of Scheduler.c for the model.
+//
+void KmSchedSetWeakMemory(int Enabled);
 
 #ifdef __cplusplus
 }
