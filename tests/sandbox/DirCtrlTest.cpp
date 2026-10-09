@@ -12,8 +12,8 @@
 // independent of the network. The regression test below is the exception: it drives a real
 // BlorgHttpGetDirectoryInfo call (scripted to stall, via SandboxSocket.h)
 // to prove a real second query sees a real outstanding fetch, not a
-// hand-built stand-in for one. DirCtrlComplete's *success* path --
-// parses a delivered FlatBuffers subtree in the publication test below,
+// hand-built stand-in for one. The publication test below also runs
+// DirCtrlComplete's parsing path on a delivered FlatBuffers subtree,
 // which also checks the descendant cache answers.
 //
 
