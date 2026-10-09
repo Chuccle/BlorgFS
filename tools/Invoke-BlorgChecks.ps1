@@ -154,6 +154,7 @@ if ($CacheMutantsOnly) {
     $read = [IO.File]::ReadAllText($readPath)
     $dir = [IO.File]::ReadAllText($dirPath)
     $subtreeTest = 'DirCtrlTest.NetworkSubtreePublishesDescendantListings'
+    $fastReadTest = 'ReadTest.FastIoReadCountsOnlyHandledReads'
     $fillTest = 'DiskCacheTest.FillAllocationFailuresCountTheRemainingBlocksAndRollBack'
     $eofTest = 'DiskCacheTest.ValidBytesCannotExtendBeyondTheImmutableKey'
     $snapshotTest = 'DiskCacheTest.PagingResourceKeepsTrimAndCacheKeyInOneVersion'
@@ -170,6 +171,8 @@ if ($CacheMutantsOnly) {
     if ([regex]::Matches($lateSeed, $publishEnd).Count -ne 1) { throw 'descendant publication end not found' }
     $lateSeed = [regex]::Replace($lateSeed, $publishEnd, '$0' + "`n    if (rootPublished)`n    {`n        BlorgPathCacheSeedListing(Dir, DirInfo, Ticket);`n    }")
     $variants = @(
+        @{ Name = 'count-fast-read-fallback'; Path = $readPath; Text = $read.Replace('if (handled)', 'if (TRUE)'); Test = $fastReadTest },
+        @{ Name = 'omit-fast-read-consumption'; Path = $readPath; Text = $read.Replace('fcb->ReadAheadConsumedBytes += IoStatus->Information;', ''); Test = $fastReadTest },
         @{ Name = 'skip-subtree-publication'; Path = $dirPath; Text = $dir.Replace('const SIZE_T published = BlorgPathCachePublishDescendants(Dir, DirInfo, descendants, count, Ticket);', 'const SIZE_T published = 0;'); Test = $subtreeTest },
         @{ Name = 'seed-root-after-descendants'; ExpectedKilled = $false; Path = $dirPath; Text = $lateSeed; Test = $subtreeTest },
         @{ Name = 'remove-cache-EOF-offset-guard'; Path = $diskPath; Text = $disk.Replace('Offset >= Key->Size || ', ''); Test = $eofTest },
@@ -183,7 +186,7 @@ if ($CacheMutantsOnly) {
     try {
         & $msbuild $project "/p:Configuration=$Configuration" '/p:Platform=x64' "/p:OutDir=$outputDirectory\" '/v:minimal' '/nologo'
         if ($LASTEXITCODE -ne 0) { throw 'fixed sandbox build failed' }
-        foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest, $subtreeTest)) {
+        foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest, $subtreeTest, $fastReadTest)) {
             & $exe "--gtest_filter=$test"
             if ($LASTEXITCODE -ne 0) { throw "fixed regression failed: $test" }
         }
@@ -209,7 +212,7 @@ if ($CacheMutantsOnly) {
         & $msbuild $project "/p:Configuration=$Configuration" '/p:Platform=x64' "/p:OutDir=$outputDirectory\" '/v:minimal' '/nologo'
         if ($LASTEXITCODE -ne 0) { throw 'restored sandbox build failed' }
     }
-    foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest, $subtreeTest)) {
+    foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest, $subtreeTest, $fastReadTest)) {
         & $exe "--gtest_filter=$test"
         if ($LASTEXITCODE -ne 0) { throw "restored regression failed: $test" }
     }

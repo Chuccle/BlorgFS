@@ -92,10 +92,20 @@ VOID CcSetAdditionalCacheAttributes(PFILE_OBJECT F, BOOLEAN NoRa, BOOLEAN NoWb) 
 // reachable on demand instead of leaving it permanently dead.
 //
 static volatile LONG CcCopyReadForceMiss = 0;
+static volatile LONG CcCopyReadInformation = 0;
 
 VOID ShimForceNextCcCopyReadMiss(VOID)
 {
     InterlockedExchange(&CcCopyReadForceMiss, 1);
+}
+
+//
+// Set one successful copy's reported byte count so the real read wrapper
+// can account for consumption; the model does not emulate cached pages.
+//
+VOID ShimSetNextCcCopyReadInformation(ULONG Information)
+{
+    InterlockedExchange(&CcCopyReadInformation, C_CAST(LONG, Information));
 }
 
 BOOLEAN CcCopyReadEx(PFILE_OBJECT F, PLARGE_INTEGER O, ULONG L, BOOLEAN W, PVOID B, PIO_STATUS_BLOCK S, PETHREAD T)
@@ -110,7 +120,7 @@ BOOLEAN CcCopyReadEx(PFILE_OBJECT F, PLARGE_INTEGER O, ULONG L, BOOLEAN W, PVOID
     if (S)
     {
         S->Status = STATUS_SUCCESS;
-        S->Information = 0;
+        S->Information = C_CAST(ULONG, InterlockedExchange(&CcCopyReadInformation, 0));
     }
 
     return TRUE;

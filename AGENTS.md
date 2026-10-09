@@ -2014,7 +2014,7 @@ Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),
 ### Cache safeguard mutation checks
 
 `powershell -File tools/Invoke-BlorgChecks.ps1 -CacheMutantsOnly -Configuration Release`
-rebuilds the real dispatch sandbox with eight safeguard mutations and an exploratory root-seed reordering: subtree publication, EOF
+rebuilds the real dispatch sandbox with ten safeguard mutations and an exploratory root-seed reordering: subtree publication, EOF
 bounds and the independent offset guard, snapshot resource acquisition, fill rollback, remaining drop counts,
 partial EOF drop counts and response-version validation. Each named regression
 must pass before mutation, fail with a gtest assertion when its safeguard is removed, and pass
@@ -2032,3 +2032,9 @@ publication is an exploratory mutant expected to survive the publication test;
 it is recorded as survived, not credited as a killed safeguard. The mutant
 preserves the root-publication acceptance guard. This does not establish change
 feed reset ordering or alias invalidation.
+
+The fast-read wrapper regression calls BlorgFastIoRead with successful and
+missed modeled Cc outcomes. It checks consumption, latency samples and the
+idle timestamp; native mutation runs must detect unconditional fallback
+accounting and omitted consumption. The byte-count seam models the Cc contract; it does
+not claim native Cache Manager page-copy or scheduling coverage.

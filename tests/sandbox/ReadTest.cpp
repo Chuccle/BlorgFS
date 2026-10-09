@@ -1141,6 +1141,38 @@ TEST_F(ReadFairTest, WaitingDemandGoesAheadOfHeldReadAhead)
 
 
 //
+// Call the real fast-read wrapper across both FsRtl outcomes. The model
+// supplies the successful byte count; assertions observe driver accounting,
+// including a miss with stale Information that must not count twice when
+// the I/O manager later retries it as an IRP.
+//
+TEST_F(ReadTest, FastIoReadCountsOnlyHandledReads)
+{
+    FILE_OBJECT file = {};
+    LARGE_INTEGER offset = {};
+    IO_STATUS_BLOCK status = {};
+    unsigned char buffer[64] = {};
+    file.FsContext = Fcb;
+    const ULONG64 samples = BlorgStatisticsForCurrentProcessor()->UserReadSamples;
+    const ULONG64 consumed = Fcb->ReadAheadConsumedBytes;
+    ShimSetNextCcCopyReadInformation(sizeof(buffer));
+    EXPECT_TRUE(BlorgFastIoRead(&file, &offset, sizeof(buffer), TRUE, 0,
+        buffer, &status, Volume));
+    EXPECT_EQ(STATUS_SUCCESS, status.Status);
+    EXPECT_EQ(sizeof(buffer), status.Information);
+    EXPECT_EQ(samples + 1, BlorgStatisticsForCurrentProcessor()->UserReadSamples);
+    EXPECT_EQ(consumed + sizeof(buffer), Fcb->ReadAheadConsumedBytes);
+    const LONG64 completed = Fcb->ReadIdleLastEndQpc;
+    EXPECT_NE(0, completed);
+    ShimForceNextCcCopyReadMiss();
+    EXPECT_FALSE(BlorgFastIoRead(&file, &offset, sizeof(buffer), TRUE, 0,
+        buffer, &status, Volume));
+    EXPECT_EQ(samples + 1, BlorgStatisticsForCurrentProcessor()->UserReadSamples);
+    EXPECT_EQ(consumed + sizeof(buffer), Fcb->ReadAheadConsumedBytes);
+    EXPECT_EQ(completed, Fcb->ReadIdleLastEndQpc);
+}
+
+//
 // Exercise the actual fast-I/O gate for both node kinds and both operation
 // kinds. A dispatch read succeeding does not show that this gate rejects
 // directories or writes before asking FsRtl about byte-range locks.

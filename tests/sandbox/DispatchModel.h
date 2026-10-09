@@ -37,6 +37,7 @@ VOID KdBreakPoint(VOID);
 //
 VOID ShimForceNextOplockCheck(NTSTATUS Status);
 VOID ShimForceNextCcCopyReadMiss(VOID);
+VOID ShimSetNextCcCopyReadInformation(ULONG Information);
 
 //
 // What a reopened FCB's refresh asked of Cc and Mm (Create.c
