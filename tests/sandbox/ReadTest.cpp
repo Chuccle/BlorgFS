@@ -527,11 +527,11 @@ TEST_F(ReadTest, CachedMdlReadUsesCcMdlRead)
 }
 
 //
-// CcCopyReadEx returning FALSE (a would-block miss with Wait=TRUE) is Cc's
-// signal to come back on a thread that can wait -- BlorgVolumeRead answers
-// by reposting to the FSP queue via BlorgFsdPostRequest rather than looping or
-// blocking here. This only reaches BlorgRead's Wait=TRUE call to
-// BlorgSetupIrpContext when the file object is marked synchronous.
+// Force the modeled CcCopyReadEx to return FALSE with Wait=TRUE and observe
+// the actual driver's fallback through BlorgFsdPostRequest. This tests the
+// repost contract, not native Cc residency or the usual waiting-copy outcome.
+// The synchronous file flag selects the Wait=TRUE call to
+// BlorgSetupIrpContext.
 //
 // STATUS_DEVICE_REMOVED, not STATUS_PENDING, is the correct result in this
 // harness: BlorgFsdPostRequest's first act is checking FspQueue.ThreadsActive,

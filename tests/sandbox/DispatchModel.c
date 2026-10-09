@@ -82,14 +82,11 @@ BOOLEAN MmFlushImageSection(PSECTION_OBJECT_POINTERS Sections, MMFLUSH_TYPE Flus
 VOID CcSetAdditionalCacheAttributes(PFILE_OBJECT F, BOOLEAN NoRa, BOOLEAN NoWb) { (void)F; (void)NoRa; (void)NoWb; }
 
 //
-// A cache miss at PASSIVE with Wait=FALSE is what Cc uses to tell the
-// caller "this would block, come back on a thread that can wait" -- Read.c
-// answers by reposting to the FSP worker pool, which is the entire reason
-// that pool exists (see FspWorkQueue.c's header comment). An always-TRUE
-// stub makes that branch structurally unreachable: no dispatch test could
-// ever exercise it, whatever it wrote, because the driver would never see
-// the FALSE that triggers it. ShimForceNextCcCopyReadMiss makes it
-// reachable on demand instead of leaving it permanently dead.
+// Force one waiting copy to return FALSE so actual driver fallback paths
+// are observable. The seam applies when Wait=TRUE, as used by the
+// synchronous-file dispatch tests; it does not model native Cc residency
+// or claim that a waiting kernel copy normally returns a would-block miss.
+// An always-TRUE stub would leave the driver's repost branch unreachable.
 //
 static volatile LONG CcCopyReadForceMiss = 0;
 static volatile LONG CcCopyReadInformation = 0;
