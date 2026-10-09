@@ -202,12 +202,13 @@ extern "C" int BlorgFuzzOnce(const unsigned char* Data, size_t Size)
     // this driver fed straight from network bytes. Fuzzing only the read
     // left that parser -- and every entry count, name conversion and
     // allocation size derived from it -- with no malformed-input coverage
-    // at all.
+    // at all. The listing asks for its subtree, so the listings beneath it
+    // are decoded too.
     //
     const bool fuzzDirectoryListing = (chunkMode & 0x04) != 0;
 
     NTSTATUS status = fuzzDirectoryListing
-        ? BlorgHttpGetDirectoryInfo(&pathString, OnDirInfo, nullptr)
+        ? BlorgHttpGetDirectoryInfo(&pathString, 64, OnDirInfo, nullptr)
         : BlorgHttpGetFileMdl(&pathString, 0, sizeof(target), mdl, OnFileRead, nullptr);
 
     SandboxDrainCompletions();
@@ -249,26 +250,47 @@ namespace
     //
     // Seeds chosen to put the fuzzer near the interesting boundaries
     // rather than making it discover HTTP from scratch: a well-formed
-    // response, ones with the length fields at their limits, and the
-    // shapes the scenario suite showed matter.
+    // response, ones with the length fields at their limits, the shapes
+    // the scenario suite showed matter, and a listing with one listing
+    // beneath it, a subtree answer's smallest shape.
     //
-    const char* const kSeeds[] =
+    struct Seed
     {
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\n\r\nABCDEFGH",
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 512\r\n\r\n",
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 0\r\n\r\n",
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 99999999999999999999\r\n\r\n",
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: -1\r\n\r\n",
-        "HTTP/1.1 206 Partial Content\r\nContent-Length:\r\n\r\n",
-        "HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nContent-Length: 9\r\n\r\nABCDEFGH",
-        "HTTP/1.1 200 OK\r\nContent-Length: 512\r\n\r\n",
-        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
-        "HTTP/1.1 999 Nonsense\r\nContent-Length: 1\r\n\r\nX",
-        "HTTP/1.1 206\r\n\r\n",
-        "\r\n\r\n",
-        "HTTP/1.1 206 Partial Content\r\n\r\n",
-        "NOT HTTP AT ALL",
+        const char* Data;
+        size_t Size;
     };
+
+#define SEED(bytes) { bytes, sizeof(bytes) - 1 }
+
+    const Seed kSeeds[] =
+    {
+        SEED("HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\n\r\nABCDEFGH"),
+        SEED("HTTP/1.1 206 Partial Content\r\nContent-Length: 512\r\n\r\n"),
+        SEED("HTTP/1.1 206 Partial Content\r\nContent-Length: 0\r\n\r\n"),
+        SEED("HTTP/1.1 206 Partial Content\r\nContent-Length: 99999999999999999999\r\n\r\n"),
+        SEED("HTTP/1.1 206 Partial Content\r\nContent-Length: -1\r\n\r\n"),
+        SEED("HTTP/1.1 206 Partial Content\r\nContent-Length:\r\n\r\n"),
+        SEED("HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nContent-Length: 9\r\n\r\nABCDEFGH"),
+        SEED("HTTP/1.1 200 OK\r\nContent-Length: 512\r\n\r\n"),
+        SEED("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
+        SEED("HTTP/1.1 999 Nonsense\r\nContent-Length: 1\r\n\r\nX"),
+        SEED("HTTP/1.1 206\r\n\r\n"),
+        SEED("\r\n\r\n"),
+        SEED("HTTP/1.1 206 Partial Content\r\n\r\n"),
+        SEED("NOT HTTP AT ALL"),
+        SEED("HTTP/1.1 200 OK\r\nContent-Length: 144\r\n\r\n"
+             "\x10\x00\x00\x00\x00\x00\x0a\x00\x0c\x00\x08\x00\x00\x00\x04\x00"
+             "\x0a\x00\x00\x00\x08\x00\x00\x00\x0c\x00\x00\x00\x01\x00\x00\x00"
+             "\x2c\x00\x00\x00\x01\x00\x00\x00\x0c\x00\x00\x00\x00\x00\x06\x00"
+             "\x08\x00\x04\x00\x06\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00"
+             "\x61\x00\x0a\x00\x08\x00\x00\x00\x00\x00\x04\x00\x0a\x00\x00\x00"
+             "\x0c\x00\x00\x00\x08\x00\x08\x00\x00\x00\x04\x00\x08\x00\x00\x00"
+             "\x04\x00\x00\x00\x01\x00\x00\x00\x0c\x00\x00\x00\x08\x00\x10\x00"
+             "\x0c\x00\x04\x00\x08\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00"
+             "\x04\x00\x00\x00\x05\x00\x00\x00\x63\x2e\x62\x69\x6e\x00\x00\x00"),
+    };
+
+#undef SEED
 
     unsigned int RandomState = 0x1234567u;
 
@@ -348,9 +370,9 @@ int main(int argc, char** argv)
 
     for (unsigned long i = 0; i < iterations; ++i)
     {
-        const char* seed = kSeeds[NextRandom() % (sizeof(kSeeds) / sizeof(kSeeds[0]))];
+        const Seed& seed = kSeeds[NextRandom() % (sizeof(kSeeds) / sizeof(kSeeds[0]))];
 
-        size_t size = strlen(seed);
+        size_t size = seed.Size;
 
         if (size + 1 > capacity)
         {
@@ -362,7 +384,7 @@ int main(int argc, char** argv)
         // patterns alongside content.
         //
         buffer[0] = (unsigned char)(NextRandom() & 0xFF);
-        memcpy(buffer + 1, seed, size);
+        memcpy(buffer + 1, seed.Data, size);
 
         size_t total = size + 1;
 

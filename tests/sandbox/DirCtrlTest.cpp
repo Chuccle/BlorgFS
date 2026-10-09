@@ -12,15 +12,15 @@
 // independent of the network. The regression test below is the exception: it drives a real
 // BlorgHttpGetDirectoryInfo call (scripted to stall, via SandboxSocket.h)
 // to prove a real second query sees a real outstanding fetch, not a
-// hand-built stand-in for one. DirCtrlComplete's *success* path --
-// actually parsing a delivered FlatBuffers listing -- is still untested;
-// that's Client.c's HttpDeserializeDirectoryInfo gap, not duplicated here.
+// hand-built stand-in for one, and the subtree test delivers a real
+// FlatBuffers answer through DirCtrlComplete's success path.
 //
 
 #include <gtest/gtest.h>
 
 #include <cwchar>
 #include <memory>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -32,6 +32,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp);
 }
 
 #include "ListingBuilder.h"
+#include "SubtreeResponse.h"
 
 #include "DeviceKindScope.h"
 
@@ -46,6 +47,7 @@ class DirCtrlTest : public ::testing::Test
 protected:
     void SetUp() override
     {
+        OriginalSubtreeEntries = global.SubtreeEntries;
         SandboxInitialize();
 
         Volume = StructsModelCreateVolume();
@@ -65,6 +67,7 @@ protected:
 
     void TearDown() override
     {
+        global.SubtreeEntries = OriginalSubtreeEntries;
         global.VolumeDeviceObject = nullptr;
 
         SandboxDrainCompletions();
@@ -164,6 +167,7 @@ protected:
         return req;
     }
 
+    ULONG OriginalSubtreeEntries = 0;
     PDEVICE_OBJECT Volume = nullptr;
     PDCB Dcb = nullptr;
     PCCB Ccb = nullptr;
@@ -531,6 +535,66 @@ TEST_F(DirCtrlTest, SecondQueryWhileFirstFetchIsOutstandingDoesNotReportNoMoreFi
         << "it should retry the fetch, same as the first call";
 
     Drain();
+}
+
+//
+// A subtree answer fetched for a query publishes each descendant as a
+// listing of its own and seeds the path cache from the root alone, and the
+// handle's snapshot keeps none of the descendants. This fixture runs no FSP
+// workers, so the requeue after publication fails and completes the query
+// with STATUS_DEVICE_REMOVED.
+//
+TEST_F(DirCtrlTest, NetworkSubtreePublishesDescendantListings)
+{
+    global.SubtreeEntries = 64;
+    const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " +
+        std::to_string(sizeof(kSubtreeOutOfOrder) - 1) + "\r\n\r\n" +
+        std::string(kSubtreeOutOfOrder, sizeof(kSubtreeOutOfOrder) - 1);
+    const SANDBOX_STEP script[] = {
+        { SandboxStepDeliver, C_CAST(const unsigned char*, response.data()), response.size(), STATUS_SUCCESS, FALSE }
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+    const ULONG64 before = BlorgStatisticsForCurrentProcessor()->ListingsPrefetched;
+    UNICODE_STRING pattern = Path(L"*");
+    unsigned char buffer[512] = {};
+    QueryRequest* query = PrepareQuery(Dcb, Ccb, &pattern, FileBothDirectoryInformation,
+        buffer, sizeof(buffer));
+    ASSERT_EQ(STATUS_PENDING, BlorgVolumeDirectoryControl(&query->Irp, &query->Stack));
+    Drain();
+    ASSERT_EQ(1, query->Irp.CompletionCount);
+    ASSERT_EQ(STATUS_DEVICE_REMOVED, query->Irp.IoStatus.Status);
+    ASSERT_NE(nullptr, Ccb->Entries);
+    EXPECT_EQ(0u, Ccb->Entries->DescendantCount);
+    EXPECT_EQ(nullptr, Ccb->Entries->Descendants);
+    EXPECT_EQ(before + 3, BlorgStatisticsForCurrentProcessor()->ListingsPrefetched);
+    UNICODE_STRING rootFile = Path(L"\\media\\r.bin");
+    DIRECTORY_ENTRY_METADATA rootMeta = {};
+    ASSERT_EQ(PathCacheExists, BlorgPathCacheLookup(&rootFile, &rootMeta));
+    EXPECT_EQ(4096u, rootMeta.Size);
+
+    struct ExpectedListing
+    {
+        const wchar_t* Path;
+        const wchar_t* File;
+    };
+    const ExpectedListing expected[] = {
+        { L"\\media\\a", L"a.bin" },
+        { L"\\media\\b", L"b.bin" },
+        { L"\\media\\a\\c", L"c.bin" }
+    };
+    for (const ExpectedListing& item : expected)
+    {
+        UNICODE_STRING path = Path(item.Path);
+        PDIRECTORY_INFO listing = BlorgPathCacheLookupListing(&path, FALSE, nullptr, nullptr, nullptr);
+        ASSERT_NE(nullptr, listing) << item.Path;
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(listing, 0);
+        EXPECT_NE(nullptr, file);
+        if (file)
+        {
+            EXPECT_EQ(item.File, std::wstring(file->Name, file->NameLength));
+        }
+        BlorgReleaseDirectoryInfo(listing);
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////

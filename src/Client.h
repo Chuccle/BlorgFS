@@ -45,14 +45,24 @@ typedef VOID(*PBLORG_FILEINFO_COMPLETION)(NTSTATUS Status, const DIRECTORY_ENTRY
 typedef VOID(*PBLORG_FILEREAD_COMPLETION)(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext);
 typedef VOID(*PBLORG_CHANGES_COMPLETION)(NTSTATUS Status, PCHANGE_BATCH Batch, PVOID CallerContext);
 
+//
+// Fetches Path's listing. A nonzero SubtreeEntries asks for the listings
+// beneath it too, up to that many entries in all, which arrive attached
+// to the listing as its Descendants; the caller takes them off with
+// BlorgTakeDescendants before sharing the listing, and frees them with
+// BlorgReleaseDescendants.
+//
 NTSTATUS BlorgHttpGetDirectoryInfo(
     const UNICODE_STRING* Path,
+    ULONG SubtreeEntries,
     PBLORG_DIRINFO_COMPLETION CompletionRoutine,
     PVOID CallerContext
 );
 
 VOID BlorgReferenceDirectoryInfo(PDIRECTORY_INFO DirInfo);
 VOID BlorgReleaseDirectoryInfo(PDIRECTORY_INFO DirInfo);
+PDIRECTORY_DESCENDANT BlorgTakeDescendants(PDIRECTORY_INFO DirInfo, PSIZE_T Count);
+VOID BlorgReleaseDescendants(PDIRECTORY_DESCENDANT Descendants, SIZE_T Count);
 
 NTSTATUS BlorgHttpGetFileInformation(
     const UNICODE_STRING* Path,
