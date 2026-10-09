@@ -233,11 +233,19 @@ typedef struct _FILE_BUFFER
     PCHAR BodyBuffer;      // Allocated buffer backing the read, or NULL
     SIZE_T BodyBufferSize; // Size of BodyBuffer in bytes
     PCHAR BaseAddress;     // Start of the requested data within BodyBuffer, or NULL
+    ULONG64 VersionSize;   // File size the response's entity tag names, when HasVersion
+    ULONG64 VersionTime;   // Modification time it names, in the ticks a listing reports
+    BOOLEAN HasVersion;    // The response named the version its bytes belong to
+    UCHAR Reserved[7];     // explicit tail padding
 } FILE_BUFFER, * PFILE_BUFFER;
 
 CHECK_PADDING_BETWEEN(FILE_BUFFER, BodyBuffer, BodyBufferSize);
 CHECK_PADDING_BETWEEN(FILE_BUFFER, BodyBufferSize, BaseAddress);
-CHECK_PADDING_END(FILE_BUFFER, BaseAddress);
+CHECK_PADDING_BETWEEN(FILE_BUFFER, BaseAddress, VersionSize);
+CHECK_PADDING_BETWEEN(FILE_BUFFER, VersionSize, VersionTime);
+CHECK_PADDING_BETWEEN(FILE_BUFFER, VersionTime, HasVersion);
+CHECK_PADDING_BETWEEN(FILE_BUFFER, HasVersion, Reserved);
+CHECK_PADDING_END(FILE_BUFFER, Reserved);
 
 /////////////////////////////////////////////
 ////// Structures for the change feed ///////
@@ -348,6 +356,18 @@ typedef struct _NON_PAGED_NODE
     ULONG64 ReadFinishTag;
     ULONG   ReadFetchesInFlight;
     UCHAR   Reserved[4];             // Pad to 8-byte alignment
+
+    //
+    // What this file's blocks are stored under in the disk cache
+    // (DiskCache.c): two hashes of its path, and the version its FCB last
+    // named when a read was issued. Here so a fetch completion at
+    // DISPATCH_LEVEL can key what it admits. Written at PASSIVE_LEVEL by
+    // BlorgDiskCacheNoteFile; DiskCacheFile[0] is zero until both hashes
+    // are set.
+    //
+    ULONG64 DiskCacheFile[2];
+    ULONG64 DiskCacheSize;
+    ULONG64 DiskCacheModifiedTime;
 } NON_PAGED_NODE, * PNON_PAGED_NODE;
 
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, SectionObjectPointers, HdrFastMutex);
@@ -356,7 +376,10 @@ CHECK_PADDING_BETWEEN(NON_PAGED_NODE, HdrResource, HdrPagingIoResource);
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, HdrPagingIoResource, ReadFinishTag);
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, ReadFinishTag, ReadFetchesInFlight);
 CHECK_PADDING_BETWEEN(NON_PAGED_NODE, ReadFetchesInFlight, Reserved);
-CHECK_PADDING_END(NON_PAGED_NODE, Reserved);
+CHECK_PADDING_BETWEEN(NON_PAGED_NODE, Reserved, DiskCacheFile);
+CHECK_PADDING_BETWEEN(NON_PAGED_NODE, DiskCacheFile, DiskCacheSize);
+CHECK_PADDING_BETWEEN(NON_PAGED_NODE, DiskCacheSize, DiskCacheModifiedTime);
+CHECK_PADDING_END(NON_PAGED_NODE, DiskCacheModifiedTime);
 
 //
 // Fields shared by every file-context node (FCB/DCB); embedded as the first

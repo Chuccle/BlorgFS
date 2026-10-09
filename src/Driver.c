@@ -433,6 +433,10 @@ static VOID DriverDeleteFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceOb
 // filesystem device object still exists, because an in-flight request or
 // pre-warm connect may queue an IO work item against it.
 //
+// The disk cache drains after the client, since a fetch completion may
+// still offer it a block, and before the device object goes for the same
+// reason: its fill writes are issued from work items queued against it.
+//
 // This used to be two drains in a fixed order, rings before requests, since
 // a live prefetch ring would otherwise keep issuing into a drained client.
 // With the ring gone there is one issuer and one gate.
@@ -442,6 +446,7 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
     UNREFERENCED_PARAMETER(DriverObject);
     BlorgDrainHttpClient();
     BlorgDrainWskSocketPrewarm();
+    BlorgDiskCacheCleanup();
 
     ObDereferenceObject(global.FileSystemDeviceObject);
     DriverDeleteFileSystemDeviceObject(global.FileSystemDeviceObject);
@@ -515,10 +520,11 @@ static_assert(
 //
 // Reads a single registry value of the expected type into Buffer, failing
 // if the stored value doesn't match ExpectedType or exceeds BufferSize.
-// infoBuffer's fixed 256-byte headroom over KEY_VALUE_PARTIAL_INFORMATION's
-// own header covers every value this driver actually reads (a DWORD, a
-// 32-byte pin, a short port string, or a BLORGFS_REG_HOST_MAX_CHARS
-// hostname) -- not a general-purpose arbitrarily-sized read.
+// infoBuffer's headroom over KEY_VALUE_PARTIAL_INFORMATION's own header is
+// the largest value this driver reads, a BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS
+// path, and covers the rest (a DWORD, a 32-byte pin, a short port string,
+// or a BLORGFS_REG_HOST_MAX_CHARS hostname) -- not a general-purpose
+// arbitrarily-sized read.
 //
 static NTSTATUS DriverReadRegistryValue(
     HANDLE ParametersKey,
@@ -531,7 +537,7 @@ static NTSTATUS DriverReadRegistryValue(
     UNICODE_STRING valueName;
     RtlInitUnicodeString(&valueName, ValueName);
 
-    UCHAR infoBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 256];
+    UCHAR infoBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS * sizeof(WCHAR)];
     ULONG resultLength = 0;
 
     NTSTATUS status = ZwQueryValueKey(
@@ -616,7 +622,12 @@ static BOOLEAN IsValidPortString(const WCHAR* Port, USHORT PortChars)
 // would hand it a number it does not accept; a sweep is exactly where
 // someone types one.
 //
-static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRING PortOut, PUNICODE_STRING HostOut)
+// DiskCacheMb sizes the disk cache and DiskCachePath, an NT path, names its
+// file; DiskCachePathOut is left empty without one, which means the default.
+// Its REG_SZ data is taken with or without a terminating NUL, since
+// RegSetValueEx stores whatever it is given.
+//
+static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICODE_STRING PortOut, PUNICODE_STRING HostOut, PUNICODE_STRING DiskCachePathOut)
 {
     UNICODE_STRING parametersSuffix = RTL_CONSTANT_STRING(L"\\Parameters");
 
@@ -714,6 +725,29 @@ static VOID DriverReadRegistryConfig(PUNICODE_STRING ServiceRegistryPath, PUNICO
     if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"SubtreeEntries", REG_DWORD, &subtreeEntries, sizeof(subtreeEntries), &actualSize)))
     {
         global.SubtreeEntries = subtreeEntries;
+    }
+
+    ULONG diskCacheMb = 0;
+
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"DiskCacheMb", REG_DWORD, &diskCacheMb, sizeof(diskCacheMb), &actualSize)))
+    {
+        global.DiskCacheMb = diskCacheMb;
+    }
+
+    WCHAR diskCachePathValue[BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS];
+
+    if (NT_SUCCESS(DriverReadRegistryValue(parametersKey, L"DiskCachePath", REG_SZ, diskCachePathValue, sizeof(diskCachePathValue), &actualSize))
+        && actualSize >= sizeof(WCHAR))
+    {
+        USHORT pathChars = C_CAST(USHORT, actualSize / sizeof(WCHAR));
+
+        if (L'\0' == diskCachePathValue[pathChars - 1])
+        {
+            pathChars--;
+        }
+
+        DiskCachePathOut->Length = pathChars * sizeof(WCHAR);
+        RtlCopyMemory(DiskCachePathOut->Buffer, diskCachePathValue, DiskCachePathOut->Length);
     }
 
     ULONG slackGrowthValue = 0;
@@ -1061,8 +1095,21 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     global.ReadFairBudget = READ_FAIR_BUDGET;
     global.ChangeFeed = TRUE;
     global.SubtreeEntries = SUBTREE_ENTRIES;
+    global.DiskCacheMb = 0;
 
-    DriverReadRegistryConfig(RegistryPath, &portString, &hostString);
+    WCHAR diskCachePathBuffer[BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS];
+    UNICODE_STRING diskCachePath;
+    diskCachePath.Length = 0;
+    diskCachePath.MaximumLength = sizeof(diskCachePathBuffer);
+    diskCachePath.Buffer = diskCachePathBuffer;
+
+    DriverReadRegistryConfig(RegistryPath, &portString, &hostString, &diskCachePath);
+
+    if (0 == diskCachePath.Length)
+    {
+        UNICODE_STRING defaultDiskCachePath = RTL_CONSTANT_STRING(DISK_CACHE_DEFAULT_PATH);
+        RtlCopyUnicodeString(&diskCachePath, &defaultDiskCachePath);
+    }
 
     if (0 == portString.Length)
     {
@@ -1145,6 +1192,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
             BLORGFS_LOG("DriverEntry() - SNI host string allocation failed; ClientHello will omit SNI\n");
         }
     }
+
+    BlorgDiskCacheInitialize(&diskCachePath, global.DiskCacheMb);
 
     BlorgPrewarmSocketPool(
         C_CAST(const SOCKADDR*, global.RemoteAddressInfo->ai_addr),
