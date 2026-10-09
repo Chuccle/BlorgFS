@@ -36,11 +36,12 @@
 // allow, which reaches what ARM64 and the compiler do to the counters and
 // flags shared through ReadNoFence, ReadAcquire, WriteRelease and the
 // weaker Interlocked forms. Store buffering and message passing are
-// covered. Load buffering is not: a read returns a write already made, so
-// no thread ever reads a value another thread writes later in its own
-// program order, which ARM64 allows for a relaxed read followed by an
-// independent relaxed write. Plain accesses outside the shims are
-// sequentially consistent in either mode.
+// covered. Load buffering, which ARM64 allows for a relaxed read followed
+// by an independent relaxed write, is explored only for a pair a test
+// declares (KmSchedIndependentRelaxedLoadStore): a shim's read returns a
+// write already made, so the driver's own reads and writes are never
+// reordered that way. Plain accesses outside the shims are sequentially
+// consistent in either mode.
 //
 
 #ifdef __cplusplus
@@ -390,6 +391,16 @@ void* KmSchedReadPointer(void* volatile* Source, int Order);
 void KmSchedWriteLong(long volatile* Target, long Value, int Order);
 void KmSchedWriteLong64(__int64 volatile* Target, __int64 Value, int Order);
 void KmSchedMemoryBarrier(void);
+
+//
+// A relaxed read of Source, then a relaxed write of Value to Target, which
+// the caller promises are independent: neither Target nor Value comes from
+// the read, and the two locations do not overlap (one that does is
+// reported as a violation and nothing is accessed). Under weak memory the
+// write may also take effect first; otherwise the read goes first. Returns
+// what the read returned.
+//
+long KmSchedIndependentRelaxedLoadStore(long volatile* Source, long volatile* Target, long Value);
 
 //
 // Weak memory, opt-in per exploration: a read may return an older write

@@ -372,6 +372,16 @@ The sandbox projects put their own directory on the include path so
 `src/Driver.h` can pull in `SandboxPrelude.h` without the driver naming a
 test directory.
 
+### Load buffering
+
+Weak memory (`KmSchedSetWeakMemory`) never returns a write not yet made,
+so it does not reorder a thread's relaxed read with its later write.
+`KmSchedIndependentRelaxedLoadStore` is a read and a write the caller
+declares independent; under weak memory the explorer also runs the write
+first, which is the load-buffering outcome ARM64 allows. The
+`SchedulerAudit` load-buffering tests pin its outcome sets with and
+without the reduction. No driver code goes through it.
+
 ### Registry configuration tests
 
 `Registry.c` is compiled into both the driver and DispatchSandbox.
