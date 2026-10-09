@@ -539,13 +539,13 @@ TEST_F(DirCtrlTest, SecondQueryWhileFirstFetchIsOutstandingDoesNotReportNoMoreFi
 }
 
 //
-// A real network listing must seed its descendants after the root seed,
-// which discards older listings beneath it. Observe all three descendant
-// cache answers and the handle snapshot, not only the client's decoder.
+// A real network listing publishes its descendant listings separately.
+// Observe all three cached answers and the handle snapshot, rather than
+// only checking the client's decoder.
 // This fixture has no FSP workers: completion publishes the snapshot, then
 // its requeue fails with STATUS_DEVICE_REMOVED and completes the query.
 //
-TEST_F(DirCtrlTest, NetworkSubtreePublishesDescendantsAfterSeedingTheRoot)
+TEST_F(DirCtrlTest, NetworkSubtreePublishesDescendantListings)
 {
     global.SubtreeEntries = 64;
     const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " +
@@ -568,6 +568,11 @@ TEST_F(DirCtrlTest, NetworkSubtreePublishesDescendantsAfterSeedingTheRoot)
     EXPECT_EQ(0u, Ccb->Entries->DescendantCount);
     EXPECT_EQ(nullptr, Ccb->Entries->Descendants);
     EXPECT_EQ(before + 3, BlorgStatisticsForCurrentProcessor()->ListingsPrefetched);
+    UNICODE_STRING rootFile = Path(L"\\media\\r.bin");
+    DIRECTORY_ENTRY_METADATA rootMeta = {};
+    ASSERT_EQ(PathCacheExists, BlorgPathCacheLookup(&rootFile, &rootMeta));
+    EXPECT_EQ(4096u, rootMeta.Size);
+
     struct ExpectedListing
     {
         const wchar_t* Path;

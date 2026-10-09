@@ -407,10 +407,10 @@ CHECK_PADDING_END(DIRCTRL_FETCH, Ticket);
 //  listing cache also refuses one older than the snapshot it already holds.
 //  Runs at PASSIVE_LEVEL from a successful fetch's completion.
 //
-//  A subtree answer's descendants are taken off the listing first, so the
-//  snapshot the cache and the handle share never holds them, and published
-//  after it: the seed drops what is cached beneath the directory, and they
-//  are newer than that.
+//  Detach a subtree answer's descendants before the root becomes a shared
+//  cache/handle snapshot, then publish each descendant listing separately.
+//  Root seeding affects path metadata; descendant listings live in the
+//  separate listing cache. The shared root retains no descendant array.
 //
 static VOID DirCtrlPublish(const UNICODE_STRING* Dir, PDIRECTORY_INFO DirInfo, const PATH_CACHE_TICKET* Ticket)
 {
