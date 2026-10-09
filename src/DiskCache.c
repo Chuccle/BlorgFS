@@ -7,16 +7,29 @@
 //
 // Reads
 // ---------------------------------------------------------------------
-// A non-cached read is served from the file only when every block it
-// covers is held for the version the open's FCB names, pinned for as long
-// as the read is in flight. It is issued as one IRP per run of blocks that
-// sit in consecutive slots, each into a partial MDL of the read's own, so
+// A non-cached read is served from the file as far as the blocks it covers
+// are held for the version the open's FCB names, each pinned for as long as
+// the read is in flight. Held blocks are read with one IRP per run that
+// sits in consecutive slots, each into a partial MDL of the read's own, so
 // nothing is copied. The IRPs are this driver's own, sent straight to the
 // cache file's device and finished by a completion routine, which needs no
 // APC from the thread that issued them: the read path can run with APCs
 // disabled (a paging read under a page fault), and a synchronous Zw call
-// would wait on one. A read the cache cannot finish is given back to the
-// caller to fetch.
+// would wait on one.
+//
+// The blocks it does not hold are fetched, one ranged GET per run of them,
+// into the client's buffer as any fetch is while the cache is live, offered
+// to the cache, and copied into the read's pages. The clock leaves what it
+// keeps scattered through a file larger than the cache, so serving a read
+// only when every block was held served almost nothing there while the
+// blocks went on being written; simulated on a file 1.5 times the cache,
+// re-read, it served 0% of reads against 40% of blocks held. A read that
+// fetches is admitted to the fair-share scheduler (Read.c) before it
+// starts, as one fetch of its whole length, and its caller says how many
+// runs it may fetch: each is a request of its own, and every request
+// counts against the fair share's fetch limit. A cache file read failing,
+// or a run fetched at another version than the held blocks, fails the
+// read back to its caller to be fetched whole; a fetch failing fails it.
 //
 // Fills
 // ---------------------------------------------------------------------
@@ -35,7 +48,8 @@
 // a file the server has since replaced carries the new tag and is not kept
 // under the old key. A read is keyed the same way, so once the FCB is
 // refreshed to a new version (Create.c) its old blocks stop matching and
-// age out.
+// age out. A read in flight across such a refresh keeps the key it pinned
+// its blocks under, and a run it fetches must be of that version too.
 //
 // The file
 // ---------------------------------------------------------------------
@@ -91,12 +105,6 @@
 #define DISK_CACHE_FILL_BACKLOG (32ull * 1024 * 1024)
 
 //
-// Most blocks one read may cover: 4 MB, far beyond any paging read Cc or
-// MM issues. A larger read is fetched.
-//
-#define DISK_CACHE_MAX_READ_BLOCKS 64
-
-//
 // One block on its way into the cache: a copy of what a fetch received,
 // and the slot reserved for it.
 //
@@ -115,33 +123,70 @@ CHECK_PADDING_BETWEEN(DISK_CACHE_FILL, Mdl, Slot);
 CHECK_PADDING_BETWEEN(DISK_CACHE_FILL, Slot, Reserved);
 CHECK_PADDING_END(DISK_CACHE_FILL, Reserved);
 
+struct _DISK_CACHE_READ;
+
 //
-// One read being served from the cache, shared by the IRPs it was split
-// into.
+// Why a read the cache began must be fetched whole after all: a part read
+// from the cache file failed or came back short, or a fetched run is of
+// another version than the held blocks beside it, which the read would
+// otherwise return mixed.
+//
+#define DISK_CACHE_READ_FAILED 0x1
+#define DISK_CACHE_READ_STALE  0x2
+
+//
+// One run of a read's blocks the cache did not hold, being fetched.
+//
+typedef struct _DISK_CACHE_READ_FETCH
+{
+    struct _DISK_CACHE_READ* Read; // The read this run belongs to
+    PUCHAR Target;                 // Where in the read's mapped buffer the body is copied
+    ULONG64 Offset;                // File offset of the run
+    ULONG Length;                  // Bytes asked of the server
+    ULONG Reserved;                // explicit tail padding
+} DISK_CACHE_READ_FETCH, * PDISK_CACHE_READ_FETCH;
+
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ_FETCH, Read, Target);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ_FETCH, Target, Offset);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ_FETCH, Offset, Length);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ_FETCH, Length, Reserved);
+CHECK_PADDING_END(DISK_CACHE_READ_FETCH, Reserved);
+
+//
+// One read being served from the cache, shared by the IRPs and fetches it
+// was split into.
 //
 typedef struct _DISK_CACHE_READ
 {
     PIRP Irp;                               // The read being served
-    PDISK_CACHE_READ_COMPLETION Completion; // Called once, when the last IRP is done
-    volatile LONG Outstanding;              // IRPs in flight, plus one the issuer holds
+    PDISK_CACHE_READ_COMPLETION Completion; // Called once, when the last part is done
+    DISK_CACHE_KEY Key;                     // The file and version the held blocks were pinned under; every fetched run must be of it
+    volatile LONG Outstanding;              // Parts in flight, plus one the issuer holds
     volatile LONG Status;                   // First failure, or STATUS_SUCCESS
-    volatile LONG64 Bytes;                  // Bytes the IRPs reported read
-    ULONG Span;                             // Bytes asked of the cache file in all
+    volatile LONG64 Bytes;                  // Bytes the parts reported read
+    ULONG Span;                             // Bytes asked of the cache file and the server in all
+    ULONG DiskSpan;                         // Of those, bytes before end of file asked of the cache file
     ULONG Valid;                            // The caller's Valid, handed back
     ULONG SlotCount;
-    ULONG Reserved;                         // explicit padding
-    ULONG Slots[DISK_CACHE_MAX_READ_BLOCKS]; // Pinned, one per block, in file order
+    ULONG FetchCount;
+    volatile LONG Refetch;                  // DISK_CACHE_READ_* reasons it must be fetched whole instead
+    DISK_CACHE_READ_FETCH Fetches[DISK_CACHE_MAX_READ_FETCHES];
+    ULONG Slots[DISK_CACHE_MAX_READ_BLOCKS]; // Pinned, one per block in file order, or DISK_CACHE_NO_SLOT where fetched
 } DISK_CACHE_READ, * PDISK_CACHE_READ;
 
 CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Irp, Completion);
-CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Completion, Outstanding);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Completion, Key);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Key, Outstanding);
 CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Outstanding, Status);
 CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Status, Bytes);
 CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Bytes, Span);
-CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Span, Valid);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Span, DiskSpan);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ, DiskSpan, Valid);
 CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Valid, SlotCount);
-CHECK_PADDING_BETWEEN(DISK_CACHE_READ, SlotCount, Reserved);
-CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Reserved, Slots);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ, SlotCount, FetchCount);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ, FetchCount, Refetch);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Refetch, Fetches);
+CHECK_PADDING_BETWEEN(DISK_CACHE_READ, Fetches, Slots);
 CHECK_PADDING_END(DISK_CACHE_READ, Slots);
 
 static struct
@@ -273,9 +318,11 @@ static NTSTATUS DiskCacheIssue(UCHAR MajorFunction, PMDL Mdl, ULONG Length, ULON
 }
 
 //
-// Drops one hold on Read; the last unpins its blocks and hands the IRP back
-// through its completion. A read that came back short failed. <=
-// DISPATCH_LEVEL.
+// Drops one hold on Read; the last unpins its blocks, marking them served
+// if the read succeeded, and hands the IRP back through its completion,
+// saying whether it is to be fetched whole. A read that came back short
+// failed. A fetch that failed fails the read outright: fetching it whole
+// would ask the same server again. <= DISPATCH_LEVEL.
 //
 static VOID DiskCacheReadSettle(PDISK_CACHE_READ Read)
 {
@@ -284,36 +331,55 @@ static VOID DiskCacheReadSettle(PDISK_CACHE_READ Read)
         return;
     }
 
-    for (ULONG i = 0; i < Read->SlotCount; ++i)
+    NTSTATUS status = Read->Status;
+    LONG refetch = Read->Refetch;
+
+    if (NT_SUCCESS(status) && 0 == refetch && Read->Bytes != Read->Span)
     {
-        BlorgDiskCacheIndexUnpin(&DiskCache.Index, Read->Slots[i]);
+        refetch |= DISK_CACHE_READ_FAILED;
     }
 
-    NTSTATUS status = Read->Status;
-
-    if (NT_SUCCESS(status) && Read->Bytes != Read->Span)
+    if (0 != refetch)
     {
         status = STATUS_UNEXPECTED_IO_ERROR;
     }
 
-    if (NT_SUCCESS(status))
+    for (ULONG i = 0; i < Read->SlotCount; ++i)
     {
-        BLORGFS_STAT_INC(DiskCacheHits);
-        BLORGFS_STAT_ADD(DiskCacheHitBytes, Read->Valid);
+        if (DISK_CACHE_NO_SLOT != Read->Slots[i])
+        {
+            BlorgDiskCacheIndexUnpin(&DiskCache.Index, Read->Slots[i], NT_SUCCESS(status));
+        }
     }
-    else
+
+    if (FlagOn(refetch, DISK_CACHE_READ_FAILED))
     {
         BLORGFS_STAT_INC(DiskCacheReadFailures);
+    }
+
+    if (NT_SUCCESS(status))
+    {
+        if (0 == Read->FetchCount)
+        {
+            BLORGFS_STAT_INC(DiskCacheHits);
+        }
+        else
+        {
+            BLORGFS_STAT_INC(DiskCachePartialHits);
+        }
+
+        BLORGFS_STAT_ADD(DiskCacheHitBytes, Read->DiskSpan);
     }
 
     PIRP irp = Read->Irp;
     PDISK_CACHE_READ_COMPLETION completion = Read->Completion;
     const ULONG valid = Read->Valid;
+    const ULONG fetches = Read->FetchCount;
 
     ExFreePool(Read);
     DiskCacheLeave();
 
-    completion(irp, status, valid);
+    completion(irp, status, valid, fetches, 0 != refetch);
 }
 
 static NTSTATUS DiskCacheReadDone(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
@@ -328,7 +394,7 @@ static NTSTATUS DiskCacheReadDone(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID C
     }
     else
     {
-        InterlockedCompareExchange(&read->Status, Irp->IoStatus.Status, STATUS_SUCCESS);
+        InterlockedOr(&read->Refetch, DISK_CACHE_READ_FAILED);
         DiskCacheLost();
     }
 
@@ -338,6 +404,63 @@ static NTSTATUS DiskCacheReadDone(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID C
     DiskCacheReadSettle(read);
 
     return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+//
+// Whether what FileBuffer received belongs to the version Key names, as
+// its entity tag says.
+//
+static BOOLEAN DiskCacheIsVersion(const DISK_CACHE_KEY* Key, const FILE_BUFFER* FileBuffer)
+{
+    return FileBuffer->HasVersion && FileBuffer->VersionSize == Key->Size && FileBuffer->VersionTime == Key->ModifiedTime;
+}
+
+static VOID DiskCacheFill(const DISK_CACHE_KEY* Key, const UCHAR* Source, ULONG64 Offset, ULONG Length);
+
+//
+// Completion for one fetched run of a partly held read, on the WSK
+// completion chain at <= DISPATCH_LEVEL. The body arrived in the client's
+// buffer, for the reason BlorgDiskCacheLive gives; it is copied into the
+// read's pages and offered to the cache before the read is settled. A body
+// of another version than the one the read's held blocks were pinned for
+// is not copied, and the read is fetched whole instead. That is checked
+// against the read's own key, not the node's: the node's moves on when its
+// FCB is refreshed, and the check must not depend on whether the cache is
+// still live, since the held blocks were read either way.
+//
+static VOID DiskCacheReadFetched(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
+{
+    PDISK_CACHE_READ_FETCH fetch = CallerContext;
+    PDISK_CACHE_READ read = fetch->Read;
+
+    if (NT_SUCCESS(Status))
+    {
+        const ULONG received = C_CAST(ULONG, min(FileBuffer->BodyBufferSize, C_CAST(SIZE_T, fetch->Length)));
+
+        BLORGFS_STAT_INC(FetchesCompleted);
+        BLORGFS_STAT_ADD(FetchBytes, received);
+
+        if (DiskCacheIsVersion(&read->Key, FileBuffer))
+        {
+            RtlCopyMemory(fetch->Target, FileBuffer->BodyBuffer, received);
+            InterlockedAdd64(&read->Bytes, C_CAST(LONG64, received));
+            DiskCacheFill(&read->Key, C_CAST(const UCHAR*, FileBuffer->BodyBuffer), fetch->Offset, received);
+        }
+        else
+        {
+            BLORGFS_STAT_INC(DiskCacheStale);
+            InterlockedOr(&read->Refetch, DISK_CACHE_READ_STALE);
+        }
+
+        BlorgFreeHttpFile(FileBuffer);
+    }
+    else
+    {
+        BLORGFS_STAT_INC(FetchesFailed);
+        InterlockedCompareExchange(&read->Status, Status, STATUS_SUCCESS);
+    }
+
+    DiskCacheReadSettle(read);
 }
 
 //
@@ -760,12 +883,99 @@ VOID BlorgDiskCacheNoteFile(PNON_PAGED_NODE Node, const UNICODE_STRING* Path, UL
 
 //
 // What is read from the file is the valid bytes rounded up to a page, whose
-// tail past end of file the fill wrote as zeros. If an IRP cannot be sent
-// once some already are, the read is failed through Completion rather than
-// handed back, since those are writing into its buffer.
+// tail past end of file the fill wrote as zeros; what is fetched stops at
+// the valid bytes, as a whole fetch would. A held part is read into a
+// partial MDL of the read's own; a fetched one lands in the client's buffer
+// and is copied into the read's mapped pages on completion. If a part
+// cannot be started once some already are, the read is failed through
+// Completion rather than handed back, since those are writing into its
+// buffer.
 //
-BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, ULONG64 Offset, ULONG Length, ULONG Valid, PDISK_CACHE_READ_COMPLETION Completion)
+static NTSTATUS DiskCacheReadPart(PDISK_CACHE_READ Read, const UNICODE_STRING* Path, ULONG64 Offset, ULONG64 At, ULONG Length, ULONG Slot)
 {
+    PMDL source = Read->Irp->MdlAddress;
+    NTSTATUS status;
+
+    if (DISK_CACHE_NO_SLOT == Slot)
+    {
+        PUCHAR mapped = MmGetSystemAddressForMdlSafe(source, NormalPagePriority | MdlMappingNoExecute);
+
+        if (!mapped)
+        {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        PDISK_CACHE_READ_FETCH fetch = &Read->Fetches[Read->FetchCount++];
+
+        fetch->Read = Read;
+        fetch->Target = mapped + (At - Offset);
+        fetch->Offset = At;
+        fetch->Length = Length;
+
+        InterlockedIncrement(&Read->Outstanding);
+        BLORGFS_STAT_INC(FetchesIssued);
+
+        status = BlorgHttpGetFile(Path, C_CAST(SIZE_T, At), Length, DiskCacheReadFetched, fetch);
+
+        if (STATUS_PENDING == status)
+        {
+            return STATUS_SUCCESS;
+        }
+
+        BLORGFS_STAT_INC(FetchesFailed);
+        InterlockedDecrement(&Read->Outstanding);
+        return status;
+    }
+
+    PUCHAR va = C_CAST(PUCHAR, MmGetMdlVirtualAddress(source)) + (At - Offset);
+    PMDL mdl = IoAllocateMdl(va, Length, FALSE, FALSE, NULL);
+
+    if (!mdl)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    IoBuildPartialMdl(source, mdl, va, Length);
+    InterlockedIncrement(&Read->Outstanding);
+
+    const ULONG64 diskOffset = (C_CAST(ULONG64, Slot) << DISK_CACHE_BLOCK_SHIFT) + (At & (DISK_CACHE_BLOCK_SIZE - 1));
+
+    status = DiskCacheIssue(IRP_MJ_READ, mdl, Length, diskOffset, DiskCacheReadDone, Read);
+
+    if (!NT_SUCCESS(status))
+    {
+        InterlockedDecrement(&Read->Outstanding);
+        IoFreeMdl(mdl);
+    }
+
+    return status;
+}
+
+//
+// Runs of blocks a read pinned by BlorgDiskCacheIndexPinHeld would have to
+// fetch, at most DISK_CACHE_MAX_READ_FETCHES.
+//
+static ULONG DiskCacheRunsToFetch(const ULONG* Slots, ULONG Count)
+{
+    ULONG runs = 0;
+
+    for (ULONG i = 0; i < Count && runs < DISK_CACHE_MAX_READ_FETCHES; ++i)
+    {
+        if (DISK_CACHE_NO_SLOT == Slots[i] && (0 == i || DISK_CACHE_NO_SLOT != Slots[i - 1]))
+        {
+            runs++;
+        }
+    }
+
+    return runs;
+}
+
+BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, const UNICODE_STRING* Path, ULONG64 Offset, ULONG Length, ULONG Valid, PULONG Fetches, PDISK_CACHE_READ_COMPLETION Completion)
+{
+    const ULONG allowed = *Fetches;
+
+    *Fetches = 0;
+
     if (!ReadNoFence(&DiskCache.Live) || !Irp->MdlAddress || 0 == Valid || Valid > Length ||
         Offset >= Key->Size || Valid > Key->Size - Offset)
     {
@@ -799,8 +1009,32 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, ULONG64 Offset, 
 
     key.Block = first;
 
-    if (!BlorgDiskCacheIndexPinRange(&DiskCache.Index, &key, last, read->Slots))
+    const ULONG held = BlorgDiskCacheIndexPinHeld(&DiskCache.Index, &key, last, read->Slots);
+
+    ULONG served = 0;
+
+    if (0 != held)
     {
+        if (0 == allowed && held != blocks)
+        {
+            *Fetches = DiskCacheRunsToFetch(read->Slots, blocks);
+        }
+        else
+        {
+            served = BlorgDiskCacheIndexPlanRead(&DiskCache.Index, read->Slots, blocks, held, allowed);
+        }
+    }
+
+    if (0 == served)
+    {
+        for (ULONG i = 0; i < blocks; ++i)
+        {
+            if (DISK_CACHE_NO_SLOT != read->Slots[i])
+            {
+                BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots[i], FALSE);
+            }
+        }
+
         ExFreePool(read);
         DiskCacheLeave();
         return FALSE;
@@ -808,46 +1042,32 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, ULONG64 Offset, 
 
     read->Irp = Irp;
     read->Completion = Completion;
+    read->Key = key;
     read->Outstanding = 1;
     read->Status = STATUS_SUCCESS;
-    read->Span = span;
     read->Valid = Valid;
     read->SlotCount = blocks;
 
-    PUCHAR base = MmGetMdlVirtualAddress(Irp->MdlAddress);
     ULONG issued = 0;
 
     while (issued < span)
     {
         const ULONG64 at = Offset + issued;
         const ULONG i = C_CAST(ULONG, (at >> DISK_CACHE_BLOCK_SHIFT) - first);
+        const ULONG slot = read->Slots[i];
         ULONG run = 1;
 
-        while (i + run < blocks && read->Slots[i + run] == read->Slots[i] + run)
+        while (i + run < blocks &&
+               ((DISK_CACHE_NO_SLOT == slot) ? (DISK_CACHE_NO_SLOT == read->Slots[i + run]) : (read->Slots[i + run] == slot + run)))
         {
             run++;
         }
 
         const ULONG64 runEnd = (first + i + run) << DISK_CACHE_BLOCK_SHIFT;
-        const ULONG length = C_CAST(ULONG, min(runEnd - at, C_CAST(ULONG64, span - issued)));
-        const ULONG64 diskOffset = (C_CAST(ULONG64, read->Slots[i]) << DISK_CACHE_BLOCK_SHIFT) + (at & (DISK_CACHE_BLOCK_SIZE - 1));
+        const ULONG stop = (DISK_CACHE_NO_SLOT == slot) ? Valid : span;
+        const ULONG length = C_CAST(ULONG, min(runEnd - at, C_CAST(ULONG64, stop - issued)));
 
-        PMDL mdl = IoAllocateMdl(base + issued, length, FALSE, FALSE, NULL);
-        NTSTATUS status = STATUS_INSUFFICIENT_RESOURCES;
-
-        if (mdl)
-        {
-            IoBuildPartialMdl(Irp->MdlAddress, mdl, base + issued, length);
-            InterlockedIncrement(&read->Outstanding);
-
-            status = DiskCacheIssue(IRP_MJ_READ, mdl, length, diskOffset, DiskCacheReadDone, read);
-
-            if (!NT_SUCCESS(status))
-            {
-                InterlockedDecrement(&read->Outstanding);
-                IoFreeMdl(mdl);
-            }
-        }
+        const NTSTATUS status = DiskCacheReadPart(read, Path, Offset, at, length, slot);
 
         if (!NT_SUCCESS(status))
         {
@@ -855,7 +1075,10 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, ULONG64 Offset, 
             {
                 for (ULONG j = 0; j < blocks; ++j)
                 {
-                    BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots[j]);
+                    if (DISK_CACHE_NO_SLOT != read->Slots[j])
+                    {
+                        BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots[j], FALSE);
+                    }
                 }
 
                 ExFreePool(read);
@@ -867,8 +1090,22 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, ULONG64 Offset, 
             break;
         }
 
+        read->Span += length;
+
+        if (DISK_CACHE_NO_SLOT != slot && issued < Valid)
+        {
+            read->DiskSpan += min(length, Valid - issued);
+        }
+
+        if (DISK_CACHE_NO_SLOT == slot && stop == issued + length)
+        {
+            break;
+        }
+
         issued += length;
     }
+
+    *Fetches = read->FetchCount;
 
     DiskCacheReadSettle(read);
 
@@ -892,23 +1129,20 @@ static ULONG64 DiskCacheBlocksLeft(ULONG64 Block, ULONG64 End, ULONG64 Size)
     return ((End == Size) && (0 != (End & (DISK_CACHE_BLOCK_SIZE - 1)))) ? whole + 1 : whole;
 }
 
-VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length)
+//
+// Copies every whole block of Length bytes at Offset of Key's file in
+// Source -- or the file's last block, if they reach end of file -- and
+// queues it to be written, if the index admits it. Source is a body of the
+// version Key names. A full write backlog or a failed allocation drops the
+// rest, each block counted as dropped: nothing this completion could do for
+// the next block would succeed where that one failed. <= DISPATCH_LEVEL,
+// from a fetch completion.
+//
+static VOID DiskCacheFill(const DISK_CACHE_KEY* Key, const UCHAR* Source, ULONG64 Offset, ULONG Length)
 {
-    DISK_CACHE_KEY key;
-    const UCHAR* source = C_CAST(const UCHAR*, FileBuffer->BodyBuffer);
+    DISK_CACHE_KEY key = *Key;
 
-    if (!ReadNoFence(&DiskCache.Live) || !source || 0 == Length || !DiskCacheKeyOf(Node, &key))
-    {
-        return;
-    }
-
-    if (!FileBuffer->HasVersion || FileBuffer->VersionSize != key.Size || FileBuffer->VersionTime != key.ModifiedTime)
-    {
-        BLORGFS_STAT_INC(DiskCacheStale);
-        return;
-    }
-
-    if (Offset > key.Size || Length > key.Size - Offset)
+    if (!Source || 0 == Length || Offset > key.Size || Length > key.Size - Offset)
     {
         return;
     }
@@ -984,7 +1218,7 @@ VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, UL
 
         const ULONG held = C_CAST(ULONG, stop - start);
 
-        RtlCopyMemory(buffer, source + (start - Offset), held);
+        RtlCopyMemory(buffer, Source + (start - Offset), held);
         RtlZeroMemory(C_CAST(PUCHAR, buffer) + held, DISK_CACHE_BLOCK_SIZE - held);
 
         fill->Buffer = buffer;
@@ -993,4 +1227,24 @@ VOID BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, UL
 
         DiskCacheQueueFill(fill);
     }
+}
+
+BOOLEAN BlorgDiskCacheAdmit(PNON_PAGED_NODE Node, const FILE_BUFFER* FileBuffer, ULONG64 Offset, ULONG Length)
+{
+    DISK_CACHE_KEY key;
+
+    if (!ReadNoFence(&DiskCache.Live) || !FileBuffer->BodyBuffer || 0 == Length || !DiskCacheKeyOf(Node, &key))
+    {
+        return TRUE;
+    }
+
+    if (!DiskCacheIsVersion(&key, FileBuffer))
+    {
+        BLORGFS_STAT_INC(DiskCacheStale);
+        return FALSE;
+    }
+
+    DiskCacheFill(&key, C_CAST(const UCHAR*, FileBuffer->BodyBuffer), Offset, Length);
+
+    return TRUE;
 }

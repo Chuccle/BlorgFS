@@ -401,7 +401,8 @@ CHECK_PADDING_END(DIRCTRL_FETCH, Ticket);
 //  Offers a fetched listing to the listing cache and, if it is the current
 //  truth for the directory, seeds the path cache from it: every child
 //  becomes a live entry with the listing's metadata, replacing any stale
-//  not-found, and deeper entries are dropped (BlorgPathCacheSeedListing).
+//  not-found, and other children are dropped, deeper entries too unless the
+//  change feed is live (BlorgPathCacheSeedListing).
 //  Both refuse it if an invalidation ran after the fetch was issued, and the
 //  listing cache also refuses one older than the snapshot it already holds.
 //  Runs at PASSIVE_LEVEL from a successful fetch's completion.

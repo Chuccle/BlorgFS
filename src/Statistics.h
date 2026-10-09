@@ -411,8 +411,9 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 ChangeFeedFlushes;           // batches too large to invalidate path by path, flushed wholesale
 
     // --- disk cache (DiskCache.c) -----------------------------------------
-    ULONG64 DiskCacheHits;               // reads served from the cache file instead of fetched
-    ULONG64 DiskCacheHitBytes;
+    ULONG64 DiskCacheHits;               // reads served wholly from the cache file instead of fetched
+    ULONG64 DiskCachePartialHits;        // reads served partly from the cache file, the blocks it lacked fetched
+    ULONG64 DiskCacheHitBytes;           // bytes of both read from the cache file
     ULONG64 DiskCacheReadFailures;       // cache reads that failed and were fetched after all
     ULONG64 DiskCacheFirstMisses;        // fetched blocks seen once, not admitted until seen again
     ULONG64 DiskCacheFills;              // blocks written into the cache
@@ -549,7 +550,7 @@ typedef struct _BLORGFS_STATISTICS
 #define BLORGFS_STATS_FLAG_CHANGE_FEED_LIVE 0x00000002
 
 
-#define BLORGFS_STATISTICS_VERSION 20
+#define BLORGFS_STATISTICS_VERSION 21
 
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {

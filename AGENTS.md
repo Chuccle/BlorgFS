@@ -1425,8 +1425,23 @@ A listing is an immutable, reference-counted snapshot. Each handle
 enumerates the one it took on its initial query until it restarts the
 scan, so a refresh landing mid-`dir` never moves entries under the
 handle's index; the cache holds its own reference and a 32 MB budget.
-Only directory queries take a stale listing: an open's not-found does not,
-since a stale listing would hide a file the server has gained.
+The budget is enforced within the bucket a listing is published to, and
+expiry is otherwise noticed only in a bucket taking a publish, so a publish
+over budget first reaps every bucket's dead listings
+(`ListingCacheReapDead`); before that, expired listings in quiet buckets
+held the budget and new ones were refused room. Only directory queries take
+a stale listing: an open's not-found does not, since a stale listing would
+hide a file the server has gained.
+
+A published listing seeds the path cache with its children and drops the
+directory's other children. With the feed down it also drops everything
+deeper, since a child directory may have been replaced; with the feed live
+it keeps what is deeper, because the feed reports such a change and drops
+the subtree itself, and dropping it on every listing emptied the path cache
+beneath a directory each time it was re-listed, the whole volume's for the
+root. The cost is a window: entries beneath a child the new listing no
+longer names stay until the feed's report of that child's removal is
+applied, which is the feed's delay, not the long lifetime.
 
 **The rule a change must keep: every result read from the server is
 inserted with the ticket taken before it was read.** Every invalidation
@@ -1816,13 +1831,32 @@ RAM.
   32 MB; past it, or when an allocation fails, the rest of the fetch is
   dropped rather than queued, and each block of it counted as dropped.
 - **Reads.** The non-cached path in `BlorgVolumeRead` asks
-  `BlorgDiskCacheRead` first. A page-aligned read of at most 64 blocks
-  whose every block is held is pinned and served by the driver's own
-  non-cached IRPs to the cache file's device, one per run of consecutive
-  slots, each into a partial MDL of the read's own buffer, completed by a
-  completion routine. Nothing waits on the calling thread, which may be a
-  paging read with APCs disabled. Anything else is fetched as before. A
-  read the cache fails part-way is fetched through `ReadFairWorker`.
+  `BlorgDiskCacheRead` first. A page-aligned read of at most 64 blocks has
+  its held blocks pinned and served by the driver's own non-cached IRPs to
+  the cache file's device, one per run of consecutive slots, each into a
+  partial MDL of the read's own buffer, completed by a completion routine.
+  The blocks it lacks are fetched, one ranged GET per run, into the
+  client's buffer like any fetch while the cache is live, admitted, and
+  copied into the read's pages; past
+  `DISK_CACHE_MAX_READ_FETCHES` (4) runs, or past what the fair share's
+  fetch limit has room for, the closest are joined
+  (`BlorgDiskCacheIndexPlanRead`). Serving only reads whose every block
+  was held served almost nothing once a file outgrew the cache, because
+  the clock leaves what it keeps scattered: simulated, a file 1.5x the
+  cache re-read had 0% of reads served against 40% of blocks held. A read
+  held whole is served before the fair share sees it, since it never
+  reaches the link; one held only in part is admitted first, charged as a
+  fetch of its whole length, and offered to the cache again if the fair
+  share held it. Its first run is that admission; each further run is a
+  request of its own and takes a slot of the fetch limit
+  (`ReadFairReserve`), so with the limit nearly full its holes are joined
+  into fewer runs rather than sent past it. Nothing waits on the calling
+  thread, which may be a paging read with APCs disabled. A read with no
+  block held is fetched as before. One whose cache file read fails, or
+  whose fetched run is of another version than its held blocks, is
+  fetched whole through `ReadRefetchWorker`, admitted first if it never
+  was (a whole hit); one whose fetch fails fails, as a read the cache had
+  no part in would.
 - **Versions.** Blocks are keyed by two hashes of the path plus the size
   and last-write time the FCB names, read together under the paging
   resource that a refresh changes them under (`ReadSnapshotFile`); the
@@ -1833,15 +1867,24 @@ RAM.
   streamed files alike). Once the change feed or a reopen refreshes the FCB
   to a new version, its old blocks stop matching and age out; there is no
   explicit invalidation. This holds once the volume is writable too, as
-  long as a write changes the version the FCB names.
+  long as a write changes the version the FCB names. A run a partly held
+  read fetches is checked against the version its held blocks were pinned
+  under, not the FCB's current one, and whether or not the cache is still
+  taking fills, so a reopen that moves the FCB on mid-read cannot return
+  one read made of two versions.
 - **Admission and replacement.** A block is written on its second miss
   only, through a four-way ghost table of tags (a direct-mapped one lost
   about a fifth of a re-read file to blocks evicting each other's tag).
   Replacement is a CLOCK over the slots, with a per-slot pin count so a
-  slot is never reused while a read or write is in flight on it. CLOCK
-  and second-miss admission cover what segmented LRU would: a scan read
-  once never gets in, and a block served since the hand last passed
-  survives a turn.
+  slot is never reused while a read or write is in flight on it. The hand
+  looks at `DISK_CACHE_CLOCK_REACH` (256) slots at most per victim, then
+  takes the first unpinned slot it passed: unbounded, the sweep after a
+  pass that served every block walked the whole cache (262,144 slots at
+  16 GB) under the index spin lock. A block is marked for the clock only
+  when a read it was pinned for succeeds. CLOCK and second-miss admission
+  cover what segmented LRU would: a scan read once never gets in, and a
+  block served since the hand last passed survives a turn, unless every
+  slot within the hand's reach is marked too.
 
 ### Why it is safe
 
@@ -1884,6 +1927,27 @@ RAM.
 - **Teardown** clears `Live`, then waits for a busy count of reads, fills
   and the fill worker to drain before closing the file (`DriverUnload`).
 
+### Where it is tested
+
+`DiskCacheIndexTest.cpp` covers the index on its own -- admission, pinning,
+the split into fetches, the clock. `DiskCacheTest.cpp` covers this file
+with a file system under it: `DiskCacheModel.c` answers the cache's own
+read and write IRPs out of a buffer, so a test can hold a completion back,
+fail the next one, or hand the store a different owner, and the real
+`DiskCache.c` is compiled into `DispatchSandbox` rather than stubbed out.
+
+Two things the model checks on every IRP the driver sends it, because a
+real file system would refuse them in a way that reads as the store being
+lost rather than as a bug: that a non-buffered write is sector aligned and
+its MDL describes what it asks for, and that the completion routine keeps
+the IRP (`STATUS_MORE_PROCESSING_REQUIRED`).
+
+A read is only eligible for the cache when its buffer is page aligned and
+its MDL starts on a page (`BlorgDiskCacheRead`), so a test handing it a
+`std::vector`'s own pointer gets every read fetched -- which looks exactly
+like a cache holding nothing. `DiskCacheTest.cpp` aligns its buffers for
+this reason.
+
 ### Not done yet
 
 - A persistent index, and the per-block MAC it needs.
@@ -1891,8 +1955,10 @@ RAM.
 - Blocks for reads Cc serves from its own cache never reach the store;
   only non-cached reads (Cc's own paging reads included) fill it.
 
-Counters: `PerfHarness stats` prints `DiskCacheHits`, `HitBytes`,
-`ReadFailures`, `FirstMisses`, `Fills`, `FillFailures`, `Dropped` and
+Counters: `PerfHarness stats` prints `DiskCacheHits` (served wholly),
+`PartialHits` (served partly, the rest fetched), `HitBytes` (read from the
+cache file by both), `ReadFailures` (the cache file's, not the server's),
+`FirstMisses`, `Fills`, `FillFailures`, `Dropped` and
 `Stale` (a fetch whose tag named another version than the FCB).
 
 Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),
