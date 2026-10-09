@@ -449,8 +449,13 @@ TEST_F(FileInfoTest, FsVolumeInformationTooSmallForLabelOverflows)
     auto* buffer = reinterpret_cast<PFILE_FS_VOLUME_INFORMATION>(storage);
     QueryRequest* req = PrepareVolumeQuery(FileFsVolumeInformation, buffer, sizeof(storage));
 
+    ULONG labelRoom = sizeof(storage) - FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
+
     EXPECT_EQ(STATUS_BUFFER_OVERFLOW, BlorgQueryVolumeInformation(Volume, &req->Irp));
-    EXPECT_EQ(0u, req->Irp.IoStatus.Information);
+    EXPECT_EQ(sizeof(L"BLORGDRIVE") - sizeof(WCHAR), buffer->VolumeLabelLength)
+        << "the caller sizes its retry from the full label length";
+    EXPECT_EQ(0, memcmp(buffer->VolumeLabel, L"BLORGDRIVE", labelRoom));
+    EXPECT_EQ(FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel) + labelRoom, req->Irp.IoStatus.Information);
 }
 
 TEST_F(FileInfoTest, FsSizeInformationReportsZeroedCapacity)
@@ -520,8 +525,13 @@ TEST_F(FileInfoTest, FsAttributeInformationTooSmallForNameOverflows)
     unsigned char storage[sizeof(FILE_FS_ATTRIBUTE_INFORMATION)] = {};
     auto* buffer = reinterpret_cast<PFILE_FS_ATTRIBUTE_INFORMATION>(storage);
     QueryRequest* req = PrepareVolumeQuery(FileFsAttributeInformation, buffer, sizeof(storage));
+    ULONG nameRoom = sizeof(storage) - FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
 
     EXPECT_EQ(STATUS_BUFFER_OVERFLOW, BlorgQueryVolumeInformation(Volume, &req->Irp));
+    EXPECT_EQ(sizeof(L"BLORGFS") - sizeof(WCHAR), buffer->FileSystemNameLength)
+        << "the caller sizes its retry from the full name length";
+    EXPECT_EQ(0, memcmp(buffer->FileSystemName, L"BLORGFS", nameRoom));
+    EXPECT_EQ(FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) + nameRoom, req->Irp.IoStatus.Information);
 }
 
 TEST_F(FileInfoTest, FsFullSizeInformationReportsZeroedCapacity)

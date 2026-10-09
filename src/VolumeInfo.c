@@ -18,6 +18,11 @@
 // in particular assume the Windows default, so the safe direction here is
 // also the truthful one.
 //
+// A label or file system name that does not fit is truncated, and its
+// length field still reports the whole: the I/O manager copies back only
+// Information bytes on BUFFER_OVERFLOW, so that is how a caller learns
+// the size to retry with.
+//
 
 static NTSTATUS VolumeInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
@@ -45,21 +50,15 @@ static NTSTATUS VolumeInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             WCHAR volumeLabelBuffer[] = L"BLORGDRIVE";
 
-            volumeInfo->VolumeLabelLength = sizeof(volumeLabelBuffer) - sizeof(WCHAR);
+            ULONG labelAvail = inputLength - FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
+            ULONG labelLength = sizeof(volumeLabelBuffer) - sizeof(WCHAR);
+            ULONG labelToCopy = (labelAvail < labelLength) ? labelAvail : labelLength;
 
-            if (inputLength - FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel) >= volumeInfo->VolumeLabelLength)
-            {
-                RtlCopyMemory(volumeInfo->VolumeLabel, volumeLabelBuffer, volumeInfo->VolumeLabelLength);
-            }
-            else
-            {
-                bytesWritten = 0;
-                result = STATUS_BUFFER_OVERFLOW;
-                break;
-            }
+            volumeInfo->VolumeLabelLength = labelLength;
+            RtlCopyMemory(volumeInfo->VolumeLabel, volumeLabelBuffer, labelToCopy);
 
-            bytesWritten = FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel) + volumeInfo->VolumeLabelLength;
-            result = STATUS_SUCCESS;
+            bytesWritten = FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel) + labelToCopy;
+            result = (labelToCopy < labelLength) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
             break;
         }
         case FileFsSizeInformation:
@@ -112,21 +111,15 @@ static NTSTATUS VolumeInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             WCHAR fileSystemNameBuffer[] = L"BLORGFS";
 
-            attributeInfo->FileSystemNameLength = sizeof(fileSystemNameBuffer) - sizeof(WCHAR);
+            ULONG nameAvail = inputLength - FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
+            ULONG nameLength = sizeof(fileSystemNameBuffer) - sizeof(WCHAR);
+            ULONG nameToCopy = (nameAvail < nameLength) ? nameAvail : nameLength;
 
-            if (inputLength - FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) >= attributeInfo->FileSystemNameLength)
-            {
-                RtlCopyMemory(attributeInfo->FileSystemName, fileSystemNameBuffer, attributeInfo->FileSystemNameLength);
-            }
-            else
-            {
-                bytesWritten = 0;
-                result = STATUS_BUFFER_OVERFLOW;
-                break;
-            }
+            attributeInfo->FileSystemNameLength = nameLength;
+            RtlCopyMemory(attributeInfo->FileSystemName, fileSystemNameBuffer, nameToCopy);
 
-            bytesWritten = FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) + attributeInfo->FileSystemNameLength;
-            result = STATUS_SUCCESS;
+            bytesWritten = FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) + nameToCopy;
+            result = (nameToCopy < nameLength) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
             break;
         }
         case FileFsFullSizeInformation:
