@@ -147,7 +147,7 @@ static NTSTATUS FsCtrlUser(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         ? C_CAST(ULONG, isFile && !FsRtlCheckLockForOplockRequest(&C_CAST(PFCB, node)->FileLock, &node->Header.AllocationSize))
         : C_CAST(ULONG, ReadNoFence64(&node->RefCount));
 
-    (void)FsRtlOplockFsctrl(&node->Header.Oplock, Irp, oplockCount);
+    C_CAST(VOID, FsRtlOplockFsctrl(&node->Header.Oplock, Irp, oplockCount));
 
     node->Header.IsFastIoPossible =
         FsRtlOplockIsFastIoPossible(&node->Header.Oplock) ? FastIoIsPossible : FastIoIsNotPossible;

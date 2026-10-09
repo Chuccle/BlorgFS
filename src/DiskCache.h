@@ -189,7 +189,7 @@ VOID BlorgDiskCacheIndexCommit(PDISK_CACHE_INDEX Index, ULONG Slot, BOOLEAN Writ
 // The I/O side (DiskCache.c). Initialize opens or creates the cache file at
 // Path and sizes it for SizeMb, at PASSIVE_LEVEL from DriverEntry; zero, or
 // any failure, leaves the cache off and every call below a no-op. Cleanup
-// waits for the cache's own I/O and closes the file, from DriverUnload.
+// waits for the cache's own I/O and closes the file, from BlorgDriverUnload.
 //
 NTSTATUS BlorgDiskCacheInitialize(const UNICODE_STRING* Path, ULONG SizeMb);
 VOID BlorgDiskCacheCleanup(VOID);

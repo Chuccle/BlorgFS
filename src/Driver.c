@@ -13,7 +13,7 @@
 
 FAST_IO_DISPATCH  BlorgFsFastDispatch;
 DRIVER_INITIALIZE DriverEntry;
-DRIVER_UNLOAD     DriverUnload;
+DRIVER_UNLOAD     BlorgDriverUnload;
 
 struct GLOBAL global;
 
@@ -278,7 +278,7 @@ NTSTATUS BlorgCreateVolumeDeviceObject(PDRIVER_OBJECT DriverObject, PDEVICE_OBJE
 // locking is needed. Without this walk, any nodes still cached in the
 // tree would outlive the lookaside lists they were allocated from.
 //
-static VOID FreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
+static VOID DriverFreeFileContextTree(PDCB RootDcb, PDEVICE_OBJECT VolumeDeviceObject)
 {
     while (!IsListEmpty(&RootDcb->ChildrenList))
     {
@@ -327,7 +327,7 @@ static VOID DriverDeleteVolumeDeviceObject(PDEVICE_OBJECT VolumeDeviceObject)
         BlorgDestroyWorkQueue();
         BlorgNodeTableTeardown();
         BlorgFreeFileContext(pDevExt->Vcb, VolumeDeviceObject);
-        FreeFileContextTree(pDevExt->RootDcb, VolumeDeviceObject);
+        DriverFreeFileContextTree(pDevExt->RootDcb, VolumeDeviceObject);
         BlorgFreeFileContext(pDevExt->RootDcb, VolumeDeviceObject);
         ExDeleteNPagedLookasideList(&pDevExt->NonPagedNodeLookasideList);
         ExDeletePagedLookasideList(&pDevExt->FcbLookasideList);
@@ -376,7 +376,7 @@ static NTSTATUS DriverCreateFileSystemDeviceObject(PDRIVER_OBJECT DriverObject, 
 
     UNICODE_STRING symlinkString = RTL_CONSTANT_STRING(BLORGFS_FSDO_SYMLINK_STRING);
 
-    (VOID)IoCreateSymbolicLink(&symlinkString, &fsdoString);
+    C_CAST(VOID, IoCreateSymbolicLink(&symlinkString, &fsdoString));
 
     IoRegisterFileSystem(fileSystemDeviceObject);
 
@@ -399,7 +399,7 @@ static VOID DriverDeleteFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceOb
     {
         UNICODE_STRING symlinkString = RTL_CONSTANT_STRING(BLORGFS_FSDO_SYMLINK_STRING);
 
-        (VOID)IoDeleteSymbolicLink(&symlinkString);
+        C_CAST(VOID, IoDeleteSymbolicLink(&symlinkString));
 
         PDEVICE_OBJECT volumeDeviceObject = global.VolumeDeviceObject;
 
@@ -442,7 +442,7 @@ static VOID DriverDeleteFileSystemDeviceObject(PDEVICE_OBJECT FileSystemDeviceOb
 // a live prefetch ring would otherwise keep issuing into a drained client.
 // With the ring gone there is one issuer and one gate.
 //
-VOID DriverUnload(PDRIVER_OBJECT DriverObject)
+VOID BlorgDriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
     BlorgDrainHttpClient();
@@ -491,7 +491,7 @@ VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 #define BLORGFS_DEFAULT_REMOTE_HOST L"10.0.50.17"
 
 //
-// BuildRemoteHostAnsiString's worst case is exactly these two caps
+// DriverBuildRemoteHostAnsiString's worst case is exactly these two caps
 // combined: BLORGFS_REG_HOST_MAX_CHARS covers the host's characters plus
 // the trailing NUL, and BLORGFS_REG_PORT_MAX_CHARS covers the ':'
 // separator plus the port's characters. Client.c sizes its Host-header
@@ -516,7 +516,7 @@ static_assert(
 // are ASCII-only by definition. Total size is bounded by
 // BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES (Driver.h), which Client.c relies on.
 //
-static PSTR BuildRemoteHostAnsiString(PCUNICODE_STRING HostString, PCUNICODE_STRING PortString)
+static PSTR DriverBuildRemoteHostAnsiString(PCUNICODE_STRING HostString, PCUNICODE_STRING PortString)
 {
     USHORT hostChars = HostString->Length / sizeof(WCHAR);
     USHORT portChars = PortString ? PortString->Length / sizeof(WCHAR) : 0;
@@ -562,7 +562,7 @@ static PSTR BuildRemoteHostAnsiString(PCUNICODE_STRING HostString, PCUNICODE_STR
 // since the failure modes are asymmetric -- omitting SNI is always legal,
 // sending a literal in it never is.
 //
-static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
+static BOOLEAN DriverHostStringIsIpLiteral(PCUNICODE_STRING HostString)
 {
     BOOLEAN digitsAndDotsOnly = TRUE;
 
@@ -612,11 +612,11 @@ static BOOLEAN HostStringIsIpLiteral(PCUNICODE_STRING HostString)
 // ternary for picking the default. RemoteHost works the same way --
 // Parameters\RemoteHost if present, else BLORGFS_DEFAULT_REMOTE_HOST --
 // and the same resolved UNICODE_STRING both drives BlorgGetHttpAddrInfo and
-// (via BuildRemoteHostAnsiString) becomes global.RemoteHostAnsi, so the
+// (via DriverBuildRemoteHostAnsiString) becomes global.RemoteHostAnsi, so the
 // Host header always names whatever address the driver actually
 // resolved/connected to, never a stale literal. The Host header carries
 // an explicit :port whenever the resolved port isn't the scheme default
-// (80 plaintext / 443 TLS) -- see BuildRemoteHostAnsiString.
+// (80 plaintext / 443 TLS) -- see DriverBuildRemoteHostAnsiString.
 //
 // The mount-manager volume-arrival notification runs last, only once the
 // FS is registered, the disk device + B: symlink are up, and the HTTP
@@ -693,7 +693,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     global.DriverObject = DriverObject;
 
-    DriverObject->DriverUnload = DriverUnload;
+    DriverObject->DriverUnload = BlorgDriverUnload;
     DriverObject->MajorFunction[IRP_MJ_CREATE] = BlorgCreate;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = BlorgClose;
     DriverObject->MajorFunction[IRP_MJ_READ] = BlorgRead;
@@ -725,7 +725,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     global.CacheManagerCallbacks.ReleaseFromReadAhead = BlorgReleaseNodeFromReadAhead;
 
     BlorgFsFastDispatch.SizeOfFastIoDispatch = sizeof(FAST_IO_DISPATCH);
-    BlorgFsFastDispatch.FastIoCheckIfPossible = FastIoCheckIfPossible;
+    BlorgFsFastDispatch.FastIoCheckIfPossible = BlorgFastIoCheckIfPossible;
     BlorgFsFastDispatch.FastIoRead = BlorgFastIoRead;
     BlorgFsFastDispatch.MdlRead = FsRtlMdlReadDev;
     BlorgFsFastDispatch.MdlReadComplete = FsRtlMdlReadCompleteDev;
@@ -872,7 +872,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     BOOLEAN portIsSchemeDefault = RtlEqualUnicodeString(&portString, &schemeDefaultPort, FALSE);
 
-    global.RemoteHostAnsi = BuildRemoteHostAnsiString(&hostString, portIsSchemeDefault ? NULL : &portString);
+    global.RemoteHostAnsi = DriverBuildRemoteHostAnsiString(&hostString, portIsSchemeDefault ? NULL : &portString);
 
     if (!global.RemoteHostAnsi)
     {
@@ -890,9 +890,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return STATUS_FAILED_DRIVER_ENTRY;
     }
 
-    if (global.TlsEnabled && !HostStringIsIpLiteral(&hostString))
+    if (global.TlsEnabled && !DriverHostStringIsIpLiteral(&hostString))
     {
-        global.RemoteHostSniAnsi = BuildRemoteHostAnsiString(&hostString, NULL);
+        global.RemoteHostSniAnsi = DriverBuildRemoteHostAnsiString(&hostString, NULL);
 
         if (!global.RemoteHostSniAnsi)
         {

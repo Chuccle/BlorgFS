@@ -238,7 +238,7 @@ VOID IoRemoveShareAccess(PFILE_OBJECT FileObject, PSHARE_ACCESS ShareAccess)
 // STATUS_PENDING here means the oplock package took ownership of the IRP
 // and will re-drive the caller from BlorgOplockComplete -- the single most
 // dangerous status this file returns, per Create.c's own comment above
-// OpenExistingFcb. An always-SUCCESS stub makes every oplock-pending path
+// CreateOpenExistingFcb. An always-SUCCESS stub makes every oplock-pending path
 // in Create.c (three call sites) and Read.c permanently unreachable: not
 // merely untested today, but incapable of ever being tested against this
 // stub. ShimForceNextOplockCheck makes the branch reachable.
@@ -454,7 +454,7 @@ NTSTATUS ObReferenceObjectByHandle(HANDLE H, ACCESS_MASK A, POBJECT_TYPE T, KPRO
 
     //
     // A NULL handle must fail, matching real Windows -- callers (e.g.
-    // FspWorkQueue.c's StopWorkQueueThreads, when PsCreateSystemThread's
+    // FspWorkQueue.c's FspStopWorkQueueThreads, when PsCreateSystemThread's
     // own no-op stub leaves ThreadHandle[i] NULL) rely on the failure to
     // skip a wait on an object that was never created. An unconditional
     // success here previously produced a NULL PVOID* that

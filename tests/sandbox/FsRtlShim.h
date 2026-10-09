@@ -46,7 +46,7 @@ typedef enum _MMFLUSH_TYPE
 //
 // FSRTL_ADVANCED_FCB_HEADER.IsFastIoPossible takes one of these; the
 // driver assigns FastIoIsQuestionable so Cc routes fast I/O through
-// FastIoCheckIfPossible rather than short-circuiting it.
+// BlorgFastIoCheckIfPossible rather than short-circuiting it.
 //
 typedef enum _FAST_IO_POSSIBLE
 {

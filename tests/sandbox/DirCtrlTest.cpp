@@ -1,9 +1,10 @@
 ﻿//
 // Coverage for the real DirCtrl.c: BlorgVolumeDirectoryControl's
-// QUERY_DIRECTORY enumeration (MatchPattern, EnumerateDirectoryEntries, and
-// all three FILE_*_DIR_INFORMATION fill routines), NOTIFY_CHANGE_DIRECTORY
-// registration, and the dispatch-entry device-type routing -- none of
-// which any other sandbox target drives.
+// QUERY_DIRECTORY enumeration (DirCtrlMatchPattern,
+// DirCtrlEnumerateDirectoryEntries, and all three FILE_*_DIR_INFORMATION
+// fill routines), NOTIFY_CHANGE_DIRECTORY registration, and the
+// dispatch-entry device-type routing -- none of which any other sandbox
+// target drives.
 //
 // Most tests here publish a listing of the directory into the listing cache
 // directly (via the shared ListingBuilder.h, the same builder
@@ -176,7 +177,7 @@ protected:
 };
 
 ///////////////////////////////////////////////////////////////////////////
-// MatchPattern, via a query with an explicit search pattern
+// DirCtrlMatchPattern, via a query with an explicit search pattern
 ///////////////////////////////////////////////////////////////////////////
 
 TEST_F(DirCtrlTest, WildcardPatternMatchesOnlyEntriesSatisfyingIt)
@@ -247,7 +248,7 @@ TEST_F(DirCtrlTest, NoFileNameMatchesEveryEntry)
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// EnumerateDirectoryEntries: buffer sizing and resume
+// DirCtrlEnumerateDirectoryEntries: buffer sizing and resume
 ///////////////////////////////////////////////////////////////////////////
 
 TEST_F(DirCtrlTest, BufferTooSmallForTheFirstEntryOverflows)
@@ -263,7 +264,7 @@ TEST_F(DirCtrlTest, BufferTooSmallForTheFirstEntryOverflows)
 
 //
 // The one-entry size comes from the driver, not from a copy of
-// AlignEntrySize: a first query with room to spare reports the stride it
+// DirCtrlAlignEntrySize: a first query with room to spare reports the stride it
 // chose in the first entry's NextEntryOffset, and that is what sizes the
 // deliberately-just-too-small buffer for the second query. Recomputing the
 // 8-byte rounding here instead would be a second implementation of it,

@@ -9,8 +9,8 @@
 // request actually goes through first: two threads opening the SAME file
 // at the same time, both landing in BlorgVolumeCreate's warm-node branch,
 // both taking Fcb->Header.Resource exclusive around the composite
-// RefCount-increment-plus-ApplyShareAccess mutation Create.c's own comment
-// calls out as needing to be atomic.
+// RefCount-increment-plus-CreateApplyShareAccess mutation Create.c's own
+// comment calls out as needing to be atomic.
 //
 // The claim under proof: no interleaving of two concurrent opens
 // - corrupts Header.Resource (double release, wrong-owner release,
@@ -19,22 +19,22 @@
 // - leaves ShareAccess.OpenCount or the FCB's RefCount inconsistent with
 //   the number of opens that actually reported success.
 //
-// OpenExistingFcb and ApplyShareAccess are `static inline` in Create.c, so
-// they are not reachable from a different translation unit -- which is
-// exactly why this drives BlorgCreate itself rather than them: the
+// CreateOpenExistingFcb and CreateApplyShareAccess are `static inline` in
+// Create.c, so they are not reachable from a different translation unit --
+// which is exactly why this drives BlorgCreate itself rather than them: the
 // alternative would be re-declaring driver internals as external, testing
 // a copy of the contract rather than the contract.
 //
 // BLIND SPOT, FOUND BY MUTATION, NOT CLOSED. Deleting
 // ExAcquireResourceExclusiveLite(Fcb->Header.Resource, TRUE) /
-// ExReleaseResourceLite from OpenExistingFcb -- removing the lock entirely,
-// the exact class of bug "concurrent dispatch synchronisation" names --
-// does NOT fail this test. It runs FEWER schedules (252 vs the real
-// code's 3432) and passes clean.
+// ExReleaseResourceLite from CreateOpenExistingFcb -- removing the lock
+// entirely, the exact class of bug "concurrent dispatch synchronisation"
+// names -- does NOT fail this test. It runs FEWER schedules (252 vs the
+// real code's 3432) and passes clean.
 //
 // The reason is structural, not a bug in this test to fix: this scheduler
 // only creates a scheduling point at a lock acquire/release or an
-// interlocked op. ApplyShareAccess's actual field mutations
+// interlocked op. CreateApplyShareAccess's actual field mutations
 // (ShareAccess->OpenCount++ and friends) are PLAIN increments, not
 // Interlocked ones -- they were never scheduling points even with the lock
 // present; the lock's acquire/release were the only scheduling points in
@@ -118,8 +118,8 @@ struct DispatchProof
 
     //
     // The B: symlink's backing disk device object, normally set once by
-    // DriverCreateDiskDeviceObject at mount and read by OpenExistingFcb to
-    // wire FileObject->Vpb on a successful open. Modelled here as a bare
+    // DriverCreateDiskDeviceObject at mount and read by CreateOpenExistingFcb
+    // to wire FileObject->Vpb on a successful open. Modelled here as a bare
     // DEVICE_OBJECT with a VPB, not through the real disk-device creation
     // path -- BlorgVolumeCreate never touches its contents beyond this one
     // pointer chase, so building the real DDO would add setup with nothing

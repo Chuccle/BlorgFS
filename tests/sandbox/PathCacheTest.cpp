@@ -411,7 +411,7 @@ TEST_F(PathCacheSeedTest, RootListingSeedsSingleSeparatorPaths)
 
 //
 // On a case-sensitive backend a file and a subdirectory can differ only in
-// case. Create.c's listing scan (FindEntryByName) is case-insensitive and
+// case. Create.c's listing scan (CreateFindEntryByName) is case-insensitive and
 // returns the file, so the seeded entry -- which stands in for that scan
 // once the DCB is gone -- must say file too, or the same open would get a
 // directory or a file depending on whether the DCB happened to be alive.

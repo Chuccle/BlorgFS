@@ -95,8 +95,8 @@ ULONG SocketTlsRecvCapacity = SOCKET_TLS_RECV_RECORDS_LARGE * SOCKET_TLS_RECORD_
 // Every async send/receive needs a KSOCKET_ASYNC_CONTEXT; the TLS record
 // receive path in particular issues them at a high rate. A lookaside
 // keeps that per-op allocation off the general pool; entries are handed
-// out with every field explicitly initialized (AllocateAsyncSocketContext
-// / ArmSocketTimeout), so no zeroing is needed on reuse.
+// out with every field explicitly initialized (SocketAllocateAsyncContext
+// / SocketArmTimeout), so no zeroing is needed on reuse.
 //
 static NPAGED_LOOKASIDE_LIST AsyncContextLookaside;
 
@@ -164,8 +164,8 @@ static PIO_WORKITEM SocketPrewarmWorkItem;
 static BOOLEAN SocketPrewarmPumpRunning;
 static BOOLEAN SocketPrewarmPumpPending;
 
-// CloseWskSocket is defined below but referenced earlier (BlorgCleanupWskSocketPool).
-static NTSTATUS CloseWskSocket(PKSOCKET Socket);
+// SocketCloseWskSocket is defined below but referenced earlier (BlorgCleanupWskSocketPool).
+static NTSTATUS SocketCloseWskSocket(PKSOCKET Socket);
 
 //
 // See Socket.h. The MDL is both the last thing built and the guard, so a
@@ -221,7 +221,7 @@ NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket)
 // file). Safe at <= DISPATCH_LEVEL: the buffers are NonPagedPoolNx and
 // the key handles are dispatch-safe (BCRYPT_PROV_DISPATCH).
 //
-static VOID FreeKSocket(PKSOCKET Socket)
+static VOID SocketFreeKSocket(PKSOCKET Socket)
 {
     BlorgTlsDestroyConnectionState(&Socket->Tls);
 
@@ -266,7 +266,7 @@ static VOID FreeKSocket(PKSOCKET Socket)
 // zeroing precondition -- contexts come from a lookaside and may carry a
 // prior op's state); caller must not have started the op yet.
 //
-static VOID ArmSocketTimeout(
+static VOID SocketArmTimeout(
     PSOCKET_OP_TIMEOUT Timeout,
     PIRP Irp,
     PKDEFERRED_ROUTINE DpcRoutine,
@@ -293,7 +293,7 @@ static VOID ArmSocketTimeout(
 // reference reserved for the DPC. Returns the status the caller should
 // report, translating a timeout-induced cancel into STATUS_IO_TIMEOUT.
 //
-static NTSTATUS DisarmSocketTimeout(PSOCKET_OP_TIMEOUT Timeout, NTSTATUS Status)
+static NTSTATUS SocketDisarmTimeout(PSOCKET_OP_TIMEOUT Timeout, NTSTATUS Status)
 {
     if (KeCancelTimer(&Timeout->Timer))
     {
@@ -312,7 +312,7 @@ static NTSTATUS DisarmSocketTimeout(PSOCKET_OP_TIMEOUT Timeout, NTSTATUS Status)
 // Drop one reference. Returns TRUE to the caller that drives the count to
 // zero -- that caller, and only that caller, frees the enclosing context.
 //
-static BOOLEAN ReleaseSocketTimeoutRef(PSOCKET_OP_TIMEOUT Timeout)
+static BOOLEAN SocketReleaseTimeoutRef(PSOCKET_OP_TIMEOUT Timeout)
 {
     return 0 == InterlockedDecrement(&Timeout->RefCount);
 }
@@ -349,7 +349,7 @@ static NTSTATUS SocketContextCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP
 // Allocates the IRP for a synchronous WSK op and wires its completion
 // routine to signal SocketContext->CompletionEvent.
 //
-static NTSTATUS InitialiseSocketContext(PKSOCKET_CONTEXT SocketContext)
+static NTSTATUS SocketInitializeContext(PKSOCKET_CONTEXT SocketContext)
 {
     KeInitializeEvent(
         &SocketContext->CompletionEvent,
@@ -376,8 +376,8 @@ static NTSTATUS InitialiseSocketContext(PKSOCKET_CONTEXT SocketContext)
     return STATUS_SUCCESS;
 }
 
-// Releases the IRP allocated by InitialiseSocketContext.
-static VOID FreeSocketContext(PKSOCKET_CONTEXT SocketContext)
+// Releases the IRP allocated by SocketInitializeContext.
+static VOID SocketFreeContext(PKSOCKET_CONTEXT SocketContext)
 {
     IoFreeIrp(SocketContext->Irp);
 }
@@ -386,7 +386,7 @@ static VOID FreeSocketContext(PKSOCKET_CONTEXT SocketContext)
 // If the op is still pending, blocks on CompletionEvent and replaces
 // *Status with the IRP's final status. No-op if already completed.
 //
-static VOID WaitForCompletionSocketContext(PKSOCKET_CONTEXT SocketContext, PNTSTATUS Status)
+static VOID SocketWaitForContextCompletion(PKSOCKET_CONTEXT SocketContext, PNTSTATUS Status)
 {
     if (*Status == STATUS_PENDING)
     {
@@ -414,7 +414,7 @@ static VOID WaitForCompletionSocketContext(PKSOCKET_CONTEXT SocketContext, PNTST
 // back to the lookaside when the refcount hits zero.
 //
 
-static PKSOCKET_ASYNC_CONTEXT AllocateAsyncSocketContext(
+static PKSOCKET_ASYNC_CONTEXT SocketAllocateAsyncContext(
     PKSOCKET_COMPLETION_ROUTINE CompletionRoutine,
     PVOID CompletionContext
 )
@@ -474,7 +474,7 @@ static VOID SocketAsyncTimeoutDpc(PKDPC Dpc, PVOID Context, PVOID SystemArgument
     InterlockedExchange(&asyncContext->Timeout.TimedOut, 1);
     IoCancelIrp(asyncContext->Timeout.Irp);
 
-    if (ReleaseSocketTimeoutRef(&asyncContext->Timeout))
+    if (SocketReleaseTimeoutRef(&asyncContext->Timeout))
     {
         IoFreeIrp(asyncContext->Irp);
         ExFreeToNPagedLookasideList(&AsyncContextLookaside, asyncContext);
@@ -486,7 +486,7 @@ static VOID SocketAsyncTimeoutDpc(PKDPC Dpc, PVOID Context, PVOID SystemArgument
 // unlocks/frees an owned MDL, invokes the caller's callback, then frees
 // the IRP and context once the timeout ref is also released. The callback
 // runs at <= DISPATCH_LEVEL and must not block; if it wants to issue
-// another async op it must use a fresh AllocateAsyncSocketContext call (or
+// another async op it must use a fresh SocketAllocateAsyncContext call (or
 // a queued work item), never a reuse of this context/IRP.
 //
 static NTSTATUS SocketAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
@@ -500,7 +500,7 @@ static NTSTATUS SocketAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP I
         return STATUS_INVALID_PARAMETER;
     }
 
-    NTSTATUS status = DisarmSocketTimeout(&asyncContext->Timeout, Irp->IoStatus.Status);
+    NTSTATUS status = SocketDisarmTimeout(&asyncContext->Timeout, Irp->IoStatus.Status);
     ULONG_PTR bytesTransferred = Irp->IoStatus.Information;
 
     if (asyncContext->Mdl)
@@ -515,7 +515,7 @@ static NTSTATUS SocketAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP I
         asyncContext->CompletionRoutine(status, bytesTransferred, asyncContext->CompletionContext);
     }
 
-    if (ReleaseSocketTimeoutRef(&asyncContext->Timeout))
+    if (SocketReleaseTimeoutRef(&asyncContext->Timeout))
     {
         IoFreeIrp(asyncContext->Irp);
         ExFreeToNPagedLookasideList(&AsyncContextLookaside, asyncContext);
@@ -613,7 +613,7 @@ VOID BlorgCleanupWskClient(VOID)
 
 //
 // Stops the pre-warm and waits out the step in flight. Called from
-// DriverUnload, before the device objects are torn down, because
+// BlorgDriverUnload, before the device objects are torn down, because
 // that step may still queue SocketPrewarmWorkItem against
 // global.FileSystemDeviceObject; and again from BlorgCleanupWskSocketPool,
 // where it finds nothing left to do.
@@ -663,7 +663,7 @@ VOID BlorgDrainWskSocketPrewarm(VOID)
 
 //
 // Drains and synchronously closes every pooled socket. Releases the pool
-// lock around each CloseWskSocket call since that call waits on an IRP
+// lock around each SocketCloseWskSocket call since that call waits on an IRP
 // and must not hold a spinlock across a blocking wait. The pre-warm is
 // drained first (BlorgDrainWskSocketPrewarm).
 //
@@ -682,7 +682,7 @@ VOID BlorgCleanupWskSocketPool(VOID)
         KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
 
         PKSOCKET socket = CONTAINING_RECORD(listEntry, KSOCKET, PoolEntry);
-        CloseWskSocket(socket);
+        SocketCloseWskSocket(socket);
 
         KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
     }
@@ -698,11 +698,11 @@ NTSTATUS BlorgGetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRIN
 {
     KSOCKET_CONTEXT socketContext;
 
-    NTSTATUS result = InitialiseSocketContext(&socketContext);
+    NTSTATUS result = SocketInitializeContext(&socketContext);
 
     if (!NT_SUCCESS(result))
     {
-        BLORGFS_PRINT("Failed InitialiseSocketContext(): 0x%X\n", result);
+        BLORGFS_PRINT("Failed SocketInitializeContext(): 0x%X\n", result);
         return result;
     }
 
@@ -719,9 +719,9 @@ NTSTATUS BlorgGetWskAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRIN
         socketContext.Irp
     );
 
-    WaitForCompletionSocketContext(&socketContext, &result);
+    SocketWaitForContextCompletion(&socketContext, &result);
 
-    FreeSocketContext(&socketContext);
+    SocketFreeContext(&socketContext);
 
     return result;
 }
@@ -744,15 +744,15 @@ VOID BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo)
 // already-rare allocation failure is worse than leaking the (already
 // broken) underlying socket.
 //
-static NTSTATUS CloseWskSocket(PKSOCKET Socket)
+static NTSTATUS SocketCloseWskSocket(PKSOCKET Socket)
 {
     KSOCKET_CONTEXT socketContext;
 
-    NTSTATUS result = InitialiseSocketContext(&socketContext);
+    NTSTATUS result = SocketInitializeContext(&socketContext);
 
     if (!NT_SUCCESS(result))
     {
-        FreeKSocket(Socket);
+        SocketFreeKSocket(Socket);
         return result;
     }
 
@@ -761,21 +761,21 @@ static NTSTATUS CloseWskSocket(PKSOCKET Socket)
         socketContext.Irp
     );
 
-    WaitForCompletionSocketContext(&socketContext, &result);
+    SocketWaitForContextCompletion(&socketContext, &result);
 
-    FreeSocketContext(&socketContext);
+    SocketFreeContext(&socketContext);
 
-    FreeKSocket(Socket);
+    SocketFreeKSocket(Socket);
 
     return result;
 }
 
 //
-// Fire-and-forget close. Unlike CloseWskSocket, this never waits, so it is
+// Fire-and-forget close. Unlike SocketCloseWskSocket, this never waits, so it is
 // safe to call from the WSK completion routines (<= DISPATCH_LEVEL) that
 // drive the async HTTP pipeline. The IRP, the KSOCKET, and this context are
 // all owned by SocketCloseAsyncCompletionRoutine once WskCloseSocket is
-// issued, and freed there. Use the synchronous CloseWskSocket only for
+// issued, and freed there. Use the synchronous SocketCloseWskSocket only for
 // PASSIVE_LEVEL teardown (BlorgCleanupWskSocketPool).
 //
 
@@ -811,7 +811,7 @@ static NTSTATUS SocketCloseAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject, P
 
     IoFreeIrp(closeCtx->Irp);
 
-    FreeKSocket(closeCtx->Socket);
+    SocketFreeKSocket(closeCtx->Socket);
     ExFreePool(closeCtx);
 
     return STATUS_MORE_PROCESSING_REQUIRED;
@@ -878,7 +878,7 @@ NTSTATUS BlorgCloseWskSocketAsync(PKSOCKET Socket)
 // the same memory -- this is a kernel-only C TU (no C++ consumers, unlike
 // Tls.h), so plain `restrict` applies directly, no portability macro needed.
 //
-static BOOLEAN SockAddrEqual(const SOCKADDR* restrict A, const SOCKADDR* restrict B)
+static BOOLEAN SocketAddressEqual(const SOCKADDR* restrict A, const SOCKADDR* restrict B)
 {
     if (A->sa_family != B->sa_family)
     {
@@ -1203,7 +1203,7 @@ static VOID SocketPrewarmPump(VOID)
 // Only the family-sized address is copied. The caller hands a PSOCKADDR at
 // an object sized for its family -- DriverEntry passes ai_addr, the sandbox
 // tests a stack SOCKADDR_IN -- so copying a full SOCKADDR_STORAGE would
-// read past its end. Every consumer of SocketPrewarmAddress (SockAddrEqual,
+// read past its end. Every consumer of SocketPrewarmAddress (SocketAddressEqual,
 // WskSocketConnect, the per-socket RemoteAddress copy) honours the family
 // size too.
 //
@@ -1279,7 +1279,7 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 //
 // Called from the async HTTP pipeline at DISPATCH_LEVEL, so a socket that
 // doesn't fit in the pool is closed via the non-blocking BlorgCloseWskSocketAsync
-// rather than the synchronous CloseWskSocket.
+// rather than the synchronous SocketCloseWskSocket.
 //
 NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket)
 {
@@ -1309,7 +1309,7 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket)
 
 //
 // Caller contract: on a failed send/receive, do not call
-// BlorgReleaseReusableWskSocket -- call CloseWskSocket (or just drop the
+// BlorgReleaseReusableWskSocket -- call SocketCloseWskSocket (or just drop the
 // socket and let it be closed) instead, so a connection the peer may
 // have already torn down never goes back into the pool to be handed to
 // a different caller.
@@ -1347,7 +1347,7 @@ NTSTATUS BlorgReceiveWskAsync(PKSOCKET Socket, PVOID Buffer, ULONG Length, ULONG
 //
 // Async receive directly into a caller-owned MDL. The MDL is borrowed,
 // not owned: asyncContext->Mdl stays NULL (set by
-// AllocateAsyncSocketContext), so SocketAsyncCompletionRoutine's
+// SocketAllocateAsyncContext), so SocketAsyncCompletionRoutine's
 // unlock/free of an owned MDL is naturally skipped -- no mode flag needed.
 // Same ownership handoff as BlorgSendRecvWskAsync: the watchdog is armed before
 // the op is issued, and asyncContext must not be touched again after the
@@ -1365,7 +1365,7 @@ NTSTATUS BlorgReceiveWskAsyncMdl(
     PVOID CompletionContext
 )
 {
-    PKSOCKET_ASYNC_CONTEXT asyncContext = AllocateAsyncSocketContext(CompletionRoutine, CompletionContext);
+    PKSOCKET_ASYNC_CONTEXT asyncContext = SocketAllocateAsyncContext(CompletionRoutine, CompletionContext);
 
     if (!asyncContext)
     {
@@ -1379,7 +1379,7 @@ NTSTATUS BlorgReceiveWskAsyncMdl(
         .Mdl = Mdl
     };
 
-    ArmSocketTimeout(
+    SocketArmTimeout(
         &asyncContext->Timeout,
         asyncContext->Irp,
         SocketAsyncTimeoutDpc,
@@ -1424,7 +1424,7 @@ NTSTATUS BlorgSendRecvWskAsync(
     PVOID CompletionContext
 )
 {
-    PKSOCKET_ASYNC_CONTEXT asyncContext = AllocateAsyncSocketContext(CompletionRoutine, CompletionContext);
+    PKSOCKET_ASYNC_CONTEXT asyncContext = SocketAllocateAsyncContext(CompletionRoutine, CompletionContext);
 
     if (!asyncContext)
     {
@@ -1460,7 +1460,7 @@ NTSTATUS BlorgSendRecvWskAsync(
         .Mdl = asyncContext->Mdl
     };
 
-    ArmSocketTimeout(
+    SocketArmTimeout(
         &asyncContext->Timeout,
         asyncContext->Irp,
         SocketAsyncTimeoutDpc,
@@ -1526,7 +1526,7 @@ static VOID SocketConnectTimeoutDpc(PKDPC Dpc, PVOID Context, PVOID SystemArgume
     InterlockedExchange(&connectCtx->Timeout.TimedOut, 1);
     IoCancelIrp(connectCtx->Timeout.Irp);
 
-    if (ReleaseSocketTimeoutRef(&connectCtx->Timeout))
+    if (SocketReleaseTimeoutRef(&connectCtx->Timeout))
     {
         IoFreeIrp(connectCtx->Irp);
         ExFreePool(connectCtx);
@@ -1553,7 +1553,7 @@ static NTSTATUS SocketConnectAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject,
         return STATUS_INVALID_PARAMETER;
     }
 
-    NTSTATUS status = DisarmSocketTimeout(&connectCtx->Timeout, Irp->IoStatus.Status);
+    NTSTATUS status = SocketDisarmTimeout(&connectCtx->Timeout, Irp->IoStatus.Status);
 
     if (NT_SUCCESS(status))
     {
@@ -1576,7 +1576,7 @@ static NTSTATUS SocketConnectAsyncCompletionRoutine(PDEVICE_OBJECT DeviceObject,
         connectCtx->CompletionRoutine(status, NULL, FALSE, connectCtx->CompletionContext);
     }
 
-    if (ReleaseSocketTimeoutRef(&connectCtx->Timeout))
+    if (SocketReleaseTimeoutRef(&connectCtx->Timeout))
     {
         IoFreeIrp(connectCtx->Irp);
         ExFreePool(connectCtx);
@@ -1644,7 +1644,7 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
             PKSOCKET pooledSocket = CONTAINING_RECORD(listEntry, KSOCKET, PoolEntry);
             RtlZeroMemory(&pooledSocket->PoolEntry, sizeof(pooledSocket->PoolEntry));
 
-            if (SockAddrEqual(C_CAST(const SOCKADDR*, &pooledSocket->RemoteAddress), RemoteAddress))
+            if (SocketAddressEqual(C_CAST(const SOCKADDR*, &pooledSocket->RemoteAddress), RemoteAddress))
             {
                 BLORGFS_STAT_INC(ConnectionsPooled);
                 CompletionRoutine(STATUS_SUCCESS, pooledSocket, TRUE, CompletionContext);
@@ -1712,7 +1712,7 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
 
     localAddress.ss_family = RemoteAddress->sa_family;
 
-    ArmSocketTimeout(
+    SocketArmTimeout(
         &connectCtx->Timeout,
         connectCtx->Irp,
         SocketConnectTimeoutDpc,

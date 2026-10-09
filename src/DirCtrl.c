@@ -26,9 +26,9 @@ typedef NTSTATUS(*PFILL_ROUTINE)(
 // Rounds a directory-entry size up to the next 8-byte boundary, as
 // required for NextEntryOffset alignment in FILE_*_DIR_INFORMATION buffers.
 //
-static inline ULONG AlignEntrySize(ULONG size)
+static inline ULONG DirCtrlAlignEntrySize(ULONG Size)
 {
-    return (size + 7u) & ~7u;
+    return (Size + 7u) & ~7u;
 }
 
 //
@@ -66,7 +66,7 @@ static inline ULONG AlignEntrySize(ULONG size)
 // __try since FsRtlIsNameInExpression can raise STATUS_NO_MEMORY under
 // low resources.
 //
-static inline BOOLEAN MatchPattern(const PUNICODE_STRING EntryName, const PUNICODE_STRING SearchPattern, ULONGLONG Flags)
+static inline BOOLEAN DirCtrlMatchPattern(const PUNICODE_STRING EntryName, const PUNICODE_STRING SearchPattern, ULONGLONG Flags)
 {
     if (FlagOn(Flags, CCB_FLAG_MATCH_ALL))
     {
@@ -131,7 +131,7 @@ static inline BOOLEAN MatchPattern(const PUNICODE_STRING EntryName, const PUNICO
 // restrict-qualified parameter as incompatible with PFILL_ROUTINE's
 // unqualified one.
 //
-static inline NTSTATUS FillFileIdBothDirInfo(
+static inline NTSTATUS DirCtrlFillFileIdBothDirInfo(
     PFILE_ID_BOTH_DIR_INFORMATION Out,
     ULONG RemainingLength,
     ULONG Index,
@@ -147,7 +147,7 @@ static inline NTSTATUS FillFileIdBothDirInfo(
 )
 {
     ULONG rawSize = FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + Name->Length;
-    ULONG alignedSize = AlignEntrySize(rawSize);
+    ULONG alignedSize = DirCtrlAlignEntrySize(rawSize);
 
     if (RemainingLength < alignedSize)
     {
@@ -166,7 +166,7 @@ static inline NTSTATUS FillFileIdBothDirInfo(
     return STATUS_SUCCESS;
 }
 
-static inline NTSTATUS FillFileFullDirInfo(
+static inline NTSTATUS DirCtrlFillFileFullDirInfo(
     PFILE_FULL_DIR_INFORMATION Out,
     ULONG RemainingLength,
     ULONG Index,
@@ -182,7 +182,7 @@ static inline NTSTATUS FillFileFullDirInfo(
 )
 {
     ULONG rawSize = FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) + Name->Length;
-    ULONG alignedSize = AlignEntrySize(rawSize);
+    ULONG alignedSize = DirCtrlAlignEntrySize(rawSize);
 
     if (RemainingLength < alignedSize)
     {
@@ -199,7 +199,7 @@ static inline NTSTATUS FillFileFullDirInfo(
     return STATUS_SUCCESS;
 }
 
-static inline NTSTATUS FillFileBothDirInfo(
+static inline NTSTATUS DirCtrlFillFileBothDirInfo(
     PFILE_BOTH_DIR_INFORMATION Out,
     ULONG RemainingLength,
     ULONG Index,
@@ -215,7 +215,7 @@ static inline NTSTATUS FillFileBothDirInfo(
 )
 {
     ULONG rawSize = FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) + Name->Length;
-    ULONG alignedSize = AlignEntrySize(rawSize);
+    ULONG alignedSize = DirCtrlAlignEntrySize(rawSize);
 
     if (RemainingLength < alignedSize)
     {
@@ -256,7 +256,7 @@ static inline NTSTATUS FillFileBothDirInfo(
 // walking that chain would otherwise read past the last written entry
 // into an unwritten slot.
 //
-static NTSTATUS EnumerateDirectoryEntries(
+static NTSTATUS DirCtrlEnumerateDirectoryEntries(
     const PCCB Ccb,
     ULONG StartIndex,
     ULONG TotalEntries,
@@ -316,7 +316,7 @@ static NTSTATUS EnumerateDirectoryEntries(
             attrs = FILE_ATTRIBUTE_NORMAL;
         }
 
-        if (MatchPattern(&name, Pattern, Flags))
+        if (DirCtrlMatchPattern(&name, Pattern, Flags))
         {
             SIZE_T written = 0;
             NTSTATUS st = FillFn(
@@ -877,7 +877,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                         }
 
                         SIZE_T used = 0;
-                        result = EnumerateDirectoryEntries(
+                        result = DirCtrlEnumerateDirectoryEntries(
                             ccb,
                             index,
                             totalEntries,
@@ -886,7 +886,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                             returnSingleEntry,
                             dirInfo,
                             remainingLength,
-                            FillFileIdBothDirInfo,
+                            DirCtrlFillFileIdBothDirInfo,
                             &used,
                             &index
                         );
@@ -920,7 +920,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                         }
 
                         SIZE_T used = 0;
-                        result = EnumerateDirectoryEntries(
+                        result = DirCtrlEnumerateDirectoryEntries(
                             ccb,
                             index,
                             totalEntries,
@@ -929,7 +929,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                             returnSingleEntry,
                             dirInfo,
                             remainingLength,
-                            FillFileFullDirInfo,
+                            DirCtrlFillFileFullDirInfo,
                             &used,
                             &index
                         );
@@ -970,7 +970,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                         }
 
                         SIZE_T used = 0;
-                        result = EnumerateDirectoryEntries(
+                        result = DirCtrlEnumerateDirectoryEntries(
                             ccb,
                             index,
                             totalEntries,
@@ -979,7 +979,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                             returnSingleEntry,
                             dirInfo,
                             remainingLength,
-                            FillFileBothDirInfo,
+                            DirCtrlFillFileBothDirInfo,
                             &used,
                             &index
                         );

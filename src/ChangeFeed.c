@@ -338,7 +338,7 @@ VOID BlorgChangeFeedStart(PDEVICE_OBJECT VolumeDeviceObject)
 }
 
 //
-// Signals the thread and reaps it, as StopWorkQueueThreads does
+// Signals the thread and reaps it, as FspStopWorkQueueThreads does
 // (FspWorkQueue.c), then takes the feed down so nothing outlives the volume
 // on the long lifetime. The feed is taken down even with no thread to reap,
 // so a stop always leaves the caches on their short TTL.

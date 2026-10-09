@@ -926,7 +926,7 @@ game launchers) opens for write as a matter of course.
 
 **Five of the six are now gone** — refusing a write on a read-only volume is
 an expected outcome, not an anomaly worth trapping (see the comment above
-`CheckFileAccess`). **Do not re-add them.** One deliberately remains, on the
+`CreateCheckFileAccess`). **Do not re-add them.** One deliberately remains, on the
 terminal `STATUS_INVALID_DEVICE_REQUEST` fallthrough at the end of
 `BlorgVolumeCreate`, which is a genuine "should not get here" -- the create
 matched no case at all. Its own reason is recorded in that function's header
@@ -1117,7 +1117,7 @@ x BlorgFS!HttpActiveRequests    -> 0n1     (standing reference, never released)
 ```
 
 Both drain gates still reading their initial standing reference of 1 proves
-`DriverUnload` **was never entered** — each drain releases that reference as
+`BlorgDriverUnload` **was never entered** — each drain releases that reference as
 its first action. That rules out the two unbounded `KeWaitForSingleObject`
 drains in `Client.c`, which is the intuitive suspect and the
 wrong ones.
@@ -1132,14 +1132,14 @@ The actual chain:
 3. On stop, `IopUnloadDriver` walks the driver's device objects. The volume
    device has `AttachedDevice != NULL` (FltMgr sitting above it), so it
    cannot be deleted: the I/O manager sets `DOE_UNLOAD_PENDING` and
-   **defers `DriverUnload`**.
+   **defers `BlorgDriverUnload`**.
 4. **`IRP_MN_DISMOUNT_VOLUME` has no handler.** `FsCtrl.c` cases
    `IRP_MN_USER_FS_REQUEST` and `IRP_MN_MOUNT_VOLUME`; dismount falls into
    `default:` and returns `STATUS_INVALID_DEVICE_REQUEST`. Nothing else will
    initiate a dismount either, because the driver mounted itself rather than
    being mounted by a storage stack.
 5. The volume therefore never dismounts, FltMgr never detaches, the deferred
-   delete never completes, and `DriverUnload` never runs.
+   delete never completes, and `BlorgDriverUnload` never runs.
 
 Fix direction (not yet implemented): give the volume a real dismount path —
 handle `IRP_MN_DISMOUNT_VOLUME`, tear down the FCB/DCB tree, clear
@@ -1960,7 +1960,7 @@ RAM.
   MDL served wrong bytes to mapped readers; the guest's `mapped` step is
   the regression check.
 - **Teardown** clears `Live`, then waits for a busy count of reads, fills
-  and the fill worker to drain before closing the file (`DriverUnload`).
+  and the fill worker to drain before closing the file (`BlorgDriverUnload`).
 
 ### Where it is tested
 

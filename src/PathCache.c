@@ -987,12 +987,12 @@ static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const 
 //     fileinfo GET before its dirinfo GET.
 //
 //  Two details keep it equivalent to the per-open listing scan in Create.c
-//  (FindEntryByName), which it stands in for once the DCB is gone:
+//  (CreateFindEntryByName), which it stands in for once the DCB is gone:
 //   - Names are matched case-insensitively there, first match winning, files
 //     before subdirectories; on a case-sensitive backend two entries can
 //     collide. Insertion refreshes an existing entry in place, so entries go
 //     in subdirectories-last-first then files-last-first, and the entry
-//     FindEntryByName would have returned is the one inserted last.
+//     CreateFindEntryByName would have returned is the one inserted last.
 //   - At most PATH_CACHE_SEED_MAX entries, the first ones in listing order.
 //     The cache holds PATH_CACHE_BUCKETS * PATH_CACHE_MAX_PER_BUCKET entries
 //     and evicts FIFO per bucket, so seeding a very large directory in full

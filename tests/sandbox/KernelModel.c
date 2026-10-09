@@ -959,7 +959,7 @@ BOOLEAN KmSetTimer(KM_TIMER* Timer, long long DueTime, KM_DPC* Dpc)
 
     //
     // Negative due times are relative to now, positive absolute -- the
-    // kernel's convention, which the driver's ArmSocketTimeout relies on
+    // kernel's convention, which the driver's SocketArmTimeout relies on
     // (it passes a negative 100ns count).
     //
     Timer->DueTime = (DueTime < 0) ? (VirtualNow - DueTime) : DueTime;
