@@ -1139,4 +1139,88 @@ TEST_F(ReadFairTest, WaitingDemandGoesAheadOfHeldReadAhead)
     EXPECT_EQ(STATUS_SUCCESS, readAhead->Irp.IoStatus.Status);
 }
 
+//
+// The fast I/O gate admits reads of a file and nothing else: a write, or
+// any operation on a directory, goes back as an IRP before FsRtl is asked
+// about byte-range locks.
+//
+TEST_F(ReadTest, FastIoGateAllowsOnlyFileReads)
+{
+    FILE_OBJECT file = {};
+    LARGE_INTEGER offset = {};
+    IO_STATUS_BLOCK status = {};
+
+    file.FsContext = Fcb;
+    EXPECT_TRUE(BlorgFastIoCheckIfPossible(&file, &offset, 4, TRUE, 0, TRUE, &status, Volume));
+    EXPECT_FALSE(BlorgFastIoCheckIfPossible(&file, &offset, 4, TRUE, 0, FALSE, &status, Volume));
+
+    file.FsContext = VcbNode;
+    EXPECT_FALSE(BlorgFastIoCheckIfPossible(&file, &offset, 4, TRUE, 0, TRUE, &status, Volume));
+    EXPECT_FALSE(BlorgFastIoCheckIfPossible(&file, &offset, 4, TRUE, 0, FALSE, &status, Volume));
+}
+
+//
+// Cc calls the lazy-write and read-ahead callbacks itself, so no read
+// through the copy stub reaches them. Each acquire marks the thread as
+// Cc's top-level IRP and each release must clear it again, along with the
+// FCB's lazy writer, and the kernel model checks the resources balance.
+//
+TEST_F(ReadTest, CacheManagerCallbacksBalanceResourcesAndTopLevelIrp)
+{
+    const PVOID lazyWriter = global.LazyWriteThread;
+
+    KeEnterCriticalRegion();
+
+    EXPECT_TRUE(BlorgAcquireNodeForLazyWrite(Fcb, TRUE));
+    EXPECT_EQ(PsGetCurrentThread(), Fcb->LazyWriteThread);
+    EXPECT_EQ(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP), IoGetTopLevelIrp());
+    BlorgReleaseNodeFromLazyWrite(Fcb);
+    EXPECT_EQ(nullptr, Fcb->LazyWriteThread);
+    EXPECT_EQ(nullptr, IoGetTopLevelIrp());
+
+    EXPECT_TRUE(BlorgAcquireNodeForReadAhead(Fcb, TRUE));
+    EXPECT_EQ(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP), IoGetTopLevelIrp());
+    BlorgReleaseNodeFromReadAhead(Fcb);
+    EXPECT_EQ(nullptr, IoGetTopLevelIrp());
+
+    KeLeaveCriticalRegion();
+
+    global.LazyWriteThread = lazyWriter;
+}
+
+//
+// A fast read FsRtl served counts as one user read and as bytes consumed
+// from the read-ahead window. One it declined comes back as an IRP that
+// counts itself, so it must leave both alone, even though IoStatus still
+// holds the byte count of the read before it.
+//
+TEST_F(ReadTest, FastIoReadCountsOnlyHandledReads)
+{
+    FILE_OBJECT file = {};
+    LARGE_INTEGER offset = {};
+    IO_STATUS_BLOCK status = {};
+    unsigned char buffer[64] = {};
+
+    file.FsContext = Fcb;
+
+    const ULONG64 samples = BlorgStatisticsForCurrentProcessor()->UserReadSamples;
+    const ULONG64 consumed = Fcb->ReadAheadConsumedBytes;
+
+    ShimSetNextCcCopyReadInformation(sizeof(buffer));
+    EXPECT_TRUE(BlorgFastIoRead(&file, &offset, sizeof(buffer), TRUE, 0, buffer, &status, Volume));
+    EXPECT_EQ(STATUS_SUCCESS, status.Status);
+    EXPECT_EQ(sizeof(buffer), status.Information);
+    EXPECT_EQ(samples + 1, BlorgStatisticsForCurrentProcessor()->UserReadSamples);
+    EXPECT_EQ(consumed + sizeof(buffer), Fcb->ReadAheadConsumedBytes);
+
+    const LONG64 completed = Fcb->ReadIdleLastEndQpc;
+    EXPECT_NE(0, completed);
+
+    ShimForceNextCcCopyReadMiss();
+    EXPECT_FALSE(BlorgFastIoRead(&file, &offset, sizeof(buffer), TRUE, 0, buffer, &status, Volume));
+    EXPECT_EQ(samples + 1, BlorgStatisticsForCurrentProcessor()->UserReadSamples);
+    EXPECT_EQ(consumed + sizeof(buffer), Fcb->ReadAheadConsumedBytes);
+    EXPECT_EQ(completed, Fcb->ReadIdleLastEndQpc);
+}
+
 } // namespace
