@@ -22,6 +22,11 @@
 // FileNetworkOpenInformation, which is the fast path the loader and
 // Explorer take.
 //
+// A name that does not fit is truncated, as FileAllInformation does: the
+// I/O manager copies back only Information bytes on BUFFER_OVERFLOW, so
+// FileNameLength has to carry the full length inside them for a caller
+// to size its retry.
+//
 static NTSTATUS FileInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
     FILE_INFORMATION_CLASS fileInfoClass = IrpSp->Parameters.QueryFile.FileInformationClass;
@@ -63,21 +68,15 @@ static NTSTATUS FileInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             PCOMMON_CONTEXT commonContext = fileObject->FsContext;
 
-            if (inputLength - UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) >= commonContext->FullPath.Length)
-            {
-                nameInfo->FileNameLength = commonContext->FullPath.Length;
-                RtlCopyMemory(nameInfo->FileName, commonContext->FullPath.Buffer, nameInfo->FileNameLength);
-            }
-            else
-            {
-                bytesWritten = 0;
-                result = STATUS_BUFFER_OVERFLOW;
-                break;
-            }
+            ULONG nameAvail = inputLength - UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName);
+            ULONG nameLength = commonContext->FullPath.Length;
+            ULONG nameToCopy = (nameAvail < nameLength) ? nameAvail : nameLength;
 
-            bytesWritten = UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) + nameInfo->FileNameLength;
+            nameInfo->FileNameLength = nameLength;
+            RtlCopyMemory(nameInfo->FileName, commonContext->FullPath.Buffer, nameToCopy);
 
-            result = STATUS_SUCCESS;
+            bytesWritten = UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) + nameToCopy;
+            result = (nameToCopy < nameLength) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
             break;
         }
         case FileBasicInformation:

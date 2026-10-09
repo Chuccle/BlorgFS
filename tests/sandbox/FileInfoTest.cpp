@@ -212,10 +212,14 @@ TEST_F(FileInfoTest, NameInformationTooSmallForTheNameOverflows)
     unsigned char storage[sizeof(FILE_NAME_INFORMATION)] = {};
     auto* buffer = reinterpret_cast<PFILE_NAME_INFORMATION>(storage);
     QueryRequest* req = PrepareFileQuery(Fcb, FileNameInformation, buffer, sizeof(storage));
+    ULONG nameRoom = sizeof(storage) - UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName);
+    ASSERT_LT(nameRoom, Fcb->FullPath.Length);
 
     EXPECT_EQ(STATUS_BUFFER_OVERFLOW, BlorgQueryInformation(Volume, &req->Irp));
-    EXPECT_EQ(0u, req->Irp.IoStatus.Information)
-        << "an overflowing name must report zero bytes written, not a partial copy";
+    EXPECT_EQ(Fcb->FullPath.Length, buffer->FileNameLength)
+        << "the caller sizes its retry from the full name length";
+    EXPECT_EQ(0, memcmp(buffer->FileName, Fcb->FullPath.Buffer, nameRoom));
+    EXPECT_EQ(UFIELD_OFFSET(FILE_NAME_INFORMATION, FileName) + nameRoom, req->Irp.IoStatus.Information);
 }
 
 TEST_F(FileInfoTest, BasicInformationReportsFileAttributesForAFile)
