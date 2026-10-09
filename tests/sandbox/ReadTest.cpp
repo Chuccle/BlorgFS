@@ -527,11 +527,11 @@ TEST_F(ReadTest, CachedMdlReadUsesCcMdlRead)
 }
 
 //
-// CcCopyReadEx returning FALSE (a would-block miss with Wait=TRUE) is Cc's
-// signal to come back on a thread that can wait -- BlorgVolumeRead answers
-// by reposting to the FSP queue via BlorgFsdPostRequest rather than looping or
-// blocking here. This only reaches BlorgRead's Wait=TRUE call to
-// BlorgSetupIrpContext when the file object is marked synchronous.
+// Force the modeled CcCopyReadEx to return FALSE with Wait=TRUE and observe
+// the actual driver's fallback through BlorgFsdPostRequest. This tests the
+// repost contract, not native Cc residency or the usual waiting-copy outcome.
+// The synchronous file flag selects the Wait=TRUE call to
+// BlorgSetupIrpContext.
 //
 // STATUS_DEVICE_REMOVED, not STATUS_PENDING, is the correct result in this
 // harness: BlorgFsdPostRequest's first act is checking FspQueue.ThreadsActive,
@@ -1139,6 +1139,38 @@ TEST_F(ReadFairTest, WaitingDemandGoesAheadOfHeldReadAhead)
     EXPECT_EQ(STATUS_SUCCESS, readAhead->Irp.IoStatus.Status);
 }
 
+
+//
+// Call the real fast-read wrapper across both FsRtl outcomes. The model
+// supplies the successful byte count; assertions observe driver accounting,
+// including a miss with stale Information that must not count twice when
+// the I/O manager later retries it as an IRP.
+//
+TEST_F(ReadTest, FastIoReadCountsOnlyHandledReads)
+{
+    FILE_OBJECT file = {};
+    LARGE_INTEGER offset = {};
+    IO_STATUS_BLOCK status = {};
+    unsigned char buffer[64] = {};
+    file.FsContext = Fcb;
+    const ULONG64 samples = BlorgStatisticsForCurrentProcessor()->UserReadSamples;
+    const ULONG64 consumed = Fcb->ReadAheadConsumedBytes;
+    ShimSetNextCcCopyReadInformation(sizeof(buffer));
+    EXPECT_TRUE(BlorgFastIoRead(&file, &offset, sizeof(buffer), TRUE, 0,
+        buffer, &status, Volume));
+    EXPECT_EQ(STATUS_SUCCESS, status.Status);
+    EXPECT_EQ(sizeof(buffer), status.Information);
+    EXPECT_EQ(samples + 1, BlorgStatisticsForCurrentProcessor()->UserReadSamples);
+    EXPECT_EQ(consumed + sizeof(buffer), Fcb->ReadAheadConsumedBytes);
+    const LONG64 completed = Fcb->ReadIdleLastEndQpc;
+    EXPECT_NE(0, completed);
+    ShimForceNextCcCopyReadMiss();
+    EXPECT_FALSE(BlorgFastIoRead(&file, &offset, sizeof(buffer), TRUE, 0,
+        buffer, &status, Volume));
+    EXPECT_EQ(samples + 1, BlorgStatisticsForCurrentProcessor()->UserReadSamples);
+    EXPECT_EQ(consumed + sizeof(buffer), Fcb->ReadAheadConsumedBytes);
+    EXPECT_EQ(completed, Fcb->ReadIdleLastEndQpc);
+}
 
 //
 // Exercise the actual fast-I/O gate for both node kinds and both operation
