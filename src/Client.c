@@ -347,7 +347,6 @@ typedef struct _HTTP_CONTEXT
     // (a reused-connection retry may resend it); freed in HttpFreeContext.
     //
     PCHAR RequestBuffer;
-    ANSI_STRING EncodedPathBuffer;    // owns the URL-encoded path memory until request is built
 
     //
     // TLS-encrypted record wrapping RequestBuffer, sent instead of it
@@ -881,11 +880,14 @@ static BOOLEAN HttpIsCharacterSafeForUrl(UCHAR C)
 // allocation, an extra conversion pass per request, and a %wZ on a path
 // this driver otherwise takes trouble to keep clear of.
 //
+// Reserve bytes are left free after the terminator, so a caller can append
+// to the encoded path in place rather than copy it to a larger buffer.
+//
 // Caller owns OutputString->Buffer on success and frees it with ExFreePool;
 // on failure the buffer is freed here and nulled, so a failed call leaves
 // nothing to clean up.
 //
-static NTSTATUS HttpUrlEncodePathToAnsi(const UNICODE_STRING* InputString, PANSI_STRING OutputString)
+static NTSTATUS HttpUrlEncodePathToAnsi(const UNICODE_STRING* InputString, SIZE_T Reserve, PANSI_STRING OutputString)
 {
     UTF8_STRING utf8String;
 
@@ -905,7 +907,7 @@ static NTSTATUS HttpUrlEncodePathToAnsi(const UNICODE_STRING* InputString, PANSI
         encodedLength += HttpIsCharacterSafeForUrl(c) ? 1 : 3;
     }
 
-    if (encodedLength + 1 > MAXUSHORT)
+    if (Reserve > MAXUSHORT || encodedLength + Reserve + 1 > MAXUSHORT)
     {
         RtlFreeUTF8String(&utf8String);
         return STATUS_NAME_TOO_LONG;
@@ -913,7 +915,7 @@ static NTSTATUS HttpUrlEncodePathToAnsi(const UNICODE_STRING* InputString, PANSI
 
     OutputString->Buffer = C_CAST(PCHAR, ExAllocatePoolUninitialized(
         NonPagedPoolNx,
-        encodedLength + 1,
+        encodedLength + Reserve + 1,
         'URLE'
     ));
 
@@ -923,7 +925,7 @@ static NTSTATUS HttpUrlEncodePathToAnsi(const UNICODE_STRING* InputString, PANSI
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    OutputString->MaximumLength = C_CAST(USHORT, encodedLength + 1);
+    OutputString->MaximumLength = C_CAST(USHORT, encodedLength + Reserve + 1);
 
     ULONG j = 0;
     status = STATUS_SUCCESS;
@@ -1520,11 +1522,6 @@ static VOID HttpFreeContext(HTTP_CONTEXT* Ctx)
         ExFreePool(Ctx->RequestBuffer);
     }
 
-    if (Ctx->EncodedPathBuffer.Buffer)
-    {
-        ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-    }
-
     BOOLEAN bufferOwnedByCaller =
         (Ctx->Operation == HttpOpFileRead) && NT_SUCCESS(Ctx->FinalStatus) && !Ctx->TargetMdl;
 
@@ -2089,12 +2086,12 @@ static VOID HttpOnTlsHandshakeComplete(NTSTATUS Status, PVOID CallerContext)
 // pooled reused connection, otherwise advances to the receive stage.
 // BytesTransferred is unused: WskSend's contract is "all or error" for
 // stream sockets, so a successful completion means the whole request is on
-// the wire. RequestBuffer and EncodedPathBuffer are deliberately NOT freed
-// here even though the send is done: a reused connection can still turn
-// out to be dead on the subsequent receive (the common idle-close case --
-// the send is accepted into the local TCP buffer but the peer's FIN
-// surfaces as a 0-byte receive), and the retry resends the same request.
-// Both are freed unconditionally in HttpFreeContext.
+// the wire. RequestBuffer is deliberately NOT freed here even though the
+// send is done: a reused connection can still turn out to be dead on the
+// subsequent receive (the common idle-close case -- the send is accepted
+// into the local TCP buffer but the peer's FIN surfaces as a 0-byte
+// receive), and the retry resends the same request. It is freed
+// unconditionally in HttpFreeContext.
 //
 static VOID HttpOnSend(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID CompletionContext)
 {
@@ -3369,10 +3366,9 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 // budget, and global.RemoteHostAnsi (bounded by
 // BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES, Driver.h).
 //
-// A NULL Path means the caller has already put the request target's query
-// in Ctx->EncodedPathBuffer, from pool, for a request that names no path
-// (BlorgHttpGetChanges); it is consumed and freed exactly as an encoded
-// path would be.
+// Target is the request target's encoded path or query, NUL-terminated.
+// The request holds its own copy, so the caller frees Target as soon as
+// this returns rather than keeping it for the life of the request.
 //
 
 //
@@ -3383,7 +3379,7 @@ static VOID HttpComplete(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 #define HTTP_BUILD_REQUEST_FORMAT_STRING_MAX_BYTES 256
 
 static NTSTATUS HttpBuildRequest(
-    const UNICODE_STRING* Path,
+    const ANSI_STRING* Target,
     const char* FormatString,
     SIZE_T ExtraDigitsBudget,
     SIZE_T StartOffset,
@@ -3392,20 +3388,11 @@ static NTSTATUS HttpBuildRequest(
     HTTP_CONTEXT* Ctx
 )
 {
-    NTSTATUS result = Path ? HttpUrlEncodePathToAnsi(Path, &Ctx->EncodedPathBuffer) : STATUS_SUCCESS;
-
-    if (!NT_SUCCESS(result))
-    {
-        return result;
-    }
-
     size_t remoteHostLength;
-    result = RtlStringCbLengthA(global.RemoteHostAnsi, BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES, &remoteHostLength);
+    NTSTATUS result = RtlStringCbLengthA(global.RemoteHostAnsi, BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES, &remoteHostLength);
 
     if (!NT_SUCCESS(result))
     {
-        ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
         return result;
     }
 
@@ -3414,49 +3401,38 @@ static NTSTATUS HttpBuildRequest(
 
     if (!NT_SUCCESS(result))
     {
-        ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
         return result;
     }
 
-    ULONG sendBufferSize = C_CAST(ULONG, formatStringLength) + 1 + Ctx->EncodedPathBuffer.Length + C_CAST(ULONG, ExtraDigitsBudget) + C_CAST(ULONG, remoteHostLength);
+    ULONG sendBufferSize = C_CAST(ULONG, formatStringLength) + 1 + Target->Length + C_CAST(ULONG, ExtraDigitsBudget) + C_CAST(ULONG, remoteHostLength);
 
     Ctx->RequestBuffer = ExAllocatePoolZero(NonPagedPoolNx, sendBufferSize, 'BOOB');
 
     if (!Ctx->RequestBuffer)
     {
-        ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     if (IsRangedRequest)
     {
-        result = RtlStringCbPrintfA(Ctx->RequestBuffer, sendBufferSize, FormatString, Ctx->EncodedPathBuffer.Buffer, global.RemoteHostAnsi, StartOffset, EndOffsetInclusive);
+        result = RtlStringCbPrintfA(Ctx->RequestBuffer, sendBufferSize, FormatString, Target->Buffer, global.RemoteHostAnsi, StartOffset, EndOffsetInclusive);
     }
     else
     {
-        result = RtlStringCbPrintfA(Ctx->RequestBuffer, sendBufferSize, FormatString, Ctx->EncodedPathBuffer.Buffer, global.RemoteHostAnsi);
+        result = RtlStringCbPrintfA(Ctx->RequestBuffer, sendBufferSize, FormatString, Target->Buffer, global.RemoteHostAnsi);
+    }
+
+    size_t requestLength = 0;
+
+    if (NT_SUCCESS(result))
+    {
+        result = RtlStringCbLengthA(Ctx->RequestBuffer, sendBufferSize, &requestLength);
     }
 
     if (!NT_SUCCESS(result))
     {
         ExFreePool(Ctx->RequestBuffer);
         Ctx->RequestBuffer = NULL;
-        ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
-        return result;
-    }
-
-    size_t requestLength;
-    result = RtlStringCbLengthA(Ctx->RequestBuffer, sendBufferSize, &requestLength);
-
-    if (!NT_SUCCESS(result))
-    {
-        ExFreePool(Ctx->RequestBuffer);
-        Ctx->RequestBuffer = NULL;
-        ExFreePool(Ctx->EncodedPathBuffer.Buffer);
-        RtlZeroMemory(&Ctx->EncodedPathBuffer, sizeof(ANSI_STRING));
         return result;
     }
 
@@ -3466,63 +3442,73 @@ static NTSTATUS HttpBuildRequest(
 }
 
 //
+// Builds a request whose target is Path, URL-encoded. The encoded path is
+// freed once the request is built.
+//
+static NTSTATUS HttpBuildPathRequest(
+    const UNICODE_STRING* Path,
+    const char* FormatString,
+    SIZE_T ExtraDigitsBudget,
+    SIZE_T StartOffset,
+    SIZE_T EndOffsetInclusive,
+    BOOLEAN IsRangedRequest,
+    HTTP_CONTEXT* Ctx
+)
+{
+    ANSI_STRING encoded;
+    NTSTATUS result = HttpUrlEncodePathToAnsi(Path, 0, &encoded);
+
+    if (!NT_SUCCESS(result))
+    {
+        return result;
+    }
+
+    result = HttpBuildRequest(&encoded, FormatString, ExtraDigitsBudget, StartOffset, EndOffsetInclusive, IsRangedRequest, Ctx);
+
+    ExFreePool(encoded.Buffer);
+
+    return result;
+}
+
+//
 // Room for "&subtree=" and a ULONG's digits after the encoded path.
 //
 #define HTTP_SUBTREE_QUERY_SUFFIX_BYTES 24
 
 //
 // Builds a listing request whose query asks for the subtree too: the
-// encoded path with "&subtree=<Entries>" after it, handed to
-// HttpBuildRequest as a prepared query (a NULL Path) so the format stays
-// the plain listing's. On failure the caller frees Ctx, which frees a
-// prepared query with it.
+// encoded path with "&subtree=<Entries>" written after it in the room the
+// encoder reserved, so the plain listing's format serves both.
 //
 static NTSTATUS HttpBuildSubtreeRequest(const UNICODE_STRING* Path, ULONG Entries, const char* FormatString, HTTP_CONTEXT* Ctx)
 {
     ANSI_STRING encoded;
-    NTSTATUS result = HttpUrlEncodePathToAnsi(Path, &encoded);
+    NTSTATUS result = HttpUrlEncodePathToAnsi(Path, HTTP_SUBTREE_QUERY_SUFFIX_BYTES, &encoded);
 
     if (!NT_SUCCESS(result))
     {
         return result;
     }
 
-    const SIZE_T size = C_CAST(SIZE_T, encoded.Length) + HTTP_SUBTREE_QUERY_SUFFIX_BYTES;
+    const size_t suffixRoom = C_CAST(size_t, encoded.MaximumLength) - encoded.Length;
+    size_t suffixLength = 0;
 
-    if (size > MAXUSHORT)
-    {
-        ExFreePool(encoded.Buffer);
-        return STATUS_NAME_TOO_LONG;
-    }
-
-    Ctx->EncodedPathBuffer.Buffer = ExAllocatePoolZero(NonPagedPoolNx, size, HTTP_TAG);
-
-    if (!Ctx->EncodedPathBuffer.Buffer)
-    {
-        ExFreePool(encoded.Buffer);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    Ctx->EncodedPathBuffer.MaximumLength = C_CAST(USHORT, size);
-
-    size_t queryLength = 0;
-    result = RtlStringCbPrintfA(Ctx->EncodedPathBuffer.Buffer, size, "%hs&subtree=%lu", encoded.Buffer, Entries);
-
-    ExFreePool(encoded.Buffer);
+    result = RtlStringCbPrintfA(encoded.Buffer + encoded.Length, suffixRoom, "&subtree=%lu", Entries);
 
     if (NT_SUCCESS(result))
     {
-        result = RtlStringCbLengthA(Ctx->EncodedPathBuffer.Buffer, size, &queryLength);
+        result = RtlStringCbLengthA(encoded.Buffer + encoded.Length, suffixRoom, &suffixLength);
     }
 
-    if (!NT_SUCCESS(result))
+    if (NT_SUCCESS(result))
     {
-        return result;
+        encoded.Length += C_CAST(USHORT, suffixLength);
+        result = HttpBuildRequest(&encoded, FormatString, 0, 0, 0, FALSE, Ctx);
     }
 
-    Ctx->EncodedPathBuffer.Length = C_CAST(USHORT, queryLength);
+    ExFreePool(encoded.Buffer);
 
-    return HttpBuildRequest(NULL, FormatString, 0, 0, 0, FALSE, Ctx);
+    return result;
 }
 
 //
@@ -3621,7 +3607,7 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
         "\r\n";
 
     NTSTATUS result = (0 == SubtreeEntries) ?
-        HttpBuildRequest(Path, requestFormat, 0, 0, 0, FALSE, ctx) :
+        HttpBuildPathRequest(Path, requestFormat, 0, 0, 0, FALSE, ctx) :
         HttpBuildSubtreeRequest(Path, SubtreeEntries, requestFormat, ctx);
 
     if (!NT_SUCCESS(result))
@@ -3671,7 +3657,7 @@ NTSTATUS BlorgHttpGetFileInformation(
         "Connection: keep-alive\r\n"
         "\r\n";
 
-    NTSTATUS result = HttpBuildRequest(Path, requestFormat, 0, 0, 0, FALSE, ctx);
+    NTSTATUS result = HttpBuildPathRequest(Path, requestFormat, 0, 0, 0, FALSE, ctx);
 
     if (!NT_SUCCESS(result))
     {
@@ -3693,9 +3679,9 @@ NTSTATUS BlorgHttpGetFileInformation(
 //
 // Issues the change-feed long-poll; CompletionRoutine is invoked exactly
 // once, with a batch it owns on success. The request names no path, so its
-// query is formatted here into the buffer HttpBuildRequest would otherwise
-// fill with an encoded path. See BlorgHttpGetDirectoryInfo for the
-// HttpBuildRequest failure cleanup rationale.
+// query is formatted on the stack and is the request's target. See
+// BlorgHttpGetDirectoryInfo for the HttpBuildRequest failure cleanup
+// rationale.
 //
 NTSTATUS BlorgHttpGetChanges(
     ULONG64 Epoch,
@@ -3719,21 +3705,13 @@ NTSTATUS BlorgHttpGetChanges(
     ctx->Completion.Changes.Routine = CompletionRoutine;
     ctx->CallerContext = CallerContext;
 
-    ctx->EncodedPathBuffer.Buffer = ExAllocatePoolZero(NonPagedPoolNx, HTTP_CHANGES_QUERY_MAX_BYTES, HTTP_TAG);
-
-    if (!ctx->EncodedPathBuffer.Buffer)
-    {
-        ctx->FinalStatus = STATUS_INSUFFICIENT_RESOURCES;
-        HttpFreeContext(ctx);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
+    CHAR queryBuffer[HTTP_CHANGES_QUERY_MAX_BYTES];
     size_t queryLength = 0;
-    NTSTATUS result = RtlStringCbPrintfA(ctx->EncodedPathBuffer.Buffer, HTTP_CHANGES_QUERY_MAX_BYTES, "epoch=%I64u&since=%I64u", Epoch, Since);
+    NTSTATUS result = RtlStringCbPrintfA(queryBuffer, sizeof(queryBuffer), "epoch=%I64u&since=%I64u", Epoch, Since);
 
     if (NT_SUCCESS(result))
     {
-        result = RtlStringCbLengthA(ctx->EncodedPathBuffer.Buffer, HTTP_CHANGES_QUERY_MAX_BYTES, &queryLength);
+        result = RtlStringCbLengthA(queryBuffer, sizeof(queryBuffer), &queryLength);
     }
 
     if (!NT_SUCCESS(result))
@@ -3743,8 +3721,10 @@ NTSTATUS BlorgHttpGetChanges(
         return result;
     }
 
-    ctx->EncodedPathBuffer.Length = C_CAST(USHORT, queryLength);
-    ctx->EncodedPathBuffer.MaximumLength = HTTP_CHANGES_QUERY_MAX_BYTES;
+    ANSI_STRING query;
+    query.Buffer = queryBuffer;
+    query.Length = C_CAST(USHORT, queryLength);
+    query.MaximumLength = C_CAST(USHORT, sizeof(queryBuffer));
 
     static const char requestFormat[] =
         "GET /get_changes?%hs HTTP/1.1\r\n"
@@ -3752,7 +3732,7 @@ NTSTATUS BlorgHttpGetChanges(
         "Connection: keep-alive\r\n"
         "\r\n";
 
-    result = HttpBuildRequest(NULL, requestFormat, 0, 0, 0, FALSE, ctx);
+    result = HttpBuildRequest(&query, requestFormat, 0, 0, 0, FALSE, ctx);
 
     if (!NT_SUCCESS(result))
     {
@@ -3835,7 +3815,7 @@ static NTSTATUS HttpGetFileCommon(
 
     const SIZE_T ULLONG_MAX_DIGITS = 20;
 
-    NTSTATUS result = HttpBuildRequest(
+    NTSTATUS result = HttpBuildPathRequest(
         Path,
         requestFormat,
         ULLONG_MAX_DIGITS * 2,

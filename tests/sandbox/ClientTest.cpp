@@ -1461,6 +1461,48 @@ TEST_F(HttpClientSubtreeTest, ARequestThatAskedForNoSubtreeDecodesNone)
     EXPECT_EQ(nullptr, root->Descendants);
 }
 
+//
+// The subtree query is written after the encoded path in the room the
+// encoder left, so the path keeps its escapes and the suffix follows the
+// last of them.
+//
+TEST_F(HttpClientSubtreeTest, TheSubtreeQueryFollowsTheEncodedPath)
+{
+    char headers[128];
+    sprintf_s(headers, "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n", sizeof(kSubtreeOutOfOrder) - 1);
+    Respond(headers, kSubtreeOutOfOrder, sizeof(kSubtreeOutOfOrder) - 1);
+
+    wchar_t path[] = L"/a b/m\u00e9dia";
+    UNICODE_STRING pathString = MakePath(path);
+
+    EXPECT_EQ(STATUS_PENDING, BlorgHttpGetDirectoryInfo(&pathString, 64, OnDirInfo, nullptr));
+
+    Drain();
+
+    ASSERT_EQ(1, LastDirInfo.Calls);
+    EXPECT_EQ(STATUS_SUCCESS, LastDirInfo.Status);
+
+    SIZE_T sentLength = 0;
+    const char* text = (const char*)SandboxLastRequest(&sentLength);
+    ASSERT_GT(sentLength, 0u);
+    EXPECT_NE(nullptr, strstr(text, "GET /get_dir_info?path=%2Fa%20b%2Fm%C3%A9dia&subtree=64 HTTP/1.1\r\n"));
+}
+
+//
+// A path whose encoding fits a request but leaves no room for the subtree
+// query is refused before anything is sent: 21,840 spaces encode to
+// 65,520 bytes, and the query's room would take the buffer past 64 KB.
+//
+TEST_F(HttpClientSubtreeTest, APathWithNoRoomForTheSubtreeQueryIsRefused)
+{
+    std::wstring path(21840, L' ');
+    path[0] = L'/';
+    UNICODE_STRING pathString = MakePath(&path[0]);
+
+    EXPECT_EQ(STATUS_NAME_TOO_LONG, BlorgHttpGetDirectoryInfo(&pathString, 64, OnDirInfo, nullptr));
+    EXPECT_EQ(0, LastDirInfo.Calls);
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Resource exhaustion
 ///////////////////////////////////////////////////////////////////////////
