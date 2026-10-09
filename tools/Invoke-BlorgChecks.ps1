@@ -45,7 +45,8 @@
 
 .PARAMETER CacheMutantsOnly
     Rebuild DispatchSandbox with deliberate cache safeguards removed and
-    require the named regression to fail. Restore exact source bytes and
+    require each removed safeguard to fail its regression; also record an
+    expected surviving reordering. Restore exact source bytes and
     rebuild the fixed sandbox before returning. Does not measure coverage.
 
 .PARAMETER CoverageOnly
@@ -145,11 +146,14 @@ if ($CacheMutantsOnly) {
     $exe = Join-Path $outputDirectory 'DispatchSandbox.exe'
     $diskPath = Join-Path $repoRoot 'src\DiskCache.c'
     $readPath = Join-Path $repoRoot 'src\Read.c'
+    $dirPath = Join-Path $repoRoot 'src\DirCtrl.c'
     $originals = @{}
-    foreach ($path in @($diskPath, $readPath)) { $originals[$path] = [IO.File]::ReadAllBytes($path) }
+    foreach ($path in @($diskPath, $readPath, $dirPath)) { $originals[$path] = [IO.File]::ReadAllBytes($path) }
     $encoding = [Text.UTF8Encoding]::new($false)
     $disk = [IO.File]::ReadAllText($diskPath)
     $read = [IO.File]::ReadAllText($readPath)
+    $dir = [IO.File]::ReadAllText($dirPath)
+    $subtreeTest = 'DirCtrlTest.NetworkSubtreePublishesDescendantListings'
     $fillTest = 'DiskCacheTest.FillAllocationFailuresCountTheRemainingBlocksAndRollBack'
     $eofTest = 'DiskCacheTest.ValidBytesCannotExtendBeyondTheImmutableKey'
     $snapshotTest = 'DiskCacheTest.PagingResourceKeepsTrimAndCacheKeyInOneVersion'
@@ -159,7 +163,16 @@ if ($CacheMutantsOnly) {
     if (-not $snapshot.Success) { throw 'snapshot helper not found' }
     $unlocked = $snapshot.Value.Replace('ExAcquireResourceSharedLite(Fcb->Header.PagingIoResource, TRUE);', '')
     $unlocked = $unlocked.Replace('ExReleaseResourceLite(Fcb->Header.PagingIoResource);', '')
+    $rootPublish = 'if (BlorgPathCachePublishListing(Dir, DirInfo, Ticket))'
+    $lateSeed = $dir.Replace($rootPublish, "const BOOLEAN rootPublished = BlorgPathCachePublishListing(Dir, DirInfo, Ticket);`n    if (rootPublished)")
+    $lateSeed = $lateSeed.Replace('BlorgPathCacheSeedListing(Dir, DirInfo, Ticket);', '')
+    $publishEnd = '(?m)        BlorgReleaseDescendants\(descendants, count\);\r?\n    \}'
+    if ([regex]::Matches($lateSeed, $publishEnd).Count -ne 1) { throw 'descendant publication end not found' }
+    $lateSeed = [regex]::Replace($lateSeed, $publishEnd, '$0' + "`n    if (rootPublished)`n    {`n        BlorgPathCacheSeedListing(Dir, DirInfo, Ticket);`n    }")
     $variants = @(
+        @{ Name = 'skip-subtree-publication'; Path = $dirPath; Text = $dir.Replace('const SIZE_T published = BlorgPathCachePublishDescendants(Dir, DirInfo, descendants, count, Ticket);', 'const SIZE_T published = 0;'); Test = $subtreeTest },
+        @{ Name = 'seed-root-after-descendants'; ExpectedKilled = $false; Path = $dirPath; Text = $lateSeed; Test = $subtreeTest },
+        @{ Name = 'remove-cache-EOF-offset-guard'; Path = $diskPath; Text = $disk.Replace('Offset >= Key->Size || ', ''); Test = $eofTest },
         @{ Name = 'weaken-cache-EOF'; Path = $diskPath; Text = $disk.Replace('Offset >= Key->Size || Valid > Key->Size - Offset', 'FALSE'); Test = $eofTest },
         @{ Name = 'remove-snapshot-resource'; Path = $readPath; Text = $read.Replace($snapshot.Value, $unlocked); Test = $snapshotTest },
         @{ Name = 'skip-fill-rollback'; Path = $diskPath; Text = $disk.Replace('BlorgDiskCacheIndexCommit(&DiskCache.Index, slot, FALSE);', ''); Test = $fillTest },
@@ -170,7 +183,7 @@ if ($CacheMutantsOnly) {
     try {
         & $msbuild $project "/p:Configuration=$Configuration" '/p:Platform=x64' "/p:OutDir=$outputDirectory\" '/v:minimal' '/nologo'
         if ($LASTEXITCODE -ne 0) { throw 'fixed sandbox build failed' }
-        foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest)) {
+        foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest, $subtreeTest)) {
             & $exe "--gtest_filter=$test"
             if ($LASTEXITCODE -ne 0) { throw "fixed regression failed: $test" }
         }
@@ -184,17 +197,19 @@ if ($CacheMutantsOnly) {
             $exitCode = $LASTEXITCODE
             $output | ForEach-Object { Write-Host $_ }
             $killed = $exitCode -ne 0 -and ($output -match '\): error:') -and ($output -match [regex]::Escape($variant.Test))
-            $result = [ordered]@{ mutant = $variant.Name; test = $variant.Test; configuration = $Configuration; killed = [bool]$killed; exit_code = $exitCode }
+            $expectedKilled = if ($variant.ContainsKey('ExpectedKilled')) { $variant.ExpectedKilled } else { $true }
+            $result = [ordered]@{ expected_killed = $expectedKilled; mutant = $variant.Name; test = $variant.Test; configuration = $Configuration; killed = [bool]$killed; exit_code = $exitCode }
             Write-Host ('CACHE_MUTANT_RESULT ' + ($result | ConvertTo-Json -Compress))
             [IO.File]::WriteAllBytes($variant.Path, $originals[$variant.Path])
-            if (-not $killed) { throw "mutant survived or failed without a named assertion: $($variant.Name)" }
+            if ($expectedKilled -and -not $killed) { throw "mutant survived or failed without a named assertion: $($variant.Name)" }
+            if (-not $expectedKilled -and $exitCode -ne 0) { throw "equivalent ordering changed the observed contract: $($variant.Name)" }
         }
     } finally {
         foreach ($path in $originals.Keys) { [IO.File]::WriteAllBytes($path, $originals[$path]) }
         & $msbuild $project "/p:Configuration=$Configuration" '/p:Platform=x64' "/p:OutDir=$outputDirectory\" '/v:minimal' '/nologo'
         if ($LASTEXITCODE -ne 0) { throw 'restored sandbox build failed' }
     }
-    foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest)) {
+    foreach ($test in @($fillTest, $eofTest, $snapshotTest, $revisionTest, $subtreeTest)) {
         & $exe "--gtest_filter=$test"
         if ($LASTEXITCODE -ne 0) { throw "restored regression failed: $test" }
     }

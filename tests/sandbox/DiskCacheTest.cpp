@@ -1140,7 +1140,8 @@ TEST_F(DiskCacheTest, FillAllocationFailuresCountTheRemainingBlocksAndRollBack)
 //
 // A caller's length and key can disagree even when held blocks exist.
 // Reject before pinning or I/O; a hit/miss assertion alone misses a read
-// that silently rounds beyond the version's declared end.
+// that silently rounds beyond the version's declared end. A pending pool
+// failure must remain available after rejecting an offset beyond EOF.
 //
 TEST_F(DiskCacheTest, ValidBytesCannotExtendBeyondTheImmutableKey)
 {
@@ -1159,6 +1160,19 @@ TEST_F(DiskCacheTest, ValidBytesCannotExtendBeyondTheImmutableKey)
     const ULONG reads = DiskCacheModelIrps(IRP_MJ_READ);
     EXPECT_FALSE(BlorgDiskCacheRead(&irp, &key, &Fcb->FullPath, 0, kBlock, kBlock,
         &fetches, DirectComplete));
+    EXPECT_EQ(reads, DiskCacheModelIrps(IRP_MJ_READ));
+    EXPECT_EQ(0u, fetches);
+    ShimPoolFailAt(0);
+    EXPECT_FALSE(BlorgDiskCacheRead(&irp, &key, &Fcb->FullPath, key.Size + 1, kBlock, 1,
+        &fetches, DirectComplete));
+    PVOID probe = ExAllocatePoolZero(NonPagedPoolNx, 1, 'tseT');
+    EXPECT_EQ(nullptr, probe) << "an offset past immutable EOF must reject before allocation";
+    if (probe)
+    {
+        ExFreePool(probe);
+    }
+    ShimPoolFailAt(-1);
+    EXPECT_EQ(0u, fetches);
     EXPECT_EQ(reads, DiskCacheModelIrps(IRP_MJ_READ));
     DirectStatus = STATUS_PENDING;
     ASSERT_TRUE(BlorgDiskCacheRead(&irp, &key, &Fcb->FullPath, 0, kBlock, kBlock - 1,

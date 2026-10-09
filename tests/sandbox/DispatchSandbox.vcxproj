@@ -182,6 +182,7 @@
     <ClCompile Include="..\..\third_party\googletest\googlemock\src\gmock_main.cc" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="SubtreeResponse.h" />
     <ClInclude Include="KernelModel.h" />
     <ClInclude Include="NtShim.h" />
     <ClInclude Include="FsRtlShim.h" />
