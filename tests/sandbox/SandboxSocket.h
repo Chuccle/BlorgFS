@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 //
 // Scriptable implementation of Socket.h / TlsHandshake.h.
@@ -119,6 +119,14 @@ VOID SandboxFailNextAcquiresWith(ULONG Count, NTSTATUS Status);
 // link it have it.
 //
 VOID SandboxFailNextHandshakesWith(ULONG Count, NTSTATUS Status);
+
+//
+// Clears the above and the counts below, which are the handshakes started
+// and those started above PASSIVE_LEVEL. Also NoTlsHandshakeStub.c's.
+//
+VOID SandboxResetHandshakes(VOID);
+ULONG SandboxHandshakesStarted(VOID);
+ULONG SandboxHandshakesAbovePassive(VOID);
 
 // Runs deferred (non-inline) completions until none remain.
 VOID SandboxDrainCompletions(VOID);

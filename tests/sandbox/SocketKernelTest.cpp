@@ -32,6 +32,12 @@ extern "C" {
 // Diagnostic read of the pump's budget word (Socket.c); used solely by
 // PrewarmChainSurvivesCompletionRacingThePumpLoop.
 ULONG BlorgPrewarmRemainingForDiagnostics(VOID);
+
+// The handshake stub's controls (NoTlsHandshakeStub.c, SandboxSocket.h).
+VOID SandboxFailNextHandshakesWith(ULONG Count, NTSTATUS Status);
+VOID SandboxResetHandshakes(VOID);
+ULONG SandboxHandshakesStarted(VOID);
+ULONG SandboxHandshakesAbovePassive(VOID);
 }
 
 namespace
@@ -110,12 +116,17 @@ protected:
         LastCompletion = {};
         LastAcquire = {};
 
+        global.TlsEnabled = FALSE;
+        SandboxResetHandshakes();
+
         ASSERT_EQ(STATUS_SUCCESS, BlorgInitialiseWskClient());
     }
 
     void TearDown() override
     {
         BlorgCleanupWskClient();
+
+        global.TlsEnabled = FALSE;
 
         //
         // Nothing may outlive a test. An IRP, MDL or pool block still live
@@ -753,10 +764,115 @@ TEST_F(SocketKernelTest, PrewarmChainIssuesExactlyItsBudgetAndTerminates)
     EXPECT_EQ(0, WskModelDeferredCount()) << "the chain did not terminate";
     EXPECT_EQ(0u, ShimPendingWorkItems());
     EXPECT_EQ(3u, WskModelConnects());
+    EXPECT_EQ(0u, SandboxHandshakesStarted()) << "a plaintext pre-warm must not handshake";
 
     BlorgCleanupWskSocketPool();
 
     EXPECT_EQ(0, KmObjectsLive(KmObjectSocket)) << "the filled pool did not drain";
+}
+
+//
+// With TLS enabled a pre-warmed socket handshakes before it is pooled. One
+// pooled bare was one the server was still waiting to hear from, and the
+// guest's terminator drops such a client after 15 s, so the first reader to
+// take it paid a failed handshake and then a fresh connect: about a second
+// each, measured, on every TLS step. The connects complete at
+// DISPATCH_LEVEL here, so this also pins the bounce to PASSIVE the real
+// handshake needs.
+//
+TEST_F(SocketKernelTest, APrewarmedSocketHandshakesBeforeItIsPooled)
+{
+    global.TlsEnabled = TRUE;
+
+    WSK_MODEL_BEHAVIOUR deferred = Behaviour(WskModelDeferred, STATUS_SUCCESS, 0);
+    WskModelSetConnectBehaviour(&deferred);
+
+    SOCKADDR_IN address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(80);
+
+    BlorgPrewarmSocketPool((PSOCKADDR)&address, 2);
+
+    int rounds = 0;
+
+    while (WskModelReleaseDeferred() + ShimDrainWorkItems() > 0 && rounds < 16)
+    {
+        ++rounds;
+    }
+
+    EXPECT_LT(rounds, 16) << "the chain did not terminate";
+    EXPECT_EQ(0u, ShimPendingWorkItems());
+    EXPECT_EQ(2u, WskModelConnects());
+    EXPECT_EQ(2u, SandboxHandshakesStarted());
+    EXPECT_EQ(0u, SandboxHandshakesAbovePassive());
+
+    WSK_MODEL_BEHAVIOUR inlineConnect = Behaviour(WskModelInline, STATUS_SUCCESS, 0);
+    WskModelSetConnectBehaviour(&inlineConnect);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        SCOPED_TRACE(::testing::Message() << "acquire #" << i);
+
+        LastAcquire = {};
+
+        ASSERT_EQ(STATUS_PENDING,
+            BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, RecordAcquire, nullptr));
+
+        ASSERT_NE(nullptr, LastAcquire.Socket);
+        EXPECT_TRUE(LastAcquire.Reused) << "the pre-warmed socket was not pooled";
+        EXPECT_EQ(TlsHandshakeComplete, LastAcquire.Socket->Tls.State);
+
+        BlorgCloseWskSocketAsync(LastAcquire.Socket);
+    }
+
+    EXPECT_EQ(2u, WskModelConnects());
+}
+
+//
+// A socket whose pre-warm handshake failed is unusable, so it is closed
+// rather than pooled, and the chain carries on to its next step.
+//
+TEST_F(SocketKernelTest, APrewarmSocketWhoseHandshakeFailsIsClosedNotPooled)
+{
+    global.TlsEnabled = TRUE;
+    SandboxFailNextHandshakesWith(1, STATUS_CONNECTION_RESET);
+
+    WSK_MODEL_BEHAVIOUR deferred = Behaviour(WskModelDeferred, STATUS_SUCCESS, 0);
+    WskModelSetConnectBehaviour(&deferred);
+
+    SOCKADDR_IN address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(80);
+
+    BlorgPrewarmSocketPool((PSOCKADDR)&address, 2);
+
+    int rounds = 0;
+
+    while (WskModelReleaseDeferred() + ShimDrainWorkItems() > 0 && rounds < 16)
+    {
+        ++rounds;
+    }
+
+    EXPECT_LT(rounds, 16) << "the chain did not terminate";
+    EXPECT_EQ(2u, WskModelConnects()) << "a failed handshake must not end the chain";
+    EXPECT_EQ(2u, SandboxHandshakesStarted());
+    EXPECT_EQ(1u, WskModelCloses()) << "the failed socket was not closed";
+    EXPECT_EQ(1, KmObjectsLive(KmObjectSocket));
+
+    WSK_MODEL_BEHAVIOUR inlineConnect = Behaviour(WskModelInline, STATUS_SUCCESS, 0);
+    WskModelSetConnectBehaviour(&inlineConnect);
+
+    LastAcquire = {};
+
+    ASSERT_EQ(STATUS_PENDING,
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, FALSE, RecordAcquire, nullptr));
+
+    ASSERT_NE(nullptr, LastAcquire.Socket);
+    EXPECT_TRUE(LastAcquire.Reused);
+    EXPECT_EQ(TlsHandshakeComplete, LastAcquire.Socket->Tls.State)
+        << "the socket whose handshake failed was pooled";
+
+    BlorgCloseWskSocketAsync(LastAcquire.Socket);
 }
 
 //

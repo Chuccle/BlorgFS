@@ -1,4 +1,4 @@
-//
+﻿//
 // BlorgTlsStartHandshakeAsync for targets that do not compile TlsHandshake.c.
 //
 // Client.c calls it from HttpKick, so it must resolve; but a target that
@@ -24,10 +24,14 @@
 // TlsHandshake.c directly. A scenario that set TlsEnabled would be testing
 // this stub, so nothing here should grow until the peer script can speak
 // records -- except a failure, which is all a scenario needs to drive what
-// Client.c does when a handshake does not complete.
+// Client.c does when a handshake does not complete, and a count of the
+// handshakes started and of those started above PASSIVE_LEVEL, which the
+// real one's CNG calls do not allow.
 //
 static ULONG FailHandshakesRemaining;
 static NTSTATUS FailHandshakesStatus;
+static ULONG HandshakesStarted;
+static ULONG HandshakesAbovePassive;
 
 VOID SandboxFailNextHandshakesWith(ULONG Count, NTSTATUS Status)
 {
@@ -35,11 +39,36 @@ VOID SandboxFailNextHandshakesWith(ULONG Count, NTSTATUS Status)
     FailHandshakesStatus = Status;
 }
 
+VOID SandboxResetHandshakes(VOID)
+{
+    FailHandshakesRemaining = 0;
+    FailHandshakesStatus = STATUS_SUCCESS;
+    HandshakesStarted = 0;
+    HandshakesAbovePassive = 0;
+}
+
+ULONG SandboxHandshakesStarted(VOID)
+{
+    return HandshakesStarted;
+}
+
+ULONG SandboxHandshakesAbovePassive(VOID)
+{
+    return HandshakesAbovePassive;
+}
+
 VOID BlorgTlsStartHandshakeAsync(
     PKSOCKET Socket,
     PBLORG_TLS_HANDSHAKE_COMPLETION CompletionRoutine,
     PVOID CallerContext)
 {
+    HandshakesStarted++;
+
+    if (PASSIVE_LEVEL < KeGetCurrentIrql())
+    {
+        HandshakesAbovePassive++;
+    }
+
     if (0 < FailHandshakesRemaining)
     {
         FailHandshakesRemaining--;

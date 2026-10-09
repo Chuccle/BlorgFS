@@ -6,6 +6,7 @@
 
 #include "Driver.h"
 #include "Socket.h"
+#include "TlsHandshake.h"
 
 #define SOCKET_TAG 'HTTP'
 
@@ -104,6 +105,7 @@ static IO_COMPLETION_ROUTINE SocketContextCompletionRoutine;
 static IO_COMPLETION_ROUTINE SocketAsyncCompletionRoutine;
 static KDEFERRED_ROUTINE SocketAsyncTimeoutDpc;
 static IO_WORKITEM_ROUTINE SocketPrewarmStepWorker;
+static IO_WORKITEM_ROUTINE SocketPrewarmHandshakeWorker;
 
 //
 // Pre-warm pump and teardown state, declared here because
@@ -142,16 +144,17 @@ static IO_WORKITEM_ROUTINE SocketPrewarmStepWorker;
 // push lock or ERESOURCE would be illegal. The sections are a handful of
 // instructions with no blocking inside, so raising to DISPATCH for them
 // costs nothing. The pump itself runs only at PASSIVE_LEVEL, because the
-// WskSocketConnect it issues must (see SocketPrewarmStepComplete).
+// WskSocketConnect it issues must (see SocketPrewarmStepFinish).
 //
 static LONG SocketPrewarmRemaining;
 static LONG SocketPrewarmInFlight;
 static LONG SocketPrewarmShuttingDown;
 
 //
-// Carries a step completed above PASSIVE_LEVEL to SocketPrewarmStepAccount.
-// One is enough: only one step is ever in flight, and its completion is the
-// only thing that queues it. Allocated by the first fill, freed by teardown
+// Carries a step completed above PASSIVE_LEVEL to its handshake or to
+// SocketPrewarmStepAccount. One is enough: only one step is ever in flight,
+// and it queues the item at most once at a time -- the handshake's
+// completion can queue it again only after the handshake worker has run. Allocated by the first fill, freed by teardown
 // once nothing is in flight.
 //
 static PIO_WORKITEM SocketPrewarmWorkItem;
@@ -909,23 +912,6 @@ static BOOLEAN SocketAddressEqual(const SOCKADDR* restrict A, const SOCKADDR* re
 }
 
 //
-// Completion for a pre-warm connect. The socket is not wanted by anyone --
-// it exists to be in the pool -- so success releases it straight there and
-// failure drops it. Either way nothing is reported: a pre-warm that fails
-// leaves exactly the behaviour that existed before pre-warming.
-//
-static VOID SocketPrewarmComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
-{
-    UNREFERENCED_PARAMETER(Reused);
-    UNREFERENCED_PARAMETER(CompletionContext);
-
-    if (NT_SUCCESS(Status) && Socket)
-    {
-        BlorgReleaseReusableWskSocket(Socket);
-    }
-}
-
-//
 // Opens connections into the pool ahead of anyone needing them.
 //
 // The pool fills only from released sockets, so it starts empty and the
@@ -975,7 +961,8 @@ ULONG BlorgPrewarmRemainingForDiagnostics(VOID)
 // SocketPrewarmPump).
 //
 // The in-flight drop comes after the socket handoff, which
-// SocketPrewarmStepComplete makes before calling or queueing this. The
+// SocketPrewarmStepComplete or SocketPrewarmHandshakeComplete makes before
+// calling or queueing this. The
 // accounting runs under the pool lock (see the state-block comment for why
 // the consume is a plain locked read-and-write rather than a CAS loop),
 // with the pump re-entry -- which takes that same lock again inside the
@@ -1005,7 +992,7 @@ static VOID SocketPrewarmStepAccount(VOID)
 }
 
 //
-// PASSIVE-level target for SocketPrewarmStepComplete's bounce.
+// PASSIVE-level target for SocketPrewarmStepFinish's bounce.
 //
 static VOID SocketPrewarmStepWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 {
@@ -1022,17 +1009,8 @@ static VOID SocketPrewarmStepWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // DISPATCH_LEVEL, so a completion above PASSIVE hands the step to the work
 // item, and the step stays in flight until it has run.
 //
-// The socket handoff (SocketPrewarmComplete ->
-// BlorgReleaseReusableWskSocket) precedes the in-flight drop so that a
-// teardown which observes InFlight == 0 knows the step's socket is already
-// in the pool its drain loop is about to walk -- drop first and the poll
-// could exit in the gap, resurrecting exactly the post-teardown release
-// this whole protocol exists to prevent.
-//
-static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
+static VOID SocketPrewarmStepFinish(VOID)
 {
-    SocketPrewarmComplete(Status, Socket, Reused, CompletionContext);
-
     if (PASSIVE_LEVEL < KeGetCurrentIrql())
     {
         IoQueueWorkItem(SocketPrewarmWorkItem, SocketPrewarmStepWorker, DelayedWorkQueue, NULL);
@@ -1040,6 +1018,80 @@ static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN 
     }
 
     SocketPrewarmStepAccount();
+}
+
+//
+// A handshake that fails leaves the socket unusable (TlsHandshake.h), so it
+// is closed rather than pooled; the step is finished either way.
+//
+static VOID SocketPrewarmHandshakeComplete(NTSTATUS Status, PVOID CallerContext)
+{
+    PKSOCKET socket = C_CAST(PKSOCKET, CallerContext);
+
+    if (NT_SUCCESS(Status))
+    {
+        BlorgReleaseReusableWskSocket(socket);
+    }
+    else
+    {
+        BlorgCloseWskSocketAsync(socket);
+    }
+
+    SocketPrewarmStepFinish();
+}
+
+//
+// PASSIVE-level target for a handshake whose connect completed above it:
+// the handshake's CNG key generation is PASSIVE-only.
+//
+static VOID SocketPrewarmHandshakeWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    BlorgTlsStartHandshakeAsync(C_CAST(PKSOCKET, Context), SocketPrewarmHandshakeComplete, Context);
+}
+
+//
+// Completion for a pre-warm connect. The socket is not wanted by anyone --
+// it exists to be in the pool -- so success releases it straight there and
+// failure drops it. Either way nothing is reported: a pre-warm that fails
+// leaves exactly the behaviour that existed before pre-warming.
+//
+// With TLS enabled the handshake runs here, before the release. A pooled
+// socket that has not handshaken is one the server is waiting to hear from,
+// and the guest's terminator drops a client that stays silent for 15 s, so
+// the first reader to take one after that paid a failed handshake and a
+// fresh connect. The step stays in flight through the handshake.
+//
+// The socket handoff precedes the in-flight drop so that a teardown which
+// observes InFlight == 0 knows the step's socket is already in the pool its
+// drain loop is about to walk -- drop first and the poll could exit in the
+// gap, resurrecting exactly the post-teardown release this whole protocol
+// exists to prevent.
+//
+static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
+{
+    UNREFERENCED_PARAMETER(Reused);
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (NT_SUCCESS(Status) && Socket)
+    {
+        if (global.TlsEnabled)
+        {
+            if (PASSIVE_LEVEL < KeGetCurrentIrql())
+            {
+                IoQueueWorkItem(SocketPrewarmWorkItem, SocketPrewarmHandshakeWorker, DelayedWorkQueue, Socket);
+                return;
+            }
+
+            BlorgTlsStartHandshakeAsync(Socket, SocketPrewarmHandshakeComplete, Socket);
+            return;
+        }
+
+        BlorgReleaseReusableWskSocket(Socket);
+    }
+
+    SocketPrewarmStepFinish();
 }
 
 //
