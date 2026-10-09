@@ -374,16 +374,21 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
 //  itself; it comes from the context each call site states: the bucket
 //  lock exclusive (excludes all droppers), the VCB resource exclusive
 //  (excludes the worker), or the reader's own immediately preceding
-//  interlocked op (full barrier).
+//  interlocked op (full barrier). Only the drops need that barrier, since
+//  their readers hold no lock; the pin and the OnReapList claim and its
+//  release take the NoFence forms, because a lock orders each of them
+//  before the reader that acts on it (the bucket lock for the pin, the VCB
+//  resource or bucket lock for the claim).
 //
 //  NodeReap.Queued/ShuttingDown are the opposite case, and are plain:
 //  NodeReap.Lock owns every write to both (kick claim/rollback, worker
 //  gate-clear, teardown latch), so atomics would only misstate that
 //  ownership. Their check-and-act pairs live inside single locked
 //  sections; the two accesses outside the lock are safe by direction --
-//  teardown's ReadAcquire poll of Queued (a missed clear delays its exit,
-//  never shortens it) and kick's latch read, which sits inside the same
-//  locked section as its claim.
+//  teardown's ReadNoFence poll of Queued (a missed clear delays its exit,
+//  never shortens it, and the reap-list lock teardown takes next orders
+//  the worker's pass before what follows) and kick's latch read, which
+//  sits inside the same locked section as its claim.
 //
 
 #define NODE_TABLE_BUCKET_BITS 8u
@@ -547,7 +552,7 @@ static VOID NodeReapKick(VOID)
 //
 VOID BlorgNodeDeferReap(PCOMMON_CONTEXT Node)
 {
-    if (InterlockedCompareExchange(&Node->OnReapList, TRUE, FALSE))
+    if (InterlockedCompareExchangeNoFence(&Node->OnReapList, TRUE, FALSE))
     {
         return;
     }
@@ -615,7 +620,7 @@ static BOOLEAN NodeTableTryRetire(PCOMMON_CONTEXT Node)
 
     if (0 == ReadNoFence64(&Node->RefCount) &&
         0 == ReadNoFence(&Node->PinCount) &&
-        !InterlockedCompareExchange(&Node->OnReapList, TRUE, FALSE))
+        !InterlockedCompareExchangeNoFence(&Node->OnReapList, TRUE, FALSE))
     {
         if (Node->TableLink.Flink)
         {
@@ -671,7 +676,7 @@ PCOMMON_CONTEXT BlorgNodeTableLookupPin(const UNICODE_STRING* Path)
         if (node->FullPath.Length == Path->Length &&
             RtlEqualUnicodeString(&node->FullPath, Path, TRUE))
         {
-            InterlockedIncrement(&node->PinCount);
+            InterlockedIncrementNoFence(&node->PinCount);
             found = node;
             break;
         }
@@ -774,7 +779,7 @@ VOID BlorgNodeTableTeardown(VOID)
 
     LARGE_INTEGER interval = { .QuadPart = -10LL * 10 * 1000 };
 
-    while (ReadAcquire(&NodeReap.Queued))
+    while (ReadNoFence(&NodeReap.Queued))
     {
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
     }
@@ -790,7 +795,7 @@ VOID BlorgNodeTableTeardown(VOID)
     {
         PCOMMON_CONTEXT node = CONTAINING_RECORD(entry, COMMON_CONTEXT, ReapLink);
         entry = entry->Next;
-        InterlockedExchange(&node->OnReapList, FALSE);
+        InterlockedExchangeNoFence(&node->OnReapList, FALSE);
     }
 
     if (NodeReap.WorkItem)
@@ -907,7 +912,7 @@ static VOID NodeReapWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
             }
             else
             {
-                InterlockedExchange(&node->OnReapList, FALSE);
+                InterlockedExchangeNoFence(&node->OnReapList, FALSE);
             }
 
             ExReleasePushLockExclusive(&bucket->Lock);
