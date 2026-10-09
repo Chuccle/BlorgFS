@@ -602,6 +602,28 @@ VOID ProbeForRead(PVOID Address, SIZE_T Length, ULONG Alignment)
     }
 }
 
+static ULONG ProbesForWrite;
+
+VOID ProbeForWrite(PVOID Address, SIZE_T Length, ULONG Alignment)
+{
+    ProbesForWrite++;
+
+    if (0 == Length)
+    {
+        return;
+    }
+
+    if (!Address || (Alignment && (((ULONG_PTR)Address) & (Alignment - 1))))
+    {
+        KmReportViolation(KmViolationLifetime, "ProbeForWrite on a misaligned or null user buffer");
+    }
+}
+
+ULONG ShimProbesForWrite(VOID)
+{
+    return ProbesForWrite;
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Rtl
 ///////////////////////////////////////////////////////////////////////////

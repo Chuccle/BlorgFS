@@ -221,6 +221,26 @@ TEST_F(DirCtrlTest, ExactPatternWithNoWildcardsRequiresAnExactMatch)
     EXPECT_EQ(0u, first->NextEntryOffset) << "only one entry can match an exact pattern";
 }
 
+//
+// A user-mode query with no MDL writes the entries straight into the
+// caller's buffer, so that buffer is probed for writing: a probe for
+// reading passes a read-only page, and the copy then faults.
+//
+TEST_F(DirCtrlTest, AUserModeQueryProbesItsBufferForWriting)
+{
+    SeedListing(1, 0);
+
+    unsigned char buffer[512] = {};
+    QueryRequest* req = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+        buffer, sizeof(buffer));
+    req->Irp.RequestorMode = UserMode;
+
+    const ULONG probes = ShimProbesForWrite();
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack));
+    EXPECT_EQ(probes + 1, ShimProbesForWrite());
+}
+
 TEST_F(DirCtrlTest, NoFileNameMatchesEveryEntry)
 {
     SeedListing(1, 1);
