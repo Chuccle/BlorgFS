@@ -115,6 +115,7 @@ NTSTATUS RtlSetOwnerSecurityDescriptor(PVOID Descriptor, PSID Owner, BOOLEAN Def
 NTSTATUS RtlSetGroupSecurityDescriptor(PVOID Descriptor, PSID Group, BOOLEAN Defaulted);
 NTSTATUS RtlAbsoluteToSelfRelativeSD(PVOID Absolute, PVOID SelfRelative, PULONG Length);
 NTSTATUS SeQuerySecurityDescriptorInfo(PULONG Information, PVOID Descriptor, PULONG Length, PVOID* ObjectsSecurityDescriptor);
+VOID ShimSetSecurityDescriptorLength(ULONG Length);
 
 VOID RtlInitUnicodeString(PUNICODE_STRING Destination, PCWSTR Source);
 BOOLEAN RtlPrefixUnicodeString(PCUNICODE_STRING Prefix, PCUNICODE_STRING String, BOOLEAN IgnoreCase);

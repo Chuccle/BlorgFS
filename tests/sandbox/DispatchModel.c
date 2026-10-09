@@ -723,14 +723,25 @@ NTSTATUS RtlAbsoluteToSelfRelativeSD(PVOID A, PVOID S, PULONG L)
     return STATUS_SUCCESS;
 }
 
+//
+// The length of the descriptor SeQuerySecurityDescriptorInfo reports, so a
+// test can ask with a buffer too small for it. Zero, the default, fits any
+// buffer.
+//
+static ULONG SecurityDescriptorLength = 0;
+
+VOID ShimSetSecurityDescriptorLength(ULONG Length)
+{
+    SecurityDescriptorLength = Length;
+}
+
 NTSTATUS SeQuerySecurityDescriptorInfo(PULONG I, PVOID D, PULONG L, PVOID* O)
 {
     (void)I; (void)D; (void)O;
 
-    if (L)
-    {
-        *L = 0;
-    }
+    const ULONG available = *L;
 
-    return STATUS_SUCCESS;
+    *L = SecurityDescriptorLength;
+
+    return (available < SecurityDescriptorLength) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
 }

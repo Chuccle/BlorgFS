@@ -2,7 +2,8 @@
 // Coverage for the real FileInfo.c and VolumeInfo.c: every FILE_XXX_INFORMATION
 // and FILE_FS_XXX_INFORMATION class the driver fills from the in-memory
 // FCB/DCB or reports statically, plus the dispatch-entry device-type
-// routing and buffer-size validation shared across them. Both files were
+// routing and buffer-size validation shared across them, and Security.c's
+// answer to a security query. Both files were
 // previously 0% -- unlike Create.c/Read.c, neither touches the network,
 // or the cache manager, so these tests build a bare FCB/DCB
 // and drive the real dispatch entry points directly.
@@ -140,6 +141,28 @@ protected:
         req->Stack.Parameters.QueryVolume.Length = length;
         req->Irp.StackLocation = &req->Stack;
         req->Irp.AssociatedIrp.SystemBuffer = buffer;
+        return req;
+    }
+
+    //
+    // IRP_MJ_QUERY_SECURITY is always neither I/O, so the descriptor goes
+    // to Irp->UserBuffer.
+    //
+    QueryRequest* PrepareSecurityQuery(PVOID buffer, ULONG length)
+    {
+        Requests.push_back(std::make_unique<QueryRequest>());
+        QueryRequest* req = Requests.back().get();
+        memset(req, 0, sizeof(*req));
+
+        req->FileObject.FsContext = Fcb;
+        req->FileObject.DeviceObject = Volume;
+        req->Stack.MajorFunction = IRP_MJ_QUERY_SECURITY;
+        req->Stack.FileObject = &req->FileObject;
+        req->Stack.DeviceObject = Volume;
+        req->Stack.Parameters.QuerySecurity.SecurityInformation = DACL_SECURITY_INFORMATION;
+        req->Stack.Parameters.QuerySecurity.Length = length;
+        req->Irp.StackLocation = &req->Stack;
+        req->Irp.UserBuffer = buffer;
         return req;
     }
 
@@ -572,6 +595,41 @@ TEST_F(FileInfoTest, SetVolumeInformationIsAlwaysUnsupported)
 
     EXPECT_EQ(STATUS_INVALID_DEVICE_REQUEST, BlorgSetVolumeInformation(Volume, &irp))
         << "the volume is read-only -- FILE_READ_ONLY_VOLUME is reported honestly";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// BlorgQuerySecurity / SecurityQueryVolume
+///////////////////////////////////////////////////////////////////////////
+
+TEST_F(FileInfoTest, SecurityQueryReturnsTheDescriptorItsBufferHolds)
+{
+    unsigned char buffer[64] = {};
+    ShimSetSecurityDescriptorLength(48);
+    QueryRequest* req = PrepareSecurityQuery(buffer, sizeof(buffer));
+
+    EXPECT_EQ(STATUS_SUCCESS, BlorgQuerySecurity(Volume, &req->Irp));
+    EXPECT_EQ((ULONG_PTR)48, req->Irp.IoStatus.Information);
+
+    ShimSetSecurityDescriptorLength(0);
+}
+
+//
+// A buffer too small for the descriptor is a warning carrying the length
+// needed, not an error: the I/O manager drops Information on an error, and
+// a caller sizing its buffer from the first query would have nothing to
+// retry with.
+//
+TEST_F(FileInfoTest, SecurityQueryTooSmallBufferReportsTheLengthNeeded)
+{
+    unsigned char buffer[16] = {};
+    ShimSetSecurityDescriptorLength(48);
+    QueryRequest* req = PrepareSecurityQuery(buffer, sizeof(buffer));
+
+    EXPECT_EQ(STATUS_BUFFER_OVERFLOW, BlorgQuerySecurity(Volume, &req->Irp));
+    EXPECT_EQ(STATUS_BUFFER_OVERFLOW, req->Irp.IoStatus.Status);
+    EXPECT_EQ((ULONG_PTR)48, req->Irp.IoStatus.Information);
+
+    ShimSetSecurityDescriptorLength(0);
 }
 
 } // namespace
