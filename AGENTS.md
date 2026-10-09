@@ -2014,7 +2014,7 @@ Sources: [TinyLFU (ACM ToS)](https://dl.acm.org/doi/10.1145/3149371),
 ### Cache safeguard mutation checks
 
 `powershell -File tools/Invoke-BlorgChecks.ps1 -CacheMutantsOnly -Configuration Release`
-rebuilds the real dispatch sandbox with six deliberate source mutations: EOF
+rebuilds the real dispatch sandbox with eight deliberate source mutations: subtree publication/seed ordering, EOF
 bounds, snapshot resource acquisition, fill rollback, remaining drop counts,
 partial EOF drop counts and response-version validation. Each named regression
 must pass before mutation, fail with a gtest assertion under mutation, and pass
