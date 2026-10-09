@@ -790,6 +790,67 @@ TEST_F(HttpClientTest, IdleClosedPooledConnectionIsRetriedOnce)
 }
 
 //
+// A pooled connection that never completed a handshake -- a pre-warmed one,
+// which enters the pool straight from its connect -- may have been dropped
+// by a server that times out silent clients, and its handshake then fails.
+// That is the idle-close race again, so it is retried once on a fresh
+// connection. The stub fails both handshakes, which pins the one retry: a
+// second fresh connection, or a success, would mean a retry loop or none.
+//
+TEST_F(HttpClientTest, APooledConnectionWhoseHandshakeFailsIsRetriedOnceOnAFreshOne)
+{
+    static const SANDBOX_STEP warmup[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWARM")
+    };
+
+    SandboxSetPeerScript(warmup, RTL_NUMBER_OF(warmup));
+
+    unsigned char first[4] = {};
+    Read(first, sizeof(first));
+    Drain();
+
+    ASSERT_EQ(1u, SandboxSocketsPooled());
+    FreeMdl();
+
+    global.TlsEnabled = TRUE;
+    SandboxFailNextHandshakesWith(2, STATUS_CONNECTION_RESET);
+
+    LastRead = {};
+    ULONG createdBefore = SandboxSocketsCreated();
+
+    unsigned char second[4] = {};
+    Read(second, sizeof(second));
+    Drain();
+
+    EXPECT_EQ(createdBefore + 1, SandboxSocketsCreated()) << "the retry must open exactly one fresh connection";
+    EXPECT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_CONNECTION_RESET, LastRead.Status);
+
+    FreeMdl();
+}
+
+//
+// On a fresh connection a failed handshake is the server's answer, not a
+// stale socket, so it fails the read at once.
+//
+TEST_F(HttpClientTest, AFreshConnectionWhoseHandshakeFailsIsNotRetried)
+{
+    global.TlsEnabled = TRUE;
+    SandboxFailNextHandshakesWith(1, STATUS_CONNECTION_RESET);
+
+    unsigned char target[4] = {};
+    Read(target, sizeof(target));
+    Drain();
+
+    EXPECT_EQ(1u, SandboxSocketsCreated());
+    EXPECT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_CONNECTION_RESET, LastRead.Status);
+
+    FreeMdl();
+}
+
+//
 // A connect that times out is replaced by a new one rather than failing the
 // read. The connect watchdog used to be a single 15 s attempt, and one lost
 // connect cost a reader all of it (a measured 15,001 ms app read). The

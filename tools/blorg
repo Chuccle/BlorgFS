@@ -22,8 +22,9 @@
 #                           build the golden image a guest boots from
 #   guest image-key         hash of the image's inputs, for caching it
 #   guest test --package DIR [--out DIR] [--server-bin PATH]
-#              [--no-verifier] [--kernel-dump] [--keep] [--booted]
-#                           one end-to-end runtime test run
+#              [--no-verifier] [--no-tls] [--kernel-dump] [--keep]
+#              [--booted]   one end-to-end runtime test run, plaintext
+#                           and then over TLS
 #   guest run [--out DIR] SCRIPT
 #                           run a bash script against the live guest, with
 #                           `blorg` on PATH; transcript kept
@@ -1008,7 +1009,8 @@ change_corpus() {
 #
 #   blorg guest test --package DIR [--out DIR]
 #                    [--server-bin PATH]
-#                    [--no-verifier] [--kernel-dump] [--keep] [--booted]
+#                    [--no-verifier] [--no-tls] [--kernel-dump] [--keep]
+#                    [--booted]
 #
 #   --package DIR   the unpacked blorg-package-windows-x64 artifact
 #                   (manifest.json, driver/, server/)
@@ -1017,6 +1019,7 @@ change_corpus() {
 #                   the Linux server-rs to run on this host (default: the
 #                   package's server/linux-x64/server-rs)
 #   --no-verifier   run without Driver Verifier on BlorgFS.sys
+#   --no-tls        run the tests plaintext only, not again over TLS
 #   --kernel-dump   bring MEMORY.DMP back too after a bugcheck (large)
 #   --keep          leave the guest (and the host's server-rs) running
 #                   afterwards, to investigate with blorg guest ...
@@ -1026,6 +1029,8 @@ change_corpus() {
 #
 # Environment (all optional):
 #   SERVER_PORT   the host port server-rs listens on (default 18080)
+#   TLS_PORT      the host port of the TLS terminator in front of it
+#                 (default 18443)
 #   LOST_WAIT_S   how long a guest lost mid-run gets to come back before
 #                 it is reset (default 300)
 # plus the GUEST_* settings above.
@@ -1041,16 +1046,24 @@ change_corpus() {
 # host-setup creates (10.0.2.2 through user networking on a host without
 # one; see guest_has_tap). So the driver's WSK traffic crosses a real NIC,
 # and the backend's filesystem is case-sensitive.
+#
+# The tests run twice: plaintext, then -- after a reboot, since the driver
+# cannot be stopped -- over TLS. server-rs speaks only HTTP, so a TLS 1.3
+# terminator here fronts it with a fresh P-256 certificate, the driver's
+# only suite, and the driver is installed with that certificate's pin. The
+# TLS run's results land in results/tls and count towards the verdict.
 guest_test() (
     set +e -uo pipefail
-    package="" out="$PWD/guest-results" verifier=1 kernel_dump=0 keep=0 booted=0
-    server_bin="" server_pid="" gone=0
+    package="" out="$PWD/guest-results" verifier=1 tls=1 kernel_dump=0 keep=0 booted=0
+    server_bin="" server_pid="" tls_pid="" gone=0
     SERVER_PORT="${SERVER_PORT:-18080}"
+    TLS_PORT="${TLS_PORT:-18443}"
     while (( $# )); do
         case "$1" in
             --package)     package="$2"; shift 2 ;;
             --out)         out="$2"; shift 2 ;;
             --no-verifier) verifier=0; shift ;;
+            --no-tls)      tls=0; shift ;;
             --kernel-dump) kernel_dump=1; shift ;;
             --server-bin)  server_bin="$2"; shift 2 ;;
             --keep)        keep=1; shift ;;
@@ -1077,9 +1090,11 @@ guest_test() (
             # The server and its corpus stay too: B: is only useful with both.
             echo "blorg guest test: guest left running (--keep); drive it with: blorg guest ..."
             [[ -n "$server_pid" ]] && echo "blorg guest test: server-rs (pid $server_pid) serving $work/corpus"
+            [[ -n "$tls_pid" ]] && echo "blorg guest test: TLS terminator (pid $tls_pid) on port $TLS_PORT"
         else
             "$BLORG" guest down >/dev/null 2>&1 || true
             [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
+            [[ -n "$tls_pid" ]] && kill "$tls_pid" 2>/dev/null
             [[ -n "${work:-}" ]] && rm -rf "$work"
         fi
         exit "$code"
@@ -1120,6 +1135,24 @@ guest_test() (
     curl -fsS "http://127.0.0.1:$SERVER_PORT/healthcheck" >/dev/null || rig_fail "server-rs did not answer /healthcheck"
     endstep
 
+    if (( tls )); then
+        step "Starting the TLS terminator on the host (port $TLS_PORT)"
+        openssl ecparam -name prime256v1 -genkey -noout -out "$work/tls-key.pem" \
+            && openssl req -new -x509 -key "$work/tls-key.pem" -out "$work/tls-cert.pem" -days 2 -subj /CN=blorgfs-guest-test \
+            || rig_fail "could not generate the TLS certificate"
+        tls_pin="$(openssl x509 -in "$work/tls-cert.pem" -pubkey -noout | openssl pkey -pubin -outform der | sha256sum | cut -c1-64)"
+        echo "  pin $tls_pin"
+        python3 -c "$TLS_PY" "$work/tls-cert.pem" "$work/tls-key.pem" "$TLS_PORT" "$SERVER_PORT" >"$out/host/tls.log" 2>&1 &
+        tls_pid=$!
+        for _ in $(seq 20); do
+            curl -fsSk "https://127.0.0.1:$TLS_PORT/healthcheck" >/dev/null 2>&1 && break
+            kill -0 "$tls_pid" 2>/dev/null || rig_fail "the TLS terminator exited at startup: $(tail -n 20 "$out/host/tls.log")"
+            sleep 0.5
+        done
+        curl -fsSk "https://127.0.0.1:$TLS_PORT/healthcheck" >/dev/null || rig_fail "the TLS terminator did not answer /healthcheck"
+        endstep
+    fi
+
     if (( booted )); then
         step "Using the running guest"
         "$BLORG" guest wait 600 || rig_fail "--booted, but no guest is answering"
@@ -1149,31 +1182,29 @@ guest_test() (
     fi
     endstep
 
-    step "Running the tests in the guest"
-    boot_before="$("$BLORG" guest boot-id)"
-    test_args="-BackendHost $(guest_backend_host) -Port $SERVER_PORT -HostChanges"
-    "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Test $test_args; exit \$LASTEXITCODE" &
-    test_pid=$!
-    # The changes step asks for the corpus to change under the mounted
-    # volume, one phase at a time; see change_corpus.
-    phases=(seed change)
-    while kill -0 "$test_pid" 2>/dev/null; do
-        if (( ${#phases[@]} )) && "$BLORG" guest ssh "if (Test-Path C:/blorgfs-ci/changes-${phases[0]}) { exit 0 } else { exit 1 }" >/dev/null 2>&1; then
-            change_corpus "$work/corpus" "${phases[0]}" && echo "blorg guest test: changes step: ${phases[0]} done on the host"
-            phases=("${phases[@]:1}")
-        fi
-        sleep 1
-    done
-    wait "$test_pid"
-    test_rc=$?
-    endstep
-
-    # ssh's own failures are 255. Anything else is the test runner's verdict.
-    # Losing the guest mid-run almost always means a bugcheck: Windows writes
-    # its dump and reboots by itself (AutoReboot), and the dump is collected
-    # below. Bounded either way: if it is not back within LOST_WAIT_S, it is
-    # reset, which still finds a dump that was written before the reset.
-    if (( test_rc == 255 )); then
+    # One -Step Test run. ssh's own failures are 255; anything else is the
+    # test runner's verdict. While it runs, the changes step asks for the
+    # corpus to change under the mounted volume, one of $phases at a time;
+    # see change_corpus. Losing the guest mid-run almost always means a
+    # bugcheck: Windows writes its dump and reboots by itself (AutoReboot),
+    # and the dump is collected below. Bounded either way: if it is not back
+    # within LOST_WAIT_S, it is reset, which still finds a dump that was
+    # written before the reset.
+    run_tests() {
+        local rc pid
+        "$BLORG" guest ssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:/blorgfs-ci/bundle/Invoke-BlorgGuest.ps1 -Step Test $*; exit \$LASTEXITCODE" &
+        pid=$!
+        while kill -0 "$pid" 2>/dev/null; do
+            if (( ${#phases[@]} )) && "$BLORG" guest ssh "if (Test-Path C:/blorgfs-ci/changes-${phases[0]}) { exit 0 } else { exit 1 }" >/dev/null 2>&1; then
+                change_corpus "$work/corpus" "${phases[0]}" && echo "blorg guest test: changes step: ${phases[0]} done on the host"
+                phases=("${phases[@]:1}")
+            fi
+            sleep 1
+        done
+        wait "$pid"
+        rc=$?
+        endstep
+        (( rc == 255 )) || return "$rc"
         step "Lost the guest mid-run (likely a bugcheck); waiting for it to reboot"
         "$BLORG" guest screenshot "$out/screen-at-loss.png" >/dev/null 2>&1 || true
         if ! "$BLORG" guest wait "${LOST_WAIT_S:-300}" 2>/dev/null; then
@@ -1184,8 +1215,28 @@ guest_test() (
             "$BLORG" guest wait 600 || { echo "blorg guest test: the guest did not come back even after a reset"; gone=1; }
         fi
         endstep
+        return 255
+    }
+
+    # Each run's boot id before and after, so a reboot nobody asked for
+    # fails the verdict while the one between the runs does not.
+    step "Running the tests in the guest"
+    boots="$("$BLORG" guest boot-id)"
+    phases=(seed change)
+    run_tests "-BackendHost $(guest_backend_host) -Port $SERVER_PORT -HostChanges"
+    test_rc=$?
+    boots+=" $("$BLORG" guest boot-id 2>/dev/null || true)"
+
+    tls_rc=""
+    if (( tls && test_rc != 255 )); then
+        step "Running the tests again over TLS"
+        "$BLORG" guest reboot || rig_fail "guest did not come back from the reboot before the TLS run"
+        boots+=" $("$BLORG" guest boot-id)"
+        phases=()
+        run_tests "-BackendHost $(guest_backend_host) -Port $SERVER_PORT -TlsPort $TLS_PORT -TlsPin $tls_pin -ResultsDir C:/blorgfs-ci/results/tls"
+        tls_rc=$?
+        boots+=" $("$BLORG" guest boot-id 2>/dev/null || true)"
     fi
-    boot_after="$("$BLORG" guest boot-id 2>/dev/null || true)"
 
     step "Collecting diagnostics"
     diag_args=()
@@ -1201,9 +1252,9 @@ guest_test() (
 
     # The verdict: the runner's own, overridden by a bugcheck or an unexplained
     # reboot -- a crash after the last step still counts.
-    python3 - "$out" "$test_rc" "$boot_before" "$boot_after" "$gone" <<'PY'
+    python3 - "$out" "$test_rc" "$tls_rc" "$boots" "$gone" <<'PY'
 import json, os, sys
-out, rc, before, after, gone = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1"
+out, rc, tls_rc, boots, gone = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4].split(" "), sys.argv[5] == "1"
 def load(p):
     try:
         with open(os.path.join(out, p), encoding="utf-8-sig") as f:
@@ -1211,22 +1262,26 @@ def load(p):
     except (OSError, ValueError):
         return None
 res = load("results/results.json") or {}
+tls = load("results/tls/results.json") or {} if tls_rc else None
 crash = load("results/diag/crash.json") or {}
 reasons = []
 if res.get("verdict") != "pass":
     reasons.append(f"tests: {res.get('verdict', 'no results')}")
+if tls is not None and tls.get("verdict") != "pass":
+    reasons.append(f"tests over TLS: {tls.get('verdict', 'no results')}")
 if crash.get("bugchecked"):
     reasons.append("guest bugchecked")
-if before and after and before != after:
+if any(b and a and b != a for b, a in zip(boots[0::2], boots[1::2])):
     reasons.append("guest rebooted during the run")
-if rc == 255:
+if rc == 255 or tls_rc == "255":
     reasons.append("lost contact with the guest mid-run")
 if gone:
     reasons.append("the guest never came back, even after a reset (screen-at-loss.png shows why)")
 verdict = "fail" if reasons else "pass"
 lines = [f"verdict={verdict}", f"package={res.get('package')}"]
 lines += [f"reason={r}" for r in reasons]
-for s in res.get("steps", []):
+steps = res.get("steps", []) + [dict(s, name=f"tls.{s['name']}") for s in (tls or {}).get("steps", [])]
+for s in steps:
     lines.append(f"step.{s['name']}={s['status']}" + (f" ({s['detail']})" if s.get("detail") else ""))
 with open(os.path.join(out, "verdict.txt"), "w") as f:
     f.write("\n".join(lines) + "\n")
@@ -1249,7 +1304,7 @@ if summary:
         for r in reasons:
             f.write(f"- **{r}**\n")
         f.write("\n| Step | Result | Time | Detail |\n|---|---|---|---|\n")
-        for s in res.get("steps", []):
+        for s in steps:
             f.write(f"| {s['name']} | {s['status']} | {s['seconds']}s | {s.get('detail') or ''} |\n")
 sys.exit(0 if verdict == "pass" else 1)
 PY
@@ -1258,8 +1313,9 @@ PY
 
 # -------------------------------------------------------- Python helpers
 #
-# Run with python3 -c: QEMU's control channels and the corpus need what
-# bash cannot do cleanly (JSON over a socket, deterministic bytes, hashes).
+# Run with python3 -c: QEMU's control channels, the corpus and the TLS
+# terminator need what bash cannot do cleanly (JSON over a socket,
+# deterministic bytes, hashes, TLS).
 
 read -r -d '' QMP_PY <<'PY' || true
 """Tiny QMP / QEMU guest agent client for blorg guest. Standard library only.
@@ -1488,6 +1544,78 @@ def main():
 
 if __name__ == "__main__":
     main()
+PY
+
+read -r -d '' TLS_PY <<'PY' || true
+"""The TLS 1.3 terminator a guest run's TLS pass connects through.
+
+    python3 -c "$TLS_PY" CERT KEY LISTEN_PORT BACKEND_PORT
+
+server-rs speaks only HTTP, so this accepts TLS on LISTEN_PORT and relays
+each connection's plaintext to 127.0.0.1:BACKEND_PORT. The certificate
+decides what the driver is offered; the driver supports one suite (ECDHE
+P-256, ECDSA P-256, AES-128-GCM) and nothing else, so the key is P-256.
+Logs one line per connection opened and closed, with the protocol and
+cipher actually negotiated, and one per failed handshake with its error.
+"""
+
+import asyncio
+import ssl
+import sys
+import time
+
+
+def log(*parts):
+    print(time.strftime("%H:%M:%S"), *parts, flush=True)
+
+
+async def pipe(reader, writer):
+    total = 0
+    try:
+        while data := await reader.read(65536):
+            total += len(data)
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionError, ssl.SSLError) as e:
+        log("pipe", type(e).__name__, e)
+    finally:
+        writer.close()
+    return total
+
+
+async def main(cert, key, listen_port, backend_port):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_cert_chain(cert, key)
+
+    async def handle(client_reader, client_writer):
+        peer = client_writer.get_extra_info("peername")
+        try:
+            await client_writer.start_tls(ctx, ssl_handshake_timeout=15)
+        except (OSError, asyncio.TimeoutError) as e:
+            log("handshake", peer, type(e).__name__, e)
+            client_writer.close()
+            return
+        tls = client_writer.get_extra_info("ssl_object")
+        log("accept", peer, tls.version(), tls.cipher()[0])
+        try:
+            backend_reader, backend_writer = await asyncio.open_connection("127.0.0.1", backend_port)
+        except OSError as e:
+            log("backend", peer, type(e).__name__, e)
+            client_writer.close()
+            return
+        up, down = await asyncio.gather(pipe(client_reader, backend_writer), pipe(backend_reader, client_writer))
+        log("close", peer, "up", up, "down", down)
+
+    asyncio.get_running_loop().set_exception_handler(
+        lambda loop, c: log("error", c.get("message"), repr(c.get("exception"))))
+    server = await asyncio.start_server(handle, "0.0.0.0", listen_port)
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main(sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])))
 PY
 
 case "${1:-}" in

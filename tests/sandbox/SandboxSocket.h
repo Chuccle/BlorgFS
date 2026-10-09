@@ -113,6 +113,13 @@ VOID SandboxFailNextAcquires(ULONG Count);
 //
 VOID SandboxFailNextAcquiresWith(ULONG Count, NTSTATUS Status);
 
+//
+// Fails the next N TLS handshakes with Status, as a server that dropped the
+// connection would. Defined by NoTlsHandshakeStub.c, so only targets that
+// link it have it.
+//
+VOID SandboxFailNextHandshakesWith(ULONG Count, NTSTATUS Status);
+
 // Runs deferred (non-inline) completions until none remain.
 VOID SandboxDrainCompletions(VOID);
 
