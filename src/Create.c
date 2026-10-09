@@ -715,15 +715,19 @@ static BOOLEAN CreateFindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRI
 //
 //  A relative open (RelatedFileObject set -- OBJECT_ATTRIBUTES.RootDirectory
 //  at the Nt layer) is the one shape where the full path has to be built
-//  here rather than taken from FileObject->FileName, and both halves of
-//  that join have a trap in them. The separator is conditional: the parent
-//  handle's own name already ends in one when it is the root, and appending
-//  a second produces a path ("\\leaf") that matches nothing the equivalent
-//  absolute open resolves to. The destination offsets are byte offsets into
-//  a PWCH, so they are cast rather than added to the pointer -- pointer
-//  arithmetic on UNICODE_STRING.Buffer scales by sizeof(WCHAR) and would
-//  place the leaf at twice its offset, past the end of the block for any
-//  parent deeper than the root. joinedLength is computed in a ULONG because
+//  here rather than taken from FileObject->FileName. The parent half is the
+//  related DCB's FullPath, not the related file object's FileName: that is
+//  whatever its own opener passed, which for a relative open is only the
+//  leaf. The joined path is a full path, so it is walked and inserted from
+//  the root like any other. Both halves of the join have a trap in them.
+//  The separator is conditional: the parent's path already ends in one
+//  when it is the root, and appending a second produces a path ("\\leaf")
+//  that matches nothing the equivalent absolute open resolves to. The
+//  destination offsets are byte offsets into a PWCH, so they are cast
+//  rather than added to the pointer -- pointer arithmetic on
+//  UNICODE_STRING.Buffer scales by sizeof(WCHAR) and would place the leaf
+//  at twice its offset, past the end of the block for any parent deeper
+//  than the root. joinedLength is computed in a ULONG because
 //  the two USHORT lengths plus a separator can exceed what a UNICODE_STRING
 //  can describe; a path that long is rejected rather than truncated into a
 //  buffer smaller than what is about to be copied into it (STATUS_OBJECT_NAME_INVALID,
@@ -817,12 +821,12 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             return STATUS_INVALID_PARAMETER;
         }
 
-        parentDcb = relatedFileObject->FsContext;
+        const UNICODE_STRING* parentPath = &C_CAST(PDCB, relatedFileObject->FsContext)->FullPath;
 
-        USHORT parentLength = relatedFileObject->FileName.Length;
+        USHORT parentLength = parentPath->Length;
 
         BOOLEAN parentEndsWithSeparator = (0 < parentLength) &&
-            (L'\\' == relatedFileObject->FileName.Buffer[(parentLength / sizeof(WCHAR)) - 1]);
+            (L'\\' == parentPath->Buffer[(parentLength / sizeof(WCHAR)) - 1]);
 
         USHORT separatorLength = parentEndsWithSeparator ? 0 : C_CAST(USHORT, sizeof(WCHAR));
 
@@ -842,7 +846,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
         filePath.IsAllocated = TRUE;
 
-        RtlCopyMemory(filePath.String.Buffer, relatedFileObject->FileName.Buffer, parentLength);
+        RtlCopyMemory(filePath.String.Buffer, parentPath->Buffer, parentLength);
 
         if (separatorLength)
         {

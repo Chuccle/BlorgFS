@@ -765,6 +765,100 @@ TEST_F(CreateDirectoryTest, RootRelativeOpenDoesNotDoubleTheSeparator)
 }
 
 //
+// The tests above resolve on the warm path, which looks the joined path up
+// in the node table and never walks the tree. A relative open that misses
+// there walks it, and the walk takes a full path: started from the parent
+// instead of the root, "\\media\\clip.bin" goes looking for a child named
+// "media" under \media. An extracted archive is exactly that shape, and
+// here the walk would land on \media\media\clip.bin and hand its FCB to an
+// open of \media\clip.bin.
+//
+TEST_F(CreateDirectoryTest, ColdRelativeOpenWalksFromTheRootNotTheParent)
+{
+    PCOMMON_CONTEXT parent = MakePublishedNode(L"\\media", TRUE);
+    ASSERT_NE(nullptr, parent);
+
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media\\media", TRUE));
+
+    PCOMMON_CONTEXT nested = MakePublishedNode(L"\\media\\media\\clip.bin", FALSE);
+    ASSERT_NE(nullptr, nested);
+
+    PublishListing(L"\\media", L"clip.bin", L"media");
+
+    CreateOpener parentOpener;
+    PrepareOpener(&parentOpener, Path(L"\\media"), FILE_LIST_DIRECTORY | FILE_TRAVERSE, kShareAll, 0);
+    BlorgCreate(Volume, &parentOpener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, parentOpener.CreateIrp.IoStatus.Status);
+
+    CreateOpener relativeOpener;
+    PrepareOpener(&relativeOpener, Path(L"clip.bin"), FILE_READ_DATA, kShareAll, 0);
+    relativeOpener.FileObject.RelatedFileObject = &parentOpener.FileObject;
+
+    BlorgCreate(Volume, &relativeOpener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, relativeOpener.CreateIrp.IoStatus.Status);
+
+    PFCB opened = C_CAST(PFCB, relativeOpener.FileObject.FsContext);
+    ASSERT_NE(nullptr, opened);
+    EXPECT_NE(nested, C_CAST(PCOMMON_CONTEXT, opened))
+        << "the open of \\media\\clip.bin was answered with \\media\\media\\clip.bin";
+
+    UNICODE_STRING expected = Path(L"\\media\\clip.bin");
+    EXPECT_TRUE(RtlEqualUnicodeString(&expected, &opened->FullPath, TRUE));
+    EXPECT_EQ(parent, C_CAST(PCOMMON_CONTEXT, opened->ParentDcb));
+    EXPECT_EQ(2048, opened->Header.FileSize.QuadPart)
+        << "the size must come from \\media's listing entry";
+
+    CloseOpener(&relativeOpener);
+    CloseOpener(&parentOpener);
+}
+
+//
+// A relative open's own file object names only its leaf, so a relative open
+// against it cannot take the parent half from there: "movies" joined with
+// "clip.bin" is a path with no leading separator, which no node, path
+// cache entry or listing is keyed by.
+//
+TEST_F(CreateDirectoryTest, RelativeOpenAgainstARelativelyOpenedDirectoryUsesItsFullPath)
+{
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media", TRUE));
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media\\movies", TRUE));
+
+    PCOMMON_CONTEXT leaf = MakePublishedNode(L"\\media\\movies\\clip.bin", FALSE);
+    ASSERT_NE(nullptr, leaf);
+
+    CreateOpener mediaOpener;
+    PrepareOpener(&mediaOpener, Path(L"\\media"), FILE_LIST_DIRECTORY | FILE_TRAVERSE, kShareAll, 0);
+    BlorgCreate(Volume, &mediaOpener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, mediaOpener.CreateIrp.IoStatus.Status);
+
+    CreateOpener moviesOpener;
+    PrepareOpener(&moviesOpener, Path(L"movies"), FILE_LIST_DIRECTORY | FILE_TRAVERSE, kShareAll, 0);
+    moviesOpener.FileObject.RelatedFileObject = &mediaOpener.FileObject;
+    BlorgCreate(Volume, &moviesOpener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, moviesOpener.CreateIrp.IoStatus.Status);
+
+    CreateOpener leafOpener;
+    PrepareOpener(&leafOpener, Path(L"clip.bin"), FILE_READ_DATA, kShareAll, 0);
+    leafOpener.FileObject.RelatedFileObject = &moviesOpener.FileObject;
+    BlorgCreate(Volume, &leafOpener.CreateIrp);
+
+    EXPECT_EQ(STATUS_SUCCESS, leafOpener.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(leaf, leafOpener.FileObject.FsContext);
+
+    if (NT_SUCCESS(leafOpener.CreateIrp.IoStatus.Status))
+    {
+        CloseOpener(&leafOpener);
+    }
+
+    CloseOpener(&moviesOpener);
+    CloseOpener(&mediaOpener);
+}
+
+//
 // A relative open that resolves nowhere locally has to go out to the
 // network, and the first pass runs on the caller's thread rather than an
 // FSP worker, so it reposts itself and returns. That repost is the one
