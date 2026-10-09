@@ -257,6 +257,27 @@ TEST_F(FileInfoTest, StandardInformationReportsSizeAndDirectoryFlag)
     EXPECT_TRUE(dirBuffer.Directory);
 }
 
+//
+// The root is a directory of its own kind, and every other class tests for
+// "not a file" to say so. FileAllInformation already reports the root as a
+// directory, so a standard query answering otherwise contradicts it.
+//
+TEST_F(FileInfoTest, StandardInformationReportsTheRootAsADirectory)
+{
+    PDCB root = nullptr;
+    UNICODE_STRING rootName = Path(L"\\");
+    ASSERT_EQ(STATUS_SUCCESS,
+        BlorgCreateDCB(&root, (CSHORT)BLORGFS_ROOT_DCB_SIGNATURE, &rootName, Volume));
+    InitializeListHead(&root->Links);
+
+    FILE_STANDARD_INFORMATION buffer{};
+    QueryRequest* req = PrepareFileQuery(root, FileStandardInformation, &buffer, sizeof(buffer));
+    EXPECT_EQ(STATUS_SUCCESS, BlorgQueryInformation(Volume, &req->Irp));
+    EXPECT_TRUE(buffer.Directory);
+
+    BlorgFreeFileContext(root, Volume);
+}
+
 TEST_F(FileInfoTest, EaInformationReportsZeroEaSize)
 {
     FILE_EA_INFORMATION buffer{ 0xFFFFFFFF };
