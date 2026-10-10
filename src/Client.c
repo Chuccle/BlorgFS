@@ -25,6 +25,9 @@
 #include "picohttpparser.h"
 
 #define HTTP_TAG 'PTTH'
+#define HTTP_REQUEST_TAG 'qHPB'
+#define HTTP_URL_TAG 'uHPB'
+
 //
 // How many response headers picohttpparser is given room to report. This is
 // not a policy limit -- it is the size of an array, and overflowing it is a
@@ -916,7 +919,7 @@ static NTSTATUS HttpUrlEncodePathToAnsi(const UNICODE_STRING* InputString, SIZE_
     OutputString->Buffer = C_CAST(PCHAR, ExAllocatePoolUninitialized(
         NonPagedPoolNx,
         encodedLength + Reserve + 1,
-        'URLE'
+        HTTP_URL_TAG
     ));
 
     if (NULL == OutputString->Buffer)
@@ -3550,7 +3553,7 @@ static NTSTATUS HttpBuildRequest(
 
     ULONG sendBufferSize = C_CAST(ULONG, formatStringLength) + 1 + Target->Length + C_CAST(ULONG, ExtraDigitsBudget) + C_CAST(ULONG, remoteHostLength);
 
-    Ctx->RequestBuffer = ExAllocatePoolZero(NonPagedPoolNx, sendBufferSize, 'BOOB');
+    Ctx->RequestBuffer = ExAllocatePoolZero(NonPagedPoolNx, sendBufferSize, HTTP_REQUEST_TAG);
 
     if (!Ctx->RequestBuffer)
     {

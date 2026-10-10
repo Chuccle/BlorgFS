@@ -8,7 +8,7 @@
 #include "Socket.h"
 #include "TlsHandshake.h"
 
-#define SOCKET_TAG 'HTTP'
+#define SOCKET_TAG 'kSPB'
 
 //
 // The WSK client registration and the captured provider dispatch, both
