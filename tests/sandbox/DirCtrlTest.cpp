@@ -740,4 +740,38 @@ TEST_F(DirCtrlTest, AMissPostedToTheFspIsCountedOnce)
     Drain();
 }
 
+
+//
+// An initial query, and a restart, of a directory whose listing is cached
+// is answered in the FSD: setting the handle's pattern and taking the
+// snapshot need nothing a worker has. Both used to be posted to the FSP
+// before the listing was even looked up, a worker hop, buffer lock and
+// system-PTE map per directory of a fully cached tree walk. The queue is
+// not running in this harness, so a post is refused.
+//
+TEST_F(DirCtrlTest, AQueryOfACachedListingIsAnsweredWithoutAPost)
+{
+    SeedListing(2, 1);
+
+    const ULONG slFlags[] = { 0, SL_RESTART_SCAN };
+
+    for (ULONG flags : slFlags)
+    {
+        unsigned char buffer[1024] = {};
+        QueryRequest* req = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+            buffer, sizeof(buffer), flags);
+        req->Irp.Tail.Overlay.DriverContext[0] = (PVOID)(ULONG_PTR)IRP_CONTEXT_FLAG_WAIT;
+
+        ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack))
+            << "flags " << flags << ": a cached listing was posted rather than answered";
+        EXPECT_TRUE(BooleanFlagOn(Ccb->Flags, CCB_FLAG_MATCH_ALL));
+        EXPECT_EQ(3u, Ccb->CurrentIndex) << "flags " << flags;
+
+        auto* first = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer);
+
+        ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), first->FileNameLength);
+        EXPECT_EQ(0, memcmp(first->FileName, L"file0.bin", first->FileNameLength));
+    }
+}
+
 } // namespace
