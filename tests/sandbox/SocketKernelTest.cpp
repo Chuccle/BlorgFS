@@ -38,6 +38,9 @@ VOID SandboxFailNextHandshakesWith(ULONG Count, NTSTATUS Status);
 VOID SandboxResetHandshakes(VOID);
 ULONG SandboxHandshakesStarted(VOID);
 ULONG SandboxHandshakesAbovePassive(VOID);
+
+// NoStatisticsStub.c's counter block.
+extern BLORGFS_STATISTICS ShimStatistics;
 }
 
 namespace
@@ -48,7 +51,7 @@ namespace
 // someone changes them there, the timing tests here should be re-read
 // rather than silently keep passing against a stale assumption.
 //
-const long long kConnectTimeoutMs = 15000;
+const long long kConnectTimeoutMs = 4000;
 const long long kSendTimeoutMs = 15000;
 const long long kReceiveTimeoutMs = 30000;
 
@@ -1085,6 +1088,138 @@ TEST_F(SocketStressTest, PrewarmChainSurvivesCompletionRacingThePumpLoop)
 
     EXPECT_EQ(0, proof.Stalls)
         << "a completion landed in the pump's publish window and the budget stalled";
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Connect watchdog, pool capacity and a changed remote address
+///////////////////////////////////////////////////////////////////////////
+
+//
+// A peer that never answers the SYN. The connect has the shortest deadline
+// of the three, and the client retries a connect only on STATUS_IO_TIMEOUT,
+// so the boundary and the status are both what is pinned here. The
+// half-built socket goes with the failure: the caller is handed none.
+//
+TEST_F(SocketKernelTest, ConnectThatNeverCompletesTimesOut)
+{
+    WSK_MODEL_BEHAVIOUR never = Behaviour(WskModelNever);
+    WskModelSetConnectBehaviour(&never);
+
+    SOCKADDR_IN address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(80);
+
+    ASSERT_EQ(STATUS_PENDING,
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&address, TRUE, RecordAcquire, nullptr));
+    EXPECT_EQ(0, LastAcquire.Calls);
+
+    KmAdvanceTime(kConnectTimeoutMs - 1);
+    WskModelPumpCancellations();
+
+    EXPECT_EQ(0, LastAcquire.Calls) << "connect watchdog fired early";
+
+    EXPECT_EQ(1, KmAdvanceTime(2)) << "the connect watchdog did not fire";
+
+    WskModelPumpCancellations();
+
+    EXPECT_EQ(1, LastAcquire.Calls);
+    EXPECT_EQ(STATUS_IO_TIMEOUT, LastAcquire.Status)
+        << "a timed-out connect must surface as IO_TIMEOUT, the one failure the client retries";
+    EXPECT_EQ(nullptr, LastAcquire.Socket);
+    EXPECT_EQ(1u, WskModelCancelled());
+}
+
+//
+// A socket released into a full pool is closed rather than kept: the
+// pool's bound is what caps the idle connections a burst leaves behind.
+// The bound is found by releasing until the first one is turned away, so
+// the test does not restate its value.
+//
+TEST_F(SocketKernelTest, ReleaseIntoAFullPoolClosesTheSocket)
+{
+    const ULONG64 turnedAwayBefore = ShimStatistics.ConnectionsClosedPoolFull;
+    const ULONG64 pooledBefore = ShimStatistics.ConnectionsReleasedToPool;
+
+    ULONG released = 0;
+    ULONG closesBeforeLast = 0;
+
+    while (turnedAwayBefore == ShimStatistics.ConnectionsClosedPoolFull)
+    {
+        ASSERT_LT(released, 1024u) << "the pool took every socket released into it";
+
+        PKSOCKET socket = AcquireSocket();
+        ASSERT_NE(nullptr, socket);
+
+        closesBeforeLast = WskModelCloses();
+        ASSERT_TRUE(NT_SUCCESS(BlorgReleaseReusableWskSocket(socket)));
+        ++released;
+    }
+
+    EXPECT_EQ(closesBeforeLast + 1, WskModelCloses())
+        << "a socket the pool had no room for was not closed";
+    EXPECT_EQ(released - 1, ShimStatistics.ConnectionsReleasedToPool - pooledBefore);
+    EXPECT_EQ(C_CAST(long, released - 1), KmObjectsLive(KmObjectSocket));
+}
+
+//
+// The pool holds connections to whatever the remote address was when they
+// were released. Once it changes -- another port, another host -- a pooled
+// socket for the old one is closed and a fresh connect made to the new one,
+// rather than a request being sent to the wrong server.
+//
+TEST_F(SocketKernelTest, PooledSocketForAnotherAddressIsClosedAndReplaced)
+{
+    SOCKADDR_IN original = {};
+    original.sin_family = AF_INET;
+    original.sin_port = htons(80);
+    original.sin_addr.s_addr = htonl(0x0A000001);
+
+    SOCKADDR_IN otherPort = original;
+    otherPort.sin_port = htons(8080);
+
+    SOCKADDR_IN otherHost = otherPort;
+    otherHost.sin_addr.s_addr = htonl(0x0A000002);
+
+    ASSERT_EQ(STATUS_PENDING,
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&original, FALSE, RecordAcquire, nullptr));
+    ASSERT_NE(nullptr, LastAcquire.Socket);
+    BlorgReleaseReusableWskSocket(LastAcquire.Socket);
+
+    const SOCKADDR_IN* targets[] = { &otherPort, &otherHost };
+    ULONG expectedConnects = 1;
+
+    for (const SOCKADDR_IN* target : targets)
+    {
+        LastAcquire = {};
+
+        ASSERT_EQ(STATUS_PENDING,
+            BlorgAcquireReusableWskSocketAsync((PSOCKADDR)target, FALSE, RecordAcquire, nullptr));
+
+        ++expectedConnects;
+
+        ASSERT_EQ(1, LastAcquire.Calls);
+        ASSERT_TRUE(NT_SUCCESS(LastAcquire.Status));
+        ASSERT_NE(nullptr, LastAcquire.Socket);
+        EXPECT_FALSE(LastAcquire.Reused) << "a socket connected to another address was handed back";
+        EXPECT_EQ(expectedConnects, WskModelConnects());
+        EXPECT_EQ(expectedConnects - 1, WskModelCloses())
+            << "the pooled socket for the old address was dropped without being closed";
+
+        const SOCKADDR_IN* connected = C_CAST(const SOCKADDR_IN*, &LastAcquire.Socket->RemoteAddress);
+        EXPECT_EQ(target->sin_port, connected->sin_port);
+        EXPECT_EQ(target->sin_addr.s_addr, connected->sin_addr.s_addr);
+
+        BlorgReleaseReusableWskSocket(LastAcquire.Socket);
+    }
+
+    LastAcquire = {};
+
+    ASSERT_EQ(STATUS_PENDING,
+        BlorgAcquireReusableWskSocketAsync((PSOCKADDR)&otherHost, FALSE, RecordAcquire, nullptr));
+    EXPECT_TRUE(LastAcquire.Reused) << "a socket for the current address must still be reused";
+    EXPECT_EQ(expectedConnects, WskModelConnects());
+
+    BlorgCloseWskSocketAsync(LastAcquire.Socket);
 }
 
 } // namespace
