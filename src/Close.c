@@ -16,7 +16,7 @@ static NTSTATUS CloseVolume(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDevic
     PFILE_OBJECT fileObject = IrpSp->FileObject;
     PVCB vcb = BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->Vcb;
 
-    switch GET_NODE_TYPE(fileObject->FsContext)
+    switch (GET_NODE_TYPE(fileObject->FsContext))
     {
         case BLORGFS_ROOT_DCB_SIGNATURE:
         {

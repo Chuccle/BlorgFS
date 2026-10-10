@@ -1002,7 +1002,7 @@ static UNICODE_STRING NodeGetLastComponent(const UNICODE_STRING* Path)
 // Case-insensitive equality check for a single path component. Length
 // check first as a cheap short-circuit before the NT string compare.
 //
-inline static BOOLEAN NodeArePathComponentsEqual(const UNICODE_STRING* Component1, const UNICODE_STRING* Component2)
+static inline BOOLEAN NodeArePathComponentsEqual(const UNICODE_STRING* Component1, const UNICODE_STRING* Component2)
 {
     if (Component1->Length != Component2->Length)
     {

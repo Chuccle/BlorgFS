@@ -1579,7 +1579,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
     PFCB fcb = IrpSp->FileObject->FsContext;
 
-    switch GET_NODE_TYPE(fcb)
+    switch (GET_NODE_TYPE(fcb))
     {
         case BLORGFS_FCB_SIGNATURE:
         {
