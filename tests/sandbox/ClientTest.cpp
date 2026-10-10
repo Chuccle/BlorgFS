@@ -2163,4 +2163,76 @@ TEST_F(HttpClientTlsTest, PartialRecordIsMovedToTheFrontWhenTheTailCannotTakeAWh
     FreeMdl();
 }
 
+//
+// Over TLS the record that ends a buffered body decrypts its inner
+// content-type byte after the body's last byte, before the record layer
+// strips it. A buffer pre-grown to end exactly at the body was reallocated
+// for that byte, and the whole body copied again: every TLS listing,
+// subtree and feed answer longer than its first buffer paid for it.
+//
+// The reference is the same answer short enough to land in the first
+// buffer, which grows nothing; the long one, 2 KB records of a 20 KB body,
+// grows once, for its body, when its headers are parsed -- whether its body
+// starts on the 8-byte boundary flatcc wants or has to slide to one, since
+// the two grow it in different places. A file-information answer is the
+// buffered metadata the sandbox can encode, so the long one is the short
+// one padded, which the verifier ignores.
+//
+TEST_F(HttpClientTlsTest, ABufferedBodyIsGrownOnceAndNotAgainForItsLastRecordsTypeByte)
+{
+    auto fetch = [this](const std::string& Body, SIZE_T Misalignment) -> LONG
+    {
+        std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(Body.size()) + "\r\nX-Pad: ";
+
+        while ((response.size() + 4) % 8 != Misalignment)
+        {
+            response += 'p';
+        }
+
+        response += "\r\n\r\n" + Body;
+
+        std::vector<std::vector<unsigned char>> records;
+
+        for (size_t at = 0; at < response.size(); at += 2048)
+        {
+            records.push_back(SealRecord(records.size(), 0x17, response.substr(at, 2048)));
+        }
+
+        DeliverInPieces({ Join(records) });
+
+        wchar_t path[] = L"/media/file.bin";
+        UNICODE_STRING pathString = MakePath(path);
+
+        LastFileInfo = {};
+        ShimPoolFailAt(-1);
+
+        EXPECT_EQ(STATUS_PENDING, BlorgHttpGetFileInformation(&pathString, OnFileInfo, nullptr));
+
+        Drain();
+
+        LONG allocations = ShimPoolAllocations();
+
+        EXPECT_EQ(1, LastFileInfo.Calls) << Body.size() << " bytes, misaligned by " << Misalignment;
+        EXPECT_EQ(STATUS_SUCCESS, LastFileInfo.Status) << Body.size() << " bytes, misaligned by " << Misalignment;
+        EXPECT_EQ(4096u, LastFileInfo.Meta.Size) << Body.size() << " bytes, misaligned by " << Misalignment;
+
+        BlorgCleanupWskClient();
+
+        return allocations;
+    };
+
+    const std::string shortBody(kFileInfo, sizeof(kFileInfo) - 1);
+    std::string longBody = shortBody;
+    longBody.append(20 * 1024, '\0');
+
+    const LONG reference = fetch(shortBody, 4);
+
+    for (SIZE_T misalignment : { SIZE_T(0), SIZE_T(4) })
+    {
+        EXPECT_EQ(reference + 1, fetch(longBody, misalignment))
+            << "misaligned by " << misalignment
+            << ": the body's buffer must be grown once, with room for the last record's type byte";
+    }
+}
+
 } // namespace

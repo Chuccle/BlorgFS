@@ -2759,9 +2759,12 @@ static NTSTATUS HttpStatusToNtStatus(int StatusCode)
 // short body is handled. In buffer mode, Buffer is then pre-grown to fit
 // the full declared body now that ContentLength is known, so the
 // remaining receive loop (if any) doesn't repeatedly realloc a page at a
-// time for large files. Dispatch does not happen until the full declared
-// Content-Length has arrived, looping HttpStageReceive as many times as
-// the peer needs to deliver it.
+// time for large files, and one byte past it: over TLS the record that
+// ends the body decrypts its inner content-type byte after the body's last
+// byte before HttpIssueTlsReceive strips it, and a buffer ending at the
+// body was reallocated, and the whole body copied, for that byte. Dispatch
+// does not happen until the full declared Content-Length has arrived,
+// looping HttpStageReceive as many times as the peer needs to deliver it.
 //
 static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
 {
@@ -2851,7 +2854,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
                         return;
                     }
 
-                    NTSTATUS alignGrowResult = HttpGrowBufferIfNeeded(Ctx, alignedBodyEnd);
+                    NTSTATUS alignGrowResult = HttpGrowBufferIfNeeded(Ctx, alignedBodyEnd + 1);
 
                     if (!NT_SUCCESS(alignGrowResult))
                     {
@@ -2870,7 +2873,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
                 }
             }
 
-            NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, Ctx->BodyEndOffset);
+            NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, Ctx->BodyEndOffset + 1);
 
             if (!NT_SUCCESS(growResult))
             {
