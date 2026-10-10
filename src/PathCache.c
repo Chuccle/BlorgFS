@@ -15,7 +15,8 @@
 //  handle, and every `dir` of the same directory paid a dirinfo GET (2.7-3.3
 //  ms on the reference link; a repeated `dir /s` of 121 directories paid all
 //  121). Its own sharding, sized for far fewer and far larger entries, and a
-//  global byte budget, since a 300-entry listing is ~170 KB.
+//  global byte budget, since a listing grows with its directory: ~90
+//  bytes an entry, so 20,000 entries are ~1.8 MB.
 //
 //  Both caches share one invalidation sequence. Every result read from
 //  elsewhere is inserted with the ticket taken before the read, and refused
@@ -221,13 +222,11 @@ static VOID PathCacheAdvanceSequence(VOID)
 }
 
 //
-// The bytes a listing occupies, as HttpDeserializeDirectoryInfo sized it.
+// The bytes a listing occupies, as BlorgAllocateDirectoryInfo sized it.
 //
 static LONG64 ListingCacheSizeOf(const DIRECTORY_INFO* Listing)
 {
-    return C_CAST(LONG64, sizeof(DIRECTORY_INFO) +
-        (Listing->FileCount * sizeof(DIRECTORY_FILE_METADATA)) +
-        (Listing->SubDirCount * sizeof(DIRECTORY_SUBDIR_METADATA)));
+    return C_CAST(LONG64, Listing->Bytes);
 }
 
 //
@@ -944,8 +943,8 @@ VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
 //
 //  Appends one listing entry's name to the directory path already in
 //  Scratch, inserts it with Meta, and trims Scratch back to the directory.
-//  Names the listing could not have produced -- empty, or longer than its
-//  own MAX_NAME_LEN field -- and paths past the cache's own limit are
+//  Names the listing could not have produced -- empty, or longer than
+//  MAX_NAME_LEN allows -- and paths past the cache's own limit are
 //  skipped rather than truncated, since a truncated path would cache a
 //  result for a different file. So is a name holding a backslash, which a
 //  Linux host allows: it would cache an entry for a path a level deeper,
@@ -1368,8 +1367,8 @@ BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO 
 }
 
 //
-//  Whether a listed name can stand as one path component: not empty, short
-//  enough for the listing's own Name field, and free of separators.
+//  Whether a listed name can stand as one path component: not empty, no
+//  longer than a listing admits (MAX_NAME_LEN), and free of separators.
 //
 static BOOLEAN PathCacheIsComponent(const WCHAR* Name, SIZE_T NameLength)
 {

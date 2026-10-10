@@ -723,7 +723,7 @@ TEST_F(PathCacheListingTest, DeadListingsDoNotHoldTheByteBudget)
         wchar_t buf[64];
         swprintf_s(buf, L"\\budget\\full\\d%03d", published);
 
-        Publish(buf, BuildSyntheticListing(2000, 0), nullptr, TRUE);
+        Publish(buf, BuildSyntheticListing(2000, 0, 250), nullptr, TRUE);
 
         PDIRECTORY_INFO listing = LookupListing(buf, FALSE);
         const bool kept = (nullptr != listing);
@@ -739,7 +739,7 @@ TEST_F(PathCacheListingTest, DeadListingsDoNotHoldTheByteBudget)
 
     ShimAdvanceInterruptTime(60 * kSecond);
 
-    Publish(L"\\budget\\after", BuildSyntheticListing(2000, 0), nullptr, TRUE);
+    Publish(L"\\budget\\after", BuildSyntheticListing(2000, 0, 250), nullptr, TRUE);
 
     PDIRECTORY_INFO listing = LookupListing(L"\\budget\\after", FALSE);
     EXPECT_NE(nullptr, listing) << "a listing was refused room held only by expired listings";
@@ -800,7 +800,7 @@ TEST_F(PathCacheListingTest, AListingTheBudgetCannotHoldEvictsNothing)
         BlorgReleaseDirectoryInfo(listing);
     }
 
-    Publish(L"\\budget\\huge", BuildSyntheticListing(70000, 0), nullptr, TRUE);
+    Publish(L"\\budget\\huge", BuildSyntheticListing(70000, 0, 250), nullptr, TRUE);
 
     PDIRECTORY_INFO huge = LookupListing(L"\\budget\\huge", FALSE);
     EXPECT_EQ(nullptr, huge);
@@ -908,10 +908,7 @@ TEST_F(PathCacheSubtreeTest, AnInvalidationThatOvertookTheAnswerRefusesEveryDesc
 //
 TEST_F(PathCacheSubtreeTest, ADescendantWithAnUnusableNameIsSkippedWithEverythingBeneathIt)
 {
-    PDIRECTORY_INFO root = BuildSyntheticListing(0, 2);
-    PDIRECTORY_SUBDIR_METADATA bad = BlorgGetSubDirEntry(root, 0);
-    wcscpy_s(bad->Name, MAX_NAME_LEN, L"a\\b");
-    bad->NameLength = 3;
+    PDIRECTORY_INFO root = BuildListing({}, { L"a\\b", L"dir1" });
 
     SIZE_T published = PublishDescendants(L"\\sub\\named", root, {
         { BuildSyntheticListing(1, 1), 0, 0 },

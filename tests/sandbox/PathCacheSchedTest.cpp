@@ -668,7 +668,7 @@ void ListingBudgetSetup(void* Parameter)
     BlorgPathCacheInit();
 
     // About 20 MB: over half the 32 MB budget.
-    proof->Listing = BuildSyntheticListing(36000, 0);
+    proof->Listing = BuildSyntheticListing(36000, 0, 250);
 
     KmSchedSpawn(ListingBudgetFirstThread, proof);
     KmSchedSpawn(ListingBudgetSecondThread, proof);

@@ -169,10 +169,10 @@
 // zero fetches the one listing, as before. A walk of the tree then finds
 // what fit already cached instead of paying a round trip per directory.
 //
-// An entry is about 60 bytes on the wire and 560 decoded, so the default
-// answer is at most ~120 KB, a few milliseconds of the reference link on
-// top of the round trip it replaces many of, and ~1.1 MB of paged pool,
-// well inside the listing cache's budget.
+// An entry is about 60 bytes on the wire and under 100 decoded, so the
+// default answer is at most ~120 KB, a few milliseconds of the reference
+// link on top of the round trip it replaces many of, and ~200 KB of paged
+// pool, well inside the listing cache's budget.
 //
 #define SUBTREE_ENTRIES 2048u
 

@@ -61,6 +61,20 @@ NTSTATUS BlorgHttpGetDirectoryInfo(
 
 VOID BlorgReferenceDirectoryInfo(PDIRECTORY_INFO DirInfo);
 VOID BlorgReleaseDirectoryInfo(PDIRECTORY_INFO DirInfo);
+
+//
+// Builds a listing (DIRECTORY_INFO). Allocate sizes one zeroed PagedPool
+// block for FileCount files, SubDirCount subdirectories and NameBytes of
+// names, terminators included, holding one reference, or returns NULL. The
+// caller fills every entry, pointing its Name into the block from
+// NamesOffset on, then Index chains each into the name index, through
+// which Find looks a name up: the first entry, files before
+// subdirectories, whose name equals Name case-insensitively, as *Entry
+// counting files first. PASSIVE_LEVEL.
+//
+PDIRECTORY_INFO BlorgAllocateDirectoryInfo(SIZE_T FileCount, SIZE_T SubDirCount, SIZE_T NameBytes);
+VOID BlorgIndexDirectoryInfo(PDIRECTORY_INFO DirInfo);
+BOOLEAN BlorgFindDirectoryEntry(PDIRECTORY_INFO DirInfo, const UNICODE_STRING* Name, PSIZE_T Entry);
 PDIRECTORY_DESCENDANT BlorgTakeDescendants(PDIRECTORY_INFO DirInfo, PSIZE_T Count);
 VOID BlorgReleaseDescendants(PDIRECTORY_DESCENDANT Descendants, SIZE_T Count);
 

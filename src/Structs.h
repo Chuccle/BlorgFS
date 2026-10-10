@@ -93,6 +93,7 @@ CHECK_PADDING_END(CREATE_NET_RESULT, Meta);
 //////// Structures for ListDirectory operation ///////////
 ///////////////////////////////////////////////////////////
 
+// Most characters a listed name takes, its NUL included.
 #define MAX_NAME_LEN 260
 
 // A single file entry in a directory listing.
@@ -103,7 +104,7 @@ typedef struct _DIRECTORY_FILE_METADATA
     ULONG64 LastAccessedTime;  // Last access time, NT FILETIME
     ULONG64 LastModifiedTime;  // Last write time, NT FILETIME
     SIZE_T  NameLength;        // Length of Name in characters
-    WCHAR   Name[MAX_NAME_LEN];// File name
+    PWCH    Name;              // File name, NUL-terminated, in the listing's own block
 } DIRECTORY_FILE_METADATA, * PDIRECTORY_FILE_METADATA;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, Size, CreationTime);
@@ -120,7 +121,7 @@ typedef struct _DIRECTORY_SUBDIR_METADATA
     ULONG64 LastAccessedTime;  // Last access time, NT FILETIME
     ULONG64 LastModifiedTime;  // Last write time, NT FILETIME
     SIZE_T  NameLength;        // Length of Name in characters
-    WCHAR   Name[MAX_NAME_LEN];// Directory name
+    PWCH    Name;              // Directory name, NUL-terminated, in the listing's own block
 } DIRECTORY_SUBDIR_METADATA, * PDIRECTORY_SUBDIR_METADATA;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, CreationTime, LastAccessedTime);
@@ -130,8 +131,12 @@ CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, NameLength, Name);
 CHECK_PADDING_END(DIRECTORY_SUBDIR_METADATA, Name);
 
 //
-// Header for a variable-length buffer holding a directory's file and
-// subdirectory entries, packed contiguously after this struct.
+// Header for a variable-length block holding a directory's listing: the
+// file entries, then the subdirectory entries, then the name index, then
+// the names the entries point at, laid out by BlorgAllocateDirectoryInfo
+// (Client.c). The index is IndexMask + 1 chain heads and one link per
+// entry, each the position of the next entry in the chain plus one, zero
+// ending it; files come first in those positions, subdirectories after.
 //
 // A listing is an immutable snapshot once deserialized, shared by the
 // listing cache (PathCache.c) and by every handle enumerating it
@@ -148,22 +153,30 @@ typedef struct _DIRECTORY_INFO
 {
     SIZE_T FilesOffset;   // Offset from start of this struct to first file entry
     SIZE_T SubDirsOffset; // Offset from start of this struct to first subdir entry
+    SIZE_T IndexOffset;   // Offset from start of this struct to the name index
+    SIZE_T NamesOffset;   // Offset from start of this struct to the first name
     SIZE_T FileCount;     // Number of DIRECTORY_FILE_METADATA entries
     SIZE_T SubDirCount;   // Number of DIRECTORY_SUBDIR_METADATA entries
+    SIZE_T Bytes;         // Size of the whole block, which the listing cache charges
     struct _DIRECTORY_DESCENDANT* Descendants; // Subtree answer only, until DirCtrlPublish takes it
     SIZE_T DescendantCount; // Number of entries in Descendants
     LONG   RefCount;      // Interlocked: holders on different threads release independently
+    ULONG  IndexMask;     // The index has a power of two chains
     BOOLEAN NoStore;      // Server marked the answer Cache-Control: no-store; never cached
-    UCHAR  Reserved[3];   // explicit tail padding
+    UCHAR  Reserved[7];   // explicit tail padding
 } DIRECTORY_INFO, * PDIRECTORY_INFO;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FilesOffset, SubDirsOffset);
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirsOffset, FileCount);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirsOffset, IndexOffset);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, IndexOffset, NamesOffset);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, NamesOffset, FileCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FileCount, SubDirCount);
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirCount, Descendants);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirCount, Bytes);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, Bytes, Descendants);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, Descendants, DescendantCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, DescendantCount, RefCount);
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, NoStore);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, IndexMask);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, IndexMask, NoStore);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, NoStore, Reserved);
 CHECK_PADDING_END(DIRECTORY_INFO, Reserved);
 
