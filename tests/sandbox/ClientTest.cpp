@@ -1613,4 +1613,450 @@ TEST_F(HttpClientTest, AnAlertOnAPooledTlsConnectionIsRetriedOnceOnAFreshOne)
     BlorgTlsGlobalCleanup();
 }
 
+const UCHAR kClientWriteKey[TLS_KEY_LEN] =
+    { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f };
+const UCHAR kClientWriteIv[TLS_IV_LEN] =
+    { 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b };
+const UCHAR kServerWriteKey[TLS_KEY_LEN] =
+    { 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f };
+const UCHAR kServerWriteIv[TLS_IV_LEN] =
+    { 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b };
+
+//
+// The client with TLS on and the handshake stub installing known traffic
+// keys, so everything after the handshake is the real record layer: the
+// request sealed by HttpEncryptRequestRecord and the response opened by
+// HttpIssueTlsReceive. The server's side is played here with Tls.c's own
+// AEAD -- records sealed under the server's key, the client's opened
+// under the client's.
+//
+class HttpClientTlsTest : public HttpClientTest
+{
+protected:
+    void SetUp() override
+    {
+        HttpClientTest::SetUp();
+
+        SavedRecvCapacity = SocketTlsRecvCapacity;
+
+        ASSERT_EQ(STATUS_SUCCESS, BlorgTlsGlobalInit());
+
+        global.TlsEnabled = TRUE;
+        SandboxResetHandshakes();
+        SandboxSetTrafficKeys(kClientWriteKey, kClientWriteIv, kServerWriteKey, kServerWriteIv);
+    }
+
+    void TearDown() override
+    {
+        HttpClientTest::TearDown();
+
+        SocketTlsRecvCapacity = SavedRecvCapacity;
+        SandboxResetHandshakes();
+        global.TlsEnabled = FALSE;
+
+        BlorgTlsGlobalCleanup();
+    }
+
+    //
+    // One application_data record as the server sends it: Content, then
+    // InnerType, then Padding zero bytes, sealed at Seq.
+    //
+    static std::vector<unsigned char> SealRecord(ULONGLONG Seq, UCHAR InnerType, const std::string& Content, size_t Padding = 0)
+    {
+        std::vector<unsigned char> inner(Content.begin(), Content.end());
+        inner.push_back(InnerType);
+        inner.insert(inner.end(), Padding, 0);
+
+        const ULONG innerLength = C_CAST(ULONG, inner.size());
+        const ULONG recordLength = innerLength + TLS_TAG_LEN;
+
+        std::vector<unsigned char> record(5 + recordLength);
+        record[0] = 0x17;
+        record[1] = 0x03;
+        record[2] = 0x03;
+        record[3] = C_CAST(unsigned char, recordLength >> 8);
+        record[4] = C_CAST(unsigned char, recordLength & 0xFF);
+
+        EXPECT_EQ(STATUS_SUCCESS, BlorgTlsAeadEncrypt(
+            kServerWriteKey, kServerWriteIv, Seq,
+            record.data(), 5,
+            inner.data(), innerLength,
+            record.data() + 5, record.data() + 5 + innerLength));
+
+        return record;
+    }
+
+    //
+    // Each piece becomes one Deliver step, so one bulk receive takes one
+    // piece however the records fall across them.
+    //
+    void DeliverInPieces(const std::vector<std::vector<unsigned char>>& NewPieces)
+    {
+        Pieces = NewPieces;
+        Steps.clear();
+
+        for (const std::vector<unsigned char>& piece : Pieces)
+        {
+            Steps.push_back({ SandboxStepDeliver, piece.data(), piece.size(), STATUS_SUCCESS, TRUE });
+        }
+
+        SandboxSetPeerScript(Steps.data(), Steps.size());
+    }
+
+    void DeliverInPieces(const std::vector<std::vector<unsigned char>>& NewPieces, const SANDBOX_STEP& Last)
+    {
+        DeliverInPieces(NewPieces);
+        Steps.push_back(Last);
+        SandboxSetPeerScript(Steps.data(), Steps.size());
+    }
+
+    static std::vector<unsigned char> Join(const std::vector<std::vector<unsigned char>>& Records)
+    {
+        std::vector<unsigned char> joined;
+
+        for (const std::vector<unsigned char>& record : Records)
+        {
+            joined.insert(joined.end(), record.begin(), record.end());
+        }
+
+        return joined;
+    }
+
+    //
+    // Opens the Index-th record the client sent on its latest connection.
+    // Each is sealed at its own place in the client's sequence, so record
+    // Index opens only at sequence Index.
+    //
+    static ::testing::AssertionResult OpenClientRecord(size_t Index, std::string* Request, UCHAR* InnerType)
+    {
+        SIZE_T sentLength = 0;
+        const unsigned char* sent = SandboxLastRequest(&sentLength);
+        SIZE_T offset = 0;
+
+        for (size_t i = 0;; ++i)
+        {
+            if (offset + 5 > sentLength)
+            {
+                return ::testing::AssertionFailure() << "the client sent only " << i << " record(s)";
+            }
+
+            const ULONG recordLength = (C_CAST(ULONG, sent[offset + 3]) << 8) | sent[offset + 4];
+
+            if (0x17 != sent[offset] || recordLength < TLS_TAG_LEN + 1 || offset + 5 + recordLength > sentLength)
+            {
+                return ::testing::AssertionFailure() << "record " << i << " is not a whole application_data record";
+            }
+
+            if (i == Index)
+            {
+                const ULONG innerLength = recordLength - TLS_TAG_LEN;
+                std::vector<unsigned char> inner(innerLength);
+
+                NTSTATUS status = BlorgTlsAeadDecrypt(
+                    kClientWriteKey, kClientWriteIv, Index,
+                    sent + offset, 5,
+                    sent + offset + 5, innerLength, sent + offset + 5 + innerLength,
+                    inner.data());
+
+                if (!NT_SUCCESS(status))
+                {
+                    return ::testing::AssertionFailure() << "record " << i << " does not open at sequence " << Index;
+                }
+
+                *InnerType = inner.back();
+                Request->assign(C_CAST(const char*, inner.data()), innerLength - 1);
+                return ::testing::AssertionSuccess();
+            }
+
+            offset += 5 + recordLength;
+        }
+    }
+
+    NTSTATUS GetFileInformation()
+    {
+        wchar_t path[] = L"/media/file.bin";
+        UNICODE_STRING pathString = MakePath(path);
+
+        return BlorgHttpGetFileInformation(&pathString, OnFileInfo, nullptr);
+    }
+
+    static std::string FileInfoResponse()
+    {
+        return "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(sizeof(kFileInfo) - 1) + "\r\n\r\n" +
+            std::string(kFileInfo, sizeof(kFileInfo) - 1);
+    }
+
+    std::vector<std::vector<unsigned char>> Pieces;
+    std::vector<SANDBOX_STEP> Steps;
+    ULONG SavedRecvCapacity = 0;
+};
+
+//
+// Two requests over one kept-alive connection. Each goes out as a single
+// application_data record sealed under the client's write key, with the
+// request whole inside and 0x17 as its inner type, and the second one a
+// sequence number on from the first; each answer opens at the server's
+// next sequence number.
+//
+TEST_F(HttpClientTlsTest, RequestsAreSealedInSequenceOnAKeptAliveConnection)
+{
+    DeliverInPieces({ SealRecord(0, 0x17, FileInfoResponse()), SealRecord(1, 0x17, FileInfoResponse()) });
+
+    ASSERT_EQ(STATUS_PENDING, GetFileInformation());
+    Drain();
+    ASSERT_EQ(STATUS_PENDING, GetFileInformation());
+    Drain();
+
+    ASSERT_EQ(2, LastFileInfo.Calls);
+    EXPECT_EQ(STATUS_SUCCESS, LastFileInfo.Status);
+    EXPECT_EQ(4096u, LastFileInfo.Meta.Size);
+    EXPECT_EQ(1u, SandboxSocketsCreated()) << "the second request did not stay on the kept-alive connection";
+    EXPECT_EQ(1u, SandboxHandshakesStarted());
+
+    for (size_t i = 0; i < 2; ++i)
+    {
+        std::string request;
+        UCHAR innerType = 0;
+
+        ASSERT_TRUE(OpenClientRecord(i, &request, &innerType));
+        EXPECT_EQ(0x17, innerType) << "request " << i;
+        EXPECT_EQ(0u, request.find("GET /get_dir_entry_info?path=")) << request;
+        EXPECT_NE(std::string::npos, request.find("\r\n\r\n")) << "request " << i << " is not whole";
+    }
+}
+
+//
+// Records do not line up with receives. Here the first receive ends three
+// bytes into the first record's header, the second ends inside the second
+// record, and the third carries the rest of it and two more whole records,
+// all of which the drain loop opens without another receive. The body
+// lands in the caller's buffer in order. The last record's inner content
+// type is the one byte that overhangs the buffer, so it too goes through
+// the scratch, and the canary after the buffer checks that byte was not
+// written in place.
+//
+TEST_F(HttpClientTlsTest, RecordsSplitAcrossReceivesAndPackedTogetherAreReassembled)
+{
+    const std::vector<unsigned char> stream = Join({
+        SealRecord(0, 0x17, "HTTP/1.1 206 Partial Content\r\nContent-Length: 12\r\n\r\n"),
+        SealRecord(1, 0x17, "ABCD"),
+        SealRecord(2, 0x17, "EFGH"),
+        SealRecord(3, 0x17, "IJKL") });
+
+    const size_t firstCut = 3;
+    const size_t secondCut = stream.size() - 2 * (5 + 5 + TLS_TAG_LEN) - 10;
+
+    DeliverInPieces({
+        std::vector<unsigned char>(stream.begin(), stream.begin() + firstCut),
+        std::vector<unsigned char>(stream.begin() + firstCut, stream.begin() + secondCut),
+        std::vector<unsigned char>(stream.begin() + secondCut, stream.end()) });
+
+    const ULONG64 decryptedBefore = ShimStatistics.TlsRecordsDecrypted;
+
+    unsigned char target[12 + 16];
+    memset(target, 0xEE, sizeof(target));
+
+    ASSERT_EQ(STATUS_PENDING, Read(target, 12));
+    Drain();
+
+    ASSERT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_SUCCESS, LastRead.Status);
+    EXPECT_EQ(12u, LastRead.Bytes);
+    EXPECT_EQ(0, memcmp(target, "ABCDEFGHIJKL", 12));
+    EXPECT_EQ(decryptedBefore + 4, ShimStatistics.TlsRecordsDecrypted);
+
+    for (size_t i = 12; i < sizeof(target); ++i)
+    {
+        ASSERT_EQ(0xEE, target[i]) << "byte " << i << " past the caller's buffer was written";
+    }
+
+    FreeMdl();
+}
+
+//
+// The record that ends the body carries its inner content type and any
+// padding past the end of the caller's buffer, so it is opened into the
+// socket's scratch and only its content copied out. Nothing past the
+// buffer may be written, which the canary after it checks.
+//
+TEST_F(HttpClientTlsTest, FinalRecordOverhangingTheBufferIsCopiedFromScratch)
+{
+    DeliverInPieces({ Join({
+        SealRecord(0, 0x17, "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\n"),
+        SealRecord(1, 0x17, "WXYZ", 64) }) });
+
+    unsigned char target[4 + 80];
+    memset(target, 0xEE, sizeof(target));
+
+    ASSERT_EQ(STATUS_PENDING, Read(target, 4));
+    Drain();
+
+    ASSERT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_SUCCESS, LastRead.Status);
+    EXPECT_EQ(0, memcmp(target, "WXYZ", 4));
+
+    for (size_t i = 4; i < sizeof(target); ++i)
+    {
+        ASSERT_EQ(0xEE, target[i]) << "byte " << i << " past the caller's buffer was written";
+    }
+
+    FreeMdl();
+}
+
+//
+// A final record whose real content is longer than the room left is a
+// server sending more than the Content-Length it declared. The read fails
+// and nothing past the buffer is written.
+//
+TEST_F(HttpClientTlsTest, FinalRecordWithMoreContentThanRoomFailsTheRead)
+{
+    DeliverInPieces({ Join({
+        SealRecord(0, 0x17, "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\n"),
+        SealRecord(1, 0x17, "WXYZWXYZ") }) });
+
+    unsigned char target[4 + 80];
+    memset(target, 0xEE, sizeof(target));
+
+    ASSERT_EQ(STATUS_PENDING, Read(target, 4));
+    Drain();
+
+    ASSERT_EQ(1, LastRead.Calls);
+    EXPECT_FALSE(NT_SUCCESS(LastRead.Status));
+
+    for (size_t i = 4; i < sizeof(target); ++i)
+    {
+        ASSERT_EQ(0xEE, target[i]) << "byte " << i << " past the caller's buffer was written";
+    }
+
+    FreeMdl();
+}
+
+//
+// A server sends NewSessionTicket after the handshake, as an encrypted
+// record whose inner type is 0x16. There is no resumption cache to keep it
+// in, so it is opened and dropped, and the response behind it is read as if
+// it were not there.
+//
+TEST_F(HttpClientTlsTest, PostHandshakeMessageIsDiscarded)
+{
+    DeliverInPieces({ Join({
+        SealRecord(0, 0x16, std::string(40, '\x04')),
+        SealRecord(1, 0x17, FileInfoResponse()) }) });
+
+    ASSERT_EQ(STATUS_PENDING, GetFileInformation());
+    Drain();
+
+    ASSERT_EQ(1, LastFileInfo.Calls);
+    EXPECT_EQ(STATUS_SUCCESS, LastFileInfo.Status);
+    EXPECT_EQ(4096u, LastFileInfo.Meta.Size);
+    EXPECT_EQ(1u, SandboxSocketsCreated()) << "the ticket was taken for a broken connection";
+}
+
+//
+// A kept-alive connection the server closed with no close_notify: the next
+// request on the pooled socket sees the connection end before any of its
+// answer. That is the idle-close race, so it is retried once on a fresh
+// connection, which handshakes again and restarts both sequences at zero.
+//
+TEST_F(HttpClientTlsTest, PooledConnectionThePeerClosedIsRetriedWithAFreshHandshake)
+{
+    DeliverInPieces({ SealRecord(0, 0x17, FileInfoResponse()) }, CLOSE_STEP);
+
+    ASSERT_EQ(STATUS_PENDING, GetFileInformation());
+    Drain();
+    ASSERT_EQ(1u, SandboxSocketsPooled());
+
+    const ULONG64 retriesBefore = ShimStatistics.KeepAliveRetries;
+
+    ASSERT_EQ(STATUS_PENDING, GetFileInformation());
+    Drain();
+
+    ASSERT_EQ(2, LastFileInfo.Calls);
+    EXPECT_EQ(STATUS_SUCCESS, LastFileInfo.Status);
+    EXPECT_EQ(4096u, LastFileInfo.Meta.Size);
+    EXPECT_EQ(retriesBefore + 1, ShimStatistics.KeepAliveRetries);
+    EXPECT_EQ(2u, SandboxSocketsCreated());
+    EXPECT_EQ(2u, SandboxHandshakesStarted());
+
+    std::string request;
+    UCHAR innerType = 0;
+    EXPECT_TRUE(OpenClientRecord(0, &request, &innerType))
+        << "the retried request must be sealed from the fresh connection's first sequence number";
+}
+
+//
+// A server that idle-closes a kept-alive connection the way RFC 8446 6.1
+// asks sends close_notify first: an alert, so outer type 0x17 with inner
+// type 0x15 once opened. The next request on the pooled socket opens that
+// before any of its answer, which is the same race as a bare close and is
+// retried the same way. Taking the alert's two bytes as response, or
+// failing outright, would fail a read the server was willing to answer.
+//
+TEST_F(HttpClientTlsTest, PooledConnectionClosedWithCloseNotifyIsRetriedOnAFreshOne)
+{
+    DeliverInPieces({ SealRecord(0, 0x17, FileInfoResponse()), SealRecord(1, 0x15, std::string("\x01\x00", 2)) },
+        CLOSE_STEP);
+
+    ASSERT_EQ(STATUS_PENDING, GetFileInformation());
+    Drain();
+    ASSERT_EQ(1u, SandboxSocketsPooled());
+
+    const ULONG64 retriesBefore = ShimStatistics.KeepAliveRetries;
+
+    ASSERT_EQ(STATUS_PENDING, GetFileInformation());
+    Drain();
+
+    ASSERT_EQ(2, LastFileInfo.Calls);
+    EXPECT_EQ(STATUS_SUCCESS, LastFileInfo.Status);
+    EXPECT_EQ(4096u, LastFileInfo.Meta.Size);
+    EXPECT_EQ(retriesBefore + 1, ShimStatistics.KeepAliveRetries);
+    EXPECT_EQ(2u, SandboxSocketsCreated());
+    EXPECT_EQ(2u, SandboxHandshakesStarted());
+}
+
+//
+// Once the accumulator's free tail can no longer take a whole maximum-size
+// record, the partial record left in it is moved to the front before the
+// next receive. The accumulator here is one maximum-size record plus 2000
+// bytes, and the first receive brings a 3000-byte record and the first
+// 1000 bytes of a maximum-size one: the 15406 bytes still to come fit only
+// once the 1000 have been moved down and the cursors reset. Without the
+// move the receive is offered too little room and the read never
+// finishes; a move that got the length or the cursors wrong breaks the
+// record's tag.
+//
+TEST_F(HttpClientTlsTest, PartialRecordIsMovedToTheFrontWhenTheTailCannotTakeAWholeRecord)
+{
+    const ULONG maxRecord = 5 + TLS_RECORD_CIPHERTEXT_MAX;
+
+    SocketTlsRecvCapacity = maxRecord + 2000;
+
+    const std::string first(3000, 'a');
+    const std::string second(16384, 'b');
+
+    const std::vector<unsigned char> headers = SealRecord(0, 0x17,
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(first.size() + second.size()) + "\r\n\r\n");
+    const std::vector<unsigned char> firstRecord = SealRecord(1, 0x17, first);
+    const std::vector<unsigned char> secondRecord = SealRecord(2, 0x17, second);
+
+    ASSERT_EQ(maxRecord, secondRecord.size());
+
+    std::vector<unsigned char> arrival = Join({ headers, firstRecord });
+    arrival.insert(arrival.end(), secondRecord.begin(), secondRecord.begin() + 1000);
+
+    DeliverInPieces({ arrival, std::vector<unsigned char>(secondRecord.begin() + 1000, secondRecord.end()) });
+
+    std::vector<unsigned char> target(first.size() + second.size());
+
+    ASSERT_EQ(STATUS_PENDING, Read(target.data(), target.size()));
+    Drain();
+
+    ASSERT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_SUCCESS, LastRead.Status);
+    EXPECT_EQ(target.size(), LastRead.Bytes);
+    EXPECT_EQ(0, memcmp(target.data(), (first + second).data(), target.size()));
+
+    FreeMdl();
+}
+
 } // namespace

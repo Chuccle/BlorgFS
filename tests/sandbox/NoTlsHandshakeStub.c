@@ -27,11 +27,11 @@
 // PASSIVE_LEVEL, which the real one's CNG calls do not allow; and traffic
 // keys. A completed handshake leaves them on the socket and imports their
 // handles, as the real key schedule does, so the client's record layer
-// runs for real: a request is sealed and sent, and a scenario scripts the
-// records that come back. The keys are all zero. The import needs the CNG
-// providers a scenario opens with BlorgTlsGlobalInit; without them it is
-// refused and the handles stay NULL, which a scenario that never sends a
-// record does not notice.
+// runs for real. The keys are all zero until a scenario sets its own,
+// and then it can seal the server's records and open the client's with
+// Tls.c's own AEAD. The import needs the CNG providers a scenario opens
+// with BlorgTlsGlobalInit; without them it is refused and the handles
+// stay NULL, which a scenario that never sends a record does not notice.
 //
 static ULONG FailHandshakesRemaining;
 static NTSTATUS FailHandshakesStatus;
@@ -55,6 +55,22 @@ VOID SandboxResetHandshakes(VOID)
     FailHandshakesStatus = STATUS_SUCCESS;
     HandshakesStarted = 0;
     HandshakesAbovePassive = 0;
+    RtlZeroMemory(ClientWriteKey, TLS_KEY_LEN);
+    RtlZeroMemory(ClientWriteIv, TLS_IV_LEN);
+    RtlZeroMemory(ServerWriteKey, TLS_KEY_LEN);
+    RtlZeroMemory(ServerWriteIv, TLS_IV_LEN);
+}
+
+VOID SandboxSetTrafficKeys(
+    const UCHAR* ClientKey,
+    const UCHAR* ClientIv,
+    const UCHAR* ServerKey,
+    const UCHAR* ServerIv)
+{
+    RtlCopyMemory(ClientWriteKey, ClientKey, TLS_KEY_LEN);
+    RtlCopyMemory(ClientWriteIv, ClientIv, TLS_IV_LEN);
+    RtlCopyMemory(ServerWriteKey, ServerKey, TLS_KEY_LEN);
+    RtlCopyMemory(ServerWriteIv, ServerIv, TLS_IV_LEN);
 }
 
 //
