@@ -648,7 +648,6 @@ static BOOLEAN DriverHostStringIsIpLiteral(PCUNICODE_STRING HostString)
 // the same window, and every early return from there on therefore tears the
 // client back down.
 //
-//
 // The fast-I/O table is zeroed before it is published, not after: nothing
 // can dispatch yet, since no device object exists, but publishing a pointer
 // to uninitialised storage and filling it lines later is an ordering one

@@ -1023,7 +1023,6 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 // unless the volume handler returns STATUS_PENDING (async HTTP fetch or
 // a pending notify registration).
 //
-//
 // One switch body covers everything that is not the volume, unknown kinds
 // included -- the same unconditional-completion rule as BlorgRead's switch
 // and for the same reason: the cases complete inside themselves, so a kind

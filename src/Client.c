@@ -120,14 +120,6 @@
 #define HTTP_CONNECT_ATTEMPTS 4u
 
 //
-// Checked SIZE_T addition. Returns FALSE (and leaves *Result unspecified)
-// on overflow instead of wrapping. Every BodyOffset + ContentLength
-// computation in this file -- combining a wire-parsed, untrusted length
-// with another value -- must go through this: a wrapped sum can make a
-// too-small buffer look big enough to a naive size check, turning
-// overflow into an out-of-bounds read/write primitive.
-//
-//
 // In-flight request gate, and why it is a base-referenced count rather
 // than a rundown reference.
 //
@@ -194,6 +186,14 @@ static VOID HttpReleaseActive(VOID)
     }
 }
 
+//
+// Checked SIZE_T addition. Returns FALSE (and leaves *Result unspecified)
+// on overflow instead of wrapping. Every BodyOffset + ContentLength
+// computation in this file -- combining a wire-parsed, untrusted length
+// with another value -- must go through this: a wrapped sum can make a
+// too-small buffer look big enough to a naive size check, turning
+// overflow into an out-of-bounds read/write primitive.
+//
 static BOOLEAN HttpCheckedAddSizeT(SIZE_T A, SIZE_T B, PSIZE_T Result)
 {
     SIZE_T sum = A + B;
@@ -505,13 +505,6 @@ typedef struct _HTTP_CONTEXT
     LONG64 SendQpc;
 
     //
-    // QPC stamp taken when the send completion fires, splitting the
-    // pre-first-byte time once more: SendQpc to here is the request going
-    // out and WSK telling us so, here to HeadersQpc is genuine wait on the
-    // peer. A usermode client's TTFB is the second of those, so only the
-    // second is a like-for-like comparison.
-    //
-    //
     // QPC stamp taken just before the send is issued, splitting the send
     // span once more. It cannot be taken after: the send may complete, and
     // the request with it, before the issue returns.
@@ -526,6 +519,13 @@ typedef struct _HTTP_CONTEXT
     //
     LONG64 SendIssuedQpc;
 
+    //
+    // QPC stamp taken when the send completion fires, splitting the
+    // pre-first-byte time once more: SendQpc to here is the request going
+    // out and WSK telling us so, here to HeadersQpc is genuine wait on the
+    // peer. A usermode client's TTFB is the second of those, so only the
+    // second is a like-for-like comparison.
+    //
     LONG64 SendDoneQpc;
 
     //
@@ -538,7 +538,6 @@ typedef struct _HTTP_CONTEXT
     // distinguishes them.
     //
     LONG64 SocketQpc;
-
 } HTTP_CONTEXT;
 
 static VOID HttpKick(HTTP_CONTEXT* Ctx);
