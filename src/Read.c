@@ -1500,10 +1500,10 @@ static VOID ReadRefetchWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // The NonCachedReads/NonCachedReadBytes pair is counted only on an IRP's
 // first pass through here, gated on IRP_CONTEXT_FLAG_IN_FSP. A read that
 // cannot issue inline is posted to the FSP, whose worker re-enters this
-// same function on the same IRP -- so counting unconditionally scored
-// every posted read twice, and when every non-paging non-cached read
-// posted, both counters read 2x reality for them. That matters beyond this driver's own telemetry:
-// NonCachedReads feeds the standard FAT_STATISTICS surface that
+// same function on the same IRP -- so counting unconditionally scored every
+// posted read twice, and when every non-paging non-cached read posted, both
+// counters read 2x reality for them. That matters beyond this driver's own
+// telemetry: NonCachedReads feeds the standard FAT_STATISTICS surface that
 // fsutil reports.
 //
 // The cached path delays CcInitializeCacheMap until the first read, in

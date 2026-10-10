@@ -141,22 +141,24 @@ NTSTATUS BlorgTlsAeadDecrypt(
     UCHAR* TLS_RESTRICT PlaintextOut);
 
 //
-// BlorgTlsAeadEncrypt/BlorgTlsAeadDecrypt's per-call BCryptOpenAlgorithmProvider +
-// BCryptGenerateSymmetricKey are PASSIVE_LEVEL-only, which would force a
-// PASSIVE bounce on every record-layer read/write. Instead the AES-GCM
-// provider is opened once, for the driver's lifetime, with
-// BCRYPT_PROV_DISPATCH -- that flag makes subsequent operations on handles
-// derived from it (BCryptGenerateSymmetricKey, BCryptEncrypt, BCryptDecrypt,
-// BCryptDestroyKey) usable at DISPATCH_LEVEL. BlorgTlsGlobalInit/BlorgTlsGlobalCleanup
-// own that handle (called from DriverEntry/BlorgDriverUnload, always PASSIVE);
-// BlorgTlsImportKeyHandle mints a per-connection, DISPATCH-usable
-// BCRYPT_KEY_HANDLE from it once the handshake derives application traffic
-// keys (TlsHandshakeSendClientFinished, already at PASSIVE);
-// BlorgTlsAeadEncryptKeyed/BlorgTlsAeadDecryptKeyed then run per-record crypto
-// against that cached handle with no PASSIVE-only calls. The plain,
-// raw-key-bytes BlorgTlsAeadEncrypt/BlorgTlsAeadDecrypt above remain used by the
-// handshake itself, which runs only a handful of times per connection and
-// is already PASSIVE.
+// BlorgTlsAeadEncrypt/BlorgTlsAeadDecrypt's per-call
+// BCryptOpenAlgorithmProvider + BCryptGenerateSymmetricKey are
+// PASSIVE_LEVEL-only, which would force a PASSIVE bounce on every
+// record-layer read/write. Instead the AES-GCM provider is opened once, for
+// the driver's lifetime, with BCRYPT_PROV_DISPATCH -- that flag makes
+// subsequent operations on handles derived from it
+// (BCryptGenerateSymmetricKey, BCryptEncrypt, BCryptDecrypt,
+// BCryptDestroyKey) usable at DISPATCH_LEVEL.
+// BlorgTlsGlobalInit/BlorgTlsGlobalCleanup own that handle (called from
+// DriverEntry/BlorgDriverUnload, always PASSIVE); BlorgTlsImportKeyHandle
+// mints a per-connection, DISPATCH-usable BCRYPT_KEY_HANDLE from it once
+// the handshake derives application traffic keys
+// (TlsHandshakeSendClientFinished, already at PASSIVE);
+// BlorgTlsAeadEncryptKeyed/BlorgTlsAeadDecryptKeyed then run per-record
+// crypto against that cached handle with no PASSIVE-only calls. The plain,
+// raw-key-bytes BlorgTlsAeadEncrypt/BlorgTlsAeadDecrypt above remain used
+// by the handshake itself, which runs only a handful of times per
+// connection and is already PASSIVE.
 //
 NTSTATUS BlorgTlsGlobalInit(VOID);
 VOID BlorgTlsGlobalCleanup(VOID);
@@ -171,12 +173,12 @@ NTSTATUS BlorgTlsAeadEncryptKeyed(
 
 //
 // Ciphertext/PlaintextOut are deliberately NOT restrict-qualified here,
-// unlike BlorgTlsAeadDecrypt/BlorgTlsAeadEncrypt above -- the record-layer receive
-// path calls this with Ciphertext == PlaintextOut, decrypting a TLS record
-// in place straight into the destination MDL to avoid a copy. BCryptDecrypt
-// allows this ("pbInput and pbOutput can be equal, in which case this
-// function will perform the decryption in place"); they may only be
-// unequal if fully disjoint, with no partial overlap.
+// unlike BlorgTlsAeadDecrypt/BlorgTlsAeadEncrypt above -- the record-layer
+// receive path calls this with Ciphertext == PlaintextOut, decrypting a TLS
+// record in place straight into the destination MDL to avoid a copy.
+// BCryptDecrypt allows this ("pbInput and pbOutput can be equal, in which
+// case this function will perform the decryption in place"); they may only
+// be unequal if fully disjoint, with no partial overlap.
 //
 NTSTATUS BlorgTlsAeadDecryptKeyed(
     BCRYPT_KEY_HANDLE KeyHandle, const UCHAR StaticIv[TLS_IV_LEN], ULONGLONG SeqNum,
@@ -380,9 +382,10 @@ typedef struct _TLS_CONNECTION_STATE
     //
     //  Cached BCRYPT_KEY_HANDLEs imported (BlorgTlsImportKeyHandle) from
     //  WriteKey/ReadKey once the handshake derives them
-    //  (TlsHandshakeSendClientFinished) -- what makes the record-layer
-    //  hot path DISPATCH-safe; see BlorgTlsAeadEncryptKeyed/BlorgTlsAeadDecryptKeyed
-    //  above. NULL until the handshake completes. Destroyed by
+    //  (TlsHandshakeSendClientFinished) -- what makes the record-layer hot
+    //  path DISPATCH-safe; see
+    //  BlorgTlsAeadEncryptKeyed/BlorgTlsAeadDecryptKeyed above. NULL until
+    //  the handshake completes. Destroyed by
     //  BlorgTlsDestroyConnectionState.
     //
     BCRYPT_KEY_HANDLE WriteKeyHandle; // imported handle for WriteKey, DISPATCH-usable

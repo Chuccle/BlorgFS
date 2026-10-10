@@ -979,11 +979,11 @@ static NTSTATUS TlsHandshakeProcessFlightMessages(PTLS_HANDSHAKE_CONTEXT Ctx, BO
 // DISPATCH-usable key handles (WriteKeyHandle/ReadKeyHandle) are cached
 // alongside the raw key bytes right after -- this is what lets the
 // record-layer hot path (ordinary HTTP read/write once this handshake
-// completes) call BlorgTlsAeadEncryptKeyed/BlorgTlsAeadDecryptKeyed without ever
-// needing a PASSIVE bounce. Safe to do here: this whole function only
+// completes) call BlorgTlsAeadEncryptKeyed/BlorgTlsAeadDecryptKeyed without
+// ever needing a PASSIVE bounce. Safe to do here: this whole function only
 // runs within the handshake's own PASSIVE-bounced completion chain (see
-// TlsHandshakeOnReceiveRecordPayload), and BlorgTlsImportKeyHandle has no IRQL
-// restriction of its own.
+// TlsHandshakeOnReceiveRecordPayload), and BlorgTlsImportKeyHandle has no
+// IRQL restriction of its own.
 //
 // The client Finished plaintext's trailing byte is the inner content
 // type (0x16, handshake), per RFC 8446 5.2's TLSInnerPlaintext.

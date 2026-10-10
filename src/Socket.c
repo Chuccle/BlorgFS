@@ -154,8 +154,8 @@ static LONG SocketPrewarmShuttingDown;
 // Carries a step completed above PASSIVE_LEVEL to its handshake or to
 // SocketPrewarmStepAccount. One is enough: only one step is ever in flight,
 // and it queues the item at most once at a time -- the handshake's
-// completion can queue it again only after the handshake worker has run. Allocated by the first fill, freed by teardown
-// once nothing is in flight.
+// completion can queue it again only after the handshake worker has run.
+// Allocated by the first fill, freed by teardown once nothing is in flight.
 //
 static PIO_WORKITEM SocketPrewarmWorkItem;
 
@@ -172,7 +172,8 @@ static PIO_WORKITEM SocketPrewarmWorkItem;
 static BOOLEAN SocketPrewarmPumpRunning;
 static BOOLEAN SocketPrewarmPumpPending;
 
-// SocketCloseWskSocket is defined below but referenced earlier (BlorgCleanupWskSocketPool).
+// SocketCloseWskSocket is defined below but referenced earlier
+// (BlorgCleanupWskSocketPool).
 static NTSTATUS SocketCloseWskSocket(PKSOCKET Socket);
 
 //
@@ -745,10 +746,10 @@ VOID BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo)
 //
 // Synchronously closes a socket and frees its KSOCKET, including TLS
 // connection state. PASSIVE_LEVEL only (blocks waiting for the close IRP);
-// use BlorgCloseWskSocketAsync from the DISPATCH_LEVEL completion chain instead.
-// If the IRP allocation fails, the KSOCKET is still freed -- there is no
-// path that lets the caller retry a close, and leaking the struct on an
-// already-rare allocation failure is worse than leaking the (already
+// use BlorgCloseWskSocketAsync from the DISPATCH_LEVEL completion chain
+// instead. If the IRP allocation fails, the KSOCKET is still freed -- there
+// is no path that lets the caller retry a close, and leaking the struct on
+// an already-rare allocation failure is worse than leaking the (already
 // broken) underlying socket.
 //
 static NTSTATUS SocketCloseWskSocket(PKSOCKET Socket)
@@ -778,12 +779,13 @@ static NTSTATUS SocketCloseWskSocket(PKSOCKET Socket)
 }
 
 //
-// Fire-and-forget close. Unlike SocketCloseWskSocket, this never waits, so it is
-// safe to call from the WSK completion routines (<= DISPATCH_LEVEL) that
-// drive the async HTTP pipeline. The IRP, the KSOCKET, and this context are
-// all owned by SocketCloseAsyncCompletionRoutine once WskCloseSocket is
-// issued, and freed there. Use the synchronous SocketCloseWskSocket only for
-// PASSIVE_LEVEL teardown (BlorgCleanupWskSocketPool).
+// Fire-and-forget close. Unlike SocketCloseWskSocket, this never waits, so
+// it is safe to call from the WSK completion routines (<= DISPATCH_LEVEL)
+// that drive the async HTTP pipeline. The IRP, the KSOCKET, and this
+// context are all owned by SocketCloseAsyncCompletionRoutine once
+// WskCloseSocket is issued, and freed there. Use the synchronous
+// SocketCloseWskSocket only for PASSIVE_LEVEL teardown
+// (BlorgCleanupWskSocketPool).
 //
 
 // Context for a single async socket close, owned by its completion routine.
@@ -1241,9 +1243,9 @@ static VOID SocketPrewarmPump(VOID)
 // Only the family-sized address is copied. The caller hands a PSOCKADDR at
 // an object sized for its family -- DriverEntry passes ai_addr, the sandbox
 // tests a stack SOCKADDR_IN -- so copying a full SOCKADDR_STORAGE would
-// read past its end. Every consumer of SocketPrewarmAddress (SocketAddressEqual,
-// WskSocketConnect, the per-socket RemoteAddress copy) honours the family
-// size too.
+// read past its end. Every consumer of SocketPrewarmAddress
+// (SocketAddressEqual, WskSocketConnect, the per-socket RemoteAddress copy)
+// honours the family size too.
 //
 // The copy is taken before the lock, onto the stack: ai_addr comes back from
 // WskGetAddressInfo in paged pool, so it cannot be read at DISPATCH_LEVEL
@@ -1295,18 +1297,18 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 }
 
 //
-// Pool ownership model: a KSOCKET handed out by BlorgAcquireReusableWskSocketAsync
-// belongs exclusively to that caller until it is passed back to
-// BlorgReleaseReusableWskSocket (or closed on failure). It should not be used
-// concurrently from more than one thread/operation at a time -- each
-// send/receive/close allocates its own IRP per call, so concurrent
-// use on one socket is a correctness issue (interleaved writes/reads on
-// the wire) rather than a kernel-memory hazard, but it's still not a
-// supported usage pattern. The pool itself does not need its own
-// busy-tracking beyond list membership: a socket is either "in the list"
-// (idle, owned by the pool) or "out" (owned by exactly one caller), and
-// the spinlock only ever protects list membership transitions, never an
-// in-flight I/O operation.
+// Pool ownership model: a KSOCKET handed out by
+// BlorgAcquireReusableWskSocketAsync belongs exclusively to that caller
+// until it is passed back to BlorgReleaseReusableWskSocket (or closed on
+// failure). It should not be used concurrently from more than one
+// thread/operation at a time -- each send/receive/close allocates its own
+// IRP per call, so concurrent use on one socket is a correctness issue
+// (interleaved writes/reads on the wire) rather than a kernel-memory
+// hazard, but it's still not a supported usage pattern. The pool itself
+// does not need its own busy-tracking beyond list membership: a socket is
+// either "in the list" (idle, owned by the pool) or "out" (owned by exactly
+// one caller), and the spinlock only ever protects list membership
+// transitions, never an in-flight I/O operation.
 //
 // LIFO: the most recently used connection goes back on the head,
 // where BlorgAcquireReusableWskSocketAsync's RemoveHeadList will hand it
@@ -1316,8 +1318,9 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 // sized by actual concurrency and lets the tail go cold.
 //
 // Called from the async HTTP pipeline at DISPATCH_LEVEL, so a socket that
-// doesn't fit in the pool is closed via the non-blocking BlorgCloseWskSocketAsync
-// rather than the synchronous SocketCloseWskSocket.
+// doesn't fit in the pool is closed via the non-blocking
+// BlorgCloseWskSocketAsync rather than the synchronous
+// SocketCloseWskSocket.
 //
 NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket)
 {

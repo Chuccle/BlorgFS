@@ -1,11 +1,12 @@
 ﻿#include "Driver.h"
 
 //
-// FILE_FS_XXX_INFORMATION query/set handlers (IRP_MJ_QUERY/SET_VOLUME_INFORMATION).
-// Reports static volume/device/attribute info; size classes report zeroed
-// (unknown) capacity in allocation units, but a non-zero sector and cluster
-// size (Driver.h), since GetDiskFreeSpace callers divide by the cluster
-// size. Volume is read-only, so set-volume-information is a no-op stub.
+// FILE_FS_XXX_INFORMATION query/set handlers
+// (IRP_MJ_QUERY/SET_VOLUME_INFORMATION). Reports static
+// volume/device/attribute info; size classes report zeroed (unknown)
+// capacity in allocation units, but a non-zero sector and cluster size
+// (Driver.h), since GetDiskFreeSpace callers divide by the cluster size.
+// Volume is read-only, so set-volume-information is a no-op stub.
 //
 // FileFsAttributeInformation deliberately does NOT advertise
 // FILE_CASE_SENSITIVE_SEARCH. Every name comparison this driver makes is

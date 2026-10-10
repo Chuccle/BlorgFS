@@ -87,8 +87,8 @@ typedef struct _KSOCKET
 
     //
     // Address this socket is connected to. Set once at creation time and
-    // never changed; used by BlorgAcquireReusableWskSocketAsync to refuse handing
-    // out a pooled socket connected to a stale/different target.
+    // never changed; used by BlorgAcquireReusableWskSocketAsync to refuse
+    // handing out a pooled socket connected to a stale/different target.
     //
     SOCKADDR_STORAGE RemoteAddress;
 

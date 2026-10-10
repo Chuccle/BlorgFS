@@ -8,12 +8,12 @@
 //
 // Drives a full TLS 1.3 handshake (ClientHello through client Finished)
 // over an already-connected KSOCKET, using the same async WSK primitives
-// (BlorgSendWskAsync/BlorgReceiveWskAsync) and completion-chain idioms as the HTTP
-// client (Client.c) -- including its stack-safety discipline for
-// synchronous completion chains (see HttpIssueReceive's comment there
-// for why that matters). This is the kernel-specific I/O-driving glue;
-// the actual protocol logic (message construction/parsing, key
-// schedule, crypto) lives entirely in Tls.c.
+// (BlorgSendWskAsync/BlorgReceiveWskAsync) and completion-chain idioms as
+// the HTTP client (Client.c) -- including its stack-safety discipline for
+// synchronous completion chains (see HttpIssueReceive's comment there for
+// why that matters). This is the kernel-specific I/O-driving glue; the
+// actual protocol logic (message construction/parsing, key schedule,
+// crypto) lives entirely in Tls.c.
 //
 
 typedef VOID(*PBLORG_TLS_HANDSHAKE_COMPLETION)(NTSTATUS Status, PVOID CallerContext);

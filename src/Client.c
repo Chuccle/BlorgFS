@@ -1864,11 +1864,11 @@ static BOOLEAN HttpMustBounceToPassive(const HTTP_CONTEXT* Ctx)
 // handshake stage. So a file read on a plaintext connection needs no work
 // item up front, and skipping it takes one pool allocation and one free off
 // every chunk on the read hot path. The idle-close retry, which is rare,
-// allocates one itself when it has to (see HttpKick). global.TlsEnabled is sampled here, at the one point
-// where an allocation failure can still be reported to the caller, rather
-// than at handshake time; HttpKick re-checks for NULL so that flipping
-// the flag live (the debugger poke documented in Driver.h) degrades to a
-// failed request rather than a NULL dereference.
+// allocates one itself when it has to (see HttpKick). global.TlsEnabled is
+// sampled here, at the one point where an allocation failure can still be
+// reported to the caller, rather than at handshake time; HttpKick re-checks
+// for NULL so that flipping the flag live (the debugger poke documented in
+// Driver.h) degrades to a failed request rather than a NULL dereference.
 //
 static BOOLEAN HttpNeedsWorkItem(HTTP_OPERATION Operation)
 {
@@ -3128,13 +3128,14 @@ static NTSTATUS HttpParseHeaders(HTTP_CONTEXT* Ctx)
 // Deserializes the response body per Ctx->Operation and fires the caller's
 // completion callback on success, clearing Completion.*.Routine so
 // HttpComplete does not invoke it a second time (dirInfo ownership
-// transfers to the caller with one reference, dropped with BlorgReleaseDirectoryInfo). Must
-// run at PASSIVE (see HttpDispatch/HttpMustBounceToPassive) since flatcc
-// and the callbacks require it. For HttpOpFileRead in zero-copy mode, the
-// body is already in the caller's MDL, so there is nothing to hand over --
-// BodyBuffer/BaseAddress are NULL (BlorgFreeHttpFile on a NULL BaseAddress is a
-// no-op) and only the byte count is meaningful; in buffer mode, ownership
-// of Ctx->Buffer transfers to the caller via BaseAddress (see
+// transfers to the caller with one reference, dropped with
+// BlorgReleaseDirectoryInfo). Must run at PASSIVE (see
+// HttpDispatch/HttpMustBounceToPassive) since flatcc and the callbacks
+// require it. For HttpOpFileRead in zero-copy mode, the body is already in
+// the caller's MDL, so there is nothing to hand over --
+// BodyBuffer/BaseAddress are NULL (BlorgFreeHttpFile on a NULL BaseAddress
+// is a no-op) and only the byte count is meaningful; in buffer mode,
+// ownership of Ctx->Buffer transfers to the caller via BaseAddress (see
 // HttpFreeContext).
 //
 static VOID HttpDispatchInline(HTTP_CONTEXT* Ctx)
@@ -4071,7 +4072,8 @@ VOID BlorgFreeHttpFile(PFILE_BUFFER FileBuffer)
     }
 }
 
-// Frees a batch BlorgHttpGetChanges delivered; one allocation, see HttpDeserializeChangeBatch.
+// Frees a batch BlorgHttpGetChanges delivered; one allocation, see
+// HttpDeserializeChangeBatch.
 VOID BlorgFreeChangeBatch(PCHANGE_BATCH Batch)
 {
     if (Batch)
@@ -4089,7 +4091,8 @@ NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRI
     return BlorgGetWskAddrInfo(NodeName, ServiceName, Hints, RemoteAddrInfo);
 }
 
-// Thin wrapper over BlorgFreeWskAddrInfo; frees results from BlorgGetHttpAddrInfo.
+// Thin wrapper over BlorgFreeWskAddrInfo; frees results from
+// BlorgGetHttpAddrInfo.
 VOID BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo)
 {
     BlorgFreeWskAddrInfo(AddrInfo);

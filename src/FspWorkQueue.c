@@ -402,14 +402,15 @@ NTSTATUS BlorgPrePostIrp(
 }
 
 //
-//  PostIrpRoutine handed to FsRtlCheckOplock / FsRtlOplockFsctrl. The oplock
-//  package calls this, then parks the IRP in its own queue -- making it
-//  eligible for asynchronous completion by a break acknowledgement on another
-//  CPU -- before it returns STATUS_PENDING. Nothing else marks the IRP pending
-//  on that path (it never reaches our CSQ until BlorgOplockComplete re-queues it),
-//  and marking after FsRtlCheckOplock returns would race that completion, so we
-//  must mark here, before the package parks it. The BlorgFsdPostRequest path uses
-//  plain BlorgPrePostIrp instead and lets IoCsqInsertIrp do the marking.
+//  PostIrpRoutine handed to FsRtlCheckOplock / FsRtlOplockFsctrl. The
+//  oplock package calls this, then parks the IRP in its own queue -- making
+//  it eligible for asynchronous completion by a break acknowledgement on
+//  another CPU -- before it returns STATUS_PENDING. Nothing else marks the
+//  IRP pending on that path (it never reaches our CSQ until
+//  BlorgOplockComplete re-queues it), and marking after FsRtlCheckOplock
+//  returns would race that completion, so we must mark here, before the
+//  package parks it. The BlorgFsdPostRequest path uses plain
+//  BlorgPrePostIrp instead and lets IoCsqInsertIrp do the marking.
 //
 //  Unlike BlorgFsdPostRequest, a buffer-lock failure cannot be turned into a
 //  fail-fast here: by the time the package invokes this routine it has
@@ -496,8 +497,9 @@ NTSTATUS BlorgFsdRequeueRequest(
 //
 // Oplock-break completion callback: on a granted/acknowledged oplock,
 // re-queues the parked IRP to the FSP workers to resume normal dispatch;
-// otherwise completes it with the failure status. Mirrors BlorgOplockPrePostIrp's
-// pending/parking side of the FsRtlCheckOplock contract.
+// otherwise completes it with the failure status. Mirrors
+// BlorgOplockPrePostIrp's pending/parking side of the FsRtlCheckOplock
+// contract.
 //
 // The ThreadsActive gate is the same one BlorgFsdPostRequest and
 // BlorgFsdRequeueRequest consult, and here it is not the advisory
