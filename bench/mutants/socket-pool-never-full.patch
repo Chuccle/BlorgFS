@@ -1,0 +1,13 @@
+diff --git a/src/Socket.c b/src/Socket.c
+index 70e33b6..5f37207 100644
+--- a/src/Socket.c
++++ b/src/Socket.c
+@@ -1329,7 +1329,7 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket)
+     KIRQL oldIrql;
+     KeAcquireSpinLock(&SocketPool.Lock, &oldIrql);
+ 
+-    if (SocketPool.Count >= SocketMaxPoolSize)
++    if (FALSE)
+     {
+         KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+         BLORGFS_STAT_INC(ConnectionsClosedPoolFull);

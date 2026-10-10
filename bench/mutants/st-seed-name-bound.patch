@@ -1,0 +1,13 @@
+diff --git a/src/PathCache.c b/src/PathCache.c
+index 7151d33..7e8d47f 100644
+--- a/src/PathCache.c
++++ b/src/PathCache.c
+@@ -949,7 +949,7 @@ VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
+ //
+ static BOOLEAN PathCacheIsComponent(const WCHAR* Name, SIZE_T NameLength)
+ {
+-    if (0 == NameLength || NameLength >= MAX_NAME_LEN)
++    if (0 == NameLength || NameLength > MAX_NAME_LEN)
+     {
+         return FALSE;
+     }

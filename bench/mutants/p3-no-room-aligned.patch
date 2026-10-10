@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index 02b7f92..4f2a2f5 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2871,7 +2871,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
+                 }
+             }
+ 
+-            NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, Ctx->BodyEndOffset + 1);
++            NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, Ctx->BodyEndOffset);
+ 
+             if (!NT_SUCCESS(growResult))
+             {

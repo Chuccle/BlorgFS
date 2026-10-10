@@ -1,0 +1,13 @@
+diff --git a/src/PathCache.c b/src/PathCache.c
+index 9eba914..8958238 100644
+--- a/src/PathCache.c
++++ b/src/PathCache.c
+@@ -226,7 +226,7 @@ static VOID PathCacheAdvanceSequence(VOID)
+ //
+ static LONG64 ListingCacheSizeOf(const DIRECTORY_INFO* Listing)
+ {
+-    return C_CAST(LONG64, Listing->Bytes);
++    return C_CAST(LONG64, sizeof(DIRECTORY_INFO));
+ }
+ 
+ //

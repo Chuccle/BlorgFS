@@ -1,0 +1,13 @@
+diff --git a/src/Create.c b/src/Create.c
+index 9e00ae2..fc6f587 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -606,7 +606,7 @@ static BOOLEAN CreateFindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRI
+         return FALSE;
+     }
+ 
+-    if (entry < Listing->FileCount)
++    if (entry <= Listing->FileCount)
+     {
+         PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(Listing, entry);
+ 

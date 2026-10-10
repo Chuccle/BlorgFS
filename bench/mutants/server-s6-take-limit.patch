@@ -1,0 +1,13 @@
+diff --git a/src/utils/cache.rs b/src/utils/cache.rs
+index cee7cfc..be7d76e 100644
+--- a/src/utils/cache.rs
++++ b/src/utils/cache.rs
+@@ -1074,7 +1074,7 @@ fn load_content(
+ 
+     let mut data = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+     file.by_ref()
+-        .take(limit.saturating_add(1))
++        .take(limit)
+         .read_to_end(&mut data)?;
+ 
+     // Trust what was actually read over what the metadata claimed. A file

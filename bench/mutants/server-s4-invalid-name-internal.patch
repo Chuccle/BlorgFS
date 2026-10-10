@@ -1,0 +1,12 @@
+diff --git a/src/error.rs b/src/error.rs
+index f09da81..4162b74 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -32,7 +32,6 @@ impl From<std::io::Error> for AppError {
+         match error.kind() {
+             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => Self::NotFound,
+             std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+-            std::io::ErrorKind::InvalidFilename => Self::BadRequest,
+             _ => Self::Internal,
+         }
+     }

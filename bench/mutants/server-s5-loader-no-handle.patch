@@ -1,0 +1,13 @@
+diff --git a/src/utils/cache.rs b/src/utils/cache.rs
+index cee7cfc..c3a7891 100644
+--- a/src/utils/cache.rs
++++ b/src/utils/cache.rs
+@@ -1069,7 +1069,7 @@ fn load_content(
+     }
+ 
+     if metadata.len() > limit {
+-        return Ok((Content::Streamed, Some(file)));
++        return Ok((Content::Streamed, None));
+     }
+ 
+     let mut data = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));

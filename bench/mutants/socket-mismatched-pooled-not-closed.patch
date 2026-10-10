@@ -1,0 +1,12 @@
+diff --git a/src/Socket.c b/src/Socket.c
+index 70e33b6..de820bf 100644
+--- a/src/Socket.c
++++ b/src/Socket.c
+@@ -1689,7 +1689,6 @@ NTSTATUS BlorgAcquireReusableWskSocketAsync(
+                 return STATUS_PENDING;
+             }
+ 
+-            BlorgCloseWskSocketAsync(pooledSocket);
+         }
+         else
+         {

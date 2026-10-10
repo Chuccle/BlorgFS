@@ -1,0 +1,13 @@
+diff --git a/src/DirCtrl.c b/src/DirCtrl.c
+index 589a4b4..bfaea7c 100644
+--- a/src/DirCtrl.c
++++ b/src/DirCtrl.c
+@@ -932,7 +932,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+                             returnSingleEntry,
+                             buffer,
+                             remainingLength,
+-                            (!Irp->MdlAddress) ? Irp->RequestorMode : KernelMode,
++                            Irp->RequestorMode,
+                             scratch,
+                             fill,
+                             &used,

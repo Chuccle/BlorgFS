@@ -1,0 +1,16 @@
+diff --git a/src/Client.c b/src/Client.c
+index 695a8cc..87ea265 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -3794,6 +3794,11 @@ static NTSTATUS HttpGetFileCommon(
+         return STATUS_INVALID_PARAMETER;
+     }
+ 
++    if (!TargetMdl && (capacity < (PAGE_SIZE * 64)))
++    {
++        capacity = PAGE_SIZE * 64;
++    }
++
+     HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpFileRead, 206, capacity);
+ 
+     if (!ctx)

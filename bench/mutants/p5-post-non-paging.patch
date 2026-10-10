@@ -1,0 +1,13 @@
+diff --git a/src/Read.c b/src/Read.c
+index 04a7049..740a5c3 100644
+--- a/src/Read.c
++++ b/src/Read.c
+@@ -1646,7 +1646,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+             BLORGFS_STAT_ADD(NonCachedReadBytes, realLength);
+         }
+ 
+-        if (!alreadyInFsp && PASSIVE_LEVEL != KeGetCurrentIrql())
++        if (!alreadyInFsp && (PASSIVE_LEVEL != KeGetCurrentIrql() || !BooleanFlagOn(Irp->Flags, IRP_PAGING_IO)))
+         {
+             BLORGFS_PRINT("BlorgVolumeRead: Enqueue to Fsp\n");
+             BLORGFS_STAT_INC(ReadsPosted);

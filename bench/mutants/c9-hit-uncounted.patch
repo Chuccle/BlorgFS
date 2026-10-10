@@ -1,0 +1,16 @@
+diff --git a/src/Create.c b/src/Create.c
+index c1cf4a6..3f2c805 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -976,11 +976,6 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
+         DIRECTORY_ENTRY_METADATA cached;
+         PATH_CACHE_RESULT pc = BlorgPathCacheLookupDated(&filePath.String, &cached, &resolvedTicket);
+ 
+-        if (PathCacheMiss != pc)
+-        {
+-            BlorgPathCacheCountLookup(pc);
+-        }
+-
+         if (PathCacheExists == pc)
+         {
+             BLORGFS_STAT_INC(CreateHits);

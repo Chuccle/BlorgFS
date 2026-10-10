@@ -1,0 +1,13 @@
+diff --git a/src/utils/http.rs b/src/utils/http.rs
+index 5d2f5f4..19cc7be 100644
+--- a/src/utils/http.rs
++++ b/src/utils/http.rs
+@@ -142,7 +142,7 @@ fn evaluate(representation: &Representation, headers: &HeaderMap) -> Answer {
+     };
+ 
+     match ranges.as_slice() {
+-        [range] => Answer::Partial(range.clone()),
++        [range, ..] => Answer::Partial(range.clone()),
+         _ => Answer::Unsatisfiable,
+     }
+ }

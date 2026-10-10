@@ -1,0 +1,12 @@
+diff --git a/src/Create.c b/src/Create.c
+index 771eba4..8f7c24b 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -531,7 +531,6 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
+     stash->Ticket = netCtx->Ticket;
+     irp->Tail.Overlay.DriverContext[1] = stash;
+ 
+-    BlorgSetIrpContextFlag(irp, IRP_CONTEXT_FLAG_NET_DONE);
+ 
+     NTSTATUS requeue = BlorgFsdRequeueRequest(irp);
+ 

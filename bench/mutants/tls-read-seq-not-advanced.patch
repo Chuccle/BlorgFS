@@ -1,0 +1,12 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..31fc712 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2567,7 +2567,6 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
+             return;
+         }
+ 
+-        socket->Tls.ReadSeq++;
+         socket->TlsRecvOffset += 5 + declaredLen;
+ 
+         BLORGFS_STAT_INC(TlsRecordsDecrypted);

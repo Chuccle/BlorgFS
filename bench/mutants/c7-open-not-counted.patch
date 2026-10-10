@@ -1,0 +1,13 @@
+diff --git a/src/Create.c b/src/Create.c
+index 0773fc5..9de8e7a 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -215,8 +215,6 @@ static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject,
+         return result;
+     }
+ 
+-    Fcb->UncleanCount++;
+-
+     ExReleaseResourceLite(Fcb->Header.Resource);
+ 
+ #pragma warning(suppress: 28175)

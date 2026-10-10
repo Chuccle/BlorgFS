@@ -1,0 +1,13 @@
+diff --git a/src/Socket.c b/src/Socket.c
+index 70e33b6..dd801da 100644
+--- a/src/Socket.c
++++ b/src/Socket.c
+@@ -263,7 +263,7 @@ static VOID SocketFreeKSocket(PKSOCKET Socket)
+ // 0, 1 and 3 s with Windows' 1 s initial RTO), so a connect that a
+ // retransmission would have rescued is not cut short.
+ //
+-#define SOCKET_CONNECT_TIMEOUT_MS  4000
++#define SOCKET_CONNECT_TIMEOUT_MS  15000
+ #define SOCKET_SEND_TIMEOUT_MS     15000
+ #define SOCKET_RECEIVE_TIMEOUT_MS  30000
+ 

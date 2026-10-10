@@ -1,0 +1,17 @@
+diff --git a/src/PathCache.c b/src/PathCache.c
+index 6fc30b4..bf2fe52 100644
+--- a/src/PathCache.c
++++ b/src/PathCache.c
+@@ -545,7 +545,11 @@ VOID BlorgPathCacheCountLookup(PATH_CACHE_RESULT Result)
+ //
+ PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta, _Inout_opt_ PPATH_CACHE_TICKET Ticket)
+ {
+-    return PathCacheFind(Path, Meta, Ticket);
++    PATH_CACHE_RESULT result = PathCacheFind(Path, Meta, Ticket);
++
++    BlorgPathCacheCountLookup(result);
++
++    return result;
+ }
+ 
+ PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta)

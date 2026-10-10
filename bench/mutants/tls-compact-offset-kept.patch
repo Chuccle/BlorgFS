@@ -1,0 +1,12 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..8684127 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2628,7 +2628,6 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
+             socket->TlsRecvLength - socket->TlsRecvOffset);
+ 
+         socket->TlsRecvLength -= socket->TlsRecvOffset;
+-        socket->TlsRecvOffset = 0;
+     }
+ 
+     BLORGFS_STAT_INC(TlsBulkReceives);

@@ -1,0 +1,13 @@
+diff --git a/src/utils/cache.rs b/src/utils/cache.rs
+index cee7cfc..e031caf 100644
+--- a/src/utils/cache.rs
++++ b/src/utils/cache.rs
+@@ -801,7 +801,7 @@ impl Store {
+                         tokio::task::spawn_blocking(move || load_content(&root, &load_path, limit))
+                             .await
+                             .map_err(AppError::from)??;
+-                    *opened = file;
++                    let _ = (opened, file);
+ 
+                     Ok::<_, AppError>(Stamped::new(content, generation))
+                 })

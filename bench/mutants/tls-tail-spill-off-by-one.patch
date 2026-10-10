@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..4e0d306 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2531,7 +2531,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
+             ULONG mdlRoom = C_CAST(ULONG, Ctx->BodyEndOffset) - Ctx->Length;
+             PUCHAR mdlDest = C_CAST(PUCHAR, targetVa) + (Ctx->Length - C_CAST(ULONG, Ctx->BodyOffset));
+ 
+-            if (innerLen <= mdlRoom)
++            if (innerLen - 1 <= mdlRoom)
+             {
+                 plaintext = mdlDest;
+             }

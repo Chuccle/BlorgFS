@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..f801ab6 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -1656,7 +1656,7 @@ static NTSTATUS HttpEncryptRequestRecord(HTTP_CONTEXT* Ctx, PCHAR* SendBufferOut
+     RtlCopyMemory(Ctx->TlsSendPlaintext, Ctx->RequestBuffer, Ctx->RequestLength);
+     Ctx->TlsSendPlaintext[Ctx->RequestLength] = 0x17;
+ 
+-    Ctx->TlsSendRecord[0] = 0x17;
++    Ctx->TlsSendRecord[0] = 0x16;
+     Ctx->TlsSendRecord[1] = 0x03;
+     Ctx->TlsSendRecord[2] = 0x03;
+     Ctx->TlsSendRecord[3] = C_CAST(UCHAR, recordLen >> 8);

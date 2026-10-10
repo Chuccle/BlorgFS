@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..eef0d6c 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2671,7 +2671,7 @@ static VOID HttpOnTlsReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID
+ 
+     if (0 == BytesTransferred)
+     {
+-        HttpFailOrRetryReusedConnection(ctx, STATUS_CONNECTION_DISCONNECTED);
++        HttpFail(ctx, STATUS_CONNECTION_DISCONNECTED);
+         return;
+     }
+ 

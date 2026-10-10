@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index 93a8eaf..967cb42 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2250,7 +2250,7 @@ static VOID HttpIssueReceive(HTTP_CONTEXT* Ctx)
+ 
+     if (0 == Ctx->BodyOffset)
+     {
+-        if (Ctx->Length == Ctx->Capacity)
++        if (Ctx->Length + PAGE_SIZE > Ctx->Capacity)
+         {
+             NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, C_CAST(SIZE_T, Ctx->Capacity) + PAGE_SIZE);
+ 

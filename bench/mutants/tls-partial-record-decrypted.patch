@@ -1,0 +1,16 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..ed1a7d1 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2490,11 +2490,6 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
+             return;
+         }
+ 
+-        if (buffered < 5 + declaredLen)
+-        {
+-            break;
+-        }
+-
+         if (0x14 == recordType)
+         {
+             socket->TlsRecvOffset += 5 + declaredLen;

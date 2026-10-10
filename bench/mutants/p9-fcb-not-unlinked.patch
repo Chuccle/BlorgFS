@@ -1,0 +1,12 @@
+diff --git a/src/Structs.c b/src/Structs.c
+index c7a7325..cb07593 100644
+--- a/src/Structs.c
++++ b/src/Structs.c
+@@ -284,7 +284,6 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
+             FsRtlUninitializeFileLock(&fcb->FileLock);
+             FsRtlUninitializeOplock(&fcb->Header.Oplock);
+             DEALLOCATE_COMMON_CONTEXT(Context);
+-            NodeChildUnlink(C_CAST(PCOMMON_CONTEXT, fcb));
+             ExFreePool(fcb->FullPath.Buffer);
+             RemoveEntryList(&(fcb->Links));
+             ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);

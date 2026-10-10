@@ -1,0 +1,12 @@
+diff --git a/src/Create.c b/src/Create.c
+index 771eba4..fdcbeb2 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -515,7 +515,6 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
+ 
+     BLORGFS_LOG("Create net result OK (dir=%u size=%llu)\n", FileInfo->IsDirectory, FileInfo->Size);
+ 
+-    BlorgPathCacheInsertExists(&netCtx->Path, FileInfo, &netCtx->Ticket);
+ 
+     PCREATE_NET_RESULT stash = ExAllocatePoolUninitialized(NonPagedPoolNx, sizeof(CREATE_NET_RESULT), 'CRET');
+ 

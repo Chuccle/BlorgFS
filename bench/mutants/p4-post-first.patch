@@ -1,0 +1,17 @@
+diff --git a/src/DirCtrl.c b/src/DirCtrl.c
+index 81c8b01..9e3f16b 100644
+--- a/src/DirCtrl.c
++++ b/src/DirCtrl.c
+@@ -758,6 +758,12 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+ 
+             if ((initialQuery || restartScan) && !netDone)
+             {
++                if (!BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_IN_FSP))
++                {
++                    ExReleaseResourceLite(dcb->Header.Resource);
++                    return BlorgFsdPostRequest(Irp, IrpSp);
++                }
++
+                 RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
+ 
+                 if (ccb->SearchPattern.Buffer)

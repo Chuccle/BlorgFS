@@ -1,0 +1,12 @@
+diff --git a/src/Structs.c b/src/Structs.c
+index c7a7325..d43d90d 100644
+--- a/src/Structs.c
++++ b/src/Structs.c
+@@ -1197,7 +1197,6 @@ NTSTATUS BlorgInsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIR
+ 
+             newFcb->ParentDcb = currentDcb;
+             InsertTailList(&currentDcb->ChildrenList, &newFcb->Links);
+-            NodeChildLink(C_CAST(PCOMMON_CONTEXT, newFcb));
+ 
+             lastCreated = C_CAST(PCOMMON_CONTEXT, newFcb);
+             break;

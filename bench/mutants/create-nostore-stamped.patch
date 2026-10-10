@@ -1,0 +1,13 @@
+diff --git a/src/Create.c b/src/Create.c
+index 771eba4..eea05b1 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -782,7 +782,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
+         {
+             dirEntInfo = stash->Meta;
+ 
+-            if (!dirEntInfo.NoStore)
++            if (TRUE)
+             {
+                 resolvedTicket = stash->Ticket;
+             }

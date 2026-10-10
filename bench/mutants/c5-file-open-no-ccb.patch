@@ -1,0 +1,13 @@
+diff --git a/src/Create.c b/src/Create.c
+index 73af41d..1eac128 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -220,7 +220,7 @@ static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject,
+ #pragma warning(suppress: 28175)
+     FileObject->Vpb = global.DiskDeviceObject->Vpb;
+     FileObject->FsContext = Fcb;
+-    FileObject->FsContext2 = pCcb;
++    FileObject->FsContext2 = NULL;
+     FileObject->SectionObjectPointer = &Fcb->NonPaged->SectionObjectPointers;
+     Irp->IoStatus.Information = FILE_OPENED;
+ 

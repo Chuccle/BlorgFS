@@ -1,0 +1,13 @@
+diff --git a/src/DiskCacheIndex.c b/src/DiskCacheIndex.c
+index 9afc600..9cb2214 100644
+--- a/src/DiskCacheIndex.c
++++ b/src/DiskCacheIndex.c
+@@ -222,7 +222,7 @@ VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, const ULONG* Slots, ULONG
+     KIRQL oldIrql;
+     KeAcquireSpinLock(&Index->Lock, &oldIrql);
+ 
+-    for (ULONG i = 0; i < Count; ++i)
++    for (ULONG i = 0; i < Count && i < 1; ++i)
+     {
+         if (DISK_CACHE_NO_SLOT == Slots[i])
+         {

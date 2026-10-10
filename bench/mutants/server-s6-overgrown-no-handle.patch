@@ -1,0 +1,13 @@
+diff --git a/src/utils/cache.rs b/src/utils/cache.rs
+index cee7cfc..609aef5 100644
+--- a/src/utils/cache.rs
++++ b/src/utils/cache.rs
+@@ -1082,7 +1082,7 @@ fn load_content(
+     let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+ 
+     if len > limit {
+-        return Ok((Content::Streamed, Some(file)));
++        return Ok((Content::Streamed, None));
+     }
+ 
+     Ok((

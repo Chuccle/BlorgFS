@@ -1,0 +1,13 @@
+diff --git a/src/DiskCacheIndex.c b/src/DiskCacheIndex.c
+index 9afc600..574b203 100644
+--- a/src/DiskCacheIndex.c
++++ b/src/DiskCacheIndex.c
+@@ -289,7 +289,7 @@ ULONG BlorgDiskCacheIndexPlanRead(PDISK_CACHE_INDEX Index, PULONG Slots, ULONG C
+             Slots[i] = DISK_CACHE_NO_SLOT;
+         }
+ 
+-        Held -= gapLength;
++        Held -= 1;
+     }
+ }
+ 

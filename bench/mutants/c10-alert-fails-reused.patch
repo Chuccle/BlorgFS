@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index ed90c6c..8c34b8d 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2481,7 +2481,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
+ 
+         if (0x15 == recordType)
+         {
+-            HttpFailOrRetryReusedConnection(Ctx, STATUS_CONNECTION_RESET);
++            HttpFail(Ctx, STATUS_CONNECTION_RESET);
+             return;
+         }
+ 

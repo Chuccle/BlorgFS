@@ -1,0 +1,13 @@
+diff --git a/src/DiskCacheIndex.c b/src/DiskCacheIndex.c
+index 9afc600..350f011 100644
+--- a/src/DiskCacheIndex.c
++++ b/src/DiskCacheIndex.c
+@@ -226,7 +226,7 @@ VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, const ULONG* Slots, ULONG
+     {
+         if (DISK_CACHE_NO_SLOT == Slots[i])
+         {
+-            continue;
++            break;
+         }
+ 
+         PDISK_CACHE_SLOT entry = &Index->Slots[Slots[i]];

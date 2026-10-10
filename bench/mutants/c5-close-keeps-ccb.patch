@@ -1,0 +1,12 @@
+diff --git a/src/Close.c b/src/Close.c
+index e05c22c..79bd1e5 100644
+--- a/src/Close.c
++++ b/src/Close.c
+@@ -35,7 +35,6 @@ static NTSTATUS CloseVolume(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDevic
+         }
+         case BLORGFS_FCB_SIGNATURE:
+         {
+-            BlorgFreeFileContext(fileObject->FsContext2, VolumeDeviceObject);
+             BlorgNodeDereference(fileObject->FsContext);
+ 
+             return STATUS_SUCCESS;

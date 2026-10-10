@@ -1,0 +1,12 @@
+diff --git a/src/Create.c b/src/Create.c
+index c1cf4a6..a032bb1 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -1021,7 +1021,6 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
+             {
+                 BOOLEAN found = CreateFindEntryByName(listing, &leaf, &dirEntInfo);
+                 BlorgReleaseDirectoryInfo(listing);
+-                BlorgPathCacheCountLookup(PathCacheMiss);
+ 
+                 if (found)
+                 {

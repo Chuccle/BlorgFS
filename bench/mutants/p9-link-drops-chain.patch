@@ -1,0 +1,13 @@
+diff --git a/src/Structs.c b/src/Structs.c
+index c7a7325..775f892 100644
+--- a/src/Structs.c
++++ b/src/Structs.c
+@@ -1029,7 +1029,7 @@ static VOID NodeChildLink(PCOMMON_CONTEXT Node)
+     UNICODE_STRING name = NodeGetLastComponent(&Node->FullPath);
+     PCOMMON_CONTEXT* bucket = &NodeChildren[BlorgNodeChildBucket(Node->ParentDcb, &name)];
+ 
+-    Node->ChildNext = *bucket;
++    Node->ChildNext = NULL;
+     *bucket = Node;
+ }
+ 

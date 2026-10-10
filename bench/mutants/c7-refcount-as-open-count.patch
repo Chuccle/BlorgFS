@@ -1,0 +1,13 @@
+diff --git a/src/FsCtrl.c b/src/FsCtrl.c
+index 6920c9e..3568286 100644
+--- a/src/FsCtrl.c
++++ b/src/FsCtrl.c
+@@ -145,7 +145,7 @@ static NTSTATUS FsCtrlUser(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+ 
+     ULONG oplockCount = sharedRequest
+         ? C_CAST(ULONG, isFile && !FsRtlCheckLockForOplockRequest(&C_CAST(PFCB, node)->FileLock, &node->Header.AllocationSize))
+-        : C_CAST(PFCB, node)->UncleanCount;
++        : C_CAST(ULONG, ReadNoFence64(&node->RefCount));
+ 
+     C_CAST(VOID, FsRtlOplockFsctrl(&node->Header.Oplock, Irp, oplockCount));
+ 

@@ -1,0 +1,13 @@
+diff --git a/src/utils/http.rs b/src/utils/http.rs
+index 5d2f5f4..78d6b67 100644
+--- a/src/utils/http.rs
++++ b/src/utils/http.rs
+@@ -116,7 +116,7 @@ fn evaluate(representation: &Representation, headers: &HeaderMap) -> Answer {
+ 
+     if let Some(unwanted) = header_bytes(headers, &header::IF_NONE_MATCH) {
+         if etag.is_some_and(|etag| {
+-            unwanted == b"*" || any_tag(unwanted, |tag| weak(tag) == weak(etag))
++            unwanted == b"*" || any_tag(unwanted, |tag| tag == etag)
+         }) {
+             return Answer::NotModified;
+         }

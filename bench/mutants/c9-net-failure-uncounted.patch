@@ -1,0 +1,12 @@
+diff --git a/src/Create.c b/src/Create.c
+index c1cf4a6..5b91db9 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -524,7 +524,6 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
+ 
+         ExFreePool(netCtx->Path.Buffer);
+         ExFreePool(netCtx);
+-        BlorgCountCreate(Status);
+         BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
+         return;
+     }

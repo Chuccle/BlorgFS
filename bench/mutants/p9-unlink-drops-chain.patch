@@ -1,0 +1,13 @@
+diff --git a/src/Structs.c b/src/Structs.c
+index c7a7325..1cdac49 100644
+--- a/src/Structs.c
++++ b/src/Structs.c
+@@ -1045,7 +1045,7 @@ static VOID NodeChildUnlink(PCOMMON_CONTEXT Node)
+     {
+         if (Node == *link)
+         {
+-            *link = Node->ChildNext;
++            *link = NULL;
+             Node->ChildNext = NULL;
+             return;
+         }

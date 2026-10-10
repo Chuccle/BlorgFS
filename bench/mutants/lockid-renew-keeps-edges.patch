@@ -1,0 +1,13 @@
+diff --git a/tests/sandbox/KernelModel.c b/tests/sandbox/KernelModel.c
+index 44306d1..aec40c8 100644
+--- a/tests/sandbox/KernelModel.c
++++ b/tests/sandbox/KernelModel.c
+@@ -593,8 +593,6 @@ int KmRenewLockId(int Id)
+     KmEnsureOrderCs();
+     EnterCriticalSection(&OrderCs);
+ 
+-    KmClearLockEdges(Id);
+-
+     LockNames[Id] = NULL;
+ 
+     LeaveCriticalSection(&OrderCs);

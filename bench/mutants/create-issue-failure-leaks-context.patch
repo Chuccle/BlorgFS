@@ -1,0 +1,13 @@
+diff --git a/src/Create.c b/src/Create.c
+index 771eba4..cb943a2 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -1075,7 +1075,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
+             ExFreePool(filePath.String.Buffer);
+         }
+ 
+-        if (STATUS_PENDING != issueResult)
++        if (FALSE)
+         {
+             ExFreePool(netCtx->Path.Buffer);
+             ExFreePool(netCtx);

@@ -1,0 +1,13 @@
+diff --git a/tests/sandbox/KernelModel.c b/tests/sandbox/KernelModel.c
+index 44306d1..0f9392f 100644
+--- a/tests/sandbox/KernelModel.c
++++ b/tests/sandbox/KernelModel.c
+@@ -583,7 +583,7 @@ void KmReleaseLockId(int Id)
+ //
+ int KmRenewLockId(int Id)
+ {
+-    if (Id <= 0 || Id >= KM_MAX_LOCKS)
++    if (1)
+     {
+         return KmAllocateLockId();
+     }

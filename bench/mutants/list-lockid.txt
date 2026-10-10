@@ -1,0 +1,4 @@
+lockid-renew-mints SocketSandbox KernelModelTest.ReinitialisingALockKeepsItsIdWithRecyclingOff
+lockid-renew-keeps-edges SocketSandbox KernelModelTest.ReinitialisingALockKeepsItsIdWithRecyclingOff
+base SocketSandbox KernelModelTest.*
+base DispatchSandbox DiskCacheTest.*

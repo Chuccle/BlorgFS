@@ -1,0 +1,13 @@
+diff --git a/src/PathCache.c b/src/PathCache.c
+index 2647fe1..b4eeff2 100644
+--- a/src/PathCache.c
++++ b/src/PathCache.c
+@@ -574,7 +574,7 @@ static VOID PathCacheInsert(const UNICODE_STRING* Path, BOOLEAN Exists, const DI
+     BOOLEAN hasMeta = Exists && Meta;
+ 
+     if (!PathCache.Ready || !Path || 0 == Path->Length || !Path->Buffer ||
+-        Path->Length > PATH_CACHE_MAX_PATH_BYTES || (hasMeta && Meta->NoStore))
++        Path->Length > PATH_CACHE_MAX_PATH_BYTES)
+     {
+         return;
+     }

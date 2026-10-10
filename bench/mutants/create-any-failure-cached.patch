@@ -1,0 +1,13 @@
+diff --git a/src/Create.c b/src/Create.c
+index 771eba4..f680518 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -502,7 +502,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
+     {
+         BLORGFS_LOG("Create net result FAILED %08x\n", Status);
+ 
+-        if (STATUS_OBJECT_NAME_NOT_FOUND == Status)
++        if (TRUE)
+         {
+             BlorgPathCacheInsertNotFound(&netCtx->Path, &netCtx->Ticket);
+         }

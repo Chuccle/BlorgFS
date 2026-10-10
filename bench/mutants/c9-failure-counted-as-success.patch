@@ -1,0 +1,13 @@
+diff --git a/src/Create.c b/src/Create.c
+index c1cf4a6..4162d99 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -1324,7 +1324,7 @@ static NTSTATUS CreateFileSystem(PIRP Irp)
+ //
+ VOID BlorgCountCreate(NTSTATUS Status)
+ {
+-    if (NT_SUCCESS(Status))
++    if (STATUS_PENDING != Status)
+     {
+         BLORGFS_STAT_INC(SuccessfulCreates);
+     }

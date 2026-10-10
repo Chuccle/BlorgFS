@@ -1,0 +1,16 @@
+diff --git a/src/FspWorkQueue.c b/src/FspWorkQueue.c
+index db2df82..816ef89 100644
+--- a/src/FspWorkQueue.c
++++ b/src/FspWorkQueue.c
+@@ -171,11 +171,6 @@ static VOID FspDiscardPendingIrpContext(PIRP Irp)
+ //
+ static VOID FspCompleteRequest(PIRP Irp, NTSTATUS Status, CCHAR PriorityBoost)
+ {
+-    if (IRP_MJ_CREATE == IoGetCurrentIrpStackLocation(Irp)->MajorFunction)
+-    {
+-        BlorgCountCreate(Status);
+-    }
+-
+     BlorgCompleteRequest(Irp, Status, PriorityBoost);
+ }
+ 

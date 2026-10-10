@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..c5056f4 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2582,7 +2582,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
+             return;
+         }
+ 
+-        if (0x16 == contentType)
++        if (FALSE)
+         {
+             continue;
+         }

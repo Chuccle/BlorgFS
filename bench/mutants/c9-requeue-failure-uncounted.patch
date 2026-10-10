@@ -1,0 +1,12 @@
+diff --git a/src/Create.c b/src/Create.c
+index c1cf4a6..5499000 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -559,7 +559,6 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
+     {
+         ExFreePool(stash);
+         irp->Tail.Overlay.DriverContext[1] = NULL;
+-        BlorgCountCreate(requeue);
+         BlorgCompleteRequest(irp, requeue, IO_DISK_INCREMENT);
+     }
+ }

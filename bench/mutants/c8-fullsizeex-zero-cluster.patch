@@ -1,0 +1,13 @@
+diff --git a/src/VolumeInfo.c b/src/VolumeInfo.c
+index 021733b..1d19353 100644
+--- a/src/VolumeInfo.c
++++ b/src/VolumeInfo.c
+@@ -162,7 +162,7 @@ static NTSTATUS VolumeInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+             fullSizeInfoEx->VolumeStorageReserveAllocationUnits = 0;
+             fullSizeInfoEx->AvailableCommittedAllocationUnits = 0;
+             fullSizeInfoEx->PoolAvailableAllocationUnits = 0;
+-            fullSizeInfoEx->SectorsPerAllocationUnit = BLORGFS_SECTORS_PER_ALLOCATION_UNIT;
++            fullSizeInfoEx->SectorsPerAllocationUnit = 0;
+             fullSizeInfoEx->BytesPerSector = BLORGFS_DISK_BYTES_PER_SECTOR;
+ 
+             bytesWritten = sizeof(FILE_FS_FULL_SIZE_INFORMATION_EX);

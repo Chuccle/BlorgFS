@@ -1,0 +1,13 @@
+diff --git a/src/Read.c b/src/Read.c
+index af09a4f..cb1fa73 100644
+--- a/src/Read.c
++++ b/src/Read.c
+@@ -1695,7 +1695,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+         }
+         else
+         {
+-            NTSTATUS lockStatus = BlorgLockUserBuffer(Irp, IoWriteAccess, bytesLength);
++            NTSTATUS lockStatus = BlorgLockUserBuffer(Irp, IoWriteAccess, 0);
+ 
+             if (!NT_SUCCESS(lockStatus))
+             {

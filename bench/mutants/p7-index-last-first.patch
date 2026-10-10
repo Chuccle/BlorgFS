@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index cdabc61..f58083e 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -1108,7 +1108,7 @@ VOID BlorgIndexDirectoryInfo(PDIRECTORY_INFO DirInfo)
+ {
+     PULONG links = HttpListingLinks(DirInfo);
+ 
+-    for (SIZE_T entry = DirInfo->FileCount + DirInfo->SubDirCount; entry > 0; entry--)
++    for (SIZE_T entry = 1; entry <= DirInfo->FileCount + DirInfo->SubDirCount; entry++)
+     {
+         UNICODE_STRING name;
+         HttpListingEntryName(DirInfo, entry - 1, &name);

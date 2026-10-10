@@ -1,0 +1,13 @@
+diff --git a/src/utils/path.rs b/src/utils/path.rs
+index 918ac6f..2dc8a90 100644
+--- a/src/utils/path.rs
++++ b/src/utils/path.rs
+@@ -57,7 +57,7 @@ impl Root {
+     ) -> std::io::Result<T> {
+         let result = self.walk(path, &operation);
+         if result.as_ref().is_err_and(|error| {
+-            error.kind() == std::io::ErrorKind::PermissionDenied && error.raw_os_error().is_none()
++            error.kind() == std::io::ErrorKind::PermissionDenied
+         }) {
+             let canonical = std::fs::canonicalize(path)?;
+             return self.walk(&canonical, &operation);

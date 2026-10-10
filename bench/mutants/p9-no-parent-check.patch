@@ -1,0 +1,16 @@
+diff --git a/src/Structs.c b/src/Structs.c
+index c7a7325..a1de6fe 100644
+--- a/src/Structs.c
++++ b/src/Structs.c
+@@ -1059,11 +1059,6 @@ static PCOMMON_CONTEXT NodeSearchByName(const DCB* ParentDcb, const UNICODE_STRI
+ {
+     for (PCOMMON_CONTEXT child = NodeChildren[BlorgNodeChildBucket(ParentDcb, Name)]; child; child = child->ChildNext)
+     {
+-        if (C_CAST(const DCB*, child->ParentDcb) != ParentDcb)
+-        {
+-            continue;
+-        }
+-
+         UNICODE_STRING lastComponent = NodeGetLastComponent(&child->FullPath);
+ 
+         if (NodeArePathComponentsEqual(Name, &lastComponent))

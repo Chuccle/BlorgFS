@@ -1,0 +1,15 @@
+diff --git a/src/error.rs b/src/error.rs
+index f09da81..2599d09 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -25,9 +25,7 @@ pub enum AppError {
+ /// nothing; neither is the server failing.
+ impl From<std::io::Error> for AppError {
+     fn from(error: std::io::Error) -> Self {
+-        if error.raw_os_error() == Some(SYMLINK_LOOP) {
+-            return Self::NotFound;
+-        }
++        let _ = SYMLINK_LOOP;
+ 
+         match error.kind() {
+             std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => Self::NotFound,

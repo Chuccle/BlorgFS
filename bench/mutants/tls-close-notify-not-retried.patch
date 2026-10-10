@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..89459a8 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2589,7 +2589,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
+ 
+         if (0x17 != contentType)
+         {
+-            HttpFailOrRetryReusedConnection(Ctx, STATUS_INVALID_PARAMETER);
++            HttpFail(Ctx, STATUS_INVALID_PARAMETER);
+             return;
+         }
+ 

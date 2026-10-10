@@ -1,0 +1,13 @@
+diff --git a/src/utils/http.rs b/src/utils/http.rs
+index 5d2f5f4..96167b7 100644
+--- a/src/utils/http.rs
++++ b/src/utils/http.rs
+@@ -103,7 +103,7 @@ fn evaluate(representation: &Representation, headers: &HeaderMap) -> Answer {
+     let etag = representation.etag.as_ref().map(HeaderValue::as_bytes);
+ 
+     if let Some(wanted) = header_bytes(headers, &header::IF_MATCH) {
+-        if !etag.is_some_and(|etag| wanted == b"*" || any_tag(wanted, |tag| tag == etag)) {
++        if wanted.is_empty() && etag.is_none() {
+             return Answer::PreconditionFailed;
+         }
+     } else if let Some(since) = header_date(headers, &header::IF_UNMODIFIED_SINCE)

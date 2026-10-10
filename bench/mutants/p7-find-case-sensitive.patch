@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index cdabc61..2cc44b6 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -1129,7 +1129,7 @@ BOOLEAN BlorgFindDirectoryEntry(PDIRECTORY_INFO DirInfo, const UNICODE_STRING* N
+         UNICODE_STRING entryName;
+         HttpListingEntryName(DirInfo, next - 1, &entryName);
+ 
+-        if (RtlEqualUnicodeString(&entryName, Name, TRUE))
++        if (RtlEqualUnicodeString(&entryName, Name, FALSE))
+         {
+             *Entry = next - 1;
+             return TRUE;

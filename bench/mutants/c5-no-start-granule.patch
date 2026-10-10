@@ -1,0 +1,12 @@
+diff --git a/src/Read.c b/src/Read.c
+index bc903fa..a8e11e9 100644
+--- a/src/Read.c
++++ b/src/Read.c
+@@ -1746,7 +1746,6 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+                 PCCB ccb = IrpSp->FileObject->FsContext2;
+ 
+                 CcSetReadAheadGranularity(IrpSp->FileObject, global.ReadAheadGranularity);
+-                ccb->ReadAheadGranularity = global.ReadAheadGranularity;
+                 fcb->ReadAheadFetchedBytes = 0;
+                 fcb->ReadAheadConsumedBytes = 0;
+             }

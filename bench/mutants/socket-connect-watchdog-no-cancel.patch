@@ -1,0 +1,12 @@
+diff --git a/src/Socket.c b/src/Socket.c
+index 70e33b6..208a20b 100644
+--- a/src/Socket.c
++++ b/src/Socket.c
+@@ -1562,7 +1562,6 @@ static VOID SocketConnectTimeoutDpc(PKDPC Dpc, PVOID Context, PVOID SystemArgume
+     BLORGFS_STAT_INC(SocketTimeouts);
+ 
+     InterlockedExchange(&connectCtx->Timeout.TimedOut, 1);
+-    IoCancelIrp(connectCtx->Timeout.Irp);
+ 
+     if (SocketReleaseTimeoutRef(&connectCtx->Timeout))
+     {

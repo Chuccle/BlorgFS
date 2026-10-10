@@ -1,0 +1,14 @@
+diff --git a/src/utils/cache.rs b/src/utils/cache.rs
+index cee7cfc..0b7a9ef 100644
+--- a/src/utils/cache.rs
++++ b/src/utils/cache.rs
+@@ -1081,9 +1081,6 @@ fn load_content(
+     // that grew past the limit since is streamed, from the handle.
+     let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+ 
+-    if len > limit {
+-        return Ok((Content::Streamed, Some(file)));
+-    }
+ 
+     Ok((
+         Content::Resident(Arc::new(FileNode {

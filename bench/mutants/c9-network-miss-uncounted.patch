@@ -1,0 +1,12 @@
+diff --git a/src/Create.c b/src/Create.c
+index c1cf4a6..0a2c577 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -1061,7 +1061,6 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
+             return BlorgFsdPostRequest(Irp, IrpSp);
+         }
+ 
+-        BlorgPathCacheCountLookup(PathCacheMiss);
+         BLORGFS_LOG("Create cache MISS -> network: %wZ\n", &filePath.String);
+ 
+         PCREATE_NET_CONTEXT netCtx = ExAllocatePoolZero(NonPagedPoolNx, sizeof(CREATE_NET_CONTEXT), 'CRET');

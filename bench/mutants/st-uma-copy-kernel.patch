@@ -1,0 +1,13 @@
+diff --git a/src/DirCtrl.c b/src/DirCtrl.c
+index 589a4b4..7997810 100644
+--- a/src/DirCtrl.c
++++ b/src/DirCtrl.c
+@@ -367,7 +367,7 @@ static NTSTATUS DirCtrlEnumerateDirectoryEntries(
+                 break;
+             }
+ 
+-            CopyToMode(cursor, Scratch, written, OutMode);
++            CopyToMode(cursor, Scratch, written, KernelMode);
+             lastEntry = cursor;
+ 
+             cursor += written;

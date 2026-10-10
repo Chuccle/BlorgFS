@@ -1,0 +1,13 @@
+diff --git a/src/DirCtrl.c b/src/DirCtrl.c
+index 589a4b4..6fe662a 100644
+--- a/src/DirCtrl.c
++++ b/src/DirCtrl.c
+@@ -390,7 +390,7 @@ static NTSTATUS DirCtrlEnumerateDirectoryEntries(
+ 
+     if (lastEntry)
+     {
+-        WriteULongToMode(C_CAST(PULONG, lastEntry), 0, OutMode);
++        WriteULongToMode(C_CAST(PULONG, lastEntry), 0, KernelMode);
+     }
+ 
+     *BytesUsed = totalWritten;

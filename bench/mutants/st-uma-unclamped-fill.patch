@@ -1,0 +1,13 @@
+diff --git a/src/DirCtrl.c b/src/DirCtrl.c
+index 589a4b4..b53541d 100644
+--- a/src/DirCtrl.c
++++ b/src/DirCtrl.c
+@@ -342,7 +342,7 @@ static NTSTATUS DirCtrlEnumerateDirectoryEntries(
+             SIZE_T written = 0;
+             NTSTATUS st = FillFn(
+                 Scratch,
+-                (remaining < DIRCTRL_ENTRY_MAX_BYTES) ? remaining : DIRCTRL_ENTRY_MAX_BYTES,
++                remaining,
+                 index,
+                 &name,
+                 creation,

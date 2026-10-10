@@ -1,0 +1,13 @@
+diff --git a/src/Read.c b/src/Read.c
+index feed4b0..c6188d3 100644
+--- a/src/Read.c
++++ b/src/Read.c
+@@ -756,7 +756,7 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
+ 
+     LONG vote = 0;
+ 
+-    if (fetched > (consumed * READ_AHEAD_ADAPT_WASTE_RATIO) + lead)
++    if (FALSE)
+     {
+         vote = 1;
+     }

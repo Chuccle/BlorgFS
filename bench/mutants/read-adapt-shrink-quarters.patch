@@ -1,0 +1,13 @@
+diff --git a/src/Read.c b/src/Read.c
+index feed4b0..1e8d917 100644
+--- a/src/Read.c
++++ b/src/Read.c
+@@ -798,7 +798,7 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
+         : global.ReadAheadMaxGranularity;
+ 
+     const ULONG next = (vote > 0)
+-        ? ((current > PAGE_SIZE) ? (current / 2) : PAGE_SIZE)
++        ? ((current > PAGE_SIZE) ? (current / 4) : PAGE_SIZE)
+         : ((current < ceiling) ? (current * 2) : ceiling);
+ 
+     if (next == current)

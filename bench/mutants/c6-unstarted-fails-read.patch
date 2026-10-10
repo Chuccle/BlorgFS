@@ -1,0 +1,13 @@
+diff --git a/src/DiskCache.c b/src/DiskCache.c
+index d6dde30..c40a870 100644
+--- a/src/DiskCache.c
++++ b/src/DiskCache.c
+@@ -1089,7 +1089,7 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, const UNICODE_ST
+                 return FALSE;
+             }
+ 
+-            InterlockedOr(&read->Refetch, DISK_CACHE_READ_UNSTARTED);
++            InterlockedCompareExchange(&read->Status, status, STATUS_SUCCESS);
+             break;
+         }
+ 

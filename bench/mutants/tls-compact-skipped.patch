@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index a789ebb..230b717 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2762,7 +2762,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
+         socket->TlsRecvLength = 0;
+         socket->TlsRecvOffset = 0;
+     }
+-    else if (socket->TlsRecvOffset &&
++    else if (FALSE && socket->TlsRecvOffset &&
+         (BlorgSocketTlsRecvCapacity - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
+     {
+         RtlMoveMemory(

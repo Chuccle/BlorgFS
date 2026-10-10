@@ -1,0 +1,13 @@
+diff --git a/src/Create.c b/src/Create.c
+index 771eba4..7dd24e2 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -504,7 +504,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
+ 
+         if (STATUS_OBJECT_NAME_NOT_FOUND == Status)
+         {
+-            BlorgPathCacheInsertNotFound(&netCtx->Path, &netCtx->Ticket);
++            BlorgPathCacheInsertNotFound(&netCtx->Path, NULL);
+         }
+ 
+         ExFreePool(netCtx->Path.Buffer);

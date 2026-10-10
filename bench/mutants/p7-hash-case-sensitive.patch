@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index cdabc61..bb0133a 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -1036,7 +1036,7 @@ static PULONG HttpListingChain(PDIRECTORY_INFO DirInfo, const UNICODE_STRING* Na
+ {
+     ULONG hash = 0;
+ 
+-    if (!NT_SUCCESS(RtlHashUnicodeString(Name, TRUE, HASH_STRING_ALGORITHM_DEFAULT, &hash)))
++    if (!NT_SUCCESS(RtlHashUnicodeString(Name, FALSE, HASH_STRING_ALGORITHM_DEFAULT, &hash)))
+     {
+         hash = 0;
+     }

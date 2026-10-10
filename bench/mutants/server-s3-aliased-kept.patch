@@ -1,0 +1,18 @@
+diff --git a/src/utils/cache.rs b/src/utils/cache.rs
+index cee7cfc..5aff4bd 100644
+--- a/src/utils/cache.rs
++++ b/src/utils/cache.rs
+@@ -984,10 +984,9 @@ impl Store {
+         // an event naming the symlink matches none of them, and which symlinks
+         // it went through is not kept.
+         for (key, value) in &self.resolved {
+-            if value.value.aliased
+-                || roots
+-                    .iter()
+-                    .any(|root| value.value.canonical.starts_with(root))
++            if roots
++                .iter()
++                .any(|root| value.value.canonical.starts_with(root))
+             {
+                 self.resolved.invalidate(&*key).await;
+             }

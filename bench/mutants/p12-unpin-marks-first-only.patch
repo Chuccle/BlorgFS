@@ -1,0 +1,13 @@
+diff --git a/src/DiskCacheIndex.c b/src/DiskCacheIndex.c
+index 9afc600..26a4a52 100644
+--- a/src/DiskCacheIndex.c
++++ b/src/DiskCacheIndex.c
+@@ -234,7 +234,7 @@ VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, const ULONG* Slots, ULONG
+         NT_ASSERT(0 < entry->Pins);
+         entry->Pins--;
+ 
+-        if (Served)
++        if (Served && 0 == i)
+         {
+             entry->Referenced = TRUE;
+         }

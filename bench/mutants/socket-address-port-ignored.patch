@@ -1,0 +1,14 @@
+diff --git a/src/Socket.c b/src/Socket.c
+index 70e33b6..02f244a 100644
+--- a/src/Socket.c
++++ b/src/Socket.c
+@@ -896,8 +896,7 @@ static BOOLEAN SocketAddressEqual(const SOCKADDR* restrict A, const SOCKADDR* re
+     {
+         PSOCKADDR_IN a4 = C_CAST(PSOCKADDR_IN, A);
+         PSOCKADDR_IN b4 = C_CAST(PSOCKADDR_IN, B);
+-        return (a4->sin_port == b4->sin_port) &&
+-            (a4->sin_addr.s_addr == b4->sin_addr.s_addr);
++        return (a4->sin_addr.s_addr == b4->sin_addr.s_addr);
+     }
+ 
+     if (A->sa_family == AF_INET6)

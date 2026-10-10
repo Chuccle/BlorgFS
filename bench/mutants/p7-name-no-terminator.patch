@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index cdabc61..81e4b65 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -1163,7 +1163,7 @@ static NTSTATUS HttpDecodeName(flatbuffers_string_t Utf8, PWCH* Cursor, PWCH* Na
+ 
+     *Name = *Cursor;
+     *NameLength = nameBytes / sizeof(WCHAR);
+-    *Cursor += *NameLength + 1;
++    *Cursor += *NameLength;
+ 
+     return STATUS_SUCCESS;
+ }

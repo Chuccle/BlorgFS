@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index cdabc61..aa8d3cd 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -1227,7 +1227,7 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
+         }
+ 
+         if (!name || 0 == flatbuffers_string_len(name) ||
+-            !HttpCheckedAddSizeT(nameBytes, (flatbuffers_string_len(name) + 1) * sizeof(WCHAR), &nameBytes))
++            !HttpCheckedAddSizeT(nameBytes, flatbuffers_string_len(name) * sizeof(WCHAR), &nameBytes))
+         {
+             BLORGFS_PRINT("HttpDecodeListing() - failed\n");
+             return STATUS_INVALID_PARAMETER;

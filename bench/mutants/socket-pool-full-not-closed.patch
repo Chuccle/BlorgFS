@@ -1,0 +1,13 @@
+diff --git a/src/Socket.c b/src/Socket.c
+index 70e33b6..5cb1765 100644
+--- a/src/Socket.c
++++ b/src/Socket.c
+@@ -1333,7 +1333,7 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket)
+     {
+         KeReleaseSpinLock(&SocketPool.Lock, oldIrql);
+         BLORGFS_STAT_INC(ConnectionsClosedPoolFull);
+-        return BlorgCloseWskSocketAsync(Socket);
++        return STATUS_SUCCESS;
+     }
+ 
+     InsertHeadList(&SocketPool.List, &Socket->PoolEntry);

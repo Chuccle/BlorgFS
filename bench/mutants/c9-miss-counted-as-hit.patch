@@ -1,0 +1,13 @@
+diff --git a/src/PathCache.c b/src/PathCache.c
+index 6fc30b4..cf3a32e 100644
+--- a/src/PathCache.c
++++ b/src/PathCache.c
+@@ -529,7 +529,7 @@ VOID BlorgPathCacheCountLookup(PATH_CACHE_RESULT Result)
+ {
+     BLORGFS_STAT_INC(MetaDataReads);
+ 
+-    if (PathCacheMiss == Result)
++    if (PathCacheMiss != Result)
+     {
+         BLORGFS_STAT_INC(PathCacheMisses);
+     }

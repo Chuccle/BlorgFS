@@ -1,0 +1,74 @@
+name: Scratch mutants
+on:
+  push:
+    branches: [ 'scratch/mutants-*' ]
+    paths: [ 'bench/mutants/**', '.github/workflows/mutants.yml' ]
+permissions:
+  contents: read
+jobs:
+  mutants:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        list: [ correct, tests, perf, lockid, style ]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57
+      - id: flatcc_hash
+        shell: pwsh
+        run: echo "flatcc_hash=$(git -C third_party/flatcc rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+      - id: cache_flatcc
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/flatcc/bin/Release
+            third_party/flatcc/build/MSVC
+          key: ${{ runner.os }}-flatcc-${{ steps.flatcc_hash.outputs.flatcc_hash }}
+      - if: steps.cache_flatcc.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+      - if: steps.cache_flatcc.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path third_party\flatcc\build\MSVC | Out-Null
+          Push-Location third_party\flatcc\build\MSVC
+          cmake '-DCMAKE_POLICY_VERSION_MINIMUM=3.5' ..\..
+          cmake --build . --config Release
+          Pop-Location
+      - shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path generated | Out-Null
+          & third_party\flatcc\bin\Release\flatcc.exe -rv --common_reader -o generated third_party\schemas\metadata_flatbuffer.fbs
+      - name: Mutants
+        shell: pwsh
+        run: |
+          $results = @()
+          function Run($project, $filter) {
+            msbuild "tests\sandbox\$project.vcxproj" /p:Configuration=Release /p:Platform=x64 /m /v:quiet /nologo | Out-Host
+            if ($LASTEXITCODE -ne 0) { return 'build-failed' }
+            $exe = @('x64\Release', 'tests\sandbox\x64\Release') | ForEach-Object { Join-Path $_ "$project.exe" } | Where-Object { Test-Path $_ } | Select-Object -First 1
+            & $exe "--gtest_filter=$filter" | Out-Host
+            if ($LASTEXITCODE -ne 0) { 'failed' } else { 'passed' }
+          }
+          foreach ($line in Get-Content bench\mutants\list-${{ matrix.list }}.txt) {
+            if (-not $line.Trim() -or $line.StartsWith('#')) { continue }
+            $name, $project, $filter = $line -split '\s+', 3
+            if ($name -eq 'base') {
+              $r = Run $project $filter
+              $results += "BASE $project $filter -> $r"
+              continue
+            }
+            git apply "bench\mutants\$name.patch"
+            if ($LASTEXITCODE -ne 0) { $results += "MUTANT $name -> patch-failed"; continue }
+            Write-Host "===== MUTANT $name"
+            $r = Run $project $filter
+            $verdict = if ($r -eq 'failed') { 'KILLED' } elseif ($r -eq 'passed') { 'SURVIVED' } else { $r }
+            $results += "MUTANT $name -> $verdict"
+            git apply -R "bench\mutants\$name.patch"
+          }
+          Write-Host '===== RESULTS'
+          $results | ForEach-Object { Write-Host $_ }

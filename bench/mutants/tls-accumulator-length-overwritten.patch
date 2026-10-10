@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..48d2f82 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -2675,7 +2675,7 @@ static VOID HttpOnTlsReceive(NTSTATUS Status, ULONG_PTR BytesTransferred, PVOID
+         return;
+     }
+ 
+-    ctx->Socket->TlsRecvLength += C_CAST(ULONG, BytesTransferred);
++    ctx->Socket->TlsRecvLength = C_CAST(ULONG, BytesTransferred);
+ 
+     HttpIssueTlsReceive(ctx);
+ }

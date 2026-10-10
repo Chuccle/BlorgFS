@@ -1,0 +1,13 @@
+diff --git a/src/Create.c b/src/Create.c
+index 771eba4..f0318e7 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -528,7 +528,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
+     }
+ 
+     stash->Meta = *FileInfo;
+-    stash->Ticket = netCtx->Ticket;
++    RtlZeroMemory(&stash->Ticket, sizeof(stash->Ticket));
+     irp->Tail.Overlay.DriverContext[1] = stash;
+ 
+     BlorgSetIrpContextFlag(irp, IRP_CONTEXT_FLAG_NET_DONE);

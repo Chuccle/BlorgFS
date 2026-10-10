@@ -1,0 +1,12 @@
+diff --git a/src/Create.c b/src/Create.c
+index c1cf4a6..17c331a 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -1363,7 +1363,6 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+             result = BlorgVolumeCreate(Irp, irpSp, DeviceObject);
+             if (STATUS_PENDING != result)
+             {
+-                BlorgCountCreate(result);
+                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
+             }
+             break;

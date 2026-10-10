@@ -1,0 +1,13 @@
+diff --git a/src/Client.c b/src/Client.c
+index 5a68ba5..3ec4b8e 100644
+--- a/src/Client.c
++++ b/src/Client.c
+@@ -1673,8 +1673,6 @@ static NTSTATUS HttpEncryptRequestRecord(HTTP_CONTEXT* Ctx, PCHAR* SendBufferOut
+         return status;
+     }
+ 
+-    Ctx->Socket->Tls.WriteSeq++;
+-
+     *SendBufferOut = Ctx->TlsSendRecord;
+     *SendLengthOut = 5 + recordLen;
+     return STATUS_SUCCESS;

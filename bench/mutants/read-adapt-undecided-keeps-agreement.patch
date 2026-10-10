@@ -1,0 +1,12 @@
+diff --git a/src/Read.c b/src/Read.c
+index bc903fa..d787132 100644
+--- a/src/Read.c
++++ b/src/Read.c
+@@ -784,7 +784,6 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
+ 
+     if (0 == vote)
+     {
+-        ccb->ReadAheadAgreement = 0;
+         return;
+     }
+ 

@@ -1,0 +1,13 @@
+diff --git a/src/utils/http.rs b/src/utils/http.rs
+index 5d2f5f4..cb35042 100644
+--- a/src/utils/http.rs
++++ b/src/utils/http.rs
+@@ -109,7 +109,7 @@ fn evaluate(representation: &Representation, headers: &HeaderMap) -> Answer {
+     } else if let Some(since) = header_date(headers, &header::IF_UNMODIFIED_SINCE)
+         && representation
+             .modified
+-            .is_some_and(|modified| modified > since)
++            .is_some_and(|modified| modified > since && false)
+     {
+         return Answer::PreconditionFailed;
+     }

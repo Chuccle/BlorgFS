@@ -1,0 +1,12 @@
+diff --git a/src/Create.c b/src/Create.c
+index c1cf4a6..a67bd7d 100644
+--- a/src/Create.c
++++ b/src/Create.c
+@@ -1016,6 +1016,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
+             BlorgPathCacheTakeTicket(&ticket);
+ 
+             PDIRECTORY_INFO listing = BlorgPathCacheLookupListing(&parentPath, FALSE, NULL, NULL, &ticket);
++            BlorgPathCacheCountLookup(PathCacheMiss);
+ 
+             if (listing)
+             {

@@ -1,0 +1,243 @@
+diff --git a/src/Read.c b/src/Read.c
+index bc903fa..feed4b0 100644
+--- a/src/Read.c
++++ b/src/Read.c
+@@ -8,7 +8,7 @@
+ 
+ //
+ //  READ_AHEAD_GRANULARITY (Driver.h) is where Cc's read-ahead granularity
+-//  starts for a cached file; ReadAdaptGranularity below moves it per handle
++//  starts for a cached file; ReadAdaptGranularity below moves it per file
+ //  from what the reader turns out to be doing. Left unset entirely, Cc's
+ //  own default is PAGE_SIZE -- a constant, not a policy -- which
+ //  under-fetches badly against a backend where every miss is an HTTP round
+@@ -702,12 +702,7 @@ static VOID ReadFairGiveBack(ULONG Fetches)
+ // amplification alone. Wasted bytes are wasted whether or not anyone has a
+ // deadline, so nothing about the consumer enters into it.
+ //
+-// The window is the file's and the granule is the handle's: the window
+-// that closes on a handle's read is judged against, and moves, the granule
+-// Cc was told on that handle's file object (see the FCB's read-ahead
+-// window in Structs.h), so no handle's vote moves another's granule.
+-//
+-// The configured value is where a handle starts, not the range it may move
++// The configured value is where a file starts, not the range it may move
+ // in: growth is allowed above it up to ReadAheadMaxGranularity, and a
+ // configuration that raised the start above that maximum keeps its own
+ // value as the ceiling rather than being quietly clamped down.
+@@ -719,15 +714,13 @@ static VOID ReadFairGiveBack(ULONG Fetches)
+ //
+ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
+ {
+-    PCCB ccb = FileObject->FsContext2;
+-
+-    if (0 == global.ReadAheadGranularity || 0 == ccb->ReadAheadGranularity ||
++    if (0 == global.ReadAheadGranularity || 0 == Fcb->ReadAheadGranularity ||
+         !global.ReadAheadAdapt)
+     {
+         return;
+     }
+ 
+-    const ULONG current = ccb->ReadAheadGranularity;
++    const ULONG current = Fcb->ReadAheadGranularity;
+ 
+     ULONG64 window = C_CAST(ULONG64, current) * READ_AHEAD_ADAPT_WINDOW_GRANULES;
+ 
+@@ -784,21 +777,21 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
+ 
+     if (0 == vote)
+     {
+-        ccb->ReadAheadAgreement = 0;
++        Fcb->ReadAheadAgreement = 0;
+         return;
+     }
+ 
+-    ccb->ReadAheadAgreement = (ccb->ReadAheadAgreement * vote > 0)
+-        ? (ccb->ReadAheadAgreement + vote)
++    Fcb->ReadAheadAgreement = (Fcb->ReadAheadAgreement * vote > 0)
++        ? (Fcb->ReadAheadAgreement + vote)
+         : vote;
+ 
+-    if (ccb->ReadAheadAgreement > -READ_AHEAD_ADAPT_AGREEMENT &&
+-        ccb->ReadAheadAgreement < READ_AHEAD_ADAPT_AGREEMENT)
++    if (Fcb->ReadAheadAgreement > -READ_AHEAD_ADAPT_AGREEMENT &&
++        Fcb->ReadAheadAgreement < READ_AHEAD_ADAPT_AGREEMENT)
+     {
+         return;
+     }
+ 
+-    ccb->ReadAheadAgreement = 0;
++    Fcb->ReadAheadAgreement = 0;
+ 
+     const ULONG ceiling = (global.ReadAheadGranularity > global.ReadAheadMaxGranularity)
+         ? global.ReadAheadGranularity
+@@ -813,7 +806,7 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
+         return;
+     }
+ 
+-    ccb->ReadAheadGranularity = next;
++    Fcb->ReadAheadGranularity = next;
+ 
+     CcSetReadAheadGranularity(FileObject, next);
+ 
+@@ -1743,12 +1736,11 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+ 
+             if (0 != global.ReadAheadGranularity)
+             {
+-                PCCB ccb = IrpSp->FileObject->FsContext2;
+-
+                 CcSetReadAheadGranularity(IrpSp->FileObject, global.ReadAheadGranularity);
+-                ccb->ReadAheadGranularity = global.ReadAheadGranularity;
++                fcb->ReadAheadGranularity = global.ReadAheadGranularity;
+                 fcb->ReadAheadFetchedBytes = 0;
+                 fcb->ReadAheadConsumedBytes = 0;
++                fcb->ReadAheadAgreement = 0;
+             }
+         }
+ 
+diff --git a/src/Structs.h b/src/Structs.h
+index d3753ab..23f0d37 100644
+--- a/src/Structs.h
++++ b/src/Structs.h
+@@ -518,8 +518,8 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
+     READ_STREAM_TRACKER Streams[READ_STREAM_TRACKER_COUNT]; // Per-stream sequentiality state
+ 
+     //
+-    // Adaptive read-ahead window, and why it lives on the FCB while the
+-    // granule it decides lives on each handle's CCB.
++    // Adaptive read-ahead granularity state, and why it lives on the FCB
++    // rather than per file object.
+     //
+     // Cc splits this finer than it first appears. The shared cache map and
+     // the section live on SECTION_OBJECT_POINTERS, which is per FCB, but
+@@ -528,24 +528,28 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
+     // That is how Cc runs independent sequential detection for two handles
+     // reading one file at different offsets.
+     //
+-    // The window stays here, and the deciding reason is the shrink rule
+-    // rather than the growth one. Read-ahead issued for one handle fills
+-    // the shared cache, and a second handle consumes those pages with no
+-    // paging read at all, so fetched-against-consumed is only coherent
++    // The state stays here anyway, and the deciding reason is the shrink
++    // rule rather than the growth one. Read-ahead issued for one handle
++    // fills the shared cache, and a second handle consumes those pages with
++    // no paging read at all, so fetched-against-consumed is only coherent
+     // where the cache is shared: split per handle, the first reader looks
+     // wasteful and the second looks free. Amplification is what the shrink
+     // rule exists to catch, and moving it per handle would make it worse.
+     //
+-    // The granule and the run of agreeing votes are the handle's
+-    // (CCB.ReadAheadGranularity), because what Cc acts on is the mask of
+-    // the file object it was told on. On the FCB, a second handle's first
+-    // read reset the file's granule to the starting value, and the first
+-    // handle's next vote then doubled or halved that rather than its own:
+-    // a copy grown to 2 MB was told 256 KB, and a shrink voted on a handle
+-    // still at the starting granule raised it. Each window is now judged
+-    // against, and moves, the granule of the handle whose read closed it.
+-    // A new handle still starts the window afresh, which costs the others
+-    // at most one delayed vote.
++    // Growth is self-correcting across handles. A handle Cc has not been
++    // told about issues reads sized by its own mask, so the
++    // honoured-against-current test in ReadAdaptGranularity fails for it
++    // and it does not grow -- it keeps the granularity it started with,
++    // which is the safe direction: a player sharing a file with a copy is
++    // left alone.
++    //
++    // What is NOT covered is the shrink direction. If a copy has grown this
++    // FCB to 2 MB and a demuxer on the same file then votes shrink, the new
++    // value is half of 2 MB and is set on the demuxer's handle, which was
++    // sitting at the starting granule -- so a shrink vote raises it. That
++    // needs two handles with opposite patterns on one file to reach, and
++    // fixing it properly needs per-file-object state, which means a CCB for
++    // file opens that this driver does not currently create.
+     //
+     // Windowed rather than cumulative: the counters reset at every
+     // evaluation so the policy tracks what a reader is doing now, not what
+@@ -556,8 +560,9 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
+     // readers can lose an increment, which costs a delayed adaptation and
+     // never correctness.
+     //
+-    // Ordered widest-first so no ULONG sits before a ULONG64 and
+-    // introduces implicit padding.
++    // Ordered widest-first so the ULONG does not sit before a ULONG64 and
++    // introduce implicit padding; ReadLastStreamIndex closes the tail
++    // explicitly rather than widening ReadAheadGranularity to hide it.
+     ULONG64 ReadAheadFetchedBytes;  // Paging bytes fetched this window
+     ULONG64 ReadAheadConsumedBytes; // Bytes the application asked for this window
+ 
+@@ -581,6 +586,19 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
+     ULONG64 ReadIdleTicks;
+     ULONG64 ReadBusyTicks;
+ 
++    ULONG   ReadAheadGranularity;   // What Cc was last told, 0 = never set
++
++    //
++    // Consecutive windows voting the same way: positive to shrink, negative
++    // to grow, zero when the last window was undecided. The policy acts
++    // only on agreement, because a single window's ratio is not evidence.
++    // Read-ahead runs ahead of consumption by construction, so within one
++    // window fetched can exceed consumed even in a steady state that
++    // averages 1.0 -- which made a one-window policy flap 170 times on a
++    // sequential read whose pattern never changed.
++    //
++    LONG    ReadAheadAgreement;
++
+     //
+     // Largest paging read Cc has issued on this file during the current
+     // window, which is how far it is willing to honour the granule.
+@@ -650,7 +668,9 @@ CHECK_PADDING_BETWEEN(FCB, ReadAheadFetchedBytes, ReadAheadConsumedBytes);
+ CHECK_PADDING_BETWEEN(FCB, ReadAheadConsumedBytes, ReadIdleLastEndQpc);
+ CHECK_PADDING_BETWEEN(FCB, ReadIdleLastEndQpc, ReadIdleTicks);
+ CHECK_PADDING_BETWEEN(FCB, ReadIdleTicks, ReadBusyTicks);
+-CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadMaxPagingBytes);
++CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadAheadGranularity);
++CHECK_PADDING_BETWEEN(FCB, ReadAheadGranularity, ReadAheadAgreement);
++CHECK_PADDING_BETWEEN(FCB, ReadAheadAgreement, ReadMaxPagingBytes);
+ CHECK_PADDING_BETWEEN(FCB, ReadMaxPagingBytes, ReadLastStreamIndex);
+ CHECK_PADDING_BETWEEN(FCB, ReadLastStreamIndex, UncleanCount);
+ CHECK_PADDING_BETWEEN(FCB, UncleanCount, Reserved);
+@@ -686,12 +706,7 @@ CHECK_PADDING_BETWEEN(DCB, OnReapList, TableBucketIndex);
+ CHECK_PADDING_BETWEEN(DCB, TableBucketIndex, ChildrenList);
+ CHECK_PADDING_END(DCB, ChildrenList);
+ 
+-//
+-// Per-handle context. A directory handle keeps its search here; a file
+-// handle keeps the read-ahead granule Cc was told on its file object, and
+-// the votes toward moving it (see the FCB's read-ahead window, and
+-// ReadAdaptGranularity in Read.c).
+-//
++// Per-handle context for an open directory search.
+ typedef struct _CCB
+ {
+     ULONG NodeTypeCode;   // Node type identifier
+@@ -700,19 +715,6 @@ typedef struct _CCB
+     UINT64 CurrentIndex;  // Next entry index to return for this handle
+     UNICODE_STRING SearchPattern; // Wildcard/name filter for this search
+     PDIRECTORY_INFO Entries;      // This handle's listing snapshot: one reference, released on restart or close
+-    ULONG ReadAheadGranularity;   // What Cc was last told on this file object, 0 = never set
+-
+-    //
+-    // Consecutive windows voting the same way on this handle's granule:
+-    // positive to shrink, negative to grow, zero when the last window was
+-    // undecided. The policy acts only on agreement, because a single
+-    // window's ratio is not evidence. Read-ahead runs ahead of consumption
+-    // by construction, so within one window fetched can exceed consumed
+-    // even in a steady state that averages 1.0 -- which made a one-window
+-    // policy flap 170 times on a sequential read whose pattern never
+-    // changed.
+-    //
+-    LONG ReadAheadAgreement;
+ } CCB, * PCCB;
+ 
+ #define CCB_FLAG_MATCH_ALL 0x0001
+@@ -722,9 +724,7 @@ CHECK_PADDING_BETWEEN(CCB, NodeByteSize, Flags);
+ CHECK_PADDING_BETWEEN(CCB, Flags, CurrentIndex);
+ CHECK_PADDING_BETWEEN(CCB, CurrentIndex, SearchPattern);
+ CHECK_PADDING_BETWEEN(CCB, SearchPattern, Entries);
+-CHECK_PADDING_BETWEEN(CCB, Entries, ReadAheadGranularity);
+-CHECK_PADDING_BETWEEN(CCB, ReadAheadGranularity, ReadAheadAgreement);
+-CHECK_PADDING_END(CCB, ReadAheadAgreement);
++CHECK_PADDING_END(CCB, Entries);
+ 
+ typedef FCB VCB;
+ typedef PFCB PVCB;

@@ -1,0 +1,13 @@
+diff --git a/src/error.rs b/src/error.rs
+index f09da81..47bc62d 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -26,7 +26,7 @@ pub enum AppError {
+ impl From<std::io::Error> for AppError {
+     fn from(error: std::io::Error) -> Self {
+         if error.raw_os_error() == Some(SYMLINK_LOOP) {
+-            return Self::NotFound;
++            return Self::PermissionDenied;
+         }
+ 
+         match error.kind() {

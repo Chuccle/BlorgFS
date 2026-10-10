@@ -1,0 +1,13 @@
+diff --git a/src/Read.c b/src/Read.c
+index feed4b0..08e0f61 100644
+--- a/src/Read.c
++++ b/src/Read.c
+@@ -799,7 +799,7 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
+ 
+     const ULONG next = (vote > 0)
+         ? ((current > PAGE_SIZE) ? (current / 2) : PAGE_SIZE)
+-        : ((current < ceiling) ? (current * 2) : ceiling);
++        : ((current < ceiling) ? (current * 4) : ceiling);
+ 
+     if (next == current)
+     {
