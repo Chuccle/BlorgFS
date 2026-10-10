@@ -5,61 +5,31 @@
 //  and the BlorgFastIoCheckIfPossible fast-I/O entry point.
 //
 
+//
+// Cc's lazy-writer pre-acquire for a file, named when its cache map is
+// created. Context is the FCB. Takes the paging I/O resource shared and
+// returns FALSE without it only when Wait is FALSE and it would block.
+//
+// APC delivery needs no disabling here, against a rogue suspend APC or
+// otherwise: the caller is either in the system context, which a user
+// cannot deliver one to, or has already disabled kernel APCs. That holds
+// for every pre-acquire routine in this file.
+//
+// The lazy writer takes an FCB only once, so LazyWriteThread is clear on
+// entry (asserted) and is set here, so it never tries to advance valid
+// data or deadlocks trying to take the FCB exclusive.
+//
+// Cc can run this on several worker threads at once for different files,
+// so the first lazy writer's seed of global.LazyWriteThread is claimed
+// with an interlocked compare-exchange: a plain check-then-set let two
+// racing acquires both see NULL and the second overwrite the first.
+//
+// The top-level IRP is set to FSRTL_CACHE_TOP_LEVEL_IRP because Cc is
+// really the top level: without it, its entry into the file system would
+// look like a recursive call and be completed with hard errors or verify.
+//
 _Requires_lock_held_(_Global_critical_region_)
-BOOLEAN
-BlorgAcquireNodeForLazyWrite(
-    PVOID Context,
-    BOOLEAN Wait
-)
-
-/*++
-
-Routine Description:
-
-    The address of this routine is specified when creating a CacheMap for
-    a file.  It is subsequently called by the Lazy Writer prior to its
-    performing lazy writes to the file.
-
-Arguments:
-
-    Context - The Fcb which was specified as a context parameter for this
-          routine.
-
-    Wait - TRUE if the caller is willing to block.
-
-Return Value:
-
-    FALSE - if Wait was specified as FALSE and blocking would have
-            been required.  The Fcb is not acquired.
-
-    TRUE - if the Fcb has been acquired
-
-Notes:
-
-    We do not need to disable APC delivery to guard against a rogue user
-    issuing a suspend APC, because the caller is guaranteed to be either in
-    the system context (to which a user cannot deliver a suspend APC), or
-    to have already disabled kernel APC delivery before calling. This holds
-    for all the other pre-acquire routines as well.
-
-    The Lazy Writer is assumed to acquire this Fcb only once, so
-    LazyWriteThread must be clear on entry (asserted); it is then set so the
-    Lazy Writer never tries to advance Valid Data or deadlocks trying to
-    get the Fcb exclusive.
-
-    Cc can run this acquire on several worker threads concurrently (for
-    different files), so the first-lazy-writer seed of
-    global.LazyWriteThread is claimed with an interlocked
-    compare-exchange -- a plain check-then-set lets two racing acquires
-    both see NULL and the second silently overwrite the first.
-
-    Setting the top-level IRP to FSRTL_CACHE_TOP_LEVEL_IRP is a kludge
-    because Cc is really the top level: when it enters the file system, we
-    would otherwise think this is a recursive call and complete the request
-    with hard errors or verify.
-
---*/
-
+BOOLEAN BlorgAcquireNodeForLazyWrite(PVOID Context, BOOLEAN Wait)
 {
     if (!ExAcquireResourceSharedLite(C_CAST(PFCB, Context)->Header.PagingIoResource, Wait))
     {
@@ -81,31 +51,12 @@ Notes:
     return TRUE;
 }
 
+//
+// Cc's lazy-writer post-release, the pair of BlorgAcquireNodeForLazyWrite.
+// Context is the FCB.
+//
 _Requires_lock_held_(_Global_critical_region_)
-VOID
-BlorgReleaseNodeFromLazyWrite(
-    PVOID Context
-)
-
-/*++
-
-Routine Description:
-
-    The address of this routine is specified when creating a CacheMap for
-    a file.  It is subsequently called by the Lazy Writer after its
-    performing lazy writes to the file.
-
-Arguments:
-
-    Context - The Fcb which was specified as a context parameter for this
-          routine.
-
-Return Value:
-
-    None
-
---*/
-
+VOID BlorgReleaseNodeFromLazyWrite(PVOID Context)
 {
     NT_ASSERT(BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(Context));
     NT_ASSERT(NULL != PsGetCurrentThread());
@@ -120,44 +71,17 @@ Return Value:
     IoSetTopLevelIrp(NULL);
 }
 
+//
+// Cc's read-ahead pre-acquire for a file, named when its cache map is
+// created. Context is the FCB. Returns FALSE without the resource only
+// when Wait is FALSE and it would block.
+//
+// The main resource, not the paging I/O resource, is taken shared, so
+// read-ahead synchronises with purges. BlorgAcquireNodeForLazyWrite's
+// notes on APC delivery and the top-level IRP apply here too.
+//
 _Requires_lock_held_(_Global_critical_region_)
-BOOLEAN
-BlorgAcquireNodeForReadAhead(
-    PVOID Context,
-    BOOLEAN Wait
-)
-
-/*++
-
-Routine Description:
-
-    The address of this routine is specified when creating a CacheMap for
-    a file.  It is subsequently called by the Lazy Writer prior to its
-    performing read ahead to the file.
-
-Arguments:
-
-    Context - The Fcb which was specified as a context parameter for this
-          routine.
-
-    Wait - TRUE if the caller is willing to block.
-
-Return Value:
-
-    FALSE - if Wait was specified as FALSE and blocking would have
-            been required.  The Fcb is not acquired.
-
-    TRUE - if the Fcb has been acquired
-
-Notes:
-
-    The normal file resource (not the paging I/O resource) is acquired
-    shared here so read-ahead synchronises correctly with purges. See
-    BlorgAcquireNodeForLazyWrite for the APC-delivery and top-level-IRP
-    kludge rationale, both of which apply here too.
-
---*/
-
+BOOLEAN BlorgAcquireNodeForReadAhead(PVOID Context, BOOLEAN Wait)
 {
     if (!ExAcquireResourceSharedLite(C_CAST(PFCB, Context)->Header.Resource,
         Wait))
@@ -172,31 +96,12 @@ Notes:
     return TRUE;
 }
 
+//
+// Cc's read-ahead post-release, the pair of BlorgAcquireNodeForReadAhead.
+// Context is the FCB.
+//
 _Requires_lock_held_(_Global_critical_region_)
-VOID
-BlorgReleaseNodeFromReadAhead(
-    PVOID Context
-)
-
-/*++
-
-Routine Description:
-
-    The address of this routine is specified when creating a CacheMap for
-    a file.  It is subsequently called by the Lazy Writer after its
-    read ahead.
-
-Arguments:
-
-    Context - The Fcb which was specified as a context parameter for this
-          routine.
-
-Return Value:
-
-    None
-
---*/
-
+VOID BlorgReleaseNodeFromReadAhead(PVOID Context)
 {
     NT_ASSERT(C_CAST(PIRP, FSRTL_CACHE_TOP_LEVEL_IRP) == IoGetTopLevelIrp());
 
@@ -205,9 +110,14 @@ Return Value:
     ExReleaseResourceLite(C_CAST(PFCB, Context)->Header.Resource);
 }
 
+//
+// Whether fast I/O may serve a read or write of Length bytes at
+// FileOffset: TRUE sends it down the fast path, FALSE makes the caller
+// take the IRP route. A read is allowed when no byte-range lock bars it.
+// Writes are always refused, since the write path is not implemented.
+//
 _Function_class_(FAST_IO_CHECK_IF_POSSIBLE)
-BOOLEAN
-BlorgFastIoCheckIfPossible(
+BOOLEAN BlorgFastIoCheckIfPossible(
     PFILE_OBJECT FileObject,
     PLARGE_INTEGER FileOffset,
     ULONG Length,
@@ -217,43 +127,6 @@ BlorgFastIoCheckIfPossible(
     PIO_STATUS_BLOCK IoStatus,
     PDEVICE_OBJECT DeviceObject
 )
-
-/*++
-
-Routine Description:
-
-    This routine checks if fast i/o is possible for a read/write operation
-
-Arguments:
-
-    FileObject - Supplies the file object used in the query
-
-    FileOffset - Supplies the starting byte offset for the read/write operation
-
-    Length - Supplies the length, in bytes, of the read/write operation
-
-    Wait - Indicates if we can wait
-
-    LockKey - Supplies the lock key
-
-    CheckForReadOperation - Indicates if this is a check for a read or write
-        operation
-
-    IoStatus - Receives the status of the operation if our return value is
-        FastIoReturnError
-
-Return Value:
-
-    BOOLEAN - TRUE if fast I/O is possible and FALSE if the caller needs
-        to take the long route.
-
-Notes:
-
-    Writes are blanket-failed for now: the write path is not yet
-    implemented, so this always routes writes through the slow path.
-
---*/
-
 {
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(IoStatus);
