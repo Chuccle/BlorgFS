@@ -23,12 +23,12 @@
 //
 //  Synthetic backing-disk geometry (~1 TB), computed from the same
 //  components reported via IOCTL_DISK_GET_DRIVE_GEOMETRY so the two IOCTLs
-//  stay consistent.
+//  stay consistent. The sector size is in Driver.h, shared with the volume
+//  size queries.
 //
 #define BLORGFS_DISK_CYLINDERS            0x20000ULL
 #define BLORGFS_DISK_TRACKS_PER_CYLINDER  255ULL
 #define BLORGFS_DISK_SECTORS_PER_TRACK    63ULL
-#define BLORGFS_DISK_BYTES_PER_SECTOR     512ULL
 #define BLORGFS_SYNTHETIC_DISK_SIZE       (BLORGFS_DISK_CYLINDERS *      \
                                            BLORGFS_DISK_TRACKS_PER_CYLINDER * \
                                            BLORGFS_DISK_SECTORS_PER_TRACK *   \

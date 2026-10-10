@@ -3,8 +3,9 @@
 //
 // FILE_FS_XXX_INFORMATION query/set handlers (IRP_MJ_QUERY/SET_VOLUME_INFORMATION).
 // Reports static volume/device/attribute info; size classes report zeroed
-// (unknown) capacity. Volume is read-only, so set-volume-information is a
-// no-op stub.
+// (unknown) capacity in allocation units, but a non-zero sector and cluster
+// size (Driver.h), since GetDiskFreeSpace callers divide by the cluster
+// size. Volume is read-only, so set-volume-information is a no-op stub.
 //
 // FileFsAttributeInformation deliberately does NOT advertise
 // FILE_CASE_SENSITIVE_SEARCH. Every name comparison this driver makes is
@@ -72,8 +73,8 @@ static NTSTATUS VolumeInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             PFILE_FS_SIZE_INFORMATION sizeInfo = systemBuffer;
             sizeInfo->TotalAllocationUnits.QuadPart = 0;
             sizeInfo->AvailableAllocationUnits.QuadPart = 0;
-            sizeInfo->SectorsPerAllocationUnit = 0;
-            sizeInfo->BytesPerSector = 0;
+            sizeInfo->SectorsPerAllocationUnit = BLORGFS_SECTORS_PER_ALLOCATION_UNIT;
+            sizeInfo->BytesPerSector = BLORGFS_DISK_BYTES_PER_SECTOR;
 
             bytesWritten = sizeof(FILE_FS_SIZE_INFORMATION);
             result = STATUS_SUCCESS;
@@ -134,8 +135,8 @@ static NTSTATUS VolumeInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             fullSizeInfo->TotalAllocationUnits.QuadPart = 0;
             fullSizeInfo->CallerAvailableAllocationUnits.QuadPart = 0;
             fullSizeInfo->ActualAvailableAllocationUnits.QuadPart = 0;
-            fullSizeInfo->SectorsPerAllocationUnit = 0;
-            fullSizeInfo->BytesPerSector = 0;
+            fullSizeInfo->SectorsPerAllocationUnit = BLORGFS_SECTORS_PER_ALLOCATION_UNIT;
+            fullSizeInfo->BytesPerSector = BLORGFS_DISK_BYTES_PER_SECTOR;
 
             bytesWritten = sizeof(FILE_FS_FULL_SIZE_INFORMATION);
             result = STATUS_SUCCESS;
@@ -161,8 +162,8 @@ static NTSTATUS VolumeInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             fullSizeInfoEx->VolumeStorageReserveAllocationUnits = 0;
             fullSizeInfoEx->AvailableCommittedAllocationUnits = 0;
             fullSizeInfoEx->PoolAvailableAllocationUnits = 0;
-            fullSizeInfoEx->SectorsPerAllocationUnit = 0;
-            fullSizeInfoEx->BytesPerSector = 0;
+            fullSizeInfoEx->SectorsPerAllocationUnit = BLORGFS_SECTORS_PER_ALLOCATION_UNIT;
+            fullSizeInfoEx->BytesPerSector = BLORGFS_DISK_BYTES_PER_SECTOR;
 
             bytesWritten = sizeof(FILE_FS_FULL_SIZE_INFORMATION_EX);
             result = STATUS_SUCCESS;
