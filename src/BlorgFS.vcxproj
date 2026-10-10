@@ -106,7 +106,7 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;Netio.lib;Cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Wdmsec.lib;Netio.lib;Cng.lib;umaccess.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
   </ItemDefinitionGroup>
@@ -126,7 +126,7 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;Netio.lib;Cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Wdmsec.lib;Netio.lib;Cng.lib;umaccess.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
   </ItemDefinitionGroup>

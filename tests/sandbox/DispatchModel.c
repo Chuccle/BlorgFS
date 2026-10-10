@@ -663,47 +663,6 @@ NTSTATUS KeWaitForMultipleObjects(
 
 VOID KdBreakPoint(VOID) { }
 
-//
-// ProbeForRead is the driver's own validation of a user buffer, so it has
-// to reject what the kernel rejects rather than wave everything through:
-// a handler that forgot to check a length must fail here, not silently
-// pass a dispatch test.
-//
-VOID ProbeForRead(PVOID Address, SIZE_T Length, ULONG Alignment)
-{
-    if (0 == Length)
-    {
-        return;
-    }
-
-    if (!Address || (Alignment && (((ULONG_PTR)Address) & (Alignment - 1))))
-    {
-        KmReportViolation(KmViolationLifetime, "ProbeForRead on a misaligned or null user buffer");
-    }
-}
-
-static ULONG ProbesForWrite;
-
-VOID ProbeForWrite(PVOID Address, SIZE_T Length, ULONG Alignment)
-{
-    ProbesForWrite++;
-
-    if (0 == Length)
-    {
-        return;
-    }
-
-    if (!Address || (Alignment && (((ULONG_PTR)Address) & (Alignment - 1))))
-    {
-        KmReportViolation(KmViolationLifetime, "ProbeForWrite on a misaligned or null user buffer");
-    }
-}
-
-ULONG ShimProbesForWrite(VOID)
-{
-    return ProbesForWrite;
-}
-
 ///////////////////////////////////////////////////////////////////////////
 // Rtl
 ///////////////////////////////////////////////////////////////////////////

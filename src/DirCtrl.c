@@ -32,6 +32,18 @@ static inline ULONG DirCtrlAlignEntrySize(ULONG Size)
 }
 
 //
+// The largest entry any fill routine writes: FILE_ID_BOTH_DIR_INFORMATION
+// has the longest fixed part, and a listing admits names of up to
+// MAX_NAME_LEN - 1 characters. Entries are built in a scratch block of this
+// size before they are copied to the caller's buffer.
+//
+#define DIRCTRL_ENTRY_MAX_BYTES \
+    C_CAST(ULONG, (FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName) + ((MAX_NAME_LEN - 1) * sizeof(WCHAR)) + 7u) & ~7u)
+
+C_ASSERT(FIELD_OFFSET(FILE_BOTH_DIR_INFORMATION, FileName) <= FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName));
+C_ASSERT(FIELD_OFFSET(FILE_FULL_DIR_INFORMATION, FileName) <= FIELD_OFFSET(FILE_ID_BOTH_DIR_INFORMATION, FileName));
+
+//
 // Shared by all three Fill*DirInfo routines below -- they fill three
 // distinct Windows FILE_*_DIR_INFORMATION struct types (no common base
 // type to write generic code against in C), but all three lay out the
@@ -256,6 +268,13 @@ static inline NTSTATUS DirCtrlFillFileBothDirInfo(
 // walking that chain would otherwise read past the last written entry
 // into an unwritten slot.
 //
+// OutBuffer can be the caller's user-mode buffer, so it is only written
+// through the user-mode accessors, as OutMode says: each entry is built in
+// Scratch (DIRCTRL_ENTRY_MAX_BYTES) and copied out whole. A fault raises
+// to the caller's handler. The fill is offered at most the scratch's size,
+// so a name longer than a listing admits overflows instead of overrunning
+// it.
+//
 static NTSTATUS DirCtrlEnumerateDirectoryEntries(
     const PCCB Ccb,
     ULONG StartIndex,
@@ -265,6 +284,8 @@ static NTSTATUS DirCtrlEnumerateDirectoryEntries(
     BOOLEAN ReturnSingle,
     PVOID OutBuffer,
     ULONG OutLength,
+    KPROCESSOR_MODE OutMode,
+    PVOID Scratch,
     PFILL_ROUTINE FillFn,
     SIZE_T* BytesUsed,
     ULONG* FinalIndex
@@ -320,8 +341,8 @@ static NTSTATUS DirCtrlEnumerateDirectoryEntries(
         {
             SIZE_T written = 0;
             NTSTATUS st = FillFn(
-                cursor,
-                remaining,
+                Scratch,
+                (remaining < DIRCTRL_ENTRY_MAX_BYTES) ? remaining : DIRCTRL_ENTRY_MAX_BYTES,
                 index,
                 &name,
                 creation,
@@ -346,6 +367,7 @@ static NTSTATUS DirCtrlEnumerateDirectoryEntries(
                 break;
             }
 
+            CopyToMode(cursor, Scratch, written, OutMode);
             lastEntry = cursor;
 
             cursor += written;
@@ -368,7 +390,7 @@ static NTSTATUS DirCtrlEnumerateDirectoryEntries(
 
     if (lastEntry)
     {
-        *C_CAST(PULONG, lastEntry) = 0;
+        WriteULongToMode(C_CAST(PULONG, lastEntry), 0, OutMode);
     }
 
     *BytesUsed = totalWritten;
@@ -377,6 +399,7 @@ static NTSTATUS DirCtrlEnumerateDirectoryEntries(
 }
 
 #define DIRCTRL_FETCH_TAG 'FDLB'
+#define DIRCTRL_ENTRY_TAG 'EDLB'
 
 //
 // One directory-listing fetch in flight: the query waiting on it, or none
@@ -873,7 +896,19 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                 }
             }
 
+            PVOID scratch = NULL;
+
             if (fill)
+            {
+                scratch = ExAllocatePoolUninitialized(PagedPool, DIRCTRL_ENTRY_MAX_BYTES, DIRCTRL_ENTRY_TAG);
+
+                if (!scratch)
+                {
+                    result = STATUS_INSUFFICIENT_RESOURCES;
+                }
+            }
+
+            if (scratch)
             {
                 __try
                 {
@@ -887,11 +922,6 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     }
                     else
                     {
-                        if (!Irp->MdlAddress && UserMode == Irp->RequestorMode)
-                        {
-                            ProbeForWrite(Irp->UserBuffer, IrpSp->Parameters.QueryDirectory.Length, sizeof(UCHAR));
-                        }
-
                         SIZE_T used = 0;
                         result = DirCtrlEnumerateDirectoryEntries(
                             ccb,
@@ -902,6 +932,8 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                             returnSingleEntry,
                             buffer,
                             remainingLength,
+                            (!Irp->MdlAddress) ? Irp->RequestorMode : KernelMode,
+                            scratch,
                             fill,
                             &used,
                             &index
@@ -920,6 +952,8 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     updateCcb = FALSE;
                     result = GetExceptionCode();
                 }
+
+                ExFreePool(scratch);
             }
 
             if (updateCcb)

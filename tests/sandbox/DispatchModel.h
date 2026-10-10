@@ -77,15 +77,6 @@ ULONG KeQueryMaximumProcessorCountEx(USHORT Group);
 ULONG64 KeQueryInterruptTime(VOID);
 VOID ShimAdvanceInterruptTime(ULONG64 Ticks100ns);
 
-VOID ProbeForRead(PVOID Address, SIZE_T Length, ULONG Alignment);
-VOID ProbeForWrite(PVOID Address, SIZE_T Length, ULONG Alignment);
-
-//
-// How many user buffers ProbeForWrite has checked, so a test can tell an
-// output buffer was probed for writing rather than only for reading.
-//
-ULONG ShimProbesForWrite(VOID);
-
 NTSTATUS KeWaitForMultipleObjects(
     ULONG Count, PVOID Object[], WAIT_TYPE WaitType, KWAIT_REASON WaitReason,
     KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
