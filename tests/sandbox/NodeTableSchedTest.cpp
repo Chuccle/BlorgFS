@@ -579,7 +579,6 @@ TEST_F(NodeTableSchedTest, NoInterleavingRetiresAPinnedNode)
 
     EXPECT_EQ(0, proof.LeftBehind)
         << "replays left nodes in the table; the next replay is a different program";
-
 }
 
 //
@@ -938,7 +937,6 @@ TEST_F(NodeTableRevivalSchedTest, NoInterleavingFreesARevivedNode)
 
     EXPECT_EQ(0, proof.LeftBehind)
         << "replays left nodes in the table; the next replay is a different program";
-
 }
 
 //

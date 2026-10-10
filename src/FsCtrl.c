@@ -252,9 +252,9 @@ NTSTATUS BlorgFileSystemControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
                     break;
                 }
             }
-            
+
             break;
-        }        
+        }
         case BlorgDeviceDisk:
         {
             break;

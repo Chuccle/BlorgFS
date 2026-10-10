@@ -798,7 +798,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         {
             return CreateOpenVcb(Irp, fileObject, desiredAccess, shareAccess, BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->Vcb);
         }
-        
+
         filePath.String = fileObject->FileName;
     }
     else
@@ -1197,7 +1197,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         {
             ExFreePool(filePath.String.Buffer);
         }
-        
+
         return result;
     }
 
