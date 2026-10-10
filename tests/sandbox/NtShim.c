@@ -1359,18 +1359,23 @@ POBJECT_TYPE* IoFileObjectType = &IoFileObjectTypeObject;
 // A monotonic counter with a fixed frequency. Statistics.c divides by the
 // frequency, so it must never be zero.
 //
+static volatile LONG64 PerformanceTicks = 0;
+
 LARGE_INTEGER KeQueryPerformanceCounter(PLARGE_INTEGER PerformanceFrequency)
 {
-    static LONG64 Ticks = 0;
-
     if (PerformanceFrequency)
     {
         PerformanceFrequency->QuadPart = 10000000;
     }
 
     LARGE_INTEGER now;
-    now.QuadPart = InterlockedIncrement64(&Ticks);
+    now.QuadPart = InterlockedIncrement64(&PerformanceTicks);
     return now;
+}
+
+VOID ShimAdvancePerformanceCounter(LONG64 Ticks)
+{
+    InterlockedExchangeAdd64(&PerformanceTicks, Ticks);
 }
 
 ///////////////////////////////////////////////////////////////////////////

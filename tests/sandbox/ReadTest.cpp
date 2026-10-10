@@ -1449,4 +1449,235 @@ TEST_F(ReadAheadHandleTest, AShrinkVotedOnOneHandleHalvesThatHandlesOwnGranule)
     EXPECT_EQ(READ_AHEAD_MAX_GRANULARITY, ShimReadAheadGranularity(&copy->FileObject));
 }
 
+///////////////////////////////////////////////////////////////////////////
+// ReadAdaptGranularity
+///////////////////////////////////////////////////////////////////////////
+
+//
+// One handle reading a file, and what the policy tells Cc about its
+// read-ahead granularity as it goes. Every assertion is on what reaches
+// Cc (CcSetReadAheadGranularity, recorded per file object by
+// DispatchModel.c) and on the ReadAdapt counters, never on where the
+// driver keeps its window. ReadAheadHandleTest sets and restores the
+// read-ahead configuration; the granule starts at READ_AHEAD_GRANULARITY.
+//
+// Cc's read-ahead is modelled by paging reads on the same file object,
+// which is what counts as fetched. Their fetches are refused before they
+// are issued (no MDL, as in DirectFetchThatFailsToIssueSettlesItsOwnAccounting):
+// a paging read is counted toward the window when it is dispatched, so the
+// network has nothing to add. The application's reads are fast I/O reads
+// whose byte count closes a window, and the time each spends inside the
+// copy against the time between them is what says whether the reader ever
+// idles.
+//
+class ReadAdaptTest : public ReadAheadHandleTest
+{
+protected:
+    void SetUp() override
+    {
+        ReadAheadHandleTest::SetUp();
+
+        BlorgStatisticsReset();
+        Stats = BlorgStatisticsForCurrentProcessor();
+        ASSERT_NE(nullptr, Stats);
+
+        ASSERT_EQ(STATUS_SUCCESS, BlorgCreateCCB(&Ccb, Volume));
+
+        Handle.FsContext = Fcb;
+        Handle.FsContext2 = Ccb;
+        Handle.DeviceObject = Volume;
+        Handle.SectionObjectPointer = &Fcb->NonPaged->SectionObjectPointers;
+    }
+
+    void TearDown() override
+    {
+        ShimSetCcCopyReadTicks(0);
+        BlorgFreeFileContext(Ccb, Volume);
+
+        ReadAheadHandleTest::TearDown();
+    }
+
+    //
+    // The handle's first cached read, which sets up its cache map and
+    // tells Cc the starting granule. Later reads find the cache map there,
+    // as the real CcInitializeCacheMap leaves it.
+    //
+    void Open()
+    {
+        ReadRequest* req = PrepareRead(Fcb, 0, PAGE_SIZE, 0, 0, NewBuffer(PAGE_SIZE));
+        req->Stack.FileObject = &Handle;
+
+        ASSERT_EQ(STATUS_SUCCESS, BlorgRead(Volume, &req->Irp));
+        ASSERT_EQ(kGranule, ShimReadAheadGranularity(&Handle));
+
+        Handle.PrivateCacheMap = &Handle;
+    }
+
+    //
+    // Count paging reads of Length bytes, each starting Gap bytes past
+    // where the last one ended.
+    //
+    void ReadAhead(ULONG count, ULONG length, ULONG64 gap)
+    {
+        for (ULONG i = 0; i < count; ++i)
+        {
+            NextOffset += gap;
+
+            ReadRequest* req = PrepareRead(Fcb, NextOffset, length, IRP_PAGING_IO | IRP_NOCACHE);
+            req->Stack.FileObject = &Handle;
+
+            EXPECT_NE(STATUS_PENDING, BlorgRead(Volume, &req->Irp));
+
+            NextOffset += length;
+        }
+    }
+
+    void Consume(ULONG bytes)
+    {
+        LARGE_INTEGER offset = {};
+        IO_STATUS_BLOCK status = {};
+        unsigned char buffer[16] = {};
+
+        ShimSetNextCcCopyReadInformation(bytes);
+        EXPECT_TRUE(BlorgFastIoRead(&Handle, &offset, bytes, TRUE, 0, buffer, &status, Volume));
+    }
+
+    //
+    // A window in which Cc fetched four times what the reader took.
+    //
+    void WastefulWindow()
+    {
+        ReadAhead(8, kGranule, kGranule);
+        Consume(2 * kGranule);
+    }
+
+    //
+    // A window that earns growth: a run of adjacent paging reads, one of
+    // them a whole granule, so Cc honoured what it was asked for; little
+    // more fetched than consumed; and a reader that spends its time inside
+    // the copy rather than between reads.
+    //
+    void GreedySequentialWindow()
+    {
+        ShimSetCcCopyReadTicks(kCopyTicks);
+        ReadAhead(16, PAGE_SIZE, 0);
+        ReadAhead(1, kGranule, 0);
+        Consume(2 * kGranule);
+        ShimSetCcCopyReadTicks(0);
+    }
+
+    static constexpr ULONG kGranule = READ_AHEAD_GRANULARITY;
+    static constexpr LONG64 kCopyTicks = 1000000;
+
+    FILE_OBJECT Handle = {};
+    PCCB Ccb = nullptr;
+    PBLORGFS_STATISTICS Stats = nullptr;
+    ULONG64 NextOffset = 0;
+};
+
+//
+// Read-ahead fetching far more than the reader takes halves the granule,
+// but only once two windows in a row say so: one window's ratio is not
+// evidence.
+//
+TEST_F(ReadAdaptTest, WastedReadAheadShrinksTheGranuleAfterTwoWindowsAgree)
+{
+    Open();
+
+    const LONG setsBefore = ShimReadAheadGranularitySets();
+
+    WastefulWindow();
+
+    EXPECT_EQ(1u, Stats->ReadAdaptWindows);
+    EXPECT_EQ(1u, Stats->ReadAdaptVotesShrink);
+    EXPECT_EQ(setsBefore, ShimReadAheadGranularitySets())
+        << "one wasteful window moved the granule on its own";
+
+    WastefulWindow();
+
+    EXPECT_EQ(2u, Stats->ReadAdaptVotesShrink);
+    EXPECT_EQ(setsBefore + 1, ShimReadAheadGranularitySets());
+    EXPECT_EQ(kGranule / 2, ShimReadAheadGranularity(&Handle));
+    EXPECT_EQ(1u, Stats->ReadAheadShrinks);
+    EXPECT_EQ(0u, Stats->ReadAheadGrows);
+}
+
+//
+// Growth needs a greedy sequential reader whose granule Cc honours, two
+// windows running. Each window that lacks one of those -- a reader that
+// pauses between reads, a reader seeking about, read-ahead Cc capped below
+// the granule -- votes nothing, and clears the vote before it, so the
+// granule only doubles on the last pair.
+//
+TEST_F(ReadAdaptTest, GreedySequentialReaderGrowsTheGranuleOnlyWhenEverySignalAgrees)
+{
+    Open();
+
+    const LONG setsBefore = ShimReadAheadGranularitySets();
+
+    GreedySequentialWindow();
+    EXPECT_EQ(1u, Stats->ReadAdaptVotesGrow);
+
+    ReadAhead(16, PAGE_SIZE, 0);
+    ReadAhead(1, kGranule, 0);
+    ShimAdvancePerformanceCounter(kCopyTicks);
+    Consume(2 * kGranule);
+    EXPECT_EQ(1u, Stats->ReadAdaptVotesGrow) << "a reader that pauses between reads has a deadline";
+
+    GreedySequentialWindow();
+    EXPECT_EQ(2u, Stats->ReadAdaptVotesGrow);
+
+    ShimSetCcCopyReadTicks(kCopyTicks);
+    ReadAhead(16, PAGE_SIZE, kGranule);
+    ReadAhead(1, kGranule, kGranule);
+    Consume(2 * kGranule);
+    ShimSetCcCopyReadTicks(0);
+    EXPECT_EQ(2u, Stats->ReadAdaptVotesGrow) << "a reader seeking about is not sequential";
+
+    GreedySequentialWindow();
+    EXPECT_EQ(3u, Stats->ReadAdaptVotesGrow);
+
+    ShimSetCcCopyReadTicks(kCopyTicks);
+    ReadAhead(17, PAGE_SIZE, 0);
+    Consume(2 * kGranule);
+    ShimSetCcCopyReadTicks(0);
+    EXPECT_EQ(3u, Stats->ReadAdaptVotesGrow) << "Cc never read a whole granule, so a larger one changes nothing";
+
+    EXPECT_EQ(6u, Stats->ReadAdaptWindows);
+    EXPECT_EQ(0u, Stats->ReadAdaptVotesShrink);
+    EXPECT_EQ(setsBefore, ShimReadAheadGranularitySets())
+        << "the granule moved without two agreeing windows in a row";
+
+    GreedySequentialWindow();
+    GreedySequentialWindow();
+
+    EXPECT_EQ(5u, Stats->ReadAdaptVotesGrow);
+    EXPECT_EQ(setsBefore + 1, ShimReadAheadGranularitySets());
+    EXPECT_EQ(2 * kGranule, ShimReadAheadGranularity(&Handle));
+    EXPECT_EQ(1u, Stats->ReadAheadGrows);
+    EXPECT_EQ(0u, Stats->ReadAheadShrinks);
+}
+
+//
+// ReadAheadAdapt=0 pins the granule where it started, however clear the
+// evidence.
+//
+TEST_F(ReadAdaptTest, AdaptOffPinsTheGranule)
+{
+    global.ReadAheadAdapt = FALSE;
+
+    Open();
+
+    const LONG setsBefore = ShimReadAheadGranularitySets();
+
+    WastefulWindow();
+    WastefulWindow();
+    WastefulWindow();
+
+    EXPECT_EQ(setsBefore, ShimReadAheadGranularitySets());
+    EXPECT_EQ(kGranule, ShimReadAheadGranularity(&Handle));
+    EXPECT_EQ(0u, Stats->ReadAdaptWindows);
+}
+
+
 } // namespace
