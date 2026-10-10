@@ -83,7 +83,7 @@ NTSTATUS BlorgClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
     }
     FsRtlExitFileSystem();
-    
+
     Irp->IoStatus.Status = result;
 
     IoCompleteRequest(Irp, IO_NO_INCREMENT);

@@ -120,7 +120,6 @@ static inline BOOLEAN DirCtrlMatchPattern(const PUNICODE_STRING EntryName, const
         {
             return FALSE;
         }
-
     }
     else
     {

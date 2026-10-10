@@ -1596,7 +1596,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         }
     }
 
-    if (!BooleanFlagOn(Irp->Flags, IRP_PAGING_IO) && 
+    if (!BooleanFlagOn(Irp->Flags, IRP_PAGING_IO) &&
         BooleanFlagOn(Irp->Flags, IRP_NOCACHE) &&
         IrpSp->FileObject->SectionObjectPointer->DataSectionObject)
     {
@@ -1793,14 +1793,13 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     BLORGFS_PRINT("Cached Read could not wait\n");
                     return BlorgFsdPostRequest(Irp, IrpSp);
                 }
-
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
                 BLORGFS_PRINT("Cached Read exception: %8lx\n", GetExceptionCode());
                 return GetExceptionCode();
             }
-            
+
             result = Irp->IoStatus.Status;
 
             NT_ASSERT(NT_SUCCESS(result));

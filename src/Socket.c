@@ -1307,7 +1307,7 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 // (idle, owned by the pool) or "out" (owned by exactly one caller), and
 // the spinlock only ever protects list membership transitions, never an
 // in-flight I/O operation.
-// 
+//
 // LIFO: the most recently used connection goes back on the head,
 // where BlorgAcquireReusableWskSocketAsync's RemoveHeadList will hand it
 // out next. A FIFO here cycles through all pooled connections,

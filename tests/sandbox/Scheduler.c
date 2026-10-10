@@ -2282,7 +2282,6 @@ static void RunOnce(KM_SCHED_BODY Setup, KM_SCHED_BODY Teardown, void* Context)
     {
         Teardown(Context);
     }
-
 }
 
 //

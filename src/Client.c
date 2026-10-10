@@ -320,7 +320,6 @@ typedef enum _HTTP_CONNECTION_SOURCE
     // never retried again.
     //
     HttpConnectionFresh
-
 } HTTP_CONNECTION_SOURCE;
 
 typedef struct _HTTP_CONTEXT HTTP_CONTEXT;

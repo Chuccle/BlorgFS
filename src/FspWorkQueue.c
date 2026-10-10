@@ -537,10 +537,10 @@ VOID BlorgOplockComplete(PVOID Context, PIRP Irp)
 // threads. The count is a parameter because BlorgCreateWorkQueue's
 // partial-failure unwind reaps only the threads it actually started.
 //
-// NOTE: This is not thread-safe against concurrent calls of 
+// NOTE: This is not thread-safe against concurrent calls of
 // BlorgCreateWorkQueue and BlorgDestroyWorkQueue.
-// 
-// Designed to follow driver lifecycle so is naturally serialized 
+//
+// Designed to follow driver lifecycle so is naturally serialized
 // by the driver load/unload path, but if that changes we internally
 // synchronise.
 //
@@ -579,10 +579,10 @@ static VOID FspStopWorkQueueThreads(ULONG ThreadCount)
 // never terminated) and the survivors running BlorgFspDispatch out of an
 // unloaded driver image.
 //
-// NOTE: This is not thread-safe against concurrent calls of 
+// NOTE: This is not thread-safe against concurrent calls of
 // BlorgCreateWorkQueue and BlorgDestroyWorkQueue.
-// 
-// Designed to follow driver lifecycle so is naturally serialized 
+//
+// Designed to follow driver lifecycle so is naturally serialized
 // by the driver load/unload path, but if that changes we internally
 // synchronise.
 //
@@ -591,7 +591,7 @@ NTSTATUS BlorgCreateWorkQueue(VOID)
     if (InterlockedCompareExchange(&FspQueue.ThreadsActive, TRUE, FALSE))
     {
         return STATUS_SUCCESS;
-    }   
+    }
 
     KeInitializeSpinLock(&FspQueue.IrpQueueSpinLock);
     InitializeListHead(&FspQueue.IrpQueue);
