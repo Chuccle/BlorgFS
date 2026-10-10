@@ -189,10 +189,17 @@ BOOLEAN FsRtlCheckLockForOplockRequest(PFILE_LOCK FileLock, PLARGE_INTEGER Alloc
     return TRUE;
 }
 
+static volatile LONG LastOplockOpenCount = 0;
+
 NTSTATUS FsRtlOplockFsctrl(POPLOCK Oplock, PIRP Irp, ULONG OpenCount)
 {
     (void)Oplock;
     (void)Irp;
-    (void)OpenCount;
+    InterlockedExchange(&LastOplockOpenCount, (LONG)OpenCount);
     return STATUS_SUCCESS;
+}
+
+ULONG ShimLastOplockOpenCount(VOID)
+{
+    return (ULONG)InterlockedCompareExchange(&LastOplockOpenCount, 0, 0);
 }

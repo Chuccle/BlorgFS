@@ -313,7 +313,23 @@ NTSTATUS FsRtlCheckOplock(POPLOCK O, PIRP I, PVOID C, PVOID W, PVOID P)
 }
 
 BOOLEAN FsRtlOplockIsFastIoPossible(POPLOCK O) { (void)O; return TRUE; }
-BOOLEAN FsRtlOplockIsSharedRequest(PIRP I) { (void)I; return TRUE; }
+//
+// Every request is a shared one unless a test asks for the next to be
+// exclusive (batch, filter, level 1, or RWH), the only kind whose grant
+// depends on how many handles are open.
+//
+static volatile LONG OplockNextExclusive = 0;
+
+VOID ShimForceNextOplockRequestExclusive(VOID)
+{
+    InterlockedExchange(&OplockNextExclusive, 1);
+}
+
+BOOLEAN FsRtlOplockIsSharedRequest(PIRP I)
+{
+    (void)I;
+    return (BOOLEAN)(0 == InterlockedExchange(&OplockNextExclusive, 0));
+}
 
 NTSTATUS FsRtlOplockBreakH(POPLOCK O, PIRP I, ULONG F, PVOID C, PVOID Cb, PVOID P)
 {

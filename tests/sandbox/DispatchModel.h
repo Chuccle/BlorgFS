@@ -36,6 +36,7 @@ VOID KdBreakPoint(VOID);
 // FspWorkQueueStressTest.cpp.
 //
 VOID ShimForceNextOplockCheck(NTSTATUS Status);
+VOID ShimForceNextOplockRequestExclusive(VOID);
 VOID ShimForceNextCcCopyReadMiss(VOID);
 VOID ShimSetNextCcCopyReadInformation(ULONG Information);
 

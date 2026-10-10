@@ -1377,4 +1377,50 @@ TEST_F(FcbReopenTest, EachFileHandleHasACcbOfItsOwn)
     CloseOpener(&first);
 }
 
+//
+// An exclusive oplock (batch, filter, level 1 or RWH) is granted only to
+// the sole open handle, so the count handed to FsRtl must be the handles
+// not yet cleaned up, as fastfat's UncleanCount is. It used to be
+// RefCount, which drops at close: the file object Cc keeps for its cache
+// map is cleaned up when its handle closes but closed only when Cc lets it
+// go, so after one cached read the next opener counted two and its batch
+// oplock was refused. Here the first handle is cleaned up and its close
+// held back, as Cc holds it.
+//
+TEST_F(FcbReopenTest, AnExclusiveOplockCountsHandlesNotYetCleanedUp)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    IO_STACK_LOCATION stack = {};
+    stack.MajorFunction = IRP_MJ_FILE_SYSTEM_CONTROL;
+    stack.MinorFunction = IRP_MN_USER_FS_REQUEST;
+    stack.DeviceObject = Volume;
+    stack.FileObject = &second.FileObject;
+    stack.Parameters.FileSystemControl.FsControlCode = FSCTL_REQUEST_BATCH_OPLOCK;
+
+    IRP request = {};
+    request.StackLocation = &stack;
+
+    ShimForceNextOplockRequestExclusive();
+    EXPECT_EQ(STATUS_PENDING, BlorgFileSystemControl(Volume, &request));
+    EXPECT_EQ(2u, ShimLastOplockOpenCount()) << "two handles are open";
+
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    IRP retry = {};
+    retry.StackLocation = &stack;
+
+    ShimForceNextOplockRequestExclusive();
+    EXPECT_EQ(STATUS_PENDING, BlorgFileSystemControl(Volume, &retry));
+    EXPECT_EQ(1u, ShimLastOplockOpenCount())
+        << "a file object cleaned up but not yet closed was counted as an open handle";
+
+    CloseOpener(&second);
+    BlorgClose(Volume, &first.CloseIrp);
+}
+
 } // namespace
