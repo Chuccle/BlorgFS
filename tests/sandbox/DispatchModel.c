@@ -58,8 +58,12 @@ static struct
     ULONG Granularity;
 } ShimReadAheadGranules[SHIM_READ_AHEAD_FILES];
 
+static volatile LONG ShimReadAheadGranularitySetCount = 0;
+
 VOID CcSetReadAheadGranularity(PFILE_OBJECT F, ULONG G)
 {
+    InterlockedIncrement(&ShimReadAheadGranularitySetCount);
+
     for (ULONG i = 0; i < SHIM_READ_AHEAD_FILES; ++i)
     {
         if (F == ShimReadAheadGranules[i].FileObject || NULL == ShimReadAheadGranules[i].FileObject)
@@ -87,6 +91,11 @@ ULONG ShimReadAheadGranularity(PFILE_OBJECT F)
 VOID ShimReadAheadGranularityReset(VOID)
 {
     RtlZeroMemory(ShimReadAheadGranules, sizeof(ShimReadAheadGranules));
+}
+
+LONG ShimReadAheadGranularitySets(VOID)
+{
+    return InterlockedCompareExchange(&ShimReadAheadGranularitySetCount, 0, 0);
 }
 
 //
@@ -144,6 +153,17 @@ static volatile LONG CcCopyReadForceMiss = 0;
 //
 static volatile LONG CcCopyReadInformation = 0;
 
+//
+// How long each successful copy takes, in performance-counter ticks: the
+// time a reader spends waiting inside the cache rather than between reads.
+//
+static volatile LONG64 CcCopyReadTicks = 0;
+
+VOID ShimSetCcCopyReadTicks(LONG64 Ticks)
+{
+    InterlockedExchange64(&CcCopyReadTicks, Ticks);
+}
+
 VOID ShimForceNextCcCopyReadMiss(VOID)
 {
     InterlockedExchange(&CcCopyReadForceMiss, 1);
@@ -168,6 +188,8 @@ BOOLEAN CcCopyReadEx(PFILE_OBJECT F, PLARGE_INTEGER O, ULONG L, BOOLEAN W, PVOID
         S->Status = STATUS_SUCCESS;
         S->Information = (ULONG)InterlockedExchange(&CcCopyReadInformation, 0);
     }
+
+    ShimAdvancePerformanceCounter(InterlockedCompareExchange64(&CcCopyReadTicks, 0, 0));
 
     return TRUE;
 }

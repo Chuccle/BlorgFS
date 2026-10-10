@@ -323,6 +323,13 @@ typedef enum _WAIT_TYPE { WaitAll, WaitAny } WAIT_TYPE;
 
 LARGE_INTEGER KeQueryPerformanceCounter(PLARGE_INTEGER PerformanceFrequency);
 
+//
+// Moves the counter on by Ticks, as that much time passing would. It
+// otherwise ticks once per call, so a test that needs one interval to be
+// long against another says so here.
+//
+VOID ShimAdvancePerformanceCounter(LONG64 Ticks);
+
 ///////////////////////////////////////////////////////////////////////////
 // Filesystem statistics
 ///////////////////////////////////////////////////////////////////////////

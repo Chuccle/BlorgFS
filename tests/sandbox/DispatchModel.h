@@ -39,6 +39,7 @@ VOID ShimForceNextOplockCheck(NTSTATUS Status);
 VOID ShimForceNextOplockRequestExclusive(VOID);
 VOID ShimForceNextCcCopyReadMiss(VOID);
 VOID ShimSetNextCcCopyReadInformation(ULONG Information);
+VOID ShimSetCcCopyReadTicks(LONG64 Ticks);
 
 //
 // What a reopened FCB's refresh asked of Cc and Mm (Create.c
@@ -52,10 +53,12 @@ VOID ShimRefuseNextCachePurge(VOID);
 //
 // The read-ahead granule the driver last told Cc on a file object
 // (CcSetReadAheadGranularity), zero if it never did, and a reset that
-// forgets every file object a test read through.
+// forgets every file object a test read through; and how many times the
+// driver has told Cc a granule at all.
 //
 ULONG ShimReadAheadGranularity(PFILE_OBJECT F);
 VOID ShimReadAheadGranularityReset(VOID);
+LONG ShimReadAheadGranularitySets(VOID);
 
 BOOLEAN ExIsResourceAcquiredExclusiveLite(PERESOURCE Resource);
 VOID ExConvertExclusiveToSharedLite(PERESOURCE Resource);
