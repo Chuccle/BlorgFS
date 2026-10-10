@@ -35,6 +35,7 @@ static NTSTATUS CloseVolume(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDevic
         }
         case BLORGFS_FCB_SIGNATURE:
         {
+            BlorgFreeFileContext(fileObject->FsContext2, VolumeDeviceObject);
             BlorgNodeDereference(fileObject->FsContext);
 
             return STATUS_SUCCESS;

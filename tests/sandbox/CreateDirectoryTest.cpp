@@ -1337,4 +1337,44 @@ TEST_F(FcbReopenTest, PurgeRefusedKeepsTheOldCopyUntilTheNextOpen)
     BlorgClose(Volume, &first.CloseIrp);
 }
 
+//
+// Every file handle has a CCB of its own. Cc keeps the read-ahead granule
+// per file object, and the cached read path keeps what it told Cc on the
+// handle's CCB (ReadAdaptGranularity, Read.c); a file open used to leave
+// FsContext2 NULL, and the granule lived on the FCB, where one handle's
+// first read reset another's. An open the share check refuses frees the
+// CCB it was given, and each close frees its handle's, which the volume's
+// CCB lookaside list checks at teardown.
+//
+TEST_F(FcbReopenTest, EachFileHandleHasACcbOfItsOwn)
+{
+    CreateOpener first;
+    PrepareOpener(&first, Path(L"\\media\\clip.bin"), FILE_READ_DATA, FILE_SHARE_READ, 0);
+    BlorgCreate(Volume, &first.CreateIrp);
+    ASSERT_EQ(STATUS_SUCCESS, first.CreateIrp.IoStatus.Status);
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    PCCB firstCcb = C_CAST(PCCB, first.FileObject.FsContext2);
+    PCCB secondCcb = C_CAST(PCCB, second.FileObject.FsContext2);
+
+    ASSERT_NE(nullptr, firstCcb);
+    ASSERT_NE(nullptr, secondCcb);
+    EXPECT_NE(firstCcb, secondCcb) << "two handles sharing one CCB share one read-ahead granule";
+    EXPECT_EQ(BLORGFS_CCB_SIGNATURE, GET_NODE_TYPE(firstCcb));
+    EXPECT_EQ(BLORGFS_CCB_SIGNATURE, GET_NODE_TYPE(secondCcb));
+
+    CreateOpener refused;
+    PrepareOpener(&refused, Path(L"\\media\\clip.bin"), FILE_READ_DATA, 0, 0);
+    BlorgCreate(Volume, &refused.CreateIrp);
+
+    EXPECT_EQ(STATUS_SHARING_VIOLATION, refused.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(nullptr, refused.FileObject.FsContext2);
+    EXPECT_EQ(2u, File->ShareAccess.OpenCount);
+
+    CloseOpener(&second);
+    CloseOpener(&first);
+}
+
 } // namespace

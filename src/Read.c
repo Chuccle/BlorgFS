@@ -8,7 +8,7 @@
 
 //
 //  READ_AHEAD_GRANULARITY (Driver.h) is where Cc's read-ahead granularity
-//  starts for a cached file; ReadAdaptGranularity below moves it per file
+//  starts for a cached file; ReadAdaptGranularity below moves it per handle
 //  from what the reader turns out to be doing. Left unset entirely, Cc's
 //  own default is PAGE_SIZE -- a constant, not a policy -- which
 //  under-fetches badly against a backend where every miss is an HTTP round
@@ -702,7 +702,12 @@ static VOID ReadFairGiveBack(ULONG Fetches)
 // amplification alone. Wasted bytes are wasted whether or not anyone has a
 // deadline, so nothing about the consumer enters into it.
 //
-// The configured value is where a file starts, not the range it may move
+// The window is the file's and the granule is the handle's: the window
+// that closes on a handle's read is judged against, and moves, the granule
+// Cc was told on that handle's file object (see the FCB's read-ahead
+// window in Structs.h), so no handle's vote moves another's granule.
+//
+// The configured value is where a handle starts, not the range it may move
 // in: growth is allowed above it up to ReadAheadMaxGranularity, and a
 // configuration that raised the start above that maximum keeps its own
 // value as the ceiling rather than being quietly clamped down.
@@ -714,13 +719,15 @@ static VOID ReadFairGiveBack(ULONG Fetches)
 //
 static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 {
-    if (0 == global.ReadAheadGranularity || 0 == Fcb->ReadAheadGranularity ||
+    PCCB ccb = FileObject->FsContext2;
+
+    if (0 == global.ReadAheadGranularity || 0 == ccb->ReadAheadGranularity ||
         !global.ReadAheadAdapt)
     {
         return;
     }
 
-    const ULONG current = Fcb->ReadAheadGranularity;
+    const ULONG current = ccb->ReadAheadGranularity;
 
     ULONG64 window = C_CAST(ULONG64, current) * READ_AHEAD_ADAPT_WINDOW_GRANULES;
 
@@ -777,21 +784,21 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 
     if (0 == vote)
     {
-        Fcb->ReadAheadAgreement = 0;
+        ccb->ReadAheadAgreement = 0;
         return;
     }
 
-    Fcb->ReadAheadAgreement = (Fcb->ReadAheadAgreement * vote > 0)
-        ? (Fcb->ReadAheadAgreement + vote)
+    ccb->ReadAheadAgreement = (ccb->ReadAheadAgreement * vote > 0)
+        ? (ccb->ReadAheadAgreement + vote)
         : vote;
 
-    if (Fcb->ReadAheadAgreement > -READ_AHEAD_ADAPT_AGREEMENT &&
-        Fcb->ReadAheadAgreement < READ_AHEAD_ADAPT_AGREEMENT)
+    if (ccb->ReadAheadAgreement > -READ_AHEAD_ADAPT_AGREEMENT &&
+        ccb->ReadAheadAgreement < READ_AHEAD_ADAPT_AGREEMENT)
     {
         return;
     }
 
-    Fcb->ReadAheadAgreement = 0;
+    ccb->ReadAheadAgreement = 0;
 
     const ULONG ceiling = (global.ReadAheadGranularity > global.ReadAheadMaxGranularity)
         ? global.ReadAheadGranularity
@@ -806,7 +813,7 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
         return;
     }
 
-    Fcb->ReadAheadGranularity = next;
+    ccb->ReadAheadGranularity = next;
 
     CcSetReadAheadGranularity(FileObject, next);
 
@@ -1736,11 +1743,12 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             if (0 != global.ReadAheadGranularity)
             {
+                PCCB ccb = IrpSp->FileObject->FsContext2;
+
                 CcSetReadAheadGranularity(IrpSp->FileObject, global.ReadAheadGranularity);
-                fcb->ReadAheadGranularity = global.ReadAheadGranularity;
+                ccb->ReadAheadGranularity = global.ReadAheadGranularity;
                 fcb->ReadAheadFetchedBytes = 0;
                 fcb->ReadAheadConsumedBytes = 0;
-                fcb->ReadAheadAgreement = 0;
             }
         }
 
