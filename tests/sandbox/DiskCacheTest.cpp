@@ -1236,4 +1236,157 @@ TEST_F(DiskCacheTest, AReadBeyondTheBlockLimitIsFetchedRatherThanServed)
     BlorgFreeFileContext(big, Volume);
 }
 
+//
+// A part of a read that cannot be started once another is in flight -- no
+// IRP, MDL or mapping for it, or no fetch -- leaves the read unable to go
+// back to its caller as untaken, since the part in flight is writing into
+// its buffer. It used to fail the whole read with the part's status, so a
+// passing shortage of memory surfaced as a failed paging read. It is
+// fetched whole once the part in flight is done, as a read the cache file
+// failed is, and the cache file is not blamed for it.
+//
+// The held block is read from the cache file first; the mapping the fetch
+// of the second block needs is the one that fails.
+//
+TEST_F(DiskCacheTest, APartThatCannotStartAfterAnotherIsFetchedWhole)
+{
+    StartCache();
+
+    Warm(0, kBlock);
+
+    const ULONG cacheReads = DiskCacheModelIrps(IRP_MJ_READ);
+
+    ShimFailNextMdlMapping();
+
+    unsigned char* buffer = Read(0, 2 * kBlock);
+
+    EXPECT_EQ(STATUS_SUCCESS, LastStatus) << "a part that could not start failed the read";
+    EXPECT_EQ(2 * kBlock, LastInformation);
+    EXPECT_EQ(0, memcmp(buffer, Body.data(), 2 * kBlock));
+    EXPECT_EQ(cacheReads + 1, DiskCacheModelIrps(IRP_MJ_READ))
+        << "the held block was to be read from the cache file before the fetch failed to start";
+    EXPECT_EQ(0u, Totals().DiskCachePartialHits);
+    EXPECT_EQ(0u, Totals().DiskCacheReadFailures) << "the cache file did nothing wrong";
+    EXPECT_TRUE(BlorgDiskCacheLive());
+
+    SIZE_T length = 0;
+    const unsigned char* request = SandboxLastRequest(&length);
+    const std::string text((const char*)request, length);
+
+    EXPECT_NE(std::string::npos, text.find("Range: bytes=0-131071")) << text;
+}
+
+//
+// A read with more holes than DISK_CACHE_MAX_READ_FETCHES runs gives up
+// the held blocks of its shortest gap, one gap at a time, until its holes
+// fit, and fetches each run with a request of its own. Here five holes
+// become four: the one held block between the first two is fetched with
+// them, and the six in the wider gaps are still read from the cache file.
+//
+// Every run here is three blocks and the file is one byte value
+// throughout, so the one scripted answer is right for whichever socket
+// each fetch lands on.
+//
+TEST_F(DiskCacheTest, AReadWithMoreHolesThanFetchesMergesTheShortestGap)
+{
+    StartCache(8);
+
+    const ULONG blocks = 18;
+    UNICODE_STRING name = Path(L"\\media\\holes.bin");
+    PFCB holes = nullptr;
+
+    ASSERT_EQ(STATUS_SUCCESS,
+        BlorgCreateFCB(&holes, (CSHORT)BLORGFS_FCB_SIGNATURE, &name, Volume, (ULONG64)blocks * kBlock));
+    InitializeListHead(&holes->Links);
+    holes->LastModifiedTime = kModifiedTime;
+
+    Body.assign((SIZE_T)blocks * kBlock, 0x6D);
+    ScriptedEtag = "\"1.0-120000\"";
+
+    Warm(1ull * kBlock, kBlock, holes);
+    Warm(3ull * kBlock, 2 * kBlock, holes);
+    Warm(8ull * kBlock, 2 * kBlock, holes);
+    Warm(13ull * kBlock, 2 * kBlock, holes);
+
+    const ULONG64 issued = Totals().FetchesIssued;
+
+    Answer(0, 3 * kBlock);
+
+    unsigned char* buffer = nullptr;
+    ReadRequest* req = Start(0, blocks * kBlock, &buffer, FALSE, holes);
+    Settle();
+
+    EXPECT_EQ(1, req->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, req->Irp.IoStatus.Status);
+    EXPECT_EQ(blocks * kBlock, req->Irp.IoStatus.Information);
+    EXPECT_EQ(0, memcmp(buffer, Body.data(), (SIZE_T)blocks * kBlock));
+    EXPECT_EQ(issued + DISK_CACHE_MAX_READ_FETCHES, Totals().FetchesIssued)
+        << "five holes must be fetched in at most four requests";
+    EXPECT_EQ(1u, Totals().DiskCachePartialHits);
+    EXPECT_EQ(6ull * kBlock, Totals().DiskCacheHitBytes)
+        << "only the held block in the shortest gap is given up";
+
+    BlorgFreeFileContext(holes, Volume);
+}
+
+//
+// Cleanup waits for every fill it counted: one whose write the cache file
+// has not finished, and one still queued for a worker that has not run.
+// Closing the file under either would complete a write on a closed file
+// or have the worker issue one there. The queued one is given up when its
+// worker finds the cache off; the one in flight is kept, since its write
+// was already on its way. The fills are offered as a fetch completion
+// offers them, so nothing here waits on the link.
+//
+TEST_F(DiskCacheTest, CleanupWaitsForFillsInFlight)
+{
+    StartCache();
+
+    DISK_CACHE_KEY key;
+    BlorgDiskCacheNoteFile(Fcb->NonPaged, &Fcb->FullPath, kFileSize, kModifiedTime, &key);
+
+    FILE_BUFFER first = {};
+    first.BodyBuffer = C_CAST(PCHAR, Body.data());
+    first.BodyBufferSize = kBlock;
+    first.HasVersion = TRUE;
+    first.VersionSize = kFileSize;
+    first.VersionTime = kModifiedTime;
+
+    FILE_BUFFER second = first;
+    second.BodyBuffer = C_CAST(PCHAR, Body.data() + kBlock);
+
+    DiskCacheModelHold(TRUE);
+
+    ASSERT_TRUE(BlorgDiskCacheAdmit(Fcb->NonPaged, &first, 0, kBlock));
+    ASSERT_TRUE(BlorgDiskCacheAdmit(Fcb->NonPaged, &first, 0, kBlock));
+    ShimDrainWorkItems();
+
+    ASSERT_EQ(1u, DiskCacheModelIrps(IRP_MJ_WRITE)) << "the first fill's write should be held by the cache file";
+
+    ASSERT_TRUE(BlorgDiskCacheAdmit(Fcb->NonPaged, &second, kBlock, kBlock));
+    ASSERT_TRUE(BlorgDiskCacheAdmit(Fcb->NonPaged, &second, kBlock, kBlock));
+
+    HANDLE cleaner = CreateThread(NULL, 0, [](LPVOID) -> DWORD { BlorgDiskCacheCleanup(); return 0; }, NULL, 0, NULL);
+    ASSERT_NE((HANDLE)NULL, cleaner);
+
+    EXPECT_EQ((DWORD)WAIT_TIMEOUT, WaitForSingleObject(cleaner, 200))
+        << "cleanup closed the cache file with fills still counted";
+
+    ShimDrainWorkItems();
+
+    EXPECT_EQ((DWORD)WAIT_TIMEOUT, WaitForSingleObject(cleaner, 200))
+        << "cleanup closed the cache file under a write still in flight";
+    EXPECT_EQ(1u, DiskCacheModelIrps(IRP_MJ_WRITE)) << "a fill queued before cleanup was written after it";
+
+    DiskCacheModelHold(FALSE);
+    DiskCacheModelCompleteHeld();
+
+    EXPECT_EQ((DWORD)WAIT_OBJECT_0, WaitForSingleObject(cleaner, 30000));
+    CloseHandle(cleaner);
+
+    EXPECT_FALSE(BlorgDiskCacheLive());
+    EXPECT_EQ(1u, Totals().DiskCacheFills);
+    EXPECT_EQ(1u, Totals().DiskCacheFillFailures);
+}
+
 } // namespace
