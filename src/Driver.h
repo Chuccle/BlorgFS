@@ -245,6 +245,10 @@ do                                                                             \
 
 _Dispatch_type_(IRP_MJ_CREATE)                   DRIVER_DISPATCH BlorgCreate;
 
+// Counts a volume create in SuccessfulCreates or FailedCreates by the
+// status it is completed with, wherever that happens (Create.c).
+VOID BlorgCountCreate(NTSTATUS Status);
+
 _Dispatch_type_(IRP_MJ_CLOSE)                    DRIVER_DISPATCH BlorgClose;
 _Dispatch_type_(IRP_MJ_READ)                     DRIVER_DISPATCH BlorgRead;
 

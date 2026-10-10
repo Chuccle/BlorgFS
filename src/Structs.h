@@ -797,6 +797,7 @@ VOID BlorgPathCacheTakeTicket(PPATH_CACHE_TICKET Ticket);
 BOOLEAN BlorgPathCacheTicketCurrent(const PATH_CACHE_TICKET* Ticket);
 PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta);
 PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta, _Inout_opt_ PPATH_CACHE_TICKET Ticket);
+VOID BlorgPathCacheCountLookup(PATH_CACHE_RESULT Result);
 PATH_CACHE_RESULT BlorgPathCachePeek(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta);
 VOID BlorgPathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket);
 VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path, _In_opt_ const PATH_CACHE_TICKET* Ticket);

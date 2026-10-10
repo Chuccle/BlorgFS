@@ -164,6 +164,22 @@ static VOID FspDiscardPendingIrpContext(PIRP Irp)
 }
 
 //
+// Completes an IRP that was posted, counting it first if it is a create:
+// a create that pends is finished here or by CreateComplete, never by
+// BlorgCreate, which counts only those finished in the FSD pass
+// (BlorgCountCreate).
+//
+static VOID FspCompleteRequest(PIRP Irp, NTSTATUS Status, CCHAR PriorityBoost)
+{
+    if (IRP_MJ_CREATE == IoGetCurrentIrpStackLocation(Irp)->MajorFunction)
+    {
+        BlorgCountCreate(Status);
+    }
+
+    BlorgCompleteRequest(Irp, Status, PriorityBoost);
+}
+
+//
 // IO_CSQ cancel callback: completes an IRP that was cancelled while still
 // queued (the CSQ has already removed it by the time this runs).
 //
@@ -173,7 +189,7 @@ VOID BlorgFspCsqCompleteCanceledIrp(IO_CSQ* Csq, PIRP Irp)
 
     FspDiscardPendingIrpContext(Irp);
 
-    BlorgCompleteRequest(Irp, STATUS_CANCELLED, IO_NO_INCREMENT);
+    FspCompleteRequest(Irp, STATUS_CANCELLED, IO_NO_INCREMENT);
 }
 
 // PsCreateSystemThread creates threads inside a critical region with kernel
@@ -300,7 +316,7 @@ Return Value:
 
             if (STATUS_PENDING != result)
             {
-                BlorgCompleteRequest(irp, result, IO_DISK_INCREMENT);
+                FspCompleteRequest(irp, result, IO_DISK_INCREMENT);
             }
 
             IoSetTopLevelIrp(NULL);
@@ -557,7 +573,7 @@ VOID BlorgOplockComplete(PVOID Context, PIRP Irp)
 
     NTSTATUS result = NT_SUCCESS(Irp->IoStatus.Status) ? STATUS_DEVICE_REMOVED : Irp->IoStatus.Status;
 
-    BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
+    FspCompleteRequest(Irp, result, IO_DISK_INCREMENT);
 }
 
 //
@@ -703,7 +719,7 @@ VOID BlorgDestroyWorkQueue(VOID)
     {
         FspDiscardPendingIrpContext(irp);
 
-        BlorgCompleteRequest(irp, STATUS_CANCELLED, IO_NO_INCREMENT);
+        FspCompleteRequest(irp, STATUS_CANCELLED, IO_NO_INCREMENT);
         irp = IoCsqRemoveNextIrp(&FspQueue.Csq, NULL);
 
         if (irp)

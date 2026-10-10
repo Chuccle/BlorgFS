@@ -524,6 +524,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
 
         ExFreePool(netCtx->Path.Buffer);
         ExFreePool(netCtx);
+        BlorgCountCreate(Status);
         BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
@@ -538,6 +539,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
     {
         ExFreePool(netCtx->Path.Buffer);
         ExFreePool(netCtx);
+        BlorgCountCreate(STATUS_INSUFFICIENT_RESOURCES);
         BlorgCompleteRequest(irp, STATUS_INSUFFICIENT_RESOURCES, IO_DISK_INCREMENT);
         return;
     }
@@ -557,6 +559,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
     {
         ExFreePool(stash);
         irp->Tail.Overlay.DriverContext[1] = NULL;
+        BlorgCountCreate(requeue);
         BlorgCompleteRequest(irp, requeue, IO_DISK_INCREMENT);
     }
 }
@@ -973,6 +976,11 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         DIRECTORY_ENTRY_METADATA cached;
         PATH_CACHE_RESULT pc = BlorgPathCacheLookupDated(&filePath.String, &cached, &resolvedTicket);
 
+        if (PathCacheMiss != pc)
+        {
+            BlorgPathCacheCountLookup(pc);
+        }
+
         if (PathCacheExists == pc)
         {
             BLORGFS_STAT_INC(CreateHits);
@@ -1013,6 +1021,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             {
                 BOOLEAN found = CreateFindEntryByName(listing, &leaf, &dirEntInfo);
                 BlorgReleaseDirectoryInfo(listing);
+                BlorgPathCacheCountLookup(PathCacheMiss);
 
                 if (found)
                 {
@@ -1052,6 +1061,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             return BlorgFsdPostRequest(Irp, IrpSp);
         }
 
+        BlorgPathCacheCountLookup(PathCacheMiss);
         BLORGFS_LOG("Create cache MISS -> network: %wZ\n", &filePath.String);
 
         PCREATE_NET_CONTEXT netCtx = ExAllocatePoolZero(NonPagedPoolNx, sizeof(CREATE_NET_CONTEXT), 'CRET');
@@ -1304,15 +1314,31 @@ static NTSTATUS CreateFileSystem(PIRP Irp)
 }
 
 //
+//  Counts a volume create in SuccessfulCreates or FailedCreates by the
+//  status it is completed with. Called wherever a volume create is
+//  completed rather than at each return inside BlorgVolumeCreate, since
+//  only the completion knows the final status: BlorgCreate for one finished
+//  in the FSD pass, the FSP worker for one finished there or cancelled in
+//  the queue, and CreateComplete for one it fails itself. A create that
+//  pends is counted once, by whichever completion finishes it.
+//
+VOID BlorgCountCreate(NTSTATUS Status)
+{
+    if (NT_SUCCESS(Status))
+    {
+        BLORGFS_STAT_INC(SuccessfulCreates);
+    }
+    else
+    {
+        BLORGFS_STAT_INC(FailedCreates);
+    }
+}
+
+//
 //  IRP_MJ_CREATE dispatch entry: sets up the IRP context/top-level state,
 //  dispatches by device type, and completes the IRP unless the volume
 //  path returned STATUS_PENDING (async network lookup or FSP requeue in
 //  flight).
-//
-//  SuccessfulCreates/FailedCreates are counted here rather than at each
-//  return inside BlorgVolumeCreate: this is the one place a create's final
-//  status is known, and a create that pends is counted by whichever
-//  completion finishes it rather than twice.
 //
 //  The default case is unreachable through the I/O manager today -- only
 //  this driver's three device objects carry its major table -- but the
@@ -1337,15 +1363,7 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             result = BlorgVolumeCreate(Irp, irpSp, DeviceObject);
             if (STATUS_PENDING != result)
             {
-                if (NT_SUCCESS(result))
-                {
-                    BLORGFS_STAT_INC(SuccessfulCreates);
-                }
-                else
-                {
-                    BLORGFS_STAT_INC(FailedCreates);
-                }
-
+                BlorgCountCreate(result);
                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
             break;

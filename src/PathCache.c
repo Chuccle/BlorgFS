@@ -520,13 +520,16 @@ static PATH_CACHE_RESULT PathCacheFind(const UNICODE_STRING* Path, PDIRECTORY_EN
 // not "metadata I/O" -- a pure cache hit moves no bytes and must not
 // inflate an I/O-shaped number.
 //
-PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta, _Inout_opt_ PPATH_CACHE_TICKET Ticket)
+// Counted apart from the lookup because a create that misses outside the
+// FSP posts itself and looks the path up again there; it is counted by the
+// pass that acts on the result (BlorgVolumeCreate), as a directory query's
+// listing miss is (DirCtrl.c), so a posted miss is counted once.
+//
+VOID BlorgPathCacheCountLookup(PATH_CACHE_RESULT Result)
 {
-    PATH_CACHE_RESULT result = PathCacheFind(Path, Meta, Ticket);
-
     BLORGFS_STAT_INC(MetaDataReads);
 
-    if (PathCacheMiss == result)
+    if (PathCacheMiss == Result)
     {
         BLORGFS_STAT_INC(PathCacheMisses);
     }
@@ -534,8 +537,15 @@ PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTO
     {
         BLORGFS_STAT_INC(PathCacheHits);
     }
+}
 
-    return result;
+//
+// Not counted: the caller counts the resolution once it knows it will act
+// on it (BlorgPathCacheCountLookup).
+//
+PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta, _Inout_opt_ PPATH_CACHE_TICKET Ticket)
+{
+    return PathCacheFind(Path, Meta, Ticket);
 }
 
 PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta)
