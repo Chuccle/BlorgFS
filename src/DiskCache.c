@@ -28,8 +28,9 @@
 // starts, as one fetch of its whole length, and its caller says how many
 // runs it may fetch: each is a request of its own, and every request
 // counts against the fair share's fetch limit. A cache file read failing,
-// or a run fetched at another version than the held blocks, fails the
-// read back to its caller to be fetched whole; a fetch failing fails it.
+// a part that cannot be started once others are in flight, or a run
+// fetched at another version than the held blocks, fails the read back to
+// its caller to be fetched whole; a fetch failing fails it.
 //
 // Fills
 // ---------------------------------------------------------------------
@@ -127,12 +128,14 @@ struct _DISK_CACHE_READ;
 
 //
 // Why a read the cache began must be fetched whole after all: a part read
-// from the cache file failed or came back short, or a fetched run is of
+// from the cache file failed or came back short, a fetched run is of
 // another version than the held blocks beside it, which the read would
-// otherwise return mixed.
+// otherwise return mixed, or a part could not be started (no IRP, MDL,
+// mapping or fetch for it) after others were.
 //
-#define DISK_CACHE_READ_FAILED 0x1
-#define DISK_CACHE_READ_STALE  0x2
+#define DISK_CACHE_READ_FAILED    0x1
+#define DISK_CACHE_READ_STALE     0x2
+#define DISK_CACHE_READ_UNSTARTED 0x4
 
 //
 // One run of a read's blocks the cache did not hold, being fetched.
@@ -344,13 +347,7 @@ static VOID DiskCacheReadSettle(PDISK_CACHE_READ Read)
         status = STATUS_UNEXPECTED_IO_ERROR;
     }
 
-    for (ULONG i = 0; i < Read->SlotCount; ++i)
-    {
-        if (DISK_CACHE_NO_SLOT != Read->Slots[i])
-        {
-            BlorgDiskCacheIndexUnpin(&DiskCache.Index, Read->Slots[i], NT_SUCCESS(status));
-        }
-    }
+    BlorgDiskCacheIndexUnpin(&DiskCache.Index, Read->Slots, Read->SlotCount, NT_SUCCESS(status));
 
     if (FlagOn(refetch, DISK_CACHE_READ_FAILED))
     {
@@ -887,9 +884,9 @@ VOID BlorgDiskCacheNoteFile(PNON_PAGED_NODE Node, const UNICODE_STRING* Path, UL
 // the valid bytes, as a whole fetch would. A held part is read into a
 // partial MDL of the read's own; a fetched one lands in the client's buffer
 // and is copied into the read's mapped pages on completion. If a part
-// cannot be started once some already are, the read is failed through
-// Completion rather than handed back, since those are writing into its
-// buffer.
+// cannot be started once some already are, the read cannot be handed back,
+// since those are writing into its buffer; it goes back through Completion
+// once they are done, to be fetched whole.
 //
 static NTSTATUS DiskCacheReadPart(PDISK_CACHE_READ Read, const UNICODE_STRING* Path, ULONG64 Offset, ULONG64 At, ULONG Length, ULONG Slot)
 {
@@ -1027,13 +1024,7 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, const UNICODE_ST
 
     if (0 == served)
     {
-        for (ULONG i = 0; i < blocks; ++i)
-        {
-            if (DISK_CACHE_NO_SLOT != read->Slots[i])
-            {
-                BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots[i], FALSE);
-            }
-        }
+        BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots, blocks, FALSE);
 
         ExFreePool(read);
         DiskCacheLeave();
@@ -1073,20 +1064,14 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, const UNICODE_ST
         {
             if (0 == issued)
             {
-                for (ULONG j = 0; j < blocks; ++j)
-                {
-                    if (DISK_CACHE_NO_SLOT != read->Slots[j])
-                    {
-                        BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots[j], FALSE);
-                    }
-                }
+                BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots, blocks, FALSE);
 
                 ExFreePool(read);
                 DiskCacheLeave();
                 return FALSE;
             }
 
-            InterlockedCompareExchange(&read->Status, status, STATUS_SUCCESS);
+            InterlockedOr(&read->Refetch, DISK_CACHE_READ_UNSTARTED);
             break;
         }
 

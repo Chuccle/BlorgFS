@@ -23,12 +23,12 @@
 //
 //  Synthetic backing-disk geometry (~1 TB), computed from the same
 //  components reported via IOCTL_DISK_GET_DRIVE_GEOMETRY so the two IOCTLs
-//  stay consistent.
+//  stay consistent. The sector size is in Driver.h, shared with the volume
+//  size queries.
 //
 #define BLORGFS_DISK_CYLINDERS            0x20000ULL
 #define BLORGFS_DISK_TRACKS_PER_CYLINDER  255ULL
 #define BLORGFS_DISK_SECTORS_PER_TRACK    63ULL
-#define BLORGFS_DISK_BYTES_PER_SECTOR     512ULL
 #define BLORGFS_SYNTHETIC_DISK_SIZE       (BLORGFS_DISK_CYLINDERS *      \
                                            BLORGFS_DISK_TRACKS_PER_CYLINDER * \
                                            BLORGFS_DISK_SECTORS_PER_TRACK *   \
@@ -36,18 +36,18 @@
 
 //
 //  Pushes a new TLS certificate pin (32-byte SHA-256 of the leaf's DER
-//  SubjectPublicKeyInfo -- see BlorgTlsSetPin/BlorgTlsCheckPin in TlsHandshake.c)
-//  without a driver reload. 0x800 is the first function code in
-//  Microsoft's reserved-for-vendor-use range. METHOD_BUFFERED: fixed
-//  32-byte payload. FILE_WRITE_ACCESS: this changes what the driver
-//  trusts, so it requires the same access an admin-only write would;
-//  also enforced by the FSDO device SDDL (BLORGFS_FSDO_DEVICE_SDDL_STRING
-//  in Driver.h), which grants World no write access. Device type is
+//  SubjectPublicKeyInfo -- see BlorgTlsSetPin/BlorgTlsCheckPin in
+//  TlsHandshake.c) without a driver reload. 0x800 is the first function
+//  code in Microsoft's reserved-for-vendor-use range. METHOD_BUFFERED:
+//  fixed 32-byte payload. FILE_WRITE_ACCESS: this changes what the driver
+//  trusts, so it requires the same access an admin-only write would; also
+//  enforced by the FSDO device SDDL (BLORGFS_FSDO_DEVICE_SDDL_STRING in
+//  Driver.h), which grants World no write access. Device type is
 //  FILE_DEVICE_UNKNOWN, not FILE_DEVICE_FILE_SYSTEM: the latter makes the
 //  I/O manager route the request as IRP_MJ_FILE_SYSTEM_CONTROL instead of
-//  the IRP_MJ_DEVICE_CONTROL this is handled under, so it would never
-//  reach DevIoCtrlFsdo at all (see the same note on the
-//  statistics IOCTLs in Statistics.h).
+//  the IRP_MJ_DEVICE_CONTROL this is handled under, so it would never reach
+//  DevIoCtrlFsdo at all (see the same note on the statistics IOCTLs in
+//  Statistics.h).
 //
 #define IOCTL_BLORGFS_SET_TLS_PIN \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_WRITE_ACCESS)
@@ -148,14 +148,15 @@ static NTSTATUS DevIoCtrlFsdo(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 //  IOCTLs and the synthetic disk-geometry/device-number/volume-extents
 //  IOCTLs that mount and process/image-activation code paths probe for.
 //  Each device must identify itself with its OWN name for
-//  IOCTL_MOUNTDEV_QUERY_DEVICE_NAME: the mount manager follows B: -> DDO and
-//  asks the DDO who it is, and answering with the VDO's name makes it
+//  IOCTL_MOUNTDEV_QUERY_DEVICE_NAME: the mount manager follows B: -> DDO
+//  and asks the DDO who it is, and answering with the VDO's name makes it
 //  resolve the volume to a device that doesn't match, so the volume lookup
-//  fails with "cannot find the file specified". IOCTL_MOUNTDEV_QUERY_UNIQUE_ID
-//  needs only a stable, volume-unique blob -- a fixed string is fine since
-//  BlorgFS exposes exactly one volume (B:). Suggested link name is B: with
-//  UseOnlyIfThereAreNoOtherLinks so the mount manager leaves any existing B:
-//  (fallback symlink or user assignment) alone rather than fighting over it.
+//  fails with "cannot find the file specified".
+//  IOCTL_MOUNTDEV_QUERY_UNIQUE_ID needs only a stable, volume-unique blob
+//  -- a fixed string is fine since BlorgFS exposes exactly one volume (B:).
+//  Suggested link name is B: with UseOnlyIfThereAreNoOtherLinks so the
+//  mount manager leaves any existing B: (fallback symlink or user
+//  assignment) alone rather than fighting over it.
 //  LINK_CREATED/LINK_DELETED notifications require no per-link state, so
 //  they are just acknowledged -- returning an error would make the manager
 //  treat registration as failed. B: presents as a local fixed disk
@@ -163,14 +164,14 @@ static NTSTATUS DevIoCtrlFsdo(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 //  launching probe IOCTL_DISK_GET_DRIVE_GEOMETRY; rejecting it surfaces to
 //  user mode as ERROR_INVALID_FUNCTION and aborts the launch, so a
 //  synthetic-but-self-consistent geometry is reported for a large fixed
-//  disk, generous enough that space checks pass. IOCTL_STORAGE_GET_DEVICE_NUMBER
-//  and IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS are both issued during process
-//  creation as the loader maps the image's volume to a backing storage
-//  device to establish the new process's image identity; rejecting either
-//  makes NtCreateUserProcess fail with STATUS_INVALID_DEVICE_REQUEST
-//  ("Incorrect function") even though every file operation and the image
-//  section succeed, so both report a synthetic disk number/extent kept
-//  consistent with each other.
+//  disk, generous enough that space checks pass.
+//  IOCTL_STORAGE_GET_DEVICE_NUMBER and IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS
+//  are both issued during process creation as the loader maps the image's
+//  volume to a backing storage device to establish the new process's image
+//  identity; rejecting either makes NtCreateUserProcess fail with
+//  STATUS_INVALID_DEVICE_REQUEST ("Incorrect function") even though every
+//  file operation and the image section succeed, so both report a synthetic
+//  disk number/extent kept consistent with each other.
 //
 static NTSTATUS DevIoCtrlDisk(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {

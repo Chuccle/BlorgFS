@@ -21,14 +21,15 @@
 // The volume is read-only, so both checks apply a single read-only mask;
 // the bit-by-bit tests below cover the file and the directory mask.
 //
-// CreateComplete (the async BlorgHttpGetFileInformation completion) is not
-// exercised here: it needs a real HTTP round trip through Client.c and the
-// SandboxSocket peer. FcbReopenTest drives the re-drive that consumes what
-// it stashes directly. Cold paths here resolve through a fresh listing of
-// the parent in the listing cache, which is exactly how a warm directory's
-// children resolve once DirCtrlComplete has published its listing. That
-// path exercises CreateSplitPathLeaf and both of CreateFindEntryByName's
-// loops for free.
+// Most cold paths here resolve through a fresh listing of the parent in
+// the listing cache, which is exactly how a warm directory's children
+// resolve once DirCtrlComplete has published its listing. That path
+// exercises CreateSplitPathLeaf and both of CreateFindEntryByName's loops
+// for free. FcbReopenTest drives the re-drive that consumes what
+// CreateComplete stashes directly, and CreateNetworkTest, at the end, the
+// lookup itself: a real HTTP round trip through Client.c and the
+// SandboxSocket peer into CreateComplete, what it remembers, and which pass
+// counts the create.
 //
 // DispatchSandbox.vcxproj lists this TU BEFORE DispatchSchedTest.cpp, not
 // alphabetically or by habit: KmExploreInterleavings (Scheduler.c) turns
@@ -47,11 +48,18 @@
 
 #include <cstdio>
 #include <cwchar>
+#include <initializer_list>
+#include <string>
 
 extern "C" {
-#include "..\..\src\Driver.h"
+#include "SandboxSocket.h"
 
 NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject);
+
+// Not declared in any header -- FspWorkQueue.c's only other caller is
+// PsCreateSystemThread, which is a no-op in this sandbox. ReadTest.cpp runs
+// it the same way, on a thread of its own.
+VOID BlorgFspDispatch(PVOID StartContext);
 }
 
 #include "ListingBuilder.h"
@@ -765,6 +773,100 @@ TEST_F(CreateDirectoryTest, RootRelativeOpenDoesNotDoubleTheSeparator)
 }
 
 //
+// The tests above resolve on the warm path, which looks the joined path up
+// in the node table and never walks the tree. A relative open that misses
+// there walks it, and the walk takes a full path: started from the parent
+// instead of the root, "\\media\\clip.bin" goes looking for a child named
+// "media" under \media. An extracted archive is exactly that shape, and
+// here the walk would land on \media\media\clip.bin and hand its FCB to an
+// open of \media\clip.bin.
+//
+TEST_F(CreateDirectoryTest, ColdRelativeOpenWalksFromTheRootNotTheParent)
+{
+    PCOMMON_CONTEXT parent = MakePublishedNode(L"\\media", TRUE);
+    ASSERT_NE(nullptr, parent);
+
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media\\media", TRUE));
+
+    PCOMMON_CONTEXT nested = MakePublishedNode(L"\\media\\media\\clip.bin", FALSE);
+    ASSERT_NE(nullptr, nested);
+
+    PublishListing(L"\\media", L"clip.bin", L"media");
+
+    CreateOpener parentOpener;
+    PrepareOpener(&parentOpener, Path(L"\\media"), FILE_LIST_DIRECTORY | FILE_TRAVERSE, kShareAll, 0);
+    BlorgCreate(Volume, &parentOpener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, parentOpener.CreateIrp.IoStatus.Status);
+
+    CreateOpener relativeOpener;
+    PrepareOpener(&relativeOpener, Path(L"clip.bin"), FILE_READ_DATA, kShareAll, 0);
+    relativeOpener.FileObject.RelatedFileObject = &parentOpener.FileObject;
+
+    BlorgCreate(Volume, &relativeOpener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, relativeOpener.CreateIrp.IoStatus.Status);
+
+    PFCB opened = C_CAST(PFCB, relativeOpener.FileObject.FsContext);
+    ASSERT_NE(nullptr, opened);
+    EXPECT_NE(nested, C_CAST(PCOMMON_CONTEXT, opened))
+        << "the open of \\media\\clip.bin was answered with \\media\\media\\clip.bin";
+
+    UNICODE_STRING expected = Path(L"\\media\\clip.bin");
+    EXPECT_TRUE(RtlEqualUnicodeString(&expected, &opened->FullPath, TRUE));
+    EXPECT_EQ(parent, C_CAST(PCOMMON_CONTEXT, opened->ParentDcb));
+    EXPECT_EQ(2048, opened->Header.FileSize.QuadPart)
+        << "the size must come from \\media's listing entry";
+
+    CloseOpener(&relativeOpener);
+    CloseOpener(&parentOpener);
+}
+
+//
+// A relative open's own file object names only its leaf, so a relative open
+// against it cannot take the parent half from there: "movies" joined with
+// "clip.bin" is a path with no leading separator, which no node, path
+// cache entry or listing is keyed by.
+//
+TEST_F(CreateDirectoryTest, RelativeOpenAgainstARelativelyOpenedDirectoryUsesItsFullPath)
+{
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media", TRUE));
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media\\movies", TRUE));
+
+    PCOMMON_CONTEXT leaf = MakePublishedNode(L"\\media\\movies\\clip.bin", FALSE);
+    ASSERT_NE(nullptr, leaf);
+
+    CreateOpener mediaOpener;
+    PrepareOpener(&mediaOpener, Path(L"\\media"), FILE_LIST_DIRECTORY | FILE_TRAVERSE, kShareAll, 0);
+    BlorgCreate(Volume, &mediaOpener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, mediaOpener.CreateIrp.IoStatus.Status);
+
+    CreateOpener moviesOpener;
+    PrepareOpener(&moviesOpener, Path(L"movies"), FILE_LIST_DIRECTORY | FILE_TRAVERSE, kShareAll, 0);
+    moviesOpener.FileObject.RelatedFileObject = &mediaOpener.FileObject;
+    BlorgCreate(Volume, &moviesOpener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, moviesOpener.CreateIrp.IoStatus.Status);
+
+    CreateOpener leafOpener;
+    PrepareOpener(&leafOpener, Path(L"clip.bin"), FILE_READ_DATA, kShareAll, 0);
+    leafOpener.FileObject.RelatedFileObject = &moviesOpener.FileObject;
+    BlorgCreate(Volume, &leafOpener.CreateIrp);
+
+    EXPECT_EQ(STATUS_SUCCESS, leafOpener.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(leaf, leafOpener.FileObject.FsContext);
+
+    if (NT_SUCCESS(leafOpener.CreateIrp.IoStatus.Status))
+    {
+        CloseOpener(&leafOpener);
+    }
+
+    CloseOpener(&moviesOpener);
+    CloseOpener(&mediaOpener);
+}
+
+//
 // A relative open that resolves nowhere locally has to go out to the
 // network, and the first pass runs on the caller's thread rather than an
 // FSP worker, so it reposts itself and returns. That repost is the one
@@ -1009,6 +1111,31 @@ protected:
         return BlorgVolumeCreate(&opener->CreateIrp, &opener->CreateStack, Volume);
     }
 
+    //
+    // Runs one FSP worker on a thread of its own until every opener's
+    // create has completed, then stops the queue and waits for it to exit.
+    // The queue must already be running.
+    //
+    static void RunFspWorkerUntilCompleted(std::initializer_list<CreateOpener*> openers)
+    {
+        HANDLE worker = CreateThread(NULL, 0, [](LPVOID) -> DWORD { BlorgFspDispatch(NULL); return 0; }, NULL, 0, NULL);
+        ASSERT_NE((HANDLE)NULL, worker);
+
+        const DWORD start = GetTickCount();
+
+        for (CreateOpener* opener : openers)
+        {
+            while (0 == ReadNoFence(&opener->CreateIrp.CompletionCount) && GetTickCount() - start < 30000)
+            {
+                SwitchToThread();
+            }
+        }
+
+        BlorgDestroyWorkQueue();
+        EXPECT_EQ(WAIT_OBJECT_0, WaitForSingleObject(worker, 30000));
+        CloseHandle(worker);
+    }
+
     PFCB File = nullptr;
     PBLORGFS_STATISTICS Stats = nullptr;
 };
@@ -1241,6 +1368,594 @@ TEST_F(FcbReopenTest, PurgeRefusedKeepsTheOldCopyUntilTheNextOpen)
     CloseOpener(&fourth);
 
     BlorgClose(Volume, &first.CloseIrp);
+}
+
+//
+// Every file handle has a CCB of its own. Cc keeps the read-ahead granule
+// per file object, and the cached read path keeps what it told Cc on the
+// handle's CCB (ReadAdaptGranularity, Read.c); a file open used to leave
+// FsContext2 NULL, and the granule lived on the FCB, where one handle's
+// first read reset another's. An open the share check refuses frees the
+// CCB it was given, and each close frees its handle's, which the volume's
+// CCB lookaside list checks at teardown.
+//
+TEST_F(FcbReopenTest, EachFileHandleHasACcbOfItsOwn)
+{
+    CreateOpener first;
+    PrepareOpener(&first, Path(L"\\media\\clip.bin"), FILE_READ_DATA, FILE_SHARE_READ, 0);
+    BlorgCreate(Volume, &first.CreateIrp);
+    ASSERT_EQ(STATUS_SUCCESS, first.CreateIrp.IoStatus.Status);
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    PCCB firstCcb = C_CAST(PCCB, first.FileObject.FsContext2);
+    PCCB secondCcb = C_CAST(PCCB, second.FileObject.FsContext2);
+
+    ASSERT_NE(nullptr, firstCcb);
+    ASSERT_NE(nullptr, secondCcb);
+    EXPECT_NE(firstCcb, secondCcb) << "two handles sharing one CCB share one read-ahead granule";
+    EXPECT_EQ(BLORGFS_CCB_SIGNATURE, GET_NODE_TYPE(firstCcb));
+    EXPECT_EQ(BLORGFS_CCB_SIGNATURE, GET_NODE_TYPE(secondCcb));
+
+    CreateOpener refused;
+    PrepareOpener(&refused, Path(L"\\media\\clip.bin"), FILE_READ_DATA, 0, 0);
+    BlorgCreate(Volume, &refused.CreateIrp);
+
+    EXPECT_EQ(STATUS_SHARING_VIOLATION, refused.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(nullptr, refused.FileObject.FsContext2);
+    EXPECT_EQ(2u, File->ShareAccess.OpenCount);
+
+    CloseOpener(&second);
+    CloseOpener(&first);
+}
+
+//
+// An exclusive oplock (batch, filter, level 1 or RWH) is granted only to
+// the sole open handle, so the count handed to FsRtl must be the handles
+// not yet cleaned up, as fastfat's UncleanCount is. It used to be
+// RefCount, which drops at close: the file object Cc keeps for its cache
+// map is cleaned up when its handle closes but closed only when Cc lets it
+// go, so after one cached read the next opener counted two and its batch
+// oplock was refused. Here the first handle is cleaned up and its close
+// held back, as Cc holds it.
+//
+TEST_F(FcbReopenTest, AnExclusiveOplockCountsHandlesNotYetCleanedUp)
+{
+    CreateOpener first;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&first));
+
+    CreateOpener second;
+    ASSERT_EQ(STATUS_SUCCESS, Open(&second));
+
+    IO_STACK_LOCATION stack = {};
+    stack.MajorFunction = IRP_MJ_FILE_SYSTEM_CONTROL;
+    stack.MinorFunction = IRP_MN_USER_FS_REQUEST;
+    stack.DeviceObject = Volume;
+    stack.FileObject = &second.FileObject;
+    stack.Parameters.FileSystemControl.FsControlCode = FSCTL_REQUEST_BATCH_OPLOCK;
+
+    IRP request = {};
+    request.StackLocation = &stack;
+
+    ShimForceNextOplockRequestExclusive();
+    EXPECT_EQ(STATUS_PENDING, BlorgFileSystemControl(Volume, &request));
+    EXPECT_EQ(2u, ShimLastOplockOpenCount()) << "two handles are open";
+
+    BlorgCleanup(Volume, &first.CleanupIrp);
+
+    IRP retry = {};
+    retry.StackLocation = &stack;
+
+    ShimForceNextOplockRequestExclusive();
+    EXPECT_EQ(STATUS_PENDING, BlorgFileSystemControl(Volume, &retry));
+    EXPECT_EQ(1u, ShimLastOplockOpenCount())
+        << "a file object cleaned up but not yet closed was counted as an open handle";
+
+    CloseOpener(&second);
+    BlorgClose(Volume, &first.CloseIrp);
+}
+
+//
+// A create that misses outside the FSP posts itself, and the worker looks
+// the path up again. Both passes used to count the lookup, so a posted miss
+// counted two MetaDataReads and two PathCacheMisses, and neither pass
+// counted the create: BlorgCreate counted only what the FSD pass finished,
+// and the worker completed the rest uncounted. The parent's listing is
+// published between the post and the worker's pass, so the worker answers
+// both opens from it, one found and one not, and the FSD pass is the one
+// that posted them. A third open of the name the worker learned is gone is
+// a path-cache hit the FSD pass finishes itself.
+//
+TEST_F(FcbReopenTest, ACreatePostedToTheFspIsCountedOnceByThePassThatFinishesIt)
+{
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
+
+    const ULONG64 successesBefore = Stats->SuccessfulCreates;
+    const ULONG64 failuresBefore = Stats->FailedCreates;
+    const ULONG64 lookupsBefore = Stats->MetaDataReads;
+    const ULONG64 missesBefore = Stats->PathCacheMisses;
+    const ULONG64 hitsBefore = Stats->PathCacheHits;
+
+    CreateOpener found;
+    PrepareOpener(&found, Path(L"\\media\\movie.bin"), FILE_READ_DATA, kShareAll, 0);
+    ASSERT_EQ(STATUS_PENDING, BlorgCreate(Volume, &found.CreateIrp));
+
+    CreateOpener ghost;
+    PrepareOpener(&ghost, Path(L"\\media\\ghost.bin"), FILE_READ_DATA, kShareAll, 0);
+    ASSERT_EQ(STATUS_PENDING, BlorgCreate(Volume, &ghost.CreateIrp));
+
+    EXPECT_EQ(lookupsBefore, Stats->MetaDataReads) << "the FSD pass counted a lookup it only posted";
+    EXPECT_EQ(missesBefore, Stats->PathCacheMisses);
+
+    PublishListing(L"\\media", L"movie.bin", L"movies");
+
+    RunFspWorkerUntilCompleted({ &found, &ghost });
+
+    ASSERT_EQ(1u, found.CreateIrp.CompletionCount);
+    ASSERT_EQ(1u, ghost.CreateIrp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, found.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, ghost.CreateIrp.IoStatus.Status);
+
+    EXPECT_EQ(successesBefore + 1, Stats->SuccessfulCreates) << "a create the worker finished was not counted";
+    EXPECT_EQ(failuresBefore + 1, Stats->FailedCreates);
+    EXPECT_EQ(lookupsBefore + 2, Stats->MetaDataReads) << "a posted miss was counted on both passes";
+    EXPECT_EQ(missesBefore + 2, Stats->PathCacheMisses);
+    EXPECT_EQ(hitsBefore, Stats->PathCacheHits);
+
+    CreateOpener again;
+    PrepareOpener(&again, Path(L"\\media\\ghost.bin"), FILE_READ_DATA, kShareAll, 0);
+    BlorgCreate(Volume, &again.CreateIrp);
+
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, again.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(failuresBefore + 2, Stats->FailedCreates);
+    EXPECT_EQ(lookupsBefore + 3, Stats->MetaDataReads);
+    EXPECT_EQ(hitsBefore + 1, Stats->PathCacheHits) << "a path-cache answer was not counted as a hit";
+    EXPECT_EQ(missesBefore + 2, Stats->PathCacheMisses);
+
+    CloseOpener(&found);
+}
+
+///////////////////////////////////////////////////////////////////////////
+// CreateFindEntryByName -- the listing's name index
+///////////////////////////////////////////////////////////////////////////
+
+//
+// An open that misses the path cache finds its name in the parent's cached
+// listing through the listing's name index (BlorgFindDirectoryEntry), as
+// the linear scan it replaced did: the first entry of that name in any
+// case, files before subdirectories. Two files and a subdirectory share
+// one name but for case here, so an index chained in the wrong order, or
+// one that let a later entry shadow an earlier, opens the other file or
+// the directory.
+//
+TEST_F(CreateDirectoryTest, AnOpenThroughAListingTakesTheFirstEntryOfItsNameFilesFirst)
+{
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media", TRUE));
+
+    PDIRECTORY_INFO listing = BuildListing({ L"Clip.bin", L"clip.BIN" }, { L"CLIP.BIN" });
+    ASSERT_NE(nullptr, listing);
+    UNICODE_STRING media = Path(L"\\media");
+    EXPECT_TRUE(BlorgPathCachePublishListing(&media, listing, nullptr));
+    BlorgReleaseDirectoryInfo(listing);
+
+    CreateOpener opener;
+    PrepareOpener(&opener, Path(L"\\media\\clip.bin"), FILE_READ_DATA, kShareAll, 0);
+    BlorgCreate(Volume, &opener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, opener.CreateIrp.IoStatus.Status);
+    ASSERT_NE(nullptr, opener.FileObject.FsContext);
+    ASSERT_EQ(BLORGFS_FCB_SIGNATURE, GET_NODE_TYPE(opener.FileObject.FsContext));
+    EXPECT_EQ(1000, C_CAST(PFCB, opener.FileObject.FsContext)->Header.FileSize.QuadPart)
+        << "the open took Clip.bin's later namesake";
+
+    CloseOpener(&opener);
+}
+
+//
+// A large directory, where the index has thousands of chains: a file deep
+// in it, in another case, opens with its own entry's size; the first
+// subdirectory, the entry right after the last file, opens as a directory;
+// and a name one past the last file is not found, without a request.
+//
+TEST_F(CreateDirectoryTest, AnOpenInALargeListingFindsItsOwnEntry)
+{
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media", TRUE));
+
+    PDIRECTORY_INFO listing = BuildSyntheticListing(5000, 100);
+    ASSERT_NE(nullptr, listing);
+    UNICODE_STRING media = Path(L"\\media");
+    EXPECT_TRUE(BlorgPathCachePublishListing(&media, listing, nullptr));
+    BlorgReleaseDirectoryInfo(listing);
+
+    CreateOpener file;
+    PrepareOpener(&file, Path(L"\\media\\FILE4321.BIN"), FILE_READ_DATA, kShareAll, 0);
+    BlorgCreate(Volume, &file.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, file.CreateIrp.IoStatus.Status);
+    ASSERT_NE(nullptr, file.FileObject.FsContext);
+    ASSERT_EQ(BLORGFS_FCB_SIGNATURE, GET_NODE_TYPE(file.FileObject.FsContext));
+    EXPECT_EQ(5321, C_CAST(PFCB, file.FileObject.FsContext)->Header.FileSize.QuadPart);
+    CloseOpener(&file);
+
+    CreateOpener dir;
+    PrepareOpener(&dir, Path(L"\\media\\dir0"), FILE_LIST_DIRECTORY, kShareAll, 0);
+    BlorgCreate(Volume, &dir.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, dir.CreateIrp.IoStatus.Status);
+    ASSERT_NE(nullptr, dir.FileObject.FsContext);
+    EXPECT_EQ(BLORGFS_DCB_SIGNATURE, GET_NODE_TYPE(dir.FileObject.FsContext));
+    CloseOpener(&dir);
+
+    CreateOpener missing;
+    PrepareOpener(&missing, Path(L"\\media\\file5000.bin"), FILE_READ_DATA, kShareAll, 0);
+    BlorgCreate(Volume, &missing.CreateIrp);
+
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, missing.CreateIrp.IoStatus.Status);
+}
+
+///////////////////////////////////////////////////////////////////////////
+// The cold network open -- CreateComplete
+///////////////////////////////////////////////////////////////////////////
+
+//
+// A DirectoryEntryMetadata for a 4096-byte file, the bytes ClientTest.cpp's
+// kFileInfo holds.
+//
+static const char kCreateFileInfo[] =
+    "\x14\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x24\x00\x1c\x00\x14\x00"
+    "\x0c\x00\x04\x00\x0c\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00"
+    "\x02\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x10\x00\x00\x00\x00\x00\x00";
+
+//
+// A path that neither the node table, the path cache nor a cached listing
+// answers is looked up on the server. The pass that sends it, driven here
+// the way the worker that dequeued it runs it, issues the lookup and pends;
+// CreateComplete memoizes the answer and either fails the IRP or re-queues
+// it with the result stashed on it, and the FSP worker's second pass opens
+// from the stash. The lookup is the real Client.c request against the peer
+// scripted through SandboxSocket.h, so the answer comes back through the
+// chain a server's does. A create CreateComplete fails, or whose re-queue
+// is refused, is completed there, which neither BlorgCreate nor the worker
+// sees, so it counts the create itself.
+//
+class CreateNetworkTest : public FcbReopenTest
+{
+protected:
+    void SetUp() override
+    {
+        SandboxInitialize();
+        FcbReopenTest::SetUp();
+    }
+
+    void TearDown() override
+    {
+        Drain();
+
+        if (QueueRunning)
+        {
+            BlorgDestroyWorkQueue();
+            QueueRunning = FALSE;
+        }
+
+        BlorgCleanupWskClient();
+
+        FcbReopenTest::TearDown();
+    }
+
+    //
+    // The script refers to the response until the test drains, so both
+    // live on the fixture. A stalled peer accepts the request and answers
+    // only once SandboxResumeStalled lets it.
+    //
+    void Respond(const char* statusAndHeaders, const char* body, SIZE_T length, BOOLEAN stall = FALSE)
+    {
+        Response = std::string(statusAndHeaders) + "Content-Length: " + std::to_string(length) +
+            "\r\n\r\n" + std::string(body, length);
+
+        SIZE_T count = 0;
+
+        if (stall)
+        {
+            Script[count++] = { SandboxStepStall, nullptr, 0, STATUS_SUCCESS, FALSE };
+        }
+
+        Script[count++] = { SandboxStepDeliver, C_CAST(const unsigned char*, Response.data()), Response.size(), STATUS_SUCCESS, FALSE };
+        SandboxSetPeerScript(Script, count);
+    }
+
+    void StartQueue()
+    {
+        ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
+        QueueRunning = TRUE;
+    }
+
+    //
+    // A work item can issue more I/O, so this runs until neither side has
+    // anything left, as ClientTest.cpp's does.
+    //
+    void Drain()
+    {
+        do
+        {
+            SandboxDrainCompletions();
+        } while (ShimDrainWorkItems() > 0);
+    }
+
+    NTSTATUS SendToTheNetwork(CreateOpener* opener, const wchar_t* path)
+    {
+        PrepareOpener(opener, Path(path), FILE_READ_DATA, kShareAll, 0);
+        opener->CreateIrp.Tail.Overlay.DriverContext[0] =
+            C_CAST(PVOID, C_CAST(ULONG_PTR, IRP_CONTEXT_FLAG_WAIT | IRP_CONTEXT_FLAG_IN_FSP));
+
+        return BlorgVolumeCreate(&opener->CreateIrp, &opener->CreateStack, Volume);
+    }
+
+    //
+    // Lets one worker take the re-queued IRP, then stops the queue once it
+    // has completed it.
+    //
+    void RunRequeuedPass(CreateOpener* opener)
+    {
+        RunFspWorkerUntilCompleted({ opener });
+        QueueRunning = FALSE;
+    }
+
+    static PCREATE_NET_RESULT Stash(CreateOpener* opener)
+    {
+        return C_CAST(PCREATE_NET_RESULT, opener->CreateIrp.Tail.Overlay.DriverContext[1]);
+    }
+
+    static BOOLEAN NetDone(CreateOpener* opener)
+    {
+        return BooleanFlagOn(C_CAST(ULONG_PTR, opener->CreateIrp.Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_NET_DONE);
+    }
+
+    static PATH_CACHE_RESULT Cached(const wchar_t* path, DIRECTORY_ENTRY_METADATA* meta)
+    {
+        UNICODE_STRING name = Path(path);
+        return BlorgPathCacheLookup(&name, meta);
+    }
+
+    std::string Response;
+    SANDBOX_STEP Script[2] = {};
+    BOOLEAN QueueRunning = FALSE;
+};
+
+TEST_F(CreateNetworkTest, ACreateTheNetworkLookupFailsIsCountedOnce)
+{
+    Respond("HTTP/1.1 404 Not Found\r\n", "", 0);
+
+    const ULONG64 failuresBefore = Stats->FailedCreates;
+    const ULONG64 lookupsBefore = Stats->MetaDataReads;
+    const ULONG64 missesBefore = Stats->PathCacheMisses;
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_PENDING, SendToTheNetwork(&opener, L"\\media\\gone.bin"));
+
+    Drain();
+
+    ASSERT_EQ(1u, opener.CreateIrp.CompletionCount);
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, opener.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(failuresBefore + 1, Stats->FailedCreates) << "a create the network lookup failed was not counted";
+    EXPECT_EQ(lookupsBefore + 1, Stats->MetaDataReads) << "the pass that went to the network did not count its miss";
+    EXPECT_EQ(missesBefore + 1, Stats->PathCacheMisses);
+}
+
+//
+// The FSP queue is not started here, so CreateComplete's re-queue of a
+// found file is refused, which is what a volume tearing down does to it.
+//
+TEST_F(CreateNetworkTest, ACreateWhoseRequeueIsRefusedIsCountedOnce)
+{
+    Respond("HTTP/1.1 200 OK\r\n", kCreateFileInfo, sizeof(kCreateFileInfo) - 1);
+
+    const ULONG64 successesBefore = Stats->SuccessfulCreates;
+    const ULONG64 failuresBefore = Stats->FailedCreates;
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_PENDING, SendToTheNetwork(&opener, L"\\media\\fresh.bin"));
+
+    Drain();
+
+    ASSERT_EQ(1u, opener.CreateIrp.CompletionCount);
+    EXPECT_EQ(STATUS_DEVICE_REMOVED, opener.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(failuresBefore + 1, Stats->FailedCreates) << "a create whose re-queue was refused was not counted";
+    EXPECT_EQ(successesBefore, Stats->SuccessfulCreates);
+}
+
+//
+// The whole cold open: one lookup, the answer remembered, the IRP handed
+// back to the queue carrying it rather than completed, and a second pass
+// that opens from what it carries instead of asking again. The file is
+// stamped with the lookup's ticket, so its next open inside the lifetime
+// is answered warm.
+//
+TEST_F(CreateNetworkTest, FoundOnTheServerOpensFromTheStashedAnswer)
+{
+    Respond("HTTP/1.1 200 OK\r\n", kCreateFileInfo, sizeof(kCreateFileInfo) - 1);
+    StartQueue();
+
+    const ULONG64 lookupsBefore = Stats->FileInfoRequests;
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_PENDING, SendToTheNetwork(&opener, L"\\media\\net.bin"));
+
+    Drain();
+
+    EXPECT_EQ(lookupsBefore + 1, Stats->FileInfoRequests);
+    ASSERT_EQ(0u, opener.CreateIrp.CompletionCount)
+        << "a found file goes back to the FSP queue for its open, not to the caller";
+    EXPECT_TRUE(NetDone(&opener));
+    ASSERT_NE(nullptr, Stash(&opener));
+    EXPECT_EQ(4096u, Stash(&opener)->Meta.Size);
+    EXPECT_FALSE(Stash(&opener)->Meta.IsDirectory);
+
+    DIRECTORY_ENTRY_METADATA cached = {};
+    EXPECT_EQ(PathCacheExists, Cached(L"\\media\\net.bin", &cached));
+    EXPECT_EQ(4096u, cached.Size);
+
+    RunRequeuedPass(&opener);
+
+    ASSERT_EQ(1u, opener.CreateIrp.CompletionCount);
+    ASSERT_EQ(STATUS_SUCCESS, opener.CreateIrp.IoStatus.Status);
+    EXPECT_FALSE(NetDone(&opener));
+    EXPECT_EQ(nullptr, Stash(&opener));
+
+    PFCB fcb = C_CAST(PFCB, opener.FileObject.FsContext);
+    ASSERT_NE(nullptr, fcb);
+    EXPECT_EQ(4096, fcb->Header.FileSize.QuadPart);
+    EXPECT_TRUE(BlorgPathCacheTicketCurrent(&fcb->MetaTicket));
+    EXPECT_EQ(lookupsBefore + 1, Stats->FileInfoRequests)
+        << "the second pass must open from the stash, not look the file up again";
+
+    CloseOpener(&opener);
+}
+
+//
+// A 404 is a definitive answer: the open fails with it, and the next open
+// of the same path is answered from the path cache without a lookup.
+//
+TEST_F(CreateNetworkTest, NotFoundOnTheServerFailsTheOpenAndIsRemembered)
+{
+    Respond("HTTP/1.1 404 Not Found\r\n", "", 0);
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_PENDING, SendToTheNetwork(&opener, L"\\media\\gone.bin"));
+
+    Drain();
+
+    ASSERT_EQ(1u, opener.CreateIrp.CompletionCount);
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, opener.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(nullptr, opener.FileObject.FsContext);
+    EXPECT_EQ(nullptr, Stash(&opener));
+
+    DIRECTORY_ENTRY_METADATA cached = {};
+    EXPECT_EQ(PathCacheNotFound, Cached(L"\\media\\gone.bin", &cached));
+
+    const ULONG64 lookupsBefore = Stats->FileInfoRequests;
+
+    CreateOpener again;
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, SendToTheNetwork(&again, L"\\media\\gone.bin"));
+    EXPECT_EQ(lookupsBefore, Stats->FileInfoRequests)
+        << "a remembered not-found must answer the next open without a lookup";
+}
+
+//
+// A file created on the server while the lookup was in flight arrives as
+// an invalidation of its path. The 404 the server answered before that
+// still fails this open, but must not be remembered: cached, it would
+// hide the new file from every open until the entry expired.
+//
+TEST_F(CreateNetworkTest, NotFoundOvertakenByAnInvalidationIsNotRemembered)
+{
+    Respond("HTTP/1.1 404 Not Found\r\n", "", 0, TRUE);
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_PENDING, SendToTheNetwork(&opener, L"\\media\\late.bin"));
+
+    Drain();
+
+    ASSERT_EQ(1u, SandboxSocketsParked());
+    ASSERT_EQ(0u, opener.CreateIrp.CompletionCount);
+
+    UNICODE_STRING path = Path(L"\\media\\late.bin");
+    BlorgPathCacheInvalidate(&path);
+
+    SandboxResumeStalled();
+    Drain();
+
+    ASSERT_EQ(1u, opener.CreateIrp.CompletionCount);
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, opener.CreateIrp.IoStatus.Status);
+
+    DIRECTORY_ENTRY_METADATA cached = {};
+    EXPECT_EQ(PathCacheMiss, Cached(L"\\media\\late.bin", &cached))
+        << "a not-found read before the invalidation was cached after it";
+}
+
+//
+// Only a 404 says the file is not there. A server error says nothing about
+// it, and remembering one as not-found would fail every open of a file
+// that exists until the entry expired.
+//
+TEST_F(CreateNetworkTest, ServerErrorFailsTheOpenAndIsNotRemembered)
+{
+    Respond("HTTP/1.1 503 Service Unavailable\r\n", "", 0);
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_PENDING, SendToTheNetwork(&opener, L"\\media\\busy.bin"));
+
+    Drain();
+
+    ASSERT_EQ(1u, opener.CreateIrp.CompletionCount);
+    EXPECT_FALSE(NT_SUCCESS(opener.CreateIrp.IoStatus.Status));
+    EXPECT_NE(STATUS_OBJECT_NAME_NOT_FOUND, opener.CreateIrp.IoStatus.Status);
+
+    DIRECTORY_ENTRY_METADATA cached = {};
+    EXPECT_EQ(PathCacheMiss, Cached(L"\\media\\busy.bin", &cached));
+}
+
+//
+// An answer the server marked no-store still opens the file, but the path
+// cache does not keep it and the FCB is not stamped with it, so the next
+// open asks again.
+//
+TEST_F(CreateNetworkTest, NoStoreAnswerOpensTheFileButVouchesForNothing)
+{
+    Respond("HTTP/1.1 200 OK\r\nCache-Control: no-store\r\n", kCreateFileInfo, sizeof(kCreateFileInfo) - 1);
+    StartQueue();
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_PENDING, SendToTheNetwork(&opener, L"\\media\\aliased.bin"));
+
+    Drain();
+
+    ASSERT_EQ(0u, opener.CreateIrp.CompletionCount);
+    ASSERT_NE(nullptr, Stash(&opener));
+    EXPECT_TRUE(Stash(&opener)->Meta.NoStore);
+
+    DIRECTORY_ENTRY_METADATA cached = {};
+    EXPECT_EQ(PathCacheMiss, Cached(L"\\media\\aliased.bin", &cached))
+        << "an answer the server marked no-store was kept in the path cache";
+
+    RunRequeuedPass(&opener);
+
+    ASSERT_EQ(1u, opener.CreateIrp.CompletionCount);
+    ASSERT_EQ(STATUS_SUCCESS, opener.CreateIrp.IoStatus.Status);
+
+    PFCB fcb = C_CAST(PFCB, opener.FileObject.FsContext);
+    ASSERT_NE(nullptr, fcb);
+    EXPECT_EQ(4096, fcb->Header.FileSize.QuadPart);
+    EXPECT_FALSE(BlorgPathCacheTicketCurrent(&fcb->MetaTicket));
+
+    CloseOpener(&opener);
+}
+
+//
+// A lookup that fails before it is issued never reaches CreateComplete, so
+// the pass that tried it owns its context and returns the failure for the
+// worker loop to complete the IRP with.
+//
+TEST_F(CreateNetworkTest, LookupThatFailsToIssueReturnsItsStatusAndFreesItsContext)
+{
+    const SIZE_T poolBefore = ShimPoolOutstanding();
+    const ULONG socketsBefore = SandboxSocketsCreated();
+
+    ShimFailNextWorkItem();
+
+    CreateOpener opener;
+    EXPECT_EQ(STATUS_INSUFFICIENT_RESOURCES, SendToTheNetwork(&opener, L"\\media\\never.bin"));
+
+    Drain();
+
+    EXPECT_EQ(0u, opener.CreateIrp.CompletionCount);
+    EXPECT_EQ(socketsBefore, SandboxSocketsCreated());
+    EXPECT_EQ(poolBefore, ShimPoolOutstanding())
+        << "the lookup's context leaked when the lookup was never issued";
+
+    DIRECTORY_ENTRY_METADATA cached = {};
+    EXPECT_EQ(PathCacheMiss, Cached(L"\\media\\never.bin", &cached));
 }
 
 } // namespace

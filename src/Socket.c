@@ -6,8 +6,9 @@
 
 #include "Driver.h"
 #include "Socket.h"
+#include "TlsHandshake.h"
 
-#define SOCKET_TAG 'HTTP'
+#define SOCKET_TAG 'kSPB'
 
 //
 // The WSK client registration and the captured provider dispatch, both
@@ -66,7 +67,7 @@ static SOCKET_POOL_STATE SocketPool;
 // along with the ring. Peer idle-close of pooled connections is handled by
 // the reused-connection retry in the HTTP client.
 //
-ULONG SocketMaxPoolSize = 64;
+static ULONG SocketMaxPoolSize = 64;
 
 //
 // TLS ciphertext accumulator sizing (see Socket.h). Ciphertext is
@@ -89,7 +90,7 @@ ULONG SocketMaxPoolSize = 64;
 
 #define SOCKET_TLS_RECORD_MAX_BYTES (5 + TLS_RECORD_CIPHERTEXT_MAX)
 
-ULONG SocketTlsRecvCapacity = SOCKET_TLS_RECV_RECORDS_LARGE * SOCKET_TLS_RECORD_MAX_BYTES;
+ULONG BlorgSocketTlsRecvCapacity = SOCKET_TLS_RECV_RECORDS_LARGE * SOCKET_TLS_RECORD_MAX_BYTES;
 
 //
 // Every async send/receive needs a KSOCKET_ASYNC_CONTEXT; the TLS record
@@ -104,6 +105,7 @@ static IO_COMPLETION_ROUTINE SocketContextCompletionRoutine;
 static IO_COMPLETION_ROUTINE SocketAsyncCompletionRoutine;
 static KDEFERRED_ROUTINE SocketAsyncTimeoutDpc;
 static IO_WORKITEM_ROUTINE SocketPrewarmStepWorker;
+static IO_WORKITEM_ROUTINE SocketPrewarmHandshakeWorker;
 
 //
 // Pre-warm pump and teardown state, declared here because
@@ -142,17 +144,18 @@ static IO_WORKITEM_ROUTINE SocketPrewarmStepWorker;
 // push lock or ERESOURCE would be illegal. The sections are a handful of
 // instructions with no blocking inside, so raising to DISPATCH for them
 // costs nothing. The pump itself runs only at PASSIVE_LEVEL, because the
-// WskSocketConnect it issues must (see SocketPrewarmStepComplete).
+// WskSocketConnect it issues must (see SocketPrewarmStepFinish).
 //
 static LONG SocketPrewarmRemaining;
 static LONG SocketPrewarmInFlight;
 static LONG SocketPrewarmShuttingDown;
 
 //
-// Carries a step completed above PASSIVE_LEVEL to SocketPrewarmStepAccount.
-// One is enough: only one step is ever in flight, and its completion is the
-// only thing that queues it. Allocated by the first fill, freed by teardown
-// once nothing is in flight.
+// Carries a step completed above PASSIVE_LEVEL to its handshake or to
+// SocketPrewarmStepAccount. One is enough: only one step is ever in flight,
+// and it queues the item at most once at a time -- the handshake's
+// completion can queue it again only after the handshake worker has run.
+// Allocated by the first fill, freed by teardown once nothing is in flight.
 //
 static PIO_WORKITEM SocketPrewarmWorkItem;
 
@@ -169,7 +172,8 @@ static PIO_WORKITEM SocketPrewarmWorkItem;
 static BOOLEAN SocketPrewarmPumpRunning;
 static BOOLEAN SocketPrewarmPumpPending;
 
-// SocketCloseWskSocket is defined below but referenced earlier (BlorgCleanupWskSocketPool).
+// SocketCloseWskSocket is defined below but referenced earlier
+// (BlorgCleanupWskSocketPool).
 static NTSTATUS SocketCloseWskSocket(PKSOCKET Socket);
 
 //
@@ -189,7 +193,7 @@ NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket)
 
     if (!Socket->TlsRecvBuffer)
     {
-        Socket->TlsRecvBuffer = ExAllocatePoolUninitialized(NonPagedPoolNx, SocketTlsRecvCapacity, SOCKET_TAG);
+        Socket->TlsRecvBuffer = ExAllocatePoolUninitialized(NonPagedPoolNx, BlorgSocketTlsRecvCapacity, SOCKET_TAG);
 
         if (!Socket->TlsRecvBuffer)
         {
@@ -207,7 +211,7 @@ NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket)
         }
     }
 
-    Socket->TlsRecvMdl = IoAllocateMdl(Socket->TlsRecvBuffer, SocketTlsRecvCapacity, FALSE, FALSE, NULL);
+    Socket->TlsRecvMdl = IoAllocateMdl(Socket->TlsRecvBuffer, BlorgSocketTlsRecvCapacity, FALSE, FALSE, NULL);
 
     if (!Socket->TlsRecvMdl)
     {
@@ -322,7 +326,7 @@ static BOOLEAN SocketReleaseTimeoutRef(PSOCKET_OP_TIMEOUT Timeout)
     return 0 == InterlockedDecrement(&Timeout->RefCount);
 }
 
-const WSK_CLIENT_DISPATCH WskAppDispatch =
+static const WSK_CLIENT_DISPATCH WskAppDispatch =
 {
     MAKE_WSK_VERSION(1,0), // Use WSK version 1.0
     0,    // Reserved
@@ -597,7 +601,7 @@ NTSTATUS BlorgInitialiseWskClient(VOID)
         }
     }
 
-    SocketTlsRecvCapacity = tlsRecvRecords * SOCKET_TLS_RECORD_MAX_BYTES;
+    BlorgSocketTlsRecvCapacity = tlsRecvRecords * SOCKET_TLS_RECORD_MAX_BYTES;
 
     return STATUS_SUCCESS;
 }
@@ -742,10 +746,10 @@ VOID BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo)
 //
 // Synchronously closes a socket and frees its KSOCKET, including TLS
 // connection state. PASSIVE_LEVEL only (blocks waiting for the close IRP);
-// use BlorgCloseWskSocketAsync from the DISPATCH_LEVEL completion chain instead.
-// If the IRP allocation fails, the KSOCKET is still freed -- there is no
-// path that lets the caller retry a close, and leaking the struct on an
-// already-rare allocation failure is worse than leaking the (already
+// use BlorgCloseWskSocketAsync from the DISPATCH_LEVEL completion chain
+// instead. If the IRP allocation fails, the KSOCKET is still freed -- there
+// is no path that lets the caller retry a close, and leaking the struct on
+// an already-rare allocation failure is worse than leaking the (already
 // broken) underlying socket.
 //
 static NTSTATUS SocketCloseWskSocket(PKSOCKET Socket)
@@ -775,12 +779,13 @@ static NTSTATUS SocketCloseWskSocket(PKSOCKET Socket)
 }
 
 //
-// Fire-and-forget close. Unlike SocketCloseWskSocket, this never waits, so it is
-// safe to call from the WSK completion routines (<= DISPATCH_LEVEL) that
-// drive the async HTTP pipeline. The IRP, the KSOCKET, and this context are
-// all owned by SocketCloseAsyncCompletionRoutine once WskCloseSocket is
-// issued, and freed there. Use the synchronous SocketCloseWskSocket only for
-// PASSIVE_LEVEL teardown (BlorgCleanupWskSocketPool).
+// Fire-and-forget close. Unlike SocketCloseWskSocket, this never waits, so
+// it is safe to call from the WSK completion routines (<= DISPATCH_LEVEL)
+// that drive the async HTTP pipeline. The IRP, the KSOCKET, and this
+// context are all owned by SocketCloseAsyncCompletionRoutine once
+// WskCloseSocket is issued, and freed there. Use the synchronous
+// SocketCloseWskSocket only for PASSIVE_LEVEL teardown
+// (BlorgCleanupWskSocketPool).
 //
 
 // Context for a single async socket close, owned by its completion routine.
@@ -909,23 +914,6 @@ static BOOLEAN SocketAddressEqual(const SOCKADDR* restrict A, const SOCKADDR* re
 }
 
 //
-// Completion for a pre-warm connect. The socket is not wanted by anyone --
-// it exists to be in the pool -- so success releases it straight there and
-// failure drops it. Either way nothing is reported: a pre-warm that fails
-// leaves exactly the behaviour that existed before pre-warming.
-//
-static VOID SocketPrewarmComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
-{
-    UNREFERENCED_PARAMETER(Reused);
-    UNREFERENCED_PARAMETER(CompletionContext);
-
-    if (NT_SUCCESS(Status) && Socket)
-    {
-        BlorgReleaseReusableWskSocket(Socket);
-    }
-}
-
-//
 // Opens connections into the pool ahead of anyone needing them.
 //
 // The pool fills only from released sockets, so it starts empty and the
@@ -975,7 +963,8 @@ ULONG BlorgPrewarmRemainingForDiagnostics(VOID)
 // SocketPrewarmPump).
 //
 // The in-flight drop comes after the socket handoff, which
-// SocketPrewarmStepComplete makes before calling or queueing this. The
+// SocketPrewarmStepComplete or SocketPrewarmHandshakeComplete makes before
+// calling or queueing this. The
 // accounting runs under the pool lock (see the state-block comment for why
 // the consume is a plain locked read-and-write rather than a CAS loop),
 // with the pump re-entry -- which takes that same lock again inside the
@@ -1005,7 +994,7 @@ static VOID SocketPrewarmStepAccount(VOID)
 }
 
 //
-// PASSIVE-level target for SocketPrewarmStepComplete's bounce.
+// PASSIVE-level target for SocketPrewarmStepFinish's bounce.
 //
 static VOID SocketPrewarmStepWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 {
@@ -1022,17 +1011,8 @@ static VOID SocketPrewarmStepWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // DISPATCH_LEVEL, so a completion above PASSIVE hands the step to the work
 // item, and the step stays in flight until it has run.
 //
-// The socket handoff (SocketPrewarmComplete ->
-// BlorgReleaseReusableWskSocket) precedes the in-flight drop so that a
-// teardown which observes InFlight == 0 knows the step's socket is already
-// in the pool its drain loop is about to walk -- drop first and the poll
-// could exit in the gap, resurrecting exactly the post-teardown release
-// this whole protocol exists to prevent.
-//
-static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
+static VOID SocketPrewarmStepFinish(VOID)
 {
-    SocketPrewarmComplete(Status, Socket, Reused, CompletionContext);
-
     if (PASSIVE_LEVEL < KeGetCurrentIrql())
     {
         IoQueueWorkItem(SocketPrewarmWorkItem, SocketPrewarmStepWorker, DelayedWorkQueue, NULL);
@@ -1040,6 +1020,80 @@ static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN 
     }
 
     SocketPrewarmStepAccount();
+}
+
+//
+// A handshake that fails leaves the socket unusable (TlsHandshake.h), so it
+// is closed rather than pooled; the step is finished either way.
+//
+static VOID SocketPrewarmHandshakeComplete(NTSTATUS Status, PVOID CallerContext)
+{
+    PKSOCKET socket = C_CAST(PKSOCKET, CallerContext);
+
+    if (NT_SUCCESS(Status))
+    {
+        BlorgReleaseReusableWskSocket(socket);
+    }
+    else
+    {
+        BlorgCloseWskSocketAsync(socket);
+    }
+
+    SocketPrewarmStepFinish();
+}
+
+//
+// PASSIVE-level target for a handshake whose connect completed above it:
+// the handshake's CNG key generation is PASSIVE-only.
+//
+static VOID SocketPrewarmHandshakeWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    BlorgTlsStartHandshakeAsync(C_CAST(PKSOCKET, Context), SocketPrewarmHandshakeComplete, Context);
+}
+
+//
+// Completion for a pre-warm connect. The socket is not wanted by anyone --
+// it exists to be in the pool -- so success releases it straight there and
+// failure drops it. Either way nothing is reported: a pre-warm that fails
+// leaves exactly the behaviour that existed before pre-warming.
+//
+// With TLS enabled the handshake runs here, before the release. A pooled
+// socket that has not handshaken is one the server is waiting to hear from,
+// and the guest's terminator drops a client that stays silent for 15 s, so
+// the first reader to take one after that paid a failed handshake and a
+// fresh connect. The step stays in flight through the handshake.
+//
+// The socket handoff precedes the in-flight drop so that a teardown which
+// observes InFlight == 0 knows the step's socket is already in the pool its
+// drain loop is about to walk -- drop first and the poll could exit in the
+// gap, resurrecting exactly the post-teardown release this whole protocol
+// exists to prevent.
+//
+static VOID SocketPrewarmStepComplete(NTSTATUS Status, PKSOCKET Socket, BOOLEAN Reused, PVOID CompletionContext)
+{
+    UNREFERENCED_PARAMETER(Reused);
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (NT_SUCCESS(Status) && Socket)
+    {
+        if (global.TlsEnabled)
+        {
+            if (PASSIVE_LEVEL < KeGetCurrentIrql())
+            {
+                IoQueueWorkItem(SocketPrewarmWorkItem, SocketPrewarmHandshakeWorker, DelayedWorkQueue, Socket);
+                return;
+            }
+
+            BlorgTlsStartHandshakeAsync(Socket, SocketPrewarmHandshakeComplete, Socket);
+            return;
+        }
+
+        BlorgReleaseReusableWskSocket(Socket);
+    }
+
+    SocketPrewarmStepFinish();
 }
 
 //
@@ -1189,9 +1243,9 @@ static VOID SocketPrewarmPump(VOID)
 // Only the family-sized address is copied. The caller hands a PSOCKADDR at
 // an object sized for its family -- DriverEntry passes ai_addr, the sandbox
 // tests a stack SOCKADDR_IN -- so copying a full SOCKADDR_STORAGE would
-// read past its end. Every consumer of SocketPrewarmAddress (SocketAddressEqual,
-// WskSocketConnect, the per-socket RemoteAddress copy) honours the family
-// size too.
+// read past its end. Every consumer of SocketPrewarmAddress
+// (SocketAddressEqual, WskSocketConnect, the per-socket RemoteAddress copy)
+// honours the family size too.
 //
 // The copy is taken before the lock, onto the stack: ai_addr comes back from
 // WskGetAddressInfo in paged pool, so it cannot be read at DISPATCH_LEVEL
@@ -1243,19 +1297,19 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 }
 
 //
-// Pool ownership model: a KSOCKET handed out by BlorgAcquireReusableWskSocketAsync
-// belongs exclusively to that caller until it is passed back to
-// BlorgReleaseReusableWskSocket (or closed on failure). It should not be used
-// concurrently from more than one thread/operation at a time -- each
-// send/receive/close allocates its own IRP per call, so concurrent
-// use on one socket is a correctness issue (interleaved writes/reads on
-// the wire) rather than a kernel-memory hazard, but it's still not a
-// supported usage pattern. The pool itself does not need its own
-// busy-tracking beyond list membership: a socket is either "in the list"
-// (idle, owned by the pool) or "out" (owned by exactly one caller), and
-// the spinlock only ever protects list membership transitions, never an
-// in-flight I/O operation.
-// 
+// Pool ownership model: a KSOCKET handed out by
+// BlorgAcquireReusableWskSocketAsync belongs exclusively to that caller
+// until it is passed back to BlorgReleaseReusableWskSocket (or closed on
+// failure). It should not be used concurrently from more than one
+// thread/operation at a time -- each send/receive/close allocates its own
+// IRP per call, so concurrent use on one socket is a correctness issue
+// (interleaved writes/reads on the wire) rather than a kernel-memory
+// hazard, but it's still not a supported usage pattern. The pool itself
+// does not need its own busy-tracking beyond list membership: a socket is
+// either "in the list" (idle, owned by the pool) or "out" (owned by exactly
+// one caller), and the spinlock only ever protects list membership
+// transitions, never an in-flight I/O operation.
+//
 // LIFO: the most recently used connection goes back on the head,
 // where BlorgAcquireReusableWskSocketAsync's RemoveHeadList will hand it
 // out next. A FIFO here cycles through all pooled connections,
@@ -1264,8 +1318,9 @@ VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count)
 // sized by actual concurrency and lets the tail go cold.
 //
 // Called from the async HTTP pipeline at DISPATCH_LEVEL, so a socket that
-// doesn't fit in the pool is closed via the non-blocking BlorgCloseWskSocketAsync
-// rather than the synchronous SocketCloseWskSocket.
+// doesn't fit in the pool is closed via the non-blocking
+// BlorgCloseWskSocketAsync rather than the synchronous
+// SocketCloseWskSocket.
 //
 NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket)
 {

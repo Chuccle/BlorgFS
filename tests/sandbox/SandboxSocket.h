@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 //
 // Scriptable implementation of Socket.h / TlsHandshake.h.
@@ -119,6 +119,24 @@ VOID SandboxFailNextAcquiresWith(ULONG Count, NTSTATUS Status);
 // link it have it.
 //
 VOID SandboxFailNextHandshakesWith(ULONG Count, NTSTATUS Status);
+
+//
+// Clears the above and the counts below, which are the handshakes started
+// and those started above PASSIVE_LEVEL. Also NoTlsHandshakeStub.c's.
+//
+VOID SandboxResetHandshakes(VOID);
+ULONG SandboxHandshakesStarted(VOID);
+ULONG SandboxHandshakesAbovePassive(VOID);
+
+//
+// Sets the traffic keys every handshake completed from now on leaves on
+// its socket, the client writing under ClientKey/ClientIv and reading under
+// ServerKey/ServerIv, from sequence zero. Their handles are imported only
+// once BlorgTlsGlobalInit has run. Each is TLS_KEY_LEN or TLS_IV_LEN
+// bytes. Until it is called, and again after SandboxResetHandshakes, they
+// are all zero. Also NoTlsHandshakeStub.c's.
+//
+VOID SandboxSetTrafficKeys(const UCHAR* ClientKey, const UCHAR* ClientIv, const UCHAR* ServerKey, const UCHAR* ServerIv);
 
 // Runs deferred (non-inline) completions until none remain.
 VOID SandboxDrainCompletions(VOID);

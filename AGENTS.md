@@ -255,14 +255,24 @@ correct drift when you find it.
   Never inside a function body — naming carries the meaning there.
 - **Padding:** never widen a field's type to satisfy `CHECK_PADDING_END`; add an
   explicit named `Reserved[N]` instead.
-- **`ProbeForRead` for all user-buffer validation,** including output buffers.
-  `ProbeForWrite` is legacy and writes every page.
+- **User buffers are read and written only through the user-mode
+  accessors** (`usermode_accessors.h`, linked from `umaccess.lib`), never
+  through `ProbeForRead`/`ProbeForWrite` and a plain dereference. Build the
+  output in kernel memory and copy it out with `CopyToMode` (or
+  `WriteULongToMode` and friends) under the request's `RequestorMode`, or
+  `KernelMode` when the buffer is an MDL's system address, inside the
+  handler's `__try`. `DirCtrl.c`'s query path is the model: each entry is
+  filled in a pool scratch block and copied to the caller's buffer whole.
+  The sandbox shims the accessors in `NtShim.c` as plain copies that a test
+  can make fault (`ShimUserAccessFaultAt`).
 
-  Two places deliberately do not probe, both following fastfat: the cached
-  read path in `Read.c` hands `Irp->UserBuffer` to `CcCopyReadEx` under SEH,
-  and `Security.c` lets `SeQuerySecurityDescriptorInfo` write into
-  `Irp->UserBuffer` directly. In both the fault is caught rather than
-  prevented. Do not "fix" either without reading why fastfat does the same.
+  Two places deliberately hand `Irp->UserBuffer` to a kernel routine
+  instead, both following fastfat: the cached read path in `Read.c` passes
+  it to `CcCopyReadEx`, and `Security.c` lets
+  `SeQuerySecurityDescriptorInfo` write into it. Both run under SEH, so a
+  fault is caught rather than prevented, and neither has an accessor form:
+  the copy happens inside the routine. Do not "fix" either without reading
+  why fastfat does the same.
 - **Never `%wZ`/`%Z` in a `DbgPrint` that can run above `PASSIVE_LEVEL`** —
   the formatting touches paged code and bugchecks. In practice that means
   anywhere on a completion chain (`HttpFail`, `HttpComplete`,
@@ -1612,6 +1622,7 @@ budget are gone (git history only) and are not coming back as-is — see
 | Grow | Only when **all** of: the consumer never idles (`ReadIsGreedy` in `Read.c`, idle ticks under 25% of a window); the transport is quiet (fewer than `READ_AHEAD_ADAPT_QUIET_DEPTH` fetches in flight, fixed at **6**); 16 consecutive exactly-adjacent reads on the *current* stream (`ReadCurrentStreak`/`ReadLastStreamIndex` — not the longest streak across trackers, which oscillated); and Cc is still honouring the granule last given (largest paging read in the window against the granule asked for — not a rate or a clock). |
 | Growth ceiling | **2 MB** (`ReadAheadMaxGranularityKb`), chosen because Cc itself caps around ~1.1 MB on this rig and going further bought nothing. |
 | Feedback loop | On by default; `ReadAheadAdapt=0` pins the granule (useful for A/B measurement). |
+| Whose state | The window (fetched against consumed, idle and busy ticks, largest paging read) is the file's, on the FCB, because every handle shares one cache. The granule and the run of agreeing votes are the handle's, on its CCB, because Cc acts on the mask of the file object it was told on: a window is judged against, and moves, the granule of the handle whose read closed it. Each handle starts at the starting granule on its first cached read. |
 | Slack-based growth | On by default; `ReadAheadSlackGrowth=0` disables it. |
 | Fair share | Past `ReadFairBudgetKb` (default **2 MB**) of fetches in flight, read-ahead from a file that already has a fetch in flight is **held** and admitted on each completion in start-time fair order, by bytes per file (`ReadFair` in `Read.c`): a file that has fetched less recently goes first, and every backlogged file gets the same bytes whatever its fetch size. A file with nothing in flight is never held (Cc keeps a player to one read-ahead at a time), nor are demand faults and uncached reads; and when a file's last fetch settles, its earliest held read is admitted whatever the budget, because other files' demand can keep the link past it for as long as they run (that stranded a player for 25 s beside two copies). Under the budget, which is everything a lone reader on a quiet link does, nothing waits. Counted as `ReadsHeld`; `ReadFairBudgetKb=0` never holds. Separately, at most `READ_FAIR_MAX_FETCHES` (32) fetches are in flight at once, demand included, and demand waiting for that goes first: a mapped read faulting a page at a time once issued 10,100 4 KB fetches together, overran the server's accept queue and failed `PrefetchVirtualMemory`. Whether a fetch waits is decided under the lock only; one that must wait and cannot get the work item that would release it fails with `STATUS_INSUFFICIENT_RESOURCES` rather than going out past the limit. |
 | **Removed**: "loaded transport grows the granule" | Was in the tree, measured to be up to **12x worse** on paced/deadline workloads, deleted outright. Growth today is slack-only. |

@@ -108,6 +108,16 @@ VOID ShimPoolFailAt(LONG Index)
     InterlockedExchange(&PoolAllocationCounter, 0);
 }
 
+LONG ShimPoolAllocations(VOID)
+{
+    return PoolAllocationCounter;
+}
+
+SIZE_T ShimPoolBlockSize(PVOID Block)
+{
+    return ((SHIM_POOL_HEADER*)Block - 1)->Size;
+}
+
 SIZE_T ShimPoolOutstanding(VOID)
 {
     return (SIZE_T)KmObjectsLive(KmObjectPool);
@@ -968,6 +978,7 @@ VOID ShimReset(VOID)
     InterlockedExchange(&MdlMappingFailPending, 0);
     InterlockedExchange(&ShimMdlAllocationFailPending, 0);
     InterlockedExchange(&WorkItemFailPending, 0);
+    ShimUserAccessFaultAt(-1);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -1229,6 +1240,51 @@ VOID ShimFreeMdl(PMDL Mdl)
     free(Mdl);
 }
 
+///////////////////////////////////////////////////////////////////////////
+// User-mode accessors
+///////////////////////////////////////////////////////////////////////////
+
+static volatile LONG UserAccessFaultIndex = -1;
+static volatile LONG UserAccessCounter = 0;
+
+VOID ShimUserAccessFaultAt(LONG Index)
+{
+    InterlockedExchange(&UserAccessFaultIndex, Index);
+    InterlockedExchange(&UserAccessCounter, 0);
+}
+
+LONG ShimUserAccesses(VOID)
+{
+    return UserAccessCounter;
+}
+
+static VOID ShimUserAccess(KPROCESSOR_MODE Mode)
+{
+    if (KernelMode == Mode)
+    {
+        return;
+    }
+
+    LONG index = InterlockedIncrement(&UserAccessCounter) - 1;
+
+    if (index == UserAccessFaultIndex)
+    {
+        RaiseException((DWORD)STATUS_ACCESS_VIOLATION, 0, 0, NULL);
+    }
+}
+
+VOID CopyToMode(volatile VOID* Destination, const VOID* Source, SIZE_T Length, KPROCESSOR_MODE Mode)
+{
+    ShimUserAccess(Mode);
+    memcpy((VOID*)Destination, Source, Length);
+}
+
+VOID WriteULongToMode(volatile ULONG* Destination, ULONG Value, KPROCESSOR_MODE Mode)
+{
+    ShimUserAccess(Mode);
+    *Destination = Value;
+}
+
 static SIZE_T RemainingStack = 16 * 1024;
 static BOOLEAN StackExpansionFailPending = FALSE;
 
@@ -1308,15 +1364,18 @@ NTSTATUS IoCsqInitialize(
 // IoMarkIrpPending around this is double-marking -- which is why the model
 // does it rather than leaving it to the caller to imitate.
 //
+// DriverContext[3] is the queue's while the IRP is in it, as the kernel's
+// is: it holds the context, or the queue itself, and removal clears it.
+// Anything a driver keeps there is gone by the time a worker dequeues it.
+//
 VOID IoCsqInsertIrp(PIO_CSQ Csq, PIRP Irp, PIO_CSQ_IRP_CONTEXT Context)
 {
     KIRQL irql = 0;
 
-    (void)Context;
-
     Csq->CsqAcquireLock(Csq, &irql);
 
     IoMarkIrpPending(Irp);
+    Irp->Tail.Overlay.DriverContext[3] = Context ? (PVOID)Context : (PVOID)Csq;
     Csq->CsqInsertIrp(Csq, Irp);
 
     Csq->CsqReleaseLock(Csq, irql);
@@ -1333,6 +1392,7 @@ PIRP IoCsqRemoveNextIrp(PIO_CSQ Csq, PVOID PeekContext)
     if (irp)
     {
         Csq->CsqRemoveIrp(Csq, irp);
+        irp->Tail.Overlay.DriverContext[3] = NULL;
     }
 
     Csq->CsqReleaseLock(Csq, irql);
@@ -1355,18 +1415,23 @@ POBJECT_TYPE* IoFileObjectType = &IoFileObjectTypeObject;
 // A monotonic counter with a fixed frequency. Statistics.c divides by the
 // frequency, so it must never be zero.
 //
+static volatile LONG64 PerformanceTicks = 0;
+
 LARGE_INTEGER KeQueryPerformanceCounter(PLARGE_INTEGER PerformanceFrequency)
 {
-    static LONG64 Ticks = 0;
-
     if (PerformanceFrequency)
     {
         PerformanceFrequency->QuadPart = 10000000;
     }
 
     LARGE_INTEGER now;
-    now.QuadPart = InterlockedIncrement64(&Ticks);
+    now.QuadPart = InterlockedIncrement64(&PerformanceTicks);
     return now;
+}
+
+VOID ShimAdvancePerformanceCounter(LONG64 Ticks)
+{
+    InterlockedExchangeAdd64(&PerformanceTicks, Ticks);
 }
 
 ///////////////////////////////////////////////////////////////////////////

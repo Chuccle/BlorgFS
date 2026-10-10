@@ -26,6 +26,7 @@
 #include <ntstrsafe.h>
 #include <wdmsec.h>
 #include <wsk.h>
+#include <usermode_accessors.h>
 #endif
 
 #include <limits.h>
@@ -169,10 +170,10 @@
 // zero fetches the one listing, as before. A walk of the tree then finds
 // what fit already cached instead of paying a round trip per directory.
 //
-// An entry is about 60 bytes on the wire and 560 decoded, so the default
-// answer is at most ~120 KB, a few milliseconds of the reference link on
-// top of the round trip it replaces many of, and ~1.1 MB of paged pool,
-// well inside the listing cache's budget.
+// An entry is about 60 bytes on the wire and under 100 decoded, so the
+// default answer is at most ~120 KB, a few milliseconds of the reference
+// link on top of the round trip it replaces many of, and ~200 KB of paged
+// pool, well inside the listing cache's budget.
 //
 #define SUBTREE_ENTRIES 2048u
 
@@ -200,6 +201,15 @@
 #define BLORGFS_REG_HOST_MAX_CHARS 128 // 127-char hostname + NUL, with headroom
 #define BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS 260 // NT path of the disk cache file + NUL
 #define BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES (BLORGFS_REG_HOST_MAX_CHARS + 8) // host plus ":65535" + NUL -- bounds global.RemoteHostAnsi (Client.c)
+
+//
+// Sector and cluster size the volume reports: the sector of the synthetic
+// disk geometry (IOCTL_DISK_GET_DRIVE_GEOMETRY in DevIoCtrl.c) and a page
+// per cluster in the size queries (VolumeInfo.c). The backend has no
+// allocation unit, but GetDiskFreeSpace callers divide by the product.
+//
+#define BLORGFS_DISK_BYTES_PER_SECTOR 512ULL
+#define BLORGFS_SECTORS_PER_ALLOCATION_UNIT (PAGE_SIZE / BLORGFS_DISK_BYTES_PER_SECTOR)
 
 #ifdef DBG
 
@@ -235,6 +245,10 @@ do                                                                             \
 #endif
 
 _Dispatch_type_(IRP_MJ_CREATE)                   DRIVER_DISPATCH BlorgCreate;
+
+// Counts a volume create in SuccessfulCreates or FailedCreates by the
+// status it is completed with, wherever that happens (Create.c).
+VOID BlorgCountCreate(NTSTATUS Status);
 
 _Dispatch_type_(IRP_MJ_CLOSE)                    DRIVER_DISPATCH BlorgClose;
 _Dispatch_type_(IRP_MJ_READ)                     DRIVER_DISPATCH BlorgRead;
@@ -312,10 +326,11 @@ extern struct GLOBAL
     //  ANSI hostname (no port) for the ClientHello SNI extension, built in
     //  DriverEntry alongside RemoteHostAnsi. NULL when TLS is disabled at
     //  load, when the configured host is an IPv4/IPv6 literal (RFC 6066
-    //  forbids literals in SNI -- see DriverHostStringIsIpLiteral, Driver.c), or
-    //  on allocation failure; BlorgTlsStartHandshakeAsync omits the extension
-    //  in all three cases. NUL-terminated (pool-zero allocated), bounded
-    //  by BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES like RemoteHostAnsi.
+    //  forbids literals in SNI -- see DriverHostStringIsIpLiteral,
+    //  Driver.c), or on allocation failure; BlorgTlsStartHandshakeAsync
+    //  omits the extension in all three cases. NUL-terminated (pool-zero
+    //  allocated), bounded by BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES like
+    //  RemoteHostAnsi.
     //
     PSTR RemoteHostSniAnsi;
 

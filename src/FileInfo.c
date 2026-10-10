@@ -117,7 +117,7 @@ static NTSTATUS FileInfoQuery(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             standardInfo->EndOfFile = commonContext->Header.FileSize;
             standardInfo->NumberOfLinks = 1;
             standardInfo->DeletePending = FALSE;
-            standardInfo->Directory = GET_NODE_TYPE(commonContext) == BLORGFS_DCB_SIGNATURE;
+            standardInfo->Directory = (GET_NODE_TYPE(commonContext) != BLORGFS_FCB_SIGNATURE);
 
             result = STATUS_SUCCESS;
             bytesWritten = sizeof(FILE_STANDARD_INFORMATION);

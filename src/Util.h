@@ -22,7 +22,7 @@ _When_((PoolType& NonPagedPoolMustSucceed) != 0,
     _Post_writable_byte_size_(NumberOfBytes)
     PVOID
     NTAPI
-    ReallocateBufferUninitialized(
+    BlorgReallocateBufferUninitialized(
         _In_ PVOID OldBuffer,
         _In_ SIZE_T OldNumberOfBytes,
         _In_ __drv_strictTypeMatch(__drv_typeExpr) POOL_TYPE PoolType,
@@ -31,44 +31,6 @@ _When_((PoolType& NonPagedPoolMustSucceed) != 0,
     )
 {
     PVOID newBuffer = ExAllocatePoolUninitialized(PoolType, NumberOfBytes, Tag);
-
-    if (!newBuffer)
-    {
-        return OldBuffer;
-    }
-
-    RtlCopyMemory(newBuffer, OldBuffer, OldNumberOfBytes);
-
-    ExFreePool(OldBuffer);
-
-    return newBuffer;
-}
-
-inline
-__drv_allocatesMem(Mem)
-_When_((PoolType& PagedPool) != 0, _IRQL_requires_max_(APC_LEVEL))
-_When_((PoolType& PagedPool) == 0, _IRQL_requires_max_(DISPATCH_LEVEL))
-_When_((PoolType& NonPagedPoolMustSucceed) != 0,
-    __drv_reportError("Must succeed pool allocations are forbidden. "
-        "Allocation failures cause a system crash"))
-    _When_((PoolType& (NonPagedPoolMustSucceed |
-        POOL_RAISE_IF_ALLOCATION_FAILURE)) == 0,
-        _Post_maybenull_ _Must_inspect_result_)
-    _When_((PoolType& (NonPagedPoolMustSucceed |
-        POOL_RAISE_IF_ALLOCATION_FAILURE)) != 0,
-        _Post_notnull_)
-    _Post_writable_byte_size_(NumberOfBytes)
-    PVOID
-    NTAPI
-    ReallocateBufferZero(
-        _In_ PVOID OldBuffer,
-        _In_ SIZE_T OldNumberOfBytes,
-        _In_ __drv_strictTypeMatch(__drv_typeExpr) POOL_TYPE PoolType,
-        _In_ SIZE_T NumberOfBytes,
-        _In_ ULONG Tag
-    )
-{
-    PVOID newBuffer = ExAllocatePoolZero(PoolType, NumberOfBytes, Tag);
 
     if (!newBuffer)
     {
@@ -152,32 +114,16 @@ inline VOID BlorgClearIrpContextFlag(PIRP Irp, ULONG_PTR Flag)
     Irp->Tail.Overlay.DriverContext[0] = C_CAST(PVOID, flags);
 }
 
+//
+// Completes Irp with Status, if there is one. On an error status for an
+// input operation Information is zeroed first, since IopCompleteRequest
+// would otherwise copy that many bytes to the caller's buffer.
+//
 inline VOID BlorgCompleteRequest(
     _In_opt_ PIRP Irp,
     NTSTATUS Status,
     CCHAR PriorityBoost
 )
-
-/*++
-
-Routine Description:
-
-    This routine completes a Irp. On an error status for an input
-    operation, Information is zeroed first, since IopCompleteRequest
-    would otherwise try to copy that many bytes to the user's buffer.
-
-Arguments:
-
-    Irp - Supplies the Irp being processed
-
-    Status - Supplies the status to complete the Irp with
-
-Return Value:
-
-    None.
-
---*/
-
 {
     if (Irp)
     {
@@ -193,30 +139,12 @@ Return Value:
     }
 }
 
-inline BOOLEAN BlorgIsIrpTopLevel(
-    PIRP Irp
-)
-
-/*++
-
-Routine Description:
-
-    This routine detects if an Irp is the Top level requestor, ie. if it os OK
-    to do a verify or pop-up now.  If TRUE is returned, then no file system
-    resources are held above us.
-
-Arguments:
-
-    Irp - Supplies the Irp being processed
-
-    Status - Supplies the status to complete the Irp with
-
-Return Value:
-
-    None.
-
---*/
-
+//
+// Makes Irp the top-level IRP if there is none and returns TRUE, which
+// means no file system resources are held above this request and a
+// verify or pop-up is safe; returns FALSE otherwise.
+//
+inline BOOLEAN BlorgIsIrpTopLevel(PIRP Irp)
 {
     if (!IoGetTopLevelIrp())
     {

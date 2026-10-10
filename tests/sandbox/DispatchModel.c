@@ -45,7 +45,58 @@ BOOLEAN CcUninitializeCacheMap(PFILE_OBJECT F, PLARGE_INTEGER T, PVOID E)
     return TRUE;
 }
 
-VOID CcSetReadAheadGranularity(PFILE_OBJECT F, ULONG G) { (void)F; (void)G; }
+//
+// Cc keeps the read-ahead granule in each file object's private cache map,
+// which the model does not have, so what the driver last told it is kept
+// here instead, for the first eight file objects a test reads through.
+//
+#define SHIM_READ_AHEAD_FILES 8
+
+static struct
+{
+    PFILE_OBJECT FileObject;
+    ULONG Granularity;
+} ShimReadAheadGranules[SHIM_READ_AHEAD_FILES];
+
+static volatile LONG ShimReadAheadGranularitySetCount = 0;
+
+VOID CcSetReadAheadGranularity(PFILE_OBJECT F, ULONG G)
+{
+    InterlockedIncrement(&ShimReadAheadGranularitySetCount);
+
+    for (ULONG i = 0; i < SHIM_READ_AHEAD_FILES; ++i)
+    {
+        if (F == ShimReadAheadGranules[i].FileObject || NULL == ShimReadAheadGranules[i].FileObject)
+        {
+            ShimReadAheadGranules[i].FileObject = F;
+            ShimReadAheadGranules[i].Granularity = G;
+            return;
+        }
+    }
+}
+
+ULONG ShimReadAheadGranularity(PFILE_OBJECT F)
+{
+    for (ULONG i = 0; i < SHIM_READ_AHEAD_FILES; ++i)
+    {
+        if (F == ShimReadAheadGranules[i].FileObject)
+        {
+            return ShimReadAheadGranules[i].Granularity;
+        }
+    }
+
+    return 0;
+}
+
+VOID ShimReadAheadGranularityReset(VOID)
+{
+    RtlZeroMemory(ShimReadAheadGranules, sizeof(ShimReadAheadGranules));
+}
+
+LONG ShimReadAheadGranularitySets(VOID)
+{
+    return InterlockedCompareExchange(&ShimReadAheadGranularitySetCount, 0, 0);
+}
 
 //
 // A purge fails in the kernel while a mapped view or an image section
@@ -102,6 +153,17 @@ static volatile LONG CcCopyReadForceMiss = 0;
 //
 static volatile LONG CcCopyReadInformation = 0;
 
+//
+// How long each successful copy takes, in performance-counter ticks: the
+// time a reader spends waiting inside the cache rather than between reads.
+//
+static volatile LONG64 CcCopyReadTicks = 0;
+
+VOID ShimSetCcCopyReadTicks(LONG64 Ticks)
+{
+    InterlockedExchange64(&CcCopyReadTicks, Ticks);
+}
+
 VOID ShimForceNextCcCopyReadMiss(VOID)
 {
     InterlockedExchange(&CcCopyReadForceMiss, 1);
@@ -126,6 +188,8 @@ BOOLEAN CcCopyReadEx(PFILE_OBJECT F, PLARGE_INTEGER O, ULONG L, BOOLEAN W, PVOID
         S->Status = STATUS_SUCCESS;
         S->Information = (ULONG)InterlockedExchange(&CcCopyReadInformation, 0);
     }
+
+    ShimAdvancePerformanceCounter(InterlockedCompareExchange64(&CcCopyReadTicks, 0, 0));
 
     return TRUE;
 }
@@ -271,7 +335,23 @@ NTSTATUS FsRtlCheckOplock(POPLOCK O, PIRP I, PVOID C, PVOID W, PVOID P)
 }
 
 BOOLEAN FsRtlOplockIsFastIoPossible(POPLOCK O) { (void)O; return TRUE; }
-BOOLEAN FsRtlOplockIsSharedRequest(PIRP I) { (void)I; return TRUE; }
+//
+// Every request is a shared one unless a test asks for the next to be
+// exclusive (batch, filter, level 1, or RWH), the only kind whose grant
+// depends on how many handles are open.
+//
+static volatile LONG OplockNextExclusive = 0;
+
+VOID ShimForceNextOplockRequestExclusive(VOID)
+{
+    InterlockedExchange(&OplockNextExclusive, 1);
+}
+
+BOOLEAN FsRtlOplockIsSharedRequest(PIRP I)
+{
+    (void)I;
+    return (BOOLEAN)(0 == InterlockedExchange(&OplockNextExclusive, 0));
+}
 
 NTSTATUS FsRtlOplockBreakH(POPLOCK O, PIRP I, ULONG F, PVOID C, PVOID Cb, PVOID P)
 {
@@ -582,47 +662,6 @@ NTSTATUS KeWaitForMultipleObjects(
 }
 
 VOID KdBreakPoint(VOID) { }
-
-//
-// ProbeForRead is the driver's own validation of a user buffer, so it has
-// to reject what the kernel rejects rather than wave everything through:
-// a handler that forgot to check a length must fail here, not silently
-// pass a dispatch test.
-//
-VOID ProbeForRead(PVOID Address, SIZE_T Length, ULONG Alignment)
-{
-    if (0 == Length)
-    {
-        return;
-    }
-
-    if (!Address || (Alignment && (((ULONG_PTR)Address) & (Alignment - 1))))
-    {
-        KmReportViolation(KmViolationLifetime, "ProbeForRead on a misaligned or null user buffer");
-    }
-}
-
-static ULONG ProbesForWrite;
-
-VOID ProbeForWrite(PVOID Address, SIZE_T Length, ULONG Alignment)
-{
-    ProbesForWrite++;
-
-    if (0 == Length)
-    {
-        return;
-    }
-
-    if (!Address || (Alignment && (((ULONG_PTR)Address) & (Alignment - 1))))
-    {
-        KmReportViolation(KmViolationLifetime, "ProbeForWrite on a misaligned or null user buffer");
-    }
-}
-
-ULONG ShimProbesForWrite(VOID)
-{
-    return ProbesForWrite;
-}
 
 ///////////////////////////////////////////////////////////////////////////
 // Rtl

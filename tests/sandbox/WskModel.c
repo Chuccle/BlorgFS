@@ -380,6 +380,10 @@ static const WSK_PROVIDER_CONNECTION_DISPATCH ConnectionDispatch =
 // transport captures the caller's security context in pageable code, so a
 // connect must be issued below DISPATCH_LEVEL.
 //
+// A Never connect is a peer that does not answer the SYN: no connection
+// exists until one would have, so the only way it ends is the driver's
+// watchdog cancelling it, and the cancel hands back no socket.
+//
 static NTSTATUS WskModelSocketConnect(
     PWSK_CLIENT Client, USHORT SocketType, ULONG Protocol,
     PSOCKADDR LocalAddress, PSOCKADDR RemoteAddress,
@@ -409,6 +413,16 @@ static NTSTATUS WskModelSocketConnect(
         KmSetIrql(saved);
 
         return STATUS_SUCCESS;
+    }
+
+    if (WskModelNever == ConnectBehaviour.Completion)
+    {
+        WSK_MODEL_PENDING* pending = (WSK_MODEL_PENDING*)calloc(1, sizeof(WSK_MODEL_PENDING));
+        pending->Irp = Irp;
+        pending->Behaviour = ConnectBehaviour;
+        Irp->Outstanding = TRUE;
+        WskModelQueuePending(pending);
+        return STATUS_PENDING;
     }
 
     WSK_MODEL_CONNECTION* connection = (WSK_MODEL_CONNECTION*)calloc(1, sizeof(WSK_MODEL_CONNECTION));

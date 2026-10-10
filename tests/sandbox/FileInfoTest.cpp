@@ -257,6 +257,27 @@ TEST_F(FileInfoTest, StandardInformationReportsSizeAndDirectoryFlag)
     EXPECT_TRUE(dirBuffer.Directory);
 }
 
+//
+// The root is a directory of its own kind, and every other class tests for
+// "not a file" to say so. FileAllInformation already reports the root as a
+// directory, so a standard query answering otherwise contradicts it.
+//
+TEST_F(FileInfoTest, StandardInformationReportsTheRootAsADirectory)
+{
+    PDCB root = nullptr;
+    UNICODE_STRING rootName = Path(L"\\");
+    ASSERT_EQ(STATUS_SUCCESS,
+        BlorgCreateDCB(&root, (CSHORT)BLORGFS_ROOT_DCB_SIGNATURE, &rootName, Volume));
+    InitializeListHead(&root->Links);
+
+    FILE_STANDARD_INFORMATION buffer{};
+    QueryRequest* req = PrepareFileQuery(root, FileStandardInformation, &buffer, sizeof(buffer));
+    EXPECT_EQ(STATUS_SUCCESS, BlorgQueryInformation(Volume, &req->Irp));
+    EXPECT_TRUE(buffer.Directory);
+
+    BlorgFreeFileContext(root, Volume);
+}
+
 TEST_F(FileInfoTest, EaInformationReportsZeroEaSize)
 {
     FILE_EA_INFORMATION buffer{ 0xFFFFFFFF };
@@ -460,12 +481,15 @@ TEST_F(FileInfoTest, FsVolumeInformationTooSmallForLabelOverflows)
 
 TEST_F(FileInfoTest, FsSizeInformationReportsZeroedCapacity)
 {
-    FILE_FS_SIZE_INFORMATION buffer{};
-    buffer.BytesPerSector = 0xFFFFFFFF;
+    FILE_FS_SIZE_INFORMATION buffer;
+    memset(&buffer, 0xFF, sizeof(buffer));
     QueryRequest* req = PrepareVolumeQuery(FileFsSizeInformation, &buffer, sizeof(buffer));
 
     ASSERT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
-    EXPECT_EQ(0u, buffer.BytesPerSector) << "capacity is unknown, not zero-by-accident";
+    EXPECT_EQ(0u, static_cast<ULONG64>(buffer.TotalAllocationUnits.QuadPart)) << "capacity is unknown, not zero-by-accident";
+    EXPECT_EQ(0u, static_cast<ULONG64>(buffer.AvailableAllocationUnits.QuadPart));
+    EXPECT_EQ(512u, buffer.BytesPerSector);
+    EXPECT_EQ(8u, buffer.SectorsPerAllocationUnit);
 }
 
 TEST_F(FileInfoTest, FsDeviceInformationReflectsTheDiskDeviceObject)
@@ -551,8 +575,8 @@ TEST_F(FileInfoTest, FsFullSizeInformationReportsZeroedCapacity)
     EXPECT_EQ(0u, static_cast<ULONG64>(buffer.TotalAllocationUnits.QuadPart)) << "capacity is unknown, not zero-by-accident";
     EXPECT_EQ(0u, static_cast<ULONG64>(buffer.ActualAvailableAllocationUnits.QuadPart));
     EXPECT_EQ(0u, static_cast<ULONG64>(buffer.CallerAvailableAllocationUnits.QuadPart));
-    EXPECT_EQ(0u, buffer.SectorsPerAllocationUnit);
-    EXPECT_EQ(0u, buffer.BytesPerSector);
+    EXPECT_EQ(8u, buffer.SectorsPerAllocationUnit);
+    EXPECT_EQ(512u, buffer.BytesPerSector);
 }
 
 TEST_F(FileInfoTest, FsFullSizeInformationExReportsZeroedCapacity)
@@ -574,8 +598,8 @@ TEST_F(FileInfoTest, FsFullSizeInformationExReportsZeroedCapacity)
     EXPECT_EQ(0, buffer.VolumeStorageReserveAllocationUnits);
     EXPECT_EQ(0, buffer.AvailableCommittedAllocationUnits);
     EXPECT_EQ(0, buffer.PoolAvailableAllocationUnits);
-    EXPECT_EQ(0u, buffer.SectorsPerAllocationUnit);
-    EXPECT_EQ(0u, buffer.BytesPerSector);
+    EXPECT_EQ(8u, buffer.SectorsPerAllocationUnit);
+    EXPECT_EQ(512u, buffer.BytesPerSector);
 }
 
 TEST_F(FileInfoTest, UnhandledFsInformationClassIsRejected)
@@ -644,6 +668,37 @@ TEST_F(FileInfoTest, SecurityQueryTooSmallBufferReportsTheLengthNeeded)
     EXPECT_EQ((ULONG_PTR)48, req->Irp.IoStatus.Information);
 
     ShimSetSecurityDescriptorLength(0);
+}
+
+//
+// GetDiskFreeSpace and its callers take the cluster size as
+// SectorsPerAllocationUnit * BytesPerSector and divide by it. Every size
+// class reported both as zero, so a caller asking how many clusters a file
+// needs divided by zero. The zeroed-capacity tests above pin each field;
+// this one pins what a caller computes from each class, and that the
+// sector matches the one IOCTL_DISK_GET_DRIVE_GEOMETRY reports.
+//
+TEST_F(FileInfoTest, EverySizeClassReportsAPageSizedClusterOfDiskSectors)
+{
+    FILE_FS_SIZE_INFORMATION size;
+    memset(&size, 0, sizeof(size));
+    QueryRequest* req = PrepareVolumeQuery(FileFsSizeInformation, &size, sizeof(size));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
+
+    FILE_FS_FULL_SIZE_INFORMATION fullSize;
+    memset(&fullSize, 0, sizeof(fullSize));
+    req = PrepareVolumeQuery(FileFsFullSizeInformation, &fullSize, sizeof(fullSize));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
+
+    FILE_FS_FULL_SIZE_INFORMATION_EX fullSizeEx;
+    memset(&fullSizeEx, 0, sizeof(fullSizeEx));
+    req = PrepareVolumeQuery(FileFsFullSizeInformationEx, &fullSizeEx, sizeof(fullSizeEx));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgQueryVolumeInformation(Volume, &req->Irp));
+
+    EXPECT_EQ(static_cast<ULONG>(BLORGFS_DISK_BYTES_PER_SECTOR), size.BytesPerSector);
+    EXPECT_EQ(static_cast<ULONG>(PAGE_SIZE), size.SectorsPerAllocationUnit * size.BytesPerSector);
+    EXPECT_EQ(static_cast<ULONG>(PAGE_SIZE), fullSize.SectorsPerAllocationUnit * fullSize.BytesPerSector);
+    EXPECT_EQ(static_cast<ULONG>(PAGE_SIZE), fullSizeEx.SectorsPerAllocationUnit * fullSizeEx.BytesPerSector);
 }
 
 } // namespace

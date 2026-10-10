@@ -36,8 +36,10 @@ VOID KdBreakPoint(VOID);
 // FspWorkQueueStressTest.cpp.
 //
 VOID ShimForceNextOplockCheck(NTSTATUS Status);
+VOID ShimForceNextOplockRequestExclusive(VOID);
 VOID ShimForceNextCcCopyReadMiss(VOID);
 VOID ShimSetNextCcCopyReadInformation(ULONG Information);
+VOID ShimSetCcCopyReadTicks(LONG64 Ticks);
 
 //
 // What a reopened FCB's refresh asked of Cc and Mm (Create.c
@@ -47,6 +49,16 @@ VOID ShimSetNextCcCopyReadInformation(ULONG Information);
 //
 LONG ShimCachePurges(VOID);
 VOID ShimRefuseNextCachePurge(VOID);
+
+//
+// The read-ahead granule the driver last told Cc on a file object
+// (CcSetReadAheadGranularity), zero if it never did, and a reset that
+// forgets every file object a test read through; and how many times the
+// driver has told Cc a granule at all.
+//
+ULONG ShimReadAheadGranularity(PFILE_OBJECT F);
+VOID ShimReadAheadGranularityReset(VOID);
+LONG ShimReadAheadGranularitySets(VOID);
 
 BOOLEAN ExIsResourceAcquiredExclusiveLite(PERESOURCE Resource);
 VOID ExConvertExclusiveToSharedLite(PERESOURCE Resource);
@@ -64,15 +76,6 @@ ULONG KeQueryActiveProcessorCountEx(USHORT Group);
 ULONG KeQueryMaximumProcessorCountEx(USHORT Group);
 ULONG64 KeQueryInterruptTime(VOID);
 VOID ShimAdvanceInterruptTime(ULONG64 Ticks100ns);
-
-VOID ProbeForRead(PVOID Address, SIZE_T Length, ULONG Alignment);
-VOID ProbeForWrite(PVOID Address, SIZE_T Length, ULONG Alignment);
-
-//
-// How many user buffers ProbeForWrite has checked, so a test can tell an
-// output buffer was probed for writing rather than only for reading.
-//
-ULONG ShimProbesForWrite(VOID);
 
 NTSTATUS KeWaitForMultipleObjects(
     ULONG Count, PVOID Object[], WAIT_TYPE WaitType, KWAIT_REASON WaitReason,

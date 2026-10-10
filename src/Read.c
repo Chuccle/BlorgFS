@@ -8,7 +8,7 @@
 
 //
 //  READ_AHEAD_GRANULARITY (Driver.h) is where Cc's read-ahead granularity
-//  starts for a cached file; ReadAdaptGranularity below moves it per file
+//  starts for a cached file; ReadAdaptGranularity below moves it per handle
 //  from what the reader turns out to be doing. Left unset entirely, Cc's
 //  own default is PAGE_SIZE -- a constant, not a policy -- which
 //  under-fetches badly against a backend where every miss is an HTTP round
@@ -412,7 +412,8 @@ static BOOLEAN ReadFairMustHold(PNON_PAGED_NODE Node, BOOLEAN MayHold)
 // STATUS_INSUFFICIENT_RESOURCES. The work item lives in DriverContext[2]
 // until the read is released -- the slot ReadIssueFetch stamps with the
 // issue time, which a held IRP has not reached. Its start tag waits in
-// DriverContext[1], which only the create path otherwise uses.
+// DriverContext[1], which a read otherwise uses only to carry its arrival
+// stamp across the FSP queue, before it gets here.
 //
 // PASSIVE_LEVEL: BlorgVolumeRead's inline path.
 //
@@ -701,7 +702,12 @@ static VOID ReadFairGiveBack(ULONG Fetches)
 // amplification alone. Wasted bytes are wasted whether or not anyone has a
 // deadline, so nothing about the consumer enters into it.
 //
-// The configured value is where a file starts, not the range it may move
+// The window is the file's and the granule is the handle's: the window
+// that closes on a handle's read is judged against, and moves, the granule
+// Cc was told on that handle's file object (see the FCB's read-ahead
+// window in Structs.h), so no handle's vote moves another's granule.
+//
+// The configured value is where a handle starts, not the range it may move
 // in: growth is allowed above it up to ReadAheadMaxGranularity, and a
 // configuration that raised the start above that maximum keeps its own
 // value as the ceiling rather than being quietly clamped down.
@@ -713,13 +719,15 @@ static VOID ReadFairGiveBack(ULONG Fetches)
 //
 static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 {
-    if (0 == global.ReadAheadGranularity || 0 == Fcb->ReadAheadGranularity ||
+    PCCB ccb = FileObject->FsContext2;
+
+    if (0 == global.ReadAheadGranularity || 0 == ccb->ReadAheadGranularity ||
         !global.ReadAheadAdapt)
     {
         return;
     }
 
-    const ULONG current = Fcb->ReadAheadGranularity;
+    const ULONG current = ccb->ReadAheadGranularity;
 
     ULONG64 window = C_CAST(ULONG64, current) * READ_AHEAD_ADAPT_WINDOW_GRANULES;
 
@@ -776,21 +784,21 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
 
     if (0 == vote)
     {
-        Fcb->ReadAheadAgreement = 0;
+        ccb->ReadAheadAgreement = 0;
         return;
     }
 
-    Fcb->ReadAheadAgreement = (Fcb->ReadAheadAgreement * vote > 0)
-        ? (Fcb->ReadAheadAgreement + vote)
+    ccb->ReadAheadAgreement = (ccb->ReadAheadAgreement * vote > 0)
+        ? (ccb->ReadAheadAgreement + vote)
         : vote;
 
-    if (Fcb->ReadAheadAgreement > -READ_AHEAD_ADAPT_AGREEMENT &&
-        Fcb->ReadAheadAgreement < READ_AHEAD_ADAPT_AGREEMENT)
+    if (ccb->ReadAheadAgreement > -READ_AHEAD_ADAPT_AGREEMENT &&
+        ccb->ReadAheadAgreement < READ_AHEAD_ADAPT_AGREEMENT)
     {
         return;
     }
 
-    Fcb->ReadAheadAgreement = 0;
+    ccb->ReadAheadAgreement = 0;
 
     const ULONG ceiling = (global.ReadAheadGranularity > global.ReadAheadMaxGranularity)
         ? global.ReadAheadGranularity
@@ -805,7 +813,7 @@ static VOID ReadAdaptGranularity(FCB* Fcb, PFILE_OBJECT FileObject)
         return;
     }
 
-    Fcb->ReadAheadGranularity = next;
+    ccb->ReadAheadGranularity = next;
 
     CcSetReadAheadGranularity(FileObject, next);
 
@@ -972,8 +980,9 @@ static VOID ReadSucceeded(PIRP Irp, LONG64 ArrivedQpc)
 //  Completion for an async non-cached read. Invoked from the WSK
 //  completion path at <= DISPATCH_LEVEL, so everything it touches must be
 //  legal there: the source body lives in the NonPagedPoolNx HTTP receive
-//  buffer, and the destination is the user buffer already locked into
-//  Irp->MdlAddress by BlorgPrePostIrp when the IRP was posted to the FSP queue.
+//  buffer, and the destination is the user buffer BlorgVolumeRead (or
+//  BlorgPrePostIrp, for a read posted from raised IRQL) locked into
+//  Irp->MdlAddress.
 //  CallerContext is the PIRP.
 //
 //  Usually a zero-copy read (BlorgHttpGetFileMdl): the body was received
@@ -989,9 +998,9 @@ static VOID ReadSucceeded(PIRP Irp, LONG64 ArrivedQpc)
 //  site in BlorgVolumeRead and measures what the driver waited on the
 //  network; DriverContext[3] carries the arrival stamp set in BlorgRead
 //  and measures what the application waited on the driver. Only READ IRPs
-//  use these two slots -- [1] belongs to the CREATE path's stash. Nothing
-//  here formats a %wZ/%Z: this runs at <= DISPATCH on the WSK completion
-//  chain, where that would touch paged code and bugcheck.
+//  use these two slots. Nothing here formats a %wZ/%Z: this runs at
+//  <= DISPATCH on the WSK completion chain, where that would touch paged
+//  code and bugcheck.
 //
 //  What arrived is offered to the disk cache before the IRP is completed,
 //  while its pages are still this read's (BlorgDiskCacheAdmit).
@@ -1420,15 +1429,20 @@ static VOID ReadRefetchWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // independent of FSP_THREAD_COUNT. Issuing inline lets the WSK completion
 // (a DPC, not a worker) satisfy the paging read, so the blocked worker's
 // own read completes without needing a second worker; FSP_THREAD_COUNT
-// becomes a pure throughput knob. Non-paging non-cached reads (e.g.
-// FILE_FLAG_NO_BUFFERING) still post: their user buffer must be locked
-// (BlorgPrePostIrp) and they need a guaranteed PASSIVE_LEVEL worker context.
-// Inline issuance happens when either already on a worker (IN_FSP -- the
-// original post locked the buffer) or this is a paging read at
-// PASSIVE_LEVEL (MM already supplied the MDL, nothing to lock); a paging
-// read at raised IRQL -- rare, but possible -- falls through to the post
-// path, safe because BlorgLockUserBuffer no-ops when Irp->MdlAddress is already
-// set (always true for paging I/O).
+// becomes a pure throughput knob. A non-paging non-cached read (e.g.
+// FILE_FLAG_NO_BUFFERING) is issued inline too: it arrives at PASSIVE_LEVEL
+// in the requester's own context, which is where its user buffer has to be
+// locked, and nothing after that lock blocks -- the fetch, the disk cache
+// and the fair share all complete or hold asynchronously. Posting it bought
+// a worker hop, an event and a context switch per read for nothing.
+// Inline issuance happens when already on a worker (IN_FSP -- the original
+// post locked the buffer) or at PASSIVE_LEVEL (MM supplied a paging read's
+// MDL, and a non-paging read's buffer is locked here); a read at raised
+// IRQL -- rare, but possible -- posts, which locks it in this context and
+// is safe for paging I/O because BlorgLockUserBuffer no-ops when
+// Irp->MdlAddress is already set. Only a non-paging read is locked here: a
+// paging read's MDL is MM's, and building one over its UserBuffer would
+// hand the client a buffer MM never described.
 //
 // Paging reads advance this reader's stream tracker and then go straight
 // to a direct fetch. Lookahead is Cc's alone: it reads ahead of the
@@ -1455,8 +1469,8 @@ static VOID ReadRefetchWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 //
 // The direct async HTTP read returns STATUS_PENDING on success; the client
 // receives the body straight into the locked user MDL (zero-copy -- both
-// arrival paths have one: MM supplies it for paging I/O, BlorgPrePostIrp locked
-// one for posted non-paging reads) and ReadComplete completes the IRP
+// arrival paths have one: MM supplies it for paging I/O, BlorgLockUserBuffer
+// locks one for non-paging reads) and ReadComplete completes the IRP
 // from the WSK completion path, so this function neither blocks nor copies
 // nor completes the IRP itself. If issuing the request fails synchronously,
 // the callback never runs and the returned error completes the IRP
@@ -1486,11 +1500,10 @@ static VOID ReadRefetchWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // The NonCachedReads/NonCachedReadBytes pair is counted only on an IRP's
 // first pass through here, gated on IRP_CONTEXT_FLAG_IN_FSP. A read that
 // cannot issue inline is posted to the FSP, whose worker re-enters this
-// same function on the same IRP -- so counting unconditionally scored
-// every posted read twice, and since in practice essentially every
-// non-cached read takes the post path, both counters simply read 2x
-// reality. That matters beyond this driver's own telemetry:
-// NonCachedReads feeds the standard FAT_STATISTICS surface that
+// same function on the same IRP -- so counting unconditionally scored every
+// posted read twice, and when every non-paging non-cached read posted, both
+// counters read 2x reality for them. That matters beyond this driver's own
+// telemetry: NonCachedReads feeds the standard FAT_STATISTICS surface that
 // fsutil reports.
 //
 // The cached path delays CcInitializeCacheMap until the first read, in
@@ -1566,7 +1579,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
     PFCB fcb = IrpSp->FileObject->FsContext;
 
-    switch GET_NODE_TYPE(fcb)
+    switch (GET_NODE_TYPE(fcb))
     {
         case BLORGFS_FCB_SIGNATURE:
         {
@@ -1583,7 +1596,7 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         }
     }
 
-    if (!BooleanFlagOn(Irp->Flags, IRP_PAGING_IO) && 
+    if (!BooleanFlagOn(Irp->Flags, IRP_PAGING_IO) &&
         BooleanFlagOn(Irp->Flags, IRP_NOCACHE) &&
         IrpSp->FileObject->SectionObjectPointer->DataSectionObject)
     {
@@ -1636,17 +1649,13 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         BOOLEAN alreadyInFsp =
             BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP);
 
-        BOOLEAN canIssueInline =
-            alreadyInFsp ||
-            (BooleanFlagOn(Irp->Flags, IRP_PAGING_IO) && PASSIVE_LEVEL == KeGetCurrentIrql());
-
         if (!alreadyInFsp)
         {
             BLORGFS_STAT_INC(NonCachedReads);
             BLORGFS_STAT_ADD(NonCachedReadBytes, realLength);
         }
 
-        if (!canIssueInline)
+        if (!alreadyInFsp && PASSIVE_LEVEL != KeGetCurrentIrql())
         {
             BLORGFS_PRINT("BlorgVolumeRead: Enqueue to Fsp\n");
             BLORGFS_STAT_INC(ReadsPosted);
@@ -1682,6 +1691,15 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             if (realLength > fcb->ReadMaxPagingBytes)
             {
                 fcb->ReadMaxPagingBytes = realLength;
+            }
+        }
+        else
+        {
+            NTSTATUS lockStatus = BlorgLockUserBuffer(Irp, IoWriteAccess, bytesLength);
+
+            if (!NT_SUCCESS(lockStatus))
+            {
+                return lockStatus;
             }
         }
 
@@ -1735,11 +1753,12 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             if (0 != global.ReadAheadGranularity)
             {
+                PCCB ccb = IrpSp->FileObject->FsContext2;
+
                 CcSetReadAheadGranularity(IrpSp->FileObject, global.ReadAheadGranularity);
-                fcb->ReadAheadGranularity = global.ReadAheadGranularity;
+                ccb->ReadAheadGranularity = global.ReadAheadGranularity;
                 fcb->ReadAheadFetchedBytes = 0;
                 fcb->ReadAheadConsumedBytes = 0;
-                fcb->ReadAheadAgreement = 0;
             }
         }
 
@@ -1751,11 +1770,6 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         }
 
         BLORGFS_PRINT("Cached read.\n");
-
-        BLORGFS_STAT_INC(ReadsCached);
-
-        fcb->ReadAheadConsumedBytes += realLength;
-        ReadAdaptGranularity(fcb, IrpSp->FileObject);
 
         if (!FlagOn(IrpSp->MinorFunction, IRP_MN_MDL))
         {
@@ -1779,14 +1793,13 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
                     BLORGFS_PRINT("Cached Read could not wait\n");
                     return BlorgFsdPostRequest(Irp, IrpSp);
                 }
-
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
                 BLORGFS_PRINT("Cached Read exception: %8lx\n", GetExceptionCode());
                 return GetExceptionCode();
             }
-            
+
             result = Irp->IoStatus.Status;
 
             NT_ASSERT(NT_SUCCESS(result));
@@ -1812,6 +1825,11 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             result = Irp->IoStatus.Status;
             NT_ASSERT(NT_SUCCESS(result));
         }
+
+        BLORGFS_STAT_INC(ReadsCached);
+
+        fcb->ReadAheadConsumedBytes += realLength;
+        ReadAdaptGranularity(fcb, IrpSp->FileObject);
     }
 
     if (!BooleanFlagOn(Irp->Flags, IRP_PAGING_IO))
@@ -1834,14 +1852,52 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 }
 
 //
+// The FCB a read's file object names, or NULL when it names anything else,
+// for the idle half of ReadRecordUserLatency.
+//
+static PFCB ReadFileFcb(PIO_STACK_LOCATION IrpSp)
+{
+    PFCB fcb = IrpSp->FileObject ? IrpSp->FileObject->FsContext : NULL;
+
+    if (fcb && BLORGFS_FCB_SIGNATURE != GET_NODE_TYPE(fcb))
+    {
+        fcb = NULL;
+    }
+
+    return fcb;
+}
+
+//
+// A posted read's pass on an FSP worker. The worker has put the arrival
+// stamp BlorgRead took back in DriverContext[3] (see FspAddToWorkQueue), and
+// a read the worker finishes closes its span here, as BlorgRead does for one
+// it finishes: a cached read that could not wait in the FSD arrives here,
+// and its stall is the one the application felt.
+//
+NTSTATUS BlorgFspRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
+{
+    const LONG64 arrivedQpc = C_CAST(LONG64, C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[3]));
+
+    NTSTATUS result = BlorgVolumeRead(Irp, IrpSp);
+
+    if (STATUS_PENDING != result)
+    {
+        ReadRecordUserLatency(ReadFileFcb(IrpSp), arrivedQpc);
+    }
+
+    return result;
+}
+
+//
 // IRP_MJ_READ dispatch entry point: sets up the IRP context and file-system
 // entry/exit bracketing, then routes to BlorgVolumeRead for the volume
 // device object (disk/FS-control device objects have no read support yet).
 //
 // A non-paging read is stamped on arrival into DriverContext[3], which
-// READ IRPs otherwise leave unused. DriverContext[2] already carries the
-// fetch issue stamp and is a different span: that one starts when the
-// driver asks the network, this one when the application asks the driver.
+// READ IRPs otherwise leave unused outside the FSP queue. DriverContext[2]
+// already carries the fetch issue stamp and is a different span: that one
+// starts when the driver asks the network, this one when the application
+// asks the driver.
 //
 // The synchronous return is where that span is closed, rather than in
 // BlorgCompleteRequest, because it is the interesting case: a cached read
@@ -1893,14 +1949,7 @@ NTSTATUS BlorgRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
             if (STATUS_PENDING != result)
             {
-                PFCB fcb = irpSp->FileObject ? irpSp->FileObject->FsContext : NULL;
-
-                if (fcb && BLORGFS_FCB_SIGNATURE != GET_NODE_TYPE(fcb))
-                {
-                    fcb = NULL;
-                }
-
-                ReadRecordUserLatency(fcb, arrivedQpc);
+                ReadRecordUserLatency(ReadFileFcb(irpSp), arrivedQpc);
                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
 

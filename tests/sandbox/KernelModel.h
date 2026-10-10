@@ -197,6 +197,13 @@ int KmAllocateLockId(void);
 void KmReleaseLockId(int Id);
 
 //
+// The id for a lock being initialised: Id itself, with its edges cleared,
+// when the lock is being re-initialised and already holds one, otherwise
+// a new one from KmAllocateLockId.
+//
+int KmRenewLockId(int Id);
+
+//
 // Recycling is off by default and on only during systematic exploration.
 //
 // It exists for the replay workload, which builds and destroys a node per

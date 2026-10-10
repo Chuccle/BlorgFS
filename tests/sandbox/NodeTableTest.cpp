@@ -22,8 +22,10 @@
 
 #include <gtest/gtest.h>
 
+#include <climits>
 #include <cstdio>
 #include <cwchar>
+#include <vector>
 
 extern "C" {
 #include "..\..\src\Driver.h"
@@ -747,6 +749,136 @@ TEST_F(NodeTableTest, TeardownCompletedBeforeALateKickRefusesToQueueTheFreedWork
     // head. Nothing else to observe here; the work-item count above is the
     // assertion that matters.
     //
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Child index
+///////////////////////////////////////////////////////////////////////////
+
+//
+// A cold open resolves each component of its path through the child
+// index rather than walking the parent's ChildrenList. Two files of one
+// name under different parents are placed in one chain on purpose: the
+// index is keyed by parent and name, and a lookup that matched on the name
+// alone would hand one parent's child to the other. The head of the chain
+// is then freed, so the child behind it must survive the unlink. A lookup
+// that misses every chain cannot tell any of this apart, so the parents
+// are made one at a time until two of them put the leaf name in one
+// bucket. The name alone cannot be searched for: the multiplicative hash
+// spreads nearby parent addresses apart for every name, so two sibling
+// directories never share a bucket for one leaf. Among more parents than
+// there are buckets two must share one, which bounds the loop.
+//
+TEST_F(NodeTableTest, ChildrenSharingAChainAreFoundUnderTheirOwnParent)
+{
+    DIRECTORY_ENTRY_METADATA dirMeta = {};
+    dirMeta.IsDirectory = TRUE;
+
+    DIRECTORY_ENTRY_METADATA fileMeta = {};
+    fileMeta.Size = 4096;
+
+    UNICODE_STRING leaf = Path(L"x");
+    std::vector<ULONG> parentOfBucket(NODE_CHILD_BUCKETS, ULONG_MAX);
+    ULONG aIndex = ULONG_MAX;
+    ULONG bIndex = 0;
+
+    for (; bIndex <= NODE_CHILD_BUCKETS; ++bIndex)
+    {
+        wchar_t dir[32] = {};
+        swprintf_s(dir, L"\\d%u", bIndex);
+        UNICODE_STRING dirPath = Path(dir);
+        PCOMMON_CONTEXT parent = nullptr;
+
+        ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &dirPath, &dirMeta, Volume, &parent));
+        ASSERT_NE(nullptr, parent);
+
+        ULONG bucket = BlorgNodeChildBucket(C_CAST(PDCB, parent), &leaf);
+
+        if (ULONG_MAX != parentOfBucket[bucket])
+        {
+            aIndex = parentOfBucket[bucket];
+            break;
+        }
+
+        parentOfBucket[bucket] = bIndex;
+    }
+
+    ASSERT_NE(ULONG_MAX, aIndex) << "no two parents put the leaf in one chain";
+
+    wchar_t aChild[40] = {};
+    wchar_t bChild[40] = {};
+    wchar_t aChildUpper[40] = {};
+    wchar_t bChildUpper[40] = {};
+    wchar_t missingChild[40] = {};
+
+    swprintf_s(aChild, L"\\d%u\\x", aIndex);
+    swprintf_s(bChild, L"\\d%u\\x", bIndex);
+    swprintf_s(aChildUpper, L"\\D%u\\X", aIndex);
+    swprintf_s(bChildUpper, L"\\D%u\\X", bIndex);
+    swprintf_s(missingChild, L"\\d%u\\missing", aIndex);
+
+    UNICODE_STRING aChildPath = Path(aChild);
+    UNICODE_STRING bChildPath = Path(bChild);
+    UNICODE_STRING aChildUpperPath = Path(aChildUpper);
+    UNICODE_STRING bChildUpperPath = Path(bChildUpper);
+    PCOMMON_CONTEXT aFile = nullptr;
+    PCOMMON_CONTEXT bFile = nullptr;
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &aChildPath, &fileMeta, Volume, &aFile));
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &bChildPath, &fileMeta, Volume, &bFile));
+    ASSERT_NE(nullptr, aFile);
+    ASSERT_NE(nullptr, bFile);
+
+    EXPECT_EQ(aFile, BlorgSearchByPath(Root, &aChildUpperPath));
+    EXPECT_EQ(bFile, BlorgSearchByPath(Root, &bChildUpperPath));
+
+    UNICODE_STRING missing = Path(missingChild);
+    EXPECT_EQ(nullptr, BlorgSearchByPath(Root, &missing));
+
+    BlorgFreeFileContext(bFile, Volume);
+
+    EXPECT_EQ(nullptr, BlorgSearchByPath(Root, &bChildPath));
+    EXPECT_EQ(aFile, BlorgSearchByPath(Root, &aChildPath))
+        << "unlinking the head of a chain lost the child behind it";
+}
+
+//
+// A freed node leaves the child index with it: the index outlives every
+// node in it, and a chain still naming a freed node would hand a later
+// open whatever reuses that memory. Covers a file and the directory it
+// was in, which are unlinked along separate paths of
+// BlorgFreeFileContext.
+//
+TEST_F(NodeTableTest, AFreedChildLeavesTheChildIndex)
+{
+    DIRECTORY_ENTRY_METADATA meta = {};
+    meta.Size = 4096;
+
+    UNICODE_STRING filePath = Path(L"\\gone\\f.bin");
+    UNICODE_STRING dirPath = Path(L"\\gone");
+    PCOMMON_CONTEXT file = nullptr;
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &filePath, &meta, Volume, &file));
+    ASSERT_NE(nullptr, file);
+
+    PCOMMON_CONTEXT dir = BlorgSearchByPath(Root, &dirPath);
+
+    ASSERT_NE(nullptr, dir);
+    ASSERT_EQ(file, BlorgSearchByPath(Root, &filePath));
+
+    BlorgFreeFileContext(file, Volume);
+
+    EXPECT_EQ(nullptr, BlorgSearchByPath(Root, &filePath));
+
+    BlorgFreeFileContext(dir, Volume);
+
+    EXPECT_EQ(nullptr, BlorgSearchByPath(Root, &dirPath));
+
+    PCOMMON_CONTEXT again = nullptr;
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgInsertByPath(Root, &filePath, &meta, Volume, &again));
+    EXPECT_NE(nullptr, again);
+    EXPECT_EQ(again, BlorgSearchByPath(Root, &filePath));
 }
 
 } // namespace

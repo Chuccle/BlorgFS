@@ -15,7 +15,8 @@
 //  handle, and every `dir` of the same directory paid a dirinfo GET (2.7-3.3
 //  ms on the reference link; a repeated `dir /s` of 121 directories paid all
 //  121). Its own sharding, sized for far fewer and far larger entries, and a
-//  global byte budget, since a 300-entry listing is ~170 KB.
+//  global byte budget, since a listing grows with its directory: ~90
+//  bytes an entry, so 20,000 entries are ~1.8 MB.
 //
 //  Both caches share one invalidation sequence. Every result read from
 //  elsewhere is inserted with the ticket taken before the read, and refused
@@ -221,13 +222,11 @@ static VOID PathCacheAdvanceSequence(VOID)
 }
 
 //
-// The bytes a listing occupies, as HttpDeserializeDirectoryInfo sized it.
+// The bytes a listing occupies, as BlorgAllocateDirectoryInfo sized it.
 //
 static LONG64 ListingCacheSizeOf(const DIRECTORY_INFO* Listing)
 {
-    return C_CAST(LONG64, sizeof(DIRECTORY_INFO) +
-        (Listing->FileCount * sizeof(DIRECTORY_FILE_METADATA)) +
-        (Listing->SubDirCount * sizeof(DIRECTORY_SUBDIR_METADATA)));
+    return C_CAST(LONG64, Listing->Bytes);
 }
 
 //
@@ -520,13 +519,16 @@ static PATH_CACHE_RESULT PathCacheFind(const UNICODE_STRING* Path, PDIRECTORY_EN
 // not "metadata I/O" -- a pure cache hit moves no bytes and must not
 // inflate an I/O-shaped number.
 //
-PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta, _Inout_opt_ PPATH_CACHE_TICKET Ticket)
+// Counted apart from the lookup because a create that misses outside the
+// FSP posts itself and looks the path up again there; it is counted by the
+// pass that acts on the result (BlorgVolumeCreate), as a directory query's
+// listing miss is (DirCtrl.c), so a posted miss is counted once.
+//
+VOID BlorgPathCacheCountLookup(PATH_CACHE_RESULT Result)
 {
-    PATH_CACHE_RESULT result = PathCacheFind(Path, Meta, Ticket);
-
     BLORGFS_STAT_INC(MetaDataReads);
 
-    if (PathCacheMiss == result)
+    if (PathCacheMiss == Result)
     {
         BLORGFS_STAT_INC(PathCacheMisses);
     }
@@ -534,8 +536,15 @@ PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTO
     {
         BLORGFS_STAT_INC(PathCacheHits);
     }
+}
 
-    return result;
+//
+// Not counted: the caller counts the resolution once it knows it will act
+// on it (BlorgPathCacheCountLookup).
+//
+PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta, _Inout_opt_ PPATH_CACHE_TICKET Ticket)
+{
+    return PathCacheFind(Path, Meta, Ticket);
 }
 
 PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta)
@@ -932,29 +941,43 @@ VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
 }
 
 //
-//  Appends one listing entry's name to the directory path already in
-//  Scratch, inserts it with Meta, and trims Scratch back to the directory.
-//  Names the listing could not have produced -- empty, or longer than its
-//  own MAX_NAME_LEN field -- and paths past the cache's own limit are
-//  skipped rather than truncated, since a truncated path would cache a
-//  result for a different file. So is a name holding a backslash, which a
-//  Linux host allows: it would cache an entry for a path a level deeper,
-//  through a directory that need not exist.
+//  Whether a listed name can stand as one path component: not empty, no
+//  longer than a listing admits (MAX_NAME_LEN - 1 characters), and free of
+//  backslashes. A Linux host allows a backslash in a name, and such a name
+//  would stand for a path a level deeper, through a directory that need
+//  not exist.
 //
-static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const WCHAR* Name, SIZE_T NameLength, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket)
+static BOOLEAN PathCacheIsComponent(const WCHAR* Name, SIZE_T NameLength)
 {
-    if (0 == NameLength || NameLength > MAX_NAME_LEN ||
-        DirLength + (NameLength * sizeof(WCHAR)) > Scratch->MaximumLength)
+    if (0 == NameLength || NameLength >= MAX_NAME_LEN)
     {
-        return;
+        return FALSE;
     }
 
-    for (SIZE_T i = 0; i < NameLength; i++)
+    for (SIZE_T i = 0; i < NameLength; ++i)
     {
         if (L'\\' == Name[i])
         {
-            return;
+            return FALSE;
         }
+    }
+
+    return TRUE;
+}
+
+//
+//  Appends one listing entry's name to the directory path already in
+//  Scratch, inserts it with Meta, and trims Scratch back to the directory.
+//  A name that cannot stand as a component (PathCacheIsComponent) and a
+//  path past the cache's own limit are skipped rather than truncated, since
+//  a truncated path would cache a result for a different file.
+//
+static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const WCHAR* Name, SIZE_T NameLength, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket)
+{
+    if (!PathCacheIsComponent(Name, NameLength) ||
+        DirLength + (NameLength * sizeof(WCHAR)) > Scratch->MaximumLength)
+    {
+        return;
     }
 
     RtlCopyMemory(C_CAST(PUCHAR, Scratch->Buffer) + DirLength, Name, NameLength * sizeof(WCHAR));
@@ -1078,15 +1101,16 @@ VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listin
 }
 
 //
-//  Returns a referenced snapshot of Dir's listing, or NULL. Fresh within the
-//  path cache's lifetime; with AllowStale, also LISTING_STALE_GRACE_100NS past it,
-//  reported through *Stale, and the first lookup to see a given snapshot
-//  stale is told through *RefreshOwed that it owes the one background
-//  refetch. That claim is an interlocked flag on the entry rather than an
-//  exclusive acquire, so stale lookups stay concurrent; the flag is never
-//  reset on the entry -- a successful refetch replaces the whole entry, and a
-//  failed one leaves this snapshot unrefreshed until it ages out and the
-//  next query fetches in the foreground.
+//  Returns a referenced snapshot of Dir's listing, or NULL. Fresh within
+//  the path cache's lifetime; with AllowStale, also
+//  LISTING_STALE_GRACE_100NS past it, reported through *Stale, and the
+//  first lookup to see a given snapshot stale is told through *RefreshOwed
+//  that it owes the one background refetch. That claim is an interlocked
+//  flag on the entry rather than an exclusive acquire, so stale lookups
+//  stay concurrent; the flag is never reset on the entry -- a successful
+//  refetch replaces the whole entry, and a failed one leaves this snapshot
+//  unrefreshed until it ages out and the next query fetches in the
+//  foreground.
 //
 //  Create.c passes AllowStale = FALSE: a listing it reads answers "not
 //  found" outright, and a snapshot older than the TTL must not hide a file
@@ -1355,28 +1379,6 @@ BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO 
     }
 
     return current;
-}
-
-//
-//  Whether a listed name can stand as one path component: not empty, short
-//  enough for the listing's own Name field, and free of separators.
-//
-static BOOLEAN PathCacheIsComponent(const WCHAR* Name, SIZE_T NameLength)
-{
-    if (0 == NameLength || NameLength >= MAX_NAME_LEN)
-    {
-        return FALSE;
-    }
-
-    for (SIZE_T i = 0; i < NameLength; ++i)
-    {
-        if (L'\\' == Name[i])
-        {
-            return FALSE;
-        }
-    }
-
-    return TRUE;
 }
 
 //

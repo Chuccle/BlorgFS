@@ -16,7 +16,7 @@ static NTSTATUS CloseVolume(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDevic
     PFILE_OBJECT fileObject = IrpSp->FileObject;
     PVCB vcb = BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->Vcb;
 
-    switch GET_NODE_TYPE(fileObject->FsContext)
+    switch (GET_NODE_TYPE(fileObject->FsContext))
     {
         case BLORGFS_ROOT_DCB_SIGNATURE:
         {
@@ -35,6 +35,7 @@ static NTSTATUS CloseVolume(PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDevic
         }
         case BLORGFS_FCB_SIGNATURE:
         {
+            BlorgFreeFileContext(fileObject->FsContext2, VolumeDeviceObject);
             BlorgNodeDereference(fileObject->FsContext);
 
             return STATUS_SUCCESS;
@@ -82,7 +83,7 @@ NTSTATUS BlorgClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
     }
     FsRtlExitFileSystem();
-    
+
     Irp->IoStatus.Status = result;
 
     IoCompleteRequest(Irp, IO_NO_INCREMENT);

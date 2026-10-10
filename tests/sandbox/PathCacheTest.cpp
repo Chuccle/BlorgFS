@@ -23,16 +23,12 @@ namespace
 {
 
 //
-// BlorgPathCacheInit/Cleanup re-initialize all 256 bucket push locks, which is
-// only cheap under KmExploreInterleavings' explicit "recycle lock ids for
-// the duration of the exploration" allowance (Scheduler.h). Outside that,
-// recycling is off by default once any sched-test in this binary has run
-// (Scheduler.c leaves it off after KmExploreInterleavings returns, so a
-// later reuse doesn't mask a real double-init), so calling Init/Cleanup
-// once per test here would mint 256 fresh ids every time and exhaust the
-// model's fixed-size lock table. Bracketing the whole process with one
-// Initialize/Cleanup pair -- the same pattern StatisticsTest.cpp uses for
-// its own process-lifetime table -- keeps this to a one-time cost.
+// BlorgPathCacheInit/Cleanup re-initialize all 512 bucket push locks. A
+// re-initialised lock keeps its model id (KmRenewLockId), so that costs no
+// ids, but the tests here have no need to pay it per test. Bracketing the
+// whole process with one Initialize/Cleanup pair -- the same pattern
+// StatisticsTest.cpp uses for its own process-lifetime table -- keeps this
+// to a one-time cost.
 //
 class PathCacheEnvironment : public ::testing::Environment
 {
@@ -440,6 +436,22 @@ TEST_F(PathCacheSeedTest, ANameHoldingABackslashIsNotSeeded)
 }
 
 //
+// A listing admits names of up to MAX_NAME_LEN - 1 characters, and the
+// seed takes the same bound as a subtree answer's component check: the
+// longest name a listing can carry is seeded, one character more is not.
+//
+TEST_F(PathCacheSeedTest, ANameLongerThanAListingAdmitsIsNotSeeded)
+{
+    const std::wstring longest(MAX_NAME_LEN - 1, L'f');
+    const std::wstring tooLong(MAX_NAME_LEN, L'd');
+
+    Seed(L"\\seed\\long", BuildSyntheticListingNamed(longest.c_str(), tooLong.c_str()));
+
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\seed\\long\\" + longest));
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\seed\\long\\" + tooLong));
+}
+
+//
 // The cache evicts FIFO per bucket, so seeding a huge directory in full
 // would flush every other entry for names that are mostly never opened.
 // Seeding stops at PATH_CACHE_SEED_MAX, keeping the first entries in
@@ -727,7 +739,7 @@ TEST_F(PathCacheListingTest, DeadListingsDoNotHoldTheByteBudget)
         wchar_t buf[64];
         swprintf_s(buf, L"\\budget\\full\\d%03d", published);
 
-        Publish(buf, BuildSyntheticListing(2000, 0), nullptr, TRUE);
+        Publish(buf, BuildSyntheticListing(2000, 0, 250), nullptr, TRUE);
 
         PDIRECTORY_INFO listing = LookupListing(buf, FALSE);
         const bool kept = (nullptr != listing);
@@ -743,7 +755,7 @@ TEST_F(PathCacheListingTest, DeadListingsDoNotHoldTheByteBudget)
 
     ShimAdvanceInterruptTime(60 * kSecond);
 
-    Publish(L"\\budget\\after", BuildSyntheticListing(2000, 0), nullptr, TRUE);
+    Publish(L"\\budget\\after", BuildSyntheticListing(2000, 0, 250), nullptr, TRUE);
 
     PDIRECTORY_INFO listing = LookupListing(L"\\budget\\after", FALSE);
     EXPECT_NE(nullptr, listing) << "a listing was refused room held only by expired listings";
@@ -804,7 +816,7 @@ TEST_F(PathCacheListingTest, AListingTheBudgetCannotHoldEvictsNothing)
         BlorgReleaseDirectoryInfo(listing);
     }
 
-    Publish(L"\\budget\\huge", BuildSyntheticListing(70000, 0), nullptr, TRUE);
+    Publish(L"\\budget\\huge", BuildSyntheticListing(70000, 0, 250), nullptr, TRUE);
 
     PDIRECTORY_INFO huge = LookupListing(L"\\budget\\huge", FALSE);
     EXPECT_EQ(nullptr, huge);
@@ -912,10 +924,7 @@ TEST_F(PathCacheSubtreeTest, AnInvalidationThatOvertookTheAnswerRefusesEveryDesc
 //
 TEST_F(PathCacheSubtreeTest, ADescendantWithAnUnusableNameIsSkippedWithEverythingBeneathIt)
 {
-    PDIRECTORY_INFO root = BuildSyntheticListing(0, 2);
-    PDIRECTORY_SUBDIR_METADATA bad = BlorgGetSubDirEntry(root, 0);
-    wcscpy_s(bad->Name, MAX_NAME_LEN, L"a\\b");
-    bad->NameLength = 3;
+    PDIRECTORY_INFO root = BuildListing({}, { L"a\\b", L"dir1" });
 
     SIZE_T published = PublishDescendants(L"\\sub\\named", root, {
         { BuildSyntheticListing(1, 1), 0, 0 },

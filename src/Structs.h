@@ -93,6 +93,7 @@ CHECK_PADDING_END(CREATE_NET_RESULT, Meta);
 //////// Structures for ListDirectory operation ///////////
 ///////////////////////////////////////////////////////////
 
+// Most characters a listed name takes, its NUL included.
 #define MAX_NAME_LEN 260
 
 // A single file entry in a directory listing.
@@ -103,7 +104,7 @@ typedef struct _DIRECTORY_FILE_METADATA
     ULONG64 LastAccessedTime;  // Last access time, NT FILETIME
     ULONG64 LastModifiedTime;  // Last write time, NT FILETIME
     SIZE_T  NameLength;        // Length of Name in characters
-    WCHAR   Name[MAX_NAME_LEN];// File name
+    PWCH    Name;              // File name, NUL-terminated, in the listing's own block
 } DIRECTORY_FILE_METADATA, * PDIRECTORY_FILE_METADATA;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_FILE_METADATA, Size, CreationTime);
@@ -120,7 +121,7 @@ typedef struct _DIRECTORY_SUBDIR_METADATA
     ULONG64 LastAccessedTime;  // Last access time, NT FILETIME
     ULONG64 LastModifiedTime;  // Last write time, NT FILETIME
     SIZE_T  NameLength;        // Length of Name in characters
-    WCHAR   Name[MAX_NAME_LEN];// Directory name
+    PWCH    Name;              // Directory name, NUL-terminated, in the listing's own block
 } DIRECTORY_SUBDIR_METADATA, * PDIRECTORY_SUBDIR_METADATA;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, CreationTime, LastAccessedTime);
@@ -130,8 +131,12 @@ CHECK_PADDING_BETWEEN(DIRECTORY_SUBDIR_METADATA, NameLength, Name);
 CHECK_PADDING_END(DIRECTORY_SUBDIR_METADATA, Name);
 
 //
-// Header for a variable-length buffer holding a directory's file and
-// subdirectory entries, packed contiguously after this struct.
+// Header for a variable-length block holding a directory's listing: the
+// file entries, then the subdirectory entries, then the name index, then
+// the names the entries point at, laid out by BlorgAllocateDirectoryInfo
+// (Client.c). The index is IndexMask + 1 chain heads and one link per
+// entry, each the position of the next entry in the chain plus one, zero
+// ending it; files come first in those positions, subdirectories after.
 //
 // A listing is an immutable snapshot once deserialized, shared by the
 // listing cache (PathCache.c) and by every handle enumerating it
@@ -148,22 +153,30 @@ typedef struct _DIRECTORY_INFO
 {
     SIZE_T FilesOffset;   // Offset from start of this struct to first file entry
     SIZE_T SubDirsOffset; // Offset from start of this struct to first subdir entry
+    SIZE_T IndexOffset;   // Offset from start of this struct to the name index
+    SIZE_T NamesOffset;   // Offset from start of this struct to the first name
     SIZE_T FileCount;     // Number of DIRECTORY_FILE_METADATA entries
     SIZE_T SubDirCount;   // Number of DIRECTORY_SUBDIR_METADATA entries
+    SIZE_T Bytes;         // Size of the whole block, which the listing cache charges
     struct _DIRECTORY_DESCENDANT* Descendants; // Subtree answer only, until DirCtrlPublish takes it
     SIZE_T DescendantCount; // Number of entries in Descendants
     LONG   RefCount;      // Interlocked: holders on different threads release independently
+    ULONG  IndexMask;     // The index has a power of two chains
     BOOLEAN NoStore;      // Server marked the answer Cache-Control: no-store; never cached
-    UCHAR  Reserved[3];   // explicit tail padding
+    UCHAR  Reserved[7];   // explicit tail padding
 } DIRECTORY_INFO, * PDIRECTORY_INFO;
 
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FilesOffset, SubDirsOffset);
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirsOffset, FileCount);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirsOffset, IndexOffset);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, IndexOffset, NamesOffset);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, NamesOffset, FileCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, FileCount, SubDirCount);
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirCount, Descendants);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, SubDirCount, Bytes);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, Bytes, Descendants);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, Descendants, DescendantCount);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, DescendantCount, RefCount);
-CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, NoStore);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, RefCount, IndexMask);
+CHECK_PADDING_BETWEEN(DIRECTORY_INFO, IndexMask, NoStore);
 CHECK_PADDING_BETWEEN(DIRECTORY_INFO, NoStore, Reserved);
 CHECK_PADDING_END(DIRECTORY_INFO, Reserved);
 
@@ -413,6 +426,8 @@ typedef struct _COMMON_CONTEXT
 
     struct _DCB* ParentDcb; // Parent directory, or NULL for the root
 
+    struct _COMMON_CONTEXT* ChildNext; // Next node in its child index chain (Structs.c), under the VCB resource exclusive
+
     SHARE_ACCESS ShareAccess; // Share access state for open handles
 
     //
@@ -449,7 +464,8 @@ CHECK_PADDING_BETWEEN(COMMON_CONTEXT, TableLink, ReapLink);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ReapLink, FullPath);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, FullPath, VolumeDeviceObject);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, VolumeDeviceObject, ParentDcb);
-CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ParentDcb, ShareAccess);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ParentDcb, ChildNext);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ChildNext, ShareAccess);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ShareAccess, PinCount);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, PinCount, CreationTime);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, CreationTime, LastAccessedTime);
@@ -518,8 +534,8 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     READ_STREAM_TRACKER Streams[READ_STREAM_TRACKER_COUNT]; // Per-stream sequentiality state
 
     //
-    // Adaptive read-ahead granularity state, and why it lives on the FCB
-    // rather than per file object.
+    // Adaptive read-ahead window, and why it lives on the FCB while the
+    // granule it decides lives on each handle's CCB.
     //
     // Cc splits this finer than it first appears. The shared cache map and
     // the section live on SECTION_OBJECT_POINTERS, which is per FCB, but
@@ -528,28 +544,24 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // That is how Cc runs independent sequential detection for two handles
     // reading one file at different offsets.
     //
-    // The state stays here anyway, and the deciding reason is the shrink
-    // rule rather than the growth one. Read-ahead issued for one handle
-    // fills the shared cache, and a second handle consumes those pages with
-    // no paging read at all, so fetched-against-consumed is only coherent
+    // The window stays here, and the deciding reason is the shrink rule
+    // rather than the growth one. Read-ahead issued for one handle fills
+    // the shared cache, and a second handle consumes those pages with no
+    // paging read at all, so fetched-against-consumed is only coherent
     // where the cache is shared: split per handle, the first reader looks
     // wasteful and the second looks free. Amplification is what the shrink
     // rule exists to catch, and moving it per handle would make it worse.
     //
-    // Growth is self-correcting across handles. A handle Cc has not been
-    // told about issues reads sized by its own mask, so the
-    // honoured-against-current test in ReadAdaptGranularity fails for it
-    // and it does not grow -- it keeps the granularity it started with,
-    // which is the safe direction: a player sharing a file with a copy is
-    // left alone.
-    //
-    // What is NOT covered is the shrink direction. If a copy has grown this
-    // FCB to 2 MB and a demuxer on the same file then votes shrink, the new
-    // value is half of 2 MB and is set on the demuxer's handle, which was
-    // sitting at the starting granule -- so a shrink vote raises it. That
-    // needs two handles with opposite patterns on one file to reach, and
-    // fixing it properly needs per-file-object state, which means a CCB for
-    // file opens that this driver does not currently create.
+    // The granule and the run of agreeing votes are the handle's
+    // (CCB.ReadAheadGranularity), because what Cc acts on is the mask of
+    // the file object it was told on. On the FCB, a second handle's first
+    // read reset the file's granule to the starting value, and the first
+    // handle's next vote then doubled or halved that rather than its own:
+    // a copy grown to 2 MB was told 256 KB, and a shrink voted on a handle
+    // still at the starting granule raised it. Each window is now judged
+    // against, and moves, the granule of the handle whose read closed it.
+    // A new handle still starts the window afresh, which costs the others
+    // at most one delayed vote.
     //
     // Windowed rather than cumulative: the counters reset at every
     // evaluation so the policy tracks what a reader is doing now, not what
@@ -560,9 +572,8 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // readers can lose an increment, which costs a delayed adaptation and
     // never correctness.
     //
-    // Ordered widest-first so the ULONG does not sit before a ULONG64 and
-    // introduce implicit padding; ReadLastStreamIndex closes the tail
-    // explicitly rather than widening ReadAheadGranularity to hide it.
+    // Ordered widest-first so no ULONG sits before a ULONG64 and
+    // introduces implicit padding.
     ULONG64 ReadAheadFetchedBytes;  // Paging bytes fetched this window
     ULONG64 ReadAheadConsumedBytes; // Bytes the application asked for this window
 
@@ -585,19 +596,6 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     //
     ULONG64 ReadIdleTicks;
     ULONG64 ReadBusyTicks;
-
-    ULONG   ReadAheadGranularity;   // What Cc was last told, 0 = never set
-
-    //
-    // Consecutive windows voting the same way: positive to shrink, negative
-    // to grow, zero when the last window was undecided. The policy acts
-    // only on agreement, because a single window's ratio is not evidence.
-    // Read-ahead runs ahead of consumption by construction, so within one
-    // window fetched can exceed consumed even in a steady state that
-    // averages 1.0 -- which made a one-window policy flap 170 times on a
-    // sequential read whose pattern never changed.
-    //
-    LONG    ReadAheadAgreement;
 
     //
     // Largest paging read Cc has issued on this file during the current
@@ -628,10 +626,20 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // current stream costs one ULONG, needs no decay, and reacts on the
     // first read of a new pattern.
     //
-    // It also closes the tail explicitly, which is what the field it
-    // replaced was doing.
-    //
     ULONG   ReadLastStreamIndex;
+
+    //
+    // Handles open on this file that have not been cleaned up: raised by a
+    // successful open and lowered by its cleanup, both under the FCB
+    // resource, which FsCtrlUser reads it under too. It is the open count
+    // an exclusive oplock grant is judged by, as fastfat's UncleanCount is.
+    // RefCount is not that count: it drops at close, and the file object
+    // Cc keeps for its cache map is cleaned up long before it is closed, so
+    // after one cached read RefCount stayed at one with no handle open and
+    // the next opener could not have a batch or RWH oplock.
+    //
+    ULONG   UncleanCount;
+    UCHAR   Reserved[4];             // Pad to 8-byte alignment
 } FCB, * PFCB;
 
 CHECK_PADDING_BETWEEN(FCB, Header, NonPaged);
@@ -641,7 +649,8 @@ CHECK_PADDING_BETWEEN(FCB, TableLink, ReapLink);
 CHECK_PADDING_BETWEEN(FCB, ReapLink, FullPath);
 CHECK_PADDING_BETWEEN(FCB, FullPath, VolumeDeviceObject);
 CHECK_PADDING_BETWEEN(FCB, VolumeDeviceObject, ParentDcb);
-CHECK_PADDING_BETWEEN(FCB, ParentDcb, ShareAccess);
+CHECK_PADDING_BETWEEN(FCB, ParentDcb, ChildNext);
+CHECK_PADDING_BETWEEN(FCB, ChildNext, ShareAccess);
 CHECK_PADDING_BETWEEN(FCB, ShareAccess, PinCount);
 CHECK_PADDING_BETWEEN(FCB, PinCount, CreationTime);
 CHECK_PADDING_BETWEEN(FCB, CreationTime, LastAccessedTime);
@@ -658,11 +667,11 @@ CHECK_PADDING_BETWEEN(FCB, ReadAheadFetchedBytes, ReadAheadConsumedBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadAheadConsumedBytes, ReadIdleLastEndQpc);
 CHECK_PADDING_BETWEEN(FCB, ReadIdleLastEndQpc, ReadIdleTicks);
 CHECK_PADDING_BETWEEN(FCB, ReadIdleTicks, ReadBusyTicks);
-CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadAheadGranularity);
-CHECK_PADDING_BETWEEN(FCB, ReadAheadGranularity, ReadAheadAgreement);
-CHECK_PADDING_BETWEEN(FCB, ReadAheadAgreement, ReadMaxPagingBytes);
+CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadMaxPagingBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadMaxPagingBytes, ReadLastStreamIndex);
-CHECK_PADDING_END(FCB, ReadLastStreamIndex);
+CHECK_PADDING_BETWEEN(FCB, ReadLastStreamIndex, UncleanCount);
+CHECK_PADDING_BETWEEN(FCB, UncleanCount, Reserved);
+CHECK_PADDING_END(FCB, Reserved);
 
 //
 // Per-directory context node. Extends COMMON_CONTEXT with child linkage.
@@ -683,7 +692,8 @@ CHECK_PADDING_BETWEEN(DCB, TableLink, ReapLink);
 CHECK_PADDING_BETWEEN(DCB, ReapLink, FullPath);
 CHECK_PADDING_BETWEEN(DCB, FullPath, VolumeDeviceObject);
 CHECK_PADDING_BETWEEN(DCB, VolumeDeviceObject, ParentDcb);
-CHECK_PADDING_BETWEEN(DCB, ParentDcb, ShareAccess);
+CHECK_PADDING_BETWEEN(DCB, ParentDcb, ChildNext);
+CHECK_PADDING_BETWEEN(DCB, ChildNext, ShareAccess);
 CHECK_PADDING_BETWEEN(DCB, ShareAccess, PinCount);
 CHECK_PADDING_BETWEEN(DCB, PinCount, CreationTime);
 CHECK_PADDING_BETWEEN(DCB, CreationTime, LastAccessedTime);
@@ -694,7 +704,12 @@ CHECK_PADDING_BETWEEN(DCB, OnReapList, TableBucketIndex);
 CHECK_PADDING_BETWEEN(DCB, TableBucketIndex, ChildrenList);
 CHECK_PADDING_END(DCB, ChildrenList);
 
-// Per-handle context for an open directory search.
+//
+// Per-handle context. A directory handle keeps its search here; a file
+// handle keeps the read-ahead granule Cc was told on its file object, and
+// the votes toward moving it (see the FCB's read-ahead window, and
+// ReadAdaptGranularity in Read.c).
+//
 typedef struct _CCB
 {
     ULONG NodeTypeCode;   // Node type identifier
@@ -703,6 +718,19 @@ typedef struct _CCB
     UINT64 CurrentIndex;  // Next entry index to return for this handle
     UNICODE_STRING SearchPattern; // Wildcard/name filter for this search
     PDIRECTORY_INFO Entries;      // This handle's listing snapshot: one reference, released on restart or close
+    ULONG ReadAheadGranularity;   // What Cc was last told on this file object, 0 = never set
+
+    //
+    // Consecutive windows voting the same way on this handle's granule:
+    // positive to shrink, negative to grow, zero when the last window was
+    // undecided. The policy acts only on agreement, because a single
+    // window's ratio is not evidence. Read-ahead runs ahead of consumption
+    // by construction, so within one window fetched can exceed consumed
+    // even in a steady state that averages 1.0 -- which made a one-window
+    // policy flap 170 times on a sequential read whose pattern never
+    // changed.
+    //
+    LONG ReadAheadAgreement;
 } CCB, * PCCB;
 
 #define CCB_FLAG_MATCH_ALL 0x0001
@@ -712,7 +740,9 @@ CHECK_PADDING_BETWEEN(CCB, NodeByteSize, Flags);
 CHECK_PADDING_BETWEEN(CCB, Flags, CurrentIndex);
 CHECK_PADDING_BETWEEN(CCB, CurrentIndex, SearchPattern);
 CHECK_PADDING_BETWEEN(CCB, SearchPattern, Entries);
-CHECK_PADDING_END(CCB, Entries);
+CHECK_PADDING_BETWEEN(CCB, Entries, ReadAheadGranularity);
+CHECK_PADDING_BETWEEN(CCB, ReadAheadGranularity, ReadAheadAgreement);
+CHECK_PADDING_END(CCB, ReadAheadAgreement);
 
 typedef FCB VCB;
 typedef PFCB PVCB;
@@ -737,6 +767,24 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
 VOID BlorgReapEmptyAncestorDcbs(PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject);
 
 ULONG BlorgHashPath(const UNICODE_STRING* Path);
+
+//
+// The child index (Structs.c), which BlorgSearchByPath and BlorgInsertByPath
+// resolve each path component through: Name under Parent is chained in
+// bucket BlorgNodeChildBucket. BlorgHashPath folds case as the component
+// compare does, so a component equal to a child's last one lands in that
+// child's bucket.
+//
+#define NODE_CHILD_BUCKET_BITS 12u
+#define NODE_CHILD_BUCKETS     (1u << NODE_CHILD_BUCKET_BITS)
+
+inline ULONG BlorgNodeChildBucket(const DCB* Parent, const UNICODE_STRING* Name)
+{
+    const ULONG parent = C_CAST(ULONG, C_CAST(ULONG_PTR, Parent) >> 4);
+
+    return ((BlorgHashPath(Name) ^ parent) * 0x9E3779B1u) >> (32u - NODE_CHILD_BUCKET_BITS);
+}
+
 PCOMMON_CONTEXT BlorgSearchByPath(const DCB* RootDcb, const UNICODE_STRING* Path);
 NTSTATUS BlorgInsertByPath(PDCB RootDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out);
 
@@ -785,6 +833,7 @@ VOID BlorgPathCacheTakeTicket(PPATH_CACHE_TICKET Ticket);
 BOOLEAN BlorgPathCacheTicketCurrent(const PATH_CACHE_TICKET* Ticket);
 PATH_CACHE_RESULT BlorgPathCacheLookup(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta);
 PATH_CACHE_RESULT BlorgPathCacheLookupDated(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta, _Inout_opt_ PPATH_CACHE_TICKET Ticket);
+VOID BlorgPathCacheCountLookup(PATH_CACHE_RESULT Result);
 PATH_CACHE_RESULT BlorgPathCachePeek(const UNICODE_STRING* Path, PDIRECTORY_ENTRY_METADATA Meta);
 VOID BlorgPathCacheInsertExists(const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket);
 VOID BlorgPathCacheInsertNotFound(const UNICODE_STRING* Path, _In_opt_ const PATH_CACHE_TICKET* Ticket);

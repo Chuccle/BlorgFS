@@ -118,9 +118,11 @@ VOID FsRtlUninitializeOplock(POPLOCK Oplock);
 //
 // The oplock package's FSCTL entry point. Inert here: BlorgFS's oplock
 // tests live in the kernel, and modelling FsRtl's own state machine would
-// be testing FsRtl rather than the driver.
+// be testing FsRtl rather than the driver. What the driver does decide is
+// the open count it hands over, which ShimLastOplockOpenCount reports.
 //
 NTSTATUS FsRtlOplockFsctrl(POPLOCK Oplock, PIRP Irp, ULONG OpenCount);
+ULONG ShimLastOplockOpenCount(VOID);
 
 BOOLEAN FsRtlCheckLockForOplockRequest(PFILE_LOCK FileLock, PLARGE_INTEGER AllocationSize);
 

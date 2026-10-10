@@ -116,17 +116,17 @@ static inline NTSTATUS CreateApplyShareAccess(PFILE_OBJECT FileObject, const ACC
 }
 
 //
-//  Called from the open-existing paths when CreateApplyShareAccess returns a sharing
-//  violation. A handle (RH/RWH) oplock holder may be keeping the file open for
-//  caching; break it so the holder closes and the conflict can resolve when the
-//  FSP re-drives this create -- without this a handle oplock locks the
-//  conflicting opener out permanently. Mirrors fastfat's FsRtlOplockBreakH on
-//  the sharing-violation path (create.c). Must be called under the node
-//  resource. Returns STATUS_PENDING if the break was posted (the IRP now
-//  belongs to the oplock package), the break error, or -- when there is no
-//  handle oplock to break -- the original sharing status. Honors
-//  FILE_COMPLETE_IF_OPLOCKED: that caller explicitly asked not to trigger a
-//  break, so we just hand its sharing violation back.
+//  Called from the open-existing paths when CreateApplyShareAccess returns
+//  a sharing violation. A handle (RH/RWH) oplock holder may be keeping the
+//  file open for caching; break it so the holder closes and the conflict
+//  can resolve when the FSP re-drives this create -- without this a handle
+//  oplock locks the conflicting opener out permanently. Mirrors fastfat's
+//  FsRtlOplockBreakH on the sharing-violation path (create.c). Must be
+//  called under the node resource. Returns STATUS_PENDING if the break was
+//  posted (the IRP now belongs to the oplock package), the break error, or
+//  -- when there is no handle oplock to break -- the original sharing
+//  status. Honors FILE_COMPLETE_IF_OPLOCKED: that caller explicitly asked
+//  not to trigger a break, so we just hand its sharing violation back.
 //
 static inline NTSTATUS CreateBreakHandleOplockOnSharingViolation(POPLOCK Oplock, PIRP Irp, NTSTATUS ShareStatus)
 {
@@ -145,30 +145,33 @@ static inline NTSTATUS CreateBreakHandleOplockOnSharingViolation(POPLOCK Oplock,
 //  Opens a handle to an already-resident FCB: checks access, breaks any
 //  conflicting oplock, bumps RefCount, and applies share access -- all
 //  under the Fcb resource so the oplock break is atomic with the
-//  RefCount/share-access update (see CreateBreakHandleOplockOnSharingViolation).
-//  That atomicity is the point: OplockRequest grants under this same
-//  resource using RefCount as OpenCount, so without it a grant could slip
-//  into the gap between the break and the bump and hand out an oplock this
-//  open never broke. The oplock package is internally thread-safe, but that
-//  protects only the OPLOCK structure, not this open-count invariant.
-//  FsRtlCheckOplock is called unconditionally (it fast-returns SUCCESS with
-//  no oplock). On a pending break it posts the IRP and returns
-//  STATUS_PENDING; BlorgOplockComplete re-queues it to the FSP, which re-drives
-//  this create from the top, releasing the resource so the re-drive starts
-//  from a clean slate. On success wires FsContext/Vpb/SectionObjectPointer
-//  onto the file object.
-//  Clears the FCB's read-ahead idle stamp on every open, which is not
-//  bookkeeping but a correctness fix. An FCB outlives its handles -- a
-//  closed file is parked on the delayed close list and revived on re-open
-//  -- so a stale stamp charges the first read of a new session the gap
-//  since the last read of the previous one. Measured, that was a single
-//  402-second sample reported as a consumer idling 99.7% of a run lasting
-//  seconds. Cleared on every open rather than only the first: a second
-//  handle arriving mid-session costs one lost sample, where keeping the
-//  stamp risks a fabricated one, and the statistics block's standard is
-//  that a counter may be lossy and may never be invented.
+//  RefCount/share-access update (see
+//  CreateBreakHandleOplockOnSharingViolation). That atomicity is the point:
+//  OplockRequest grants under this same resource using UncleanCount as
+//  OpenCount, so without it a grant could slip into the gap between the
+//  break and the bump and hand out an oplock this open never broke. The
+//  oplock package is internally thread-safe, but that protects only the
+//  OPLOCK structure, not this open-count invariant. FsRtlCheckOplock is
+//  called unconditionally (it fast-returns SUCCESS with no oplock). On a
+//  pending break it posts the IRP and returns STATUS_PENDING;
+//  BlorgOplockComplete re-queues it to the FSP, which re-drives this create
+//  from the top, releasing the resource so the re-drive starts from a clean
+//  slate. On success wires FsContext/Vpb/SectionObjectPointer onto the file
+//  object, and the handle's CCB, which carries the read-ahead granule Cc is
+//  told on this file object (ReadAdaptGranularity, Read.c), allocated after
+//  the oplock check as CreateOpenExistingDcb does. Clears the FCB's
+//  read-ahead idle stamp on every open, which is not bookkeeping but a
+//  correctness fix. An FCB outlives its handles -- a closed file is parked
+//  on the delayed close list and revived on re-open -- so a stale stamp
+//  charges the first read of a new session the gap since the last read of
+//  the previous one. Measured, that was a single 402-second sample reported
+//  as a consumer idling 99.7% of a run lasting seconds. Cleared on every
+//  open rather than only the first: a second handle arriving mid-session
+//  costs one lost sample, where keeping the stamp risks a fabricated one,
+//  and the statistics block's standard is that a counter may be lossy and
+//  may never be invented.
 //
-static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PFCB Fcb)
+static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PFCB Fcb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     if (!CreateCheckFileAccess(DesiredAccess))
     {
@@ -188,26 +191,39 @@ static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, 
         return oplockStatus;
     }
 
+    PCCB pCcb;
+
+    NTSTATUS result = BlorgCreateCCB(&pCcb, VolumeDeviceObject);
+
+    if (!NT_SUCCESS(result))
+    {
+        ExReleaseResourceLite(Fcb->Header.Resource);
+        return result;
+    }
+
     const BOOLEAN firstOpen = (1 == InterlockedIncrement64(&Fcb->RefCount));
 
     Fcb->ReadIdleLastEndQpc = 0;
 
-    NTSTATUS result = CreateApplyShareAccess(FileObject, DesiredAccess, ShareAccess, &Fcb->ShareAccess, firstOpen);
+    result = CreateApplyShareAccess(FileObject, DesiredAccess, ShareAccess, &Fcb->ShareAccess, firstOpen);
 
     if (!NT_SUCCESS(result))
     {
         InterlockedDecrement64(&Fcb->RefCount);
         result = CreateBreakHandleOplockOnSharingViolation(&Fcb->Header.Oplock, Irp, result);
         ExReleaseResourceLite(Fcb->Header.Resource);
+        BlorgFreeFileContext(pCcb, VolumeDeviceObject);
         return result;
     }
+
+    Fcb->UncleanCount++;
 
     ExReleaseResourceLite(Fcb->Header.Resource);
 
 #pragma warning(suppress: 28175)
     FileObject->Vpb = global.DiskDeviceObject->Vpb;
     FileObject->FsContext = Fcb;
-    FileObject->FsContext2 = NULL;
+    FileObject->FsContext2 = pCcb;
     FileObject->SectionObjectPointer = &Fcb->NonPaged->SectionObjectPointers;
     Irp->IoStatus.Information = FILE_OPENED;
 
@@ -259,16 +275,16 @@ static BOOLEAN CreateFcbIsCurrent(PFCB Fcb)
 
 //
 //  Applies current metadata, read under Ticket, to a resident FCB on the
-//  cold path, under the VCB resource exclusive and before CreateOpenExistingFcb.
-//  When the size and write time match, which is the usual case, only the
-//  stamp moves: the FCB is known current as of Ticket. Otherwise what Cc
-//  and Mm hold of the old contents is dropped and the FCB takes the new
-//  size and times. Dropping them needs no handle open, no user-mapped view
-//  left (a view outlives its handle) and no image section (a running
-//  executable). When any of those holds the old pages the FCB keeps the
-//  old copy, which is still internally consistent, and is stamped anyway:
-//  every open would otherwise take the VCB resource exclusive to fail the
-//  same purge, so the next attempt waits for the stamp to lapse, a
+//  cold path, under the VCB resource exclusive and before
+//  CreateOpenExistingFcb. When the size and write time match, which is the
+//  usual case, only the stamp moves: the FCB is known current as of Ticket.
+//  Otherwise what Cc and Mm hold of the old contents is dropped and the FCB
+//  takes the new size and times. Dropping them needs no handle open, no
+//  user-mapped view left (a view outlives its handle) and no image section
+//  (a running executable). When any of those holds the old pages the FCB
+//  keeps the old copy, which is still internally consistent, and is stamped
+//  anyway: every open would otherwise take the VCB resource exclusive to
+//  fail the same purge, so the next attempt waits for the stamp to lapse, a
 //  lifetime or the next invalidation on.
 //
 //  The sizes change under the paging resource as well, which is what Mm
@@ -322,9 +338,9 @@ static VOID CreateFcbRefresh(PFCB Fcb, const DIRECTORY_ENTRY_METADATA* Meta, con
 
 //
 //  Opens a handle to an already-resident non-root DCB: same pattern as
-//  CreateOpenExistingFcb (access check, oplock break, RefCount bump, share
-//  access, all under the Dcb resource), but also allocates the CCB used
-//  for this directory handle's enumeration/notify state. The oplock break
+//  CreateOpenExistingFcb (access check, oplock break, CCB allocation,
+//  RefCount bump, share access, all under the Dcb resource); here the CCB
+//  holds this directory handle's enumeration/notify state. The oplock break
 //  happens before the CCB is allocated so a pending break leaks nothing;
 //  the resource is released on every early-out path.
 //
@@ -487,11 +503,12 @@ typedef struct _CREATE_NET_CONTEXT
 //  Async completion for the BlorgHttpGetFileInformation lookup issued from
 //  BlorgVolumeCreate. Memoizes the result in the path cache (only a
 //  definitive not-found, never a transient failure, and neither if an
-//  invalidation overtook the request -- see PATH_CACHE_TICKET), stashes the metadata
-//  on the IRP, and re-queues it with NET_DONE set so BlorgVolumeCreate
-//  resumes from the top with the result already in hand. If the re-queue
-//  fails (FSP threads tearing down), the stash is freed and the create is
-//  failed with the re-queue status rather than leaking the stash.
+//  invalidation overtook the request -- see PATH_CACHE_TICKET), stashes the
+//  metadata on the IRP, and re-queues it with NET_DONE set so
+//  BlorgVolumeCreate resumes from the top with the result already in hand.
+//  If the re-queue fails (FSP threads tearing down), the stash is freed and
+//  the create is failed with the re-queue status rather than leaking the
+//  stash.
 //
 static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* FileInfo, PVOID CallerContext)
 {
@@ -509,6 +526,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
 
         ExFreePool(netCtx->Path.Buffer);
         ExFreePool(netCtx);
+        BlorgCountCreate(Status);
         BlorgCompleteRequest(irp, Status, IO_DISK_INCREMENT);
         return;
     }
@@ -523,6 +541,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
     {
         ExFreePool(netCtx->Path.Buffer);
         ExFreePool(netCtx);
+        BlorgCountCreate(STATUS_INSUFFICIENT_RESOURCES);
         BlorgCompleteRequest(irp, STATUS_INSUFFICIENT_RESOURCES, IO_DISK_INCREMENT);
         return;
     }
@@ -542,6 +561,7 @@ static VOID CreateComplete(NTSTATUS Status, const DIRECTORY_ENTRY_METADATA* File
     {
         ExFreePool(stash);
         irp->Tail.Overlay.DriverContext[1] = NULL;
+        BlorgCountCreate(requeue);
         BlorgCompleteRequest(irp, requeue, IO_DISK_INCREMENT);
     }
 }
@@ -594,62 +614,38 @@ static BOOLEAN CreateSplitPathLeaf(const UNICODE_STRING* Path, PUNICODE_STRING P
 
 //
 //  Looks up a single entry by name within a cached parent-directory
-//  listing, checking files then subdirectories, and fills Out with its
-//  metadata on a match.
+//  listing, through its name index (BlorgFindDirectoryEntry), and fills
+//  Out with its metadata on a match.
 //
 static BOOLEAN CreateFindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Name, PDIRECTORY_ENTRY_METADATA Out)
 {
-    for (SIZE_T i = 0; i < Listing->FileCount; i++)
+    SIZE_T entry;
+
+    if (!BlorgFindDirectoryEntry(Listing, Name, &entry))
     {
-        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(Listing, i);
-
-        if (!file)
-        {
-            break;
-        }
-
-        UNICODE_STRING entryName;
-        entryName.Buffer = file->Name;
-        entryName.Length = C_CAST(USHORT, file->NameLength * sizeof(WCHAR));
-        entryName.MaximumLength = entryName.Length;
-
-        if (RtlEqualUnicodeString(&entryName, Name, TRUE))
-        {
-            Out->Size = file->Size;
-            Out->CreationTime = file->CreationTime;
-            Out->LastAccessedTime = file->LastAccessedTime;
-            Out->LastModifiedTime = file->LastModifiedTime;
-            Out->IsDirectory = FALSE;
-            return TRUE;
-        }
+        return FALSE;
     }
 
-    for (SIZE_T i = 0; i < Listing->SubDirCount; i++)
+    if (entry < Listing->FileCount)
     {
-        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(Listing, i);
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(Listing, entry);
 
-        if (!sub)
-        {
-            break;
-        }
-
-        UNICODE_STRING entryName;
-        entryName.Buffer = sub->Name;
-        entryName.Length = C_CAST(USHORT, sub->NameLength * sizeof(WCHAR));
-        entryName.MaximumLength = entryName.Length;
-
-        if (RtlEqualUnicodeString(&entryName, Name, TRUE))
-        {
-            Out->Size = 0;
-            Out->CreationTime = sub->CreationTime;
-            Out->LastAccessedTime = sub->LastAccessedTime;
-            Out->LastModifiedTime = sub->LastModifiedTime;
-            Out->IsDirectory = TRUE;
-            return TRUE;
-        }
+        Out->Size = file->Size;
+        Out->CreationTime = file->CreationTime;
+        Out->LastAccessedTime = file->LastAccessedTime;
+        Out->LastModifiedTime = file->LastModifiedTime;
+        Out->IsDirectory = FALSE;
+        return TRUE;
     }
 
-    return FALSE;
+    PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(Listing, entry - Listing->FileCount);
+
+    Out->Size = 0;
+    Out->CreationTime = sub->CreationTime;
+    Out->LastAccessedTime = sub->LastAccessedTime;
+    Out->LastModifiedTime = sub->LastModifiedTime;
+    Out->IsDirectory = TRUE;
+    return TRUE;
 }
 
 //
@@ -713,21 +709,26 @@ static BOOLEAN CreateFindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRI
 //  holds. Otherwise its open resolves like a miss, and CreateFcbRefresh
 //  brings the FCB up to date on the cold path before opening it.
 //
-//  A relative open (RelatedFileObject set -- OBJECT_ATTRIBUTES.RootDirectory
-//  at the Nt layer) is the one shape where the full path has to be built
-//  here rather than taken from FileObject->FileName, and both halves of
-//  that join have a trap in them. The separator is conditional: the parent
-//  handle's own name already ends in one when it is the root, and appending
-//  a second produces a path ("\\leaf") that matches nothing the equivalent
-//  absolute open resolves to. The destination offsets are byte offsets into
-//  a PWCH, so they are cast rather than added to the pointer -- pointer
-//  arithmetic on UNICODE_STRING.Buffer scales by sizeof(WCHAR) and would
-//  place the leaf at twice its offset, past the end of the block for any
-//  parent deeper than the root. joinedLength is computed in a ULONG because
-//  the two USHORT lengths plus a separator can exceed what a UNICODE_STRING
-//  can describe; a path that long is rejected rather than truncated into a
-//  buffer smaller than what is about to be copied into it (STATUS_OBJECT_NAME_INVALID,
-//  matching the leading-separator rejection just above it).
+//  A relative open (RelatedFileObject set --
+//  OBJECT_ATTRIBUTES.RootDirectory at the Nt layer) is the one shape where
+//  the full path has to be built here rather than taken from
+//  FileObject->FileName. The parent half is the related DCB's FullPath, not
+//  the related file object's FileName: that is whatever its own opener
+//  passed, which for a relative open is only the leaf. The joined path is a
+//  full path, so it is walked and inserted from the root like any other.
+//  Both halves of the join have a trap in them. The separator is
+//  conditional: the parent's path already ends in one when it is the root,
+//  and appending a second produces a path ("\\leaf") that matches nothing
+//  the equivalent absolute open resolves to. The destination offsets are
+//  byte offsets into a PWCH, so they are cast rather than added to the
+//  pointer -- pointer arithmetic on UNICODE_STRING.Buffer scales by
+//  sizeof(WCHAR) and would place the leaf at twice its offset, past the end
+//  of the block for any parent deeper than the root. joinedLength is
+//  computed in a ULONG because the two USHORT lengths plus a separator can
+//  exceed what a UNICODE_STRING can describe; a path that long is rejected
+//  rather than truncated into a buffer smaller than what is about to be
+//  copied into it (STATUS_OBJECT_NAME_INVALID, matching the
+//  leading-separator rejection just above it).
 //
 //  The KdBreakPoint() on the final fallthrough is deliberate and is the
 //  only one left in the driver -- every other one was removed because it
@@ -800,7 +801,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         {
             return CreateOpenVcb(Irp, fileObject, desiredAccess, shareAccess, BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->Vcb);
         }
-        
+
         filePath.String = fileObject->FileName;
     }
     else
@@ -817,12 +818,12 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             return STATUS_INVALID_PARAMETER;
         }
 
-        parentDcb = relatedFileObject->FsContext;
+        const UNICODE_STRING* parentPath = &C_CAST(PDCB, relatedFileObject->FsContext)->FullPath;
 
-        USHORT parentLength = relatedFileObject->FileName.Length;
+        USHORT parentLength = parentPath->Length;
 
         BOOLEAN parentEndsWithSeparator = (0 < parentLength) &&
-            (L'\\' == relatedFileObject->FileName.Buffer[(parentLength / sizeof(WCHAR)) - 1]);
+            (L'\\' == parentPath->Buffer[(parentLength / sizeof(WCHAR)) - 1]);
 
         USHORT separatorLength = parentEndsWithSeparator ? 0 : C_CAST(USHORT, sizeof(WCHAR));
 
@@ -842,7 +843,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
         filePath.IsAllocated = TRUE;
 
-        RtlCopyMemory(filePath.String.Buffer, relatedFileObject->FileName.Buffer, parentLength);
+        RtlCopyMemory(filePath.String.Buffer, parentPath->Buffer, parentLength);
 
         if (separatorLength)
         {
@@ -932,7 +933,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                 }
                 else
                 {
-                    result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
+                    result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode), VolumeDeviceObject);
                 }
 
                 BlorgNodeUnpin(desiredNode);
@@ -953,6 +954,11 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
         DIRECTORY_ENTRY_METADATA cached;
         PATH_CACHE_RESULT pc = BlorgPathCacheLookupDated(&filePath.String, &cached, &resolvedTicket);
+
+        if (PathCacheMiss != pc)
+        {
+            BlorgPathCacheCountLookup(pc);
+        }
 
         if (PathCacheExists == pc)
         {
@@ -994,6 +1000,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             {
                 BOOLEAN found = CreateFindEntryByName(listing, &leaf, &dirEntInfo);
                 BlorgReleaseDirectoryInfo(listing);
+                BlorgPathCacheCountLookup(PathCacheMiss);
 
                 if (found)
                 {
@@ -1033,6 +1040,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             return BlorgFsdPostRequest(Irp, IrpSp);
         }
 
+        BlorgPathCacheCountLookup(PathCacheMiss);
         BLORGFS_LOG("Create cache MISS -> network: %wZ\n", &filePath.String);
 
         PCREATE_NET_CONTEXT netCtx = ExAllocatePoolZero(NonPagedPoolNx, sizeof(CREATE_NET_CONTEXT), 'CRET');
@@ -1159,7 +1167,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
                 CreateFcbRefresh(C_CAST(PFCB, desiredNode), &dirEntInfo, &resolvedTicket, fileObject);
 
-                result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
+                result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode), VolumeDeviceObject);
 
                 if (STATUS_SUCCESS == result)
                 {
@@ -1192,7 +1200,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
         {
             ExFreePool(filePath.String.Buffer);
         }
-        
+
         return result;
     }
 
@@ -1228,7 +1236,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             {
                 C_CAST(PFCB, desiredNode)->MetaTicket = resolvedTicket;
 
-                result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
+                result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode), VolumeDeviceObject);
 
                 if (STATUS_SUCCESS == result)
                 {
@@ -1285,15 +1293,31 @@ static NTSTATUS CreateFileSystem(PIRP Irp)
 }
 
 //
+//  Counts a volume create in SuccessfulCreates or FailedCreates by the
+//  status it is completed with. Called wherever a volume create is
+//  completed rather than at each return inside BlorgVolumeCreate, since
+//  only the completion knows the final status: BlorgCreate for one finished
+//  in the FSD pass, the FSP worker for one finished there or cancelled in
+//  the queue, and CreateComplete for one it fails itself. A create that
+//  pends is counted once, by whichever completion finishes it.
+//
+VOID BlorgCountCreate(NTSTATUS Status)
+{
+    if (NT_SUCCESS(Status))
+    {
+        BLORGFS_STAT_INC(SuccessfulCreates);
+    }
+    else
+    {
+        BLORGFS_STAT_INC(FailedCreates);
+    }
+}
+
+//
 //  IRP_MJ_CREATE dispatch entry: sets up the IRP context/top-level state,
 //  dispatches by device type, and completes the IRP unless the volume
 //  path returned STATUS_PENDING (async network lookup or FSP requeue in
 //  flight).
-//
-//  SuccessfulCreates/FailedCreates are counted here rather than at each
-//  return inside BlorgVolumeCreate: this is the one place a create's final
-//  status is known, and a create that pends is counted by whichever
-//  completion finishes it rather than twice.
 //
 //  The default case is unreachable through the I/O manager today -- only
 //  this driver's three device objects carry its major table -- but the
@@ -1318,15 +1342,7 @@ NTSTATUS BlorgCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             result = BlorgVolumeCreate(Irp, irpSp, DeviceObject);
             if (STATUS_PENDING != result)
             {
-                if (NT_SUCCESS(result))
-                {
-                    BLORGFS_STAT_INC(SuccessfulCreates);
-                }
-                else
-                {
-                    BLORGFS_STAT_INC(FailedCreates);
-                }
-
+                BlorgCountCreate(result);
                 BlorgCompleteRequest(Irp, result, IO_DISK_INCREMENT);
             }
             break;

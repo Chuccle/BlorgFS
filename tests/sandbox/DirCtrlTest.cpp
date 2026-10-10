@@ -222,11 +222,70 @@ TEST_F(DirCtrlTest, ExactPatternWithNoWildcardsRequiresAnExactMatch)
 }
 
 //
-// A user-mode query with no MDL writes the entries straight into the
-// caller's buffer, so that buffer is probed for writing: a probe for
-// reading passes a read-only page, and the copy then faults.
+// A user-mode query with no MDL hands the driver a raw user address, so
+// every write to it goes through the user-mode accessors: one copy per
+// entry and the final NextEntryOffset.
 //
-TEST_F(DirCtrlTest, AUserModeQueryProbesItsBufferForWriting)
+TEST_F(DirCtrlTest, AUserModeQueryWritesItsBufferThroughTheUserModeAccessors)
+{
+    SeedListing(2, 0);
+
+    unsigned char buffer[512] = {};
+    QueryRequest* req = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+        buffer, sizeof(buffer));
+    req->Irp.RequestorMode = UserMode;
+
+    ShimUserAccessFaultAt(-1);
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack));
+    EXPECT_EQ(3, ShimUserAccesses());
+
+    auto* first = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer);
+
+    ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), first->FileNameLength);
+    EXPECT_EQ(0, memcmp(first->FileName, L"file0.bin", first->FileNameLength));
+}
+
+//
+// A user buffer that faults part way fails the query with the fault's
+// status and leaves the handle where it was, so the next query serves the
+// entries again rather than skipping the ones that were copied before the
+// fault. The fault is armed on the second entry's copy, after the first
+// one reached the buffer.
+//
+TEST_F(DirCtrlTest, AFaultingUserBufferFailsTheQueryWithoutAdvancingTheHandle)
+{
+    SeedListing(2, 0);
+
+    unsigned char buffer[512] = {};
+    QueryRequest* req = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+        buffer, sizeof(buffer));
+    req->Irp.RequestorMode = UserMode;
+
+    ShimUserAccessFaultAt(1);
+
+    EXPECT_EQ((NTSTATUS)STATUS_ACCESS_VIOLATION, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack));
+    EXPECT_EQ(0u, Ccb->CurrentIndex);
+
+    ShimUserAccessFaultAt(-1);
+
+    unsigned char retryBuffer[512] = {};
+    QueryRequest* retry = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+        retryBuffer, sizeof(retryBuffer), SL_RETURN_SINGLE_ENTRY);
+
+    ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&retry->Irp, &retry->Stack));
+
+    auto* first = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(retryBuffer);
+
+    ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), first->FileNameLength);
+    EXPECT_EQ(0, memcmp(first->FileName, L"file0.bin", first->FileNameLength));
+}
+
+//
+// The last write of a query is the zeroed NextEntryOffset of the entry it
+// stopped on, and it is a user-mode write like the copies before it.
+//
+TEST_F(DirCtrlTest, AFaultOnTheFinalNextEntryOffsetFailsTheQuery)
 {
     SeedListing(1, 0);
 
@@ -235,10 +294,59 @@ TEST_F(DirCtrlTest, AUserModeQueryProbesItsBufferForWriting)
         buffer, sizeof(buffer));
     req->Irp.RequestorMode = UserMode;
 
-    const ULONG probes = ShimProbesForWrite();
+    ShimUserAccessFaultAt(1);
 
-    ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack));
-    EXPECT_EQ(probes + 1, ShimProbesForWrite());
+    EXPECT_EQ((NTSTATUS)STATUS_ACCESS_VIOLATION, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack));
+    EXPECT_EQ(0u, Ccb->CurrentIndex);
+}
+
+//
+// A user-mode query whose buffer was locked into an MDL is written through
+// the MDL's system address, which is kernel memory: no user-mode access
+// is made, so an armed fault never fires.
+//
+TEST_F(DirCtrlTest, AUserModeQueryWithAnMdlWritesTheSystemAddress)
+{
+    SeedListing(1, 0);
+
+    unsigned char buffer[512] = {};
+    QueryRequest* req = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+        buffer, sizeof(buffer));
+    req->Irp.RequestorMode = UserMode;
+    req->Irp.MdlAddress = ShimCreateMdl(buffer, sizeof(buffer));
+    ASSERT_NE(nullptr, req->Irp.MdlAddress);
+
+    ShimUserAccessFaultAt(0);
+
+    NTSTATUS status = BlorgVolumeDirectoryControl(&req->Irp, &req->Stack);
+
+    ShimFreeMdl(req->Irp.MdlAddress);
+    req->Irp.MdlAddress = nullptr;
+
+    ASSERT_EQ(STATUS_SUCCESS, status);
+    EXPECT_EQ(0, ShimUserAccesses());
+
+    auto* first = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer);
+
+    ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), first->FileNameLength);
+    EXPECT_EQ(0, memcmp(first->FileName, L"file0.bin", first->FileNameLength));
+}
+
+//
+// Entries are built in a scratch block sized for the longest name a
+// listing admits. A longer one cannot come out of a decoded listing, but
+// if one did it must overflow like any entry that does not fit, not
+// overrun the scratch.
+//
+TEST_F(DirCtrlTest, ANameLongerThanAListingAdmitsOverflowsRatherThanOverrunning)
+{
+    Publish(BuildListing({ std::wstring(MAX_NAME_LEN + 40, L'x') }, {}));
+
+    std::vector<unsigned char> buffer(4096, 0);
+    QueryRequest* req = PrepareQuery(Dcb, Ccb, nullptr, FileIdBothDirectoryInformation,
+        buffer.data(), (ULONG)buffer.size());
+
+    EXPECT_EQ(STATUS_BUFFER_OVERFLOW, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack));
 }
 
 TEST_F(DirCtrlTest, NoFileNameMatchesEveryEntry)
@@ -315,6 +423,8 @@ TEST_F(DirCtrlTest, PartialFillAfterAtLeastOneEntrySucceedsRatherThanOverflowing
         << "a fill failure after at least one entry already fit must not surface as overflow "
            "-- that is what produces the Explorer ERROR_MORE_DATA popup on a normal listing";
     EXPECT_EQ(1u, Ccb->CurrentIndex) << "resume must point at the entry that didn't fit";
+    EXPECT_EQ(0u, reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer.data())->NextEntryOffset)
+        << "the entry the query stopped on must end the chain";
 }
 
 TEST_F(DirCtrlTest, ReturnSingleEntryStopsAfterOneMatchEvenWithRoomForMore)
@@ -738,6 +848,40 @@ TEST_F(DirCtrlTest, AMissPostedToTheFspIsCountedOnce)
     EXPECT_EQ(missesBefore + 1, stats->ListingCacheMisses);
 
     Drain();
+}
+
+
+//
+// An initial query, and a restart, of a directory whose listing is cached
+// is answered in the FSD: setting the handle's pattern and taking the
+// snapshot need nothing a worker has. Both used to be posted to the FSP
+// before the listing was even looked up, a worker hop, buffer lock and
+// system-PTE map per directory of a fully cached tree walk. The queue is
+// not running in this harness, so a post is refused.
+//
+TEST_F(DirCtrlTest, AQueryOfACachedListingIsAnsweredWithoutAPost)
+{
+    SeedListing(2, 1);
+
+    const ULONG slFlags[] = { 0, SL_RESTART_SCAN };
+
+    for (ULONG flags : slFlags)
+    {
+        unsigned char buffer[1024] = {};
+        QueryRequest* req = PrepareQuery(Dcb, Ccb, nullptr, FileBothDirectoryInformation,
+            buffer, sizeof(buffer), flags);
+        req->Irp.Tail.Overlay.DriverContext[0] = (PVOID)(ULONG_PTR)IRP_CONTEXT_FLAG_WAIT;
+
+        ASSERT_EQ(STATUS_SUCCESS, BlorgVolumeDirectoryControl(&req->Irp, &req->Stack))
+            << "flags " << flags << ": a cached listing was posted rather than answered";
+        EXPECT_TRUE(BooleanFlagOn(Ccb->Flags, CCB_FLAG_MATCH_ALL));
+        EXPECT_EQ(3u, Ccb->CurrentIndex) << "flags " << flags;
+
+        auto* first = reinterpret_cast<PFILE_BOTH_DIR_INFORMATION>(buffer);
+
+        ASSERT_EQ(sizeof(L"file0.bin") - sizeof(WCHAR), first->FileNameLength);
+        EXPECT_EQ(0, memcmp(first->FileName, L"file0.bin", first->FileNameLength));
+    }
 }
 
 } // namespace

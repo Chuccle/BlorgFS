@@ -198,7 +198,7 @@ PVOID ExAllocatePoolUninitialized(POOL_TYPE PoolType, SIZE_T NumberOfBytes, ULON
 VOID  ExFreePool(PVOID P);
 
 //
-// ReallocateBufferUninitialized is a real inline in Util.h and comes
+// BlorgReallocateBufferUninitialized is a real inline in Util.h and comes
 // from there; the sandbox does not reimplement it. Its exact contract
 // (returns the ORIGINAL pointer on failure, always a different one on
 // success) is what Client.c detects failure by, so a second
@@ -213,6 +213,15 @@ SIZE_T ShimPoolOutstanding(VOID);
 // the least-tested and most dangerous code it has.
 //
 VOID ShimPoolFailAt(LONG Index);
+
+//
+// Allocations made since the last ShimPoolFailAt, failed ones included, and
+// the size a live block was asked for. A test that pins what a path costs
+// in pool -- a regrow it should not make, a buffer larger than it needs --
+// asserts on these.
+//
+LONG ShimPoolAllocations(VOID);
+SIZE_T ShimPoolBlockSize(PVOID Block);
 
 //
 // Raises *Flag the moment Block is freed, whichever allocator frees it.
@@ -586,6 +595,28 @@ VOID ShimFailNextMdlAllocation(VOID);
 //
 PMDL ShimCreateMdl(PVOID Base, SIZE_T Length);
 VOID ShimFreeMdl(PMDL Mdl);
+
+///////////////////////////////////////////////////////////////////////////
+// User-mode accessors (usermode_accessors.h)
+///////////////////////////////////////////////////////////////////////////
+
+//
+// The driver writes a caller's user-mode buffer only through these. Here
+// they are plain copies; what the sandbox adds is the fault. In the kernel
+// a user-mode access to a bad page raises STATUS_ACCESS_VIOLATION into the
+// caller's __except, so the shim can be told to raise exactly that, and a
+// KernelMode access never faults, as the kernel's would not for the
+// buffers the driver hands it.
+//
+VOID CopyToMode(volatile VOID* Destination, const VOID* Source, SIZE_T Length, KPROCESSOR_MODE Mode);
+VOID WriteULongToMode(volatile ULONG* Destination, ULONG Value, KPROCESSOR_MODE Mode);
+
+//
+// Raises STATUS_ACCESS_VIOLATION from the Nth user-mode access from now
+// (-1 disables), and counts the user-mode accesses made since.
+//
+VOID ShimUserAccessFaultAt(LONG Index);
+LONG ShimUserAccesses(VOID);
 
 ///////////////////////////////////////////////////////////////////////////
 // Kernel stack budget

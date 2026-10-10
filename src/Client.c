@@ -25,6 +25,9 @@
 #include "picohttpparser.h"
 
 #define HTTP_TAG 'PTTH'
+#define HTTP_REQUEST_TAG 'qHPB'
+#define HTTP_URL_TAG 'uHPB'
+
 //
 // How many response headers picohttpparser is given room to report. This is
 // not a policy limit -- it is the size of an array, and overflowing it is a
@@ -44,7 +47,6 @@
 //
 #define HTTP_MAX_HEADERS 64
 #define HTTP_INITIAL_RECV_CAPACITY (PAGE_SIZE * 4)
-#define HTTP_FILE_INITIAL_RECV_CAPACITY (PAGE_SIZE * 64) // 256 KB initial capacity for file-read responses
 
 //
 // Initial receive capacity for a zero-copy (MDL) file read. Nothing but
@@ -63,7 +65,7 @@
 
 //
 // The TLS bulk-receive accumulator this file drains lives on the KSOCKET
-// and is sized and allocated by Socket.c (SocketTlsRecvCapacity,
+// and is sized and allocated by Socket.c (BlorgSocketTlsRecvCapacity,
 // BlorgEnsureTlsRecvBuffer). It is shared with the handshake, which fills it
 // first: bytes the handshake's last bulk receive pulled in past the
 // server's Finished -- a NewSessionTicket, typically -- stay buffered on
@@ -117,14 +119,6 @@
 //
 #define HTTP_CONNECT_ATTEMPTS 4u
 
-//
-// Checked SIZE_T addition. Returns FALSE (and leaves *Result unspecified)
-// on overflow instead of wrapping. Every BodyOffset + ContentLength
-// computation in this file -- combining a wire-parsed, untrusted length
-// with another value -- must go through this: a wrapped sum can make a
-// too-small buffer look big enough to a naive size check, turning
-// overflow into an out-of-bounds read/write primitive.
-//
 //
 // In-flight request gate, and why it is a base-referenced count rather
 // than a rundown reference.
@@ -192,6 +186,14 @@ static VOID HttpReleaseActive(VOID)
     }
 }
 
+//
+// Checked SIZE_T addition. Returns FALSE (and leaves *Result unspecified)
+// on overflow instead of wrapping. Every BodyOffset + ContentLength
+// computation in this file -- combining a wire-parsed, untrusted length
+// with another value -- must go through this: a wrapped sum can make a
+// too-small buffer look big enough to a naive size check, turning
+// overflow into an out-of-bounds read/write primitive.
+//
 static BOOLEAN HttpCheckedAddSizeT(SIZE_T A, SIZE_T B, PSIZE_T Result)
 {
     SIZE_T sum = A + B;
@@ -219,13 +221,14 @@ static BOOLEAN HttpCheckedAddSizeT(SIZE_T A, SIZE_T B, PSIZE_T Result)
 //
 // The counts come from the wire. flatcc's verifier bounds them to the
 // buffer, which stops them being nonsense, but it does not stop them being
-// enormously amplified: each 4-byte vector offset expands to a
-// DIRECTORY_FILE_METADATA, which carries an inline WCHAR Name[260] and so
-// costs 560 bytes. At HTTP_MAX_CONTENT_LENGTH that is 16.7M entries
-// becoming an 8.8 GB PagedPool request from a single 64 MB response -- a
-// ~140x amplification, and a memory-pressure DoS a malicious or
-// compromised backend gets for free. The allocation failing cleanly is not
-// much comfort when the machine has spent itself trying.
+// amplified: each 4-byte vector offset expands to a
+// DIRECTORY_FILE_METADATA of 48 bytes and up to 12 of name index, its
+// name aside. At HTTP_MAX_CONTENT_LENGTH that is 16.7M entries becoming a
+// 1 GB PagedPool request from a single 64 MB response -- a ~15x
+// amplification, and a memory-pressure DoS a malicious or compromised
+// backend gets for free. When every entry carried a 520-byte name field
+// it was 8.8 GB. The allocation failing cleanly is not much comfort when
+// the machine has spent itself trying.
 //
 // So the ceiling on ContentLength is not sufficient on its own: it bounds
 // the input, not what the input is inflated into. This ties the counts back
@@ -317,7 +320,6 @@ typedef enum _HTTP_CONNECTION_SOURCE
     // never retried again.
     //
     HttpConnectionFresh
-
 } HTTP_CONNECTION_SOURCE;
 
 typedef struct _HTTP_CONTEXT HTTP_CONTEXT;
@@ -502,13 +504,6 @@ typedef struct _HTTP_CONTEXT
     LONG64 SendQpc;
 
     //
-    // QPC stamp taken when the send completion fires, splitting the
-    // pre-first-byte time once more: SendQpc to here is the request going
-    // out and WSK telling us so, here to HeadersQpc is genuine wait on the
-    // peer. A usermode client's TTFB is the second of those, so only the
-    // second is a like-for-like comparison.
-    //
-    //
     // QPC stamp taken just before the send is issued, splitting the send
     // span once more. It cannot be taken after: the send may complete, and
     // the request with it, before the issue returns.
@@ -523,6 +518,13 @@ typedef struct _HTTP_CONTEXT
     //
     LONG64 SendIssuedQpc;
 
+    //
+    // QPC stamp taken when the send completion fires, splitting the
+    // pre-first-byte time once more: SendQpc to here is the request going
+    // out and WSK telling us so, here to HeadersQpc is genuine wait on the
+    // peer. A usermode client's TTFB is the second of those, so only the
+    // second is a like-for-like comparison.
+    //
     LONG64 SendDoneQpc;
 
     //
@@ -535,7 +537,6 @@ typedef struct _HTTP_CONTEXT
     // distinguishes them.
     //
     LONG64 SocketQpc;
-
 } HTTP_CONTEXT;
 
 static VOID HttpKick(HTTP_CONTEXT* Ctx);
@@ -916,7 +917,7 @@ static NTSTATUS HttpUrlEncodePathToAnsi(const UNICODE_STRING* InputString, SIZE_
     OutputString->Buffer = C_CAST(PCHAR, ExAllocatePoolUninitialized(
         NonPagedPoolNx,
         encodedLength + Reserve + 1,
-        'URLE'
+        HTTP_URL_TAG
     ));
 
     if (NULL == OutputString->Buffer)
@@ -1000,30 +1001,203 @@ static PCHAR HttpAlignBodyInPlace(PCHAR Body, SIZE_T BodyLen)
 }
 
 //
+// The name of entry Entry of DirInfo, files first, then subdirectories.
+//
+static VOID HttpListingEntryName(PDIRECTORY_INFO DirInfo, SIZE_T Entry, PUNICODE_STRING Name)
+{
+    PWCH buffer;
+    SIZE_T length;
+
+    if (Entry < DirInfo->FileCount)
+    {
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(DirInfo, Entry);
+
+        buffer = file->Name;
+        length = file->NameLength;
+    }
+    else
+    {
+        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(DirInfo, Entry - DirInfo->FileCount);
+
+        buffer = sub->Name;
+        length = sub->NameLength;
+    }
+
+    Name->Buffer = buffer;
+    Name->Length = C_CAST(USHORT, length * sizeof(WCHAR));
+    Name->MaximumLength = Name->Length;
+}
+
+//
+// The chain of DirInfo's name index that Name is in. Case is folded as
+// RtlEqualUnicodeString folds it, so names equal but for case share a
+// chain, and the hash is mixed into its high bits, which pick the chain.
+//
+static PULONG HttpListingChain(PDIRECTORY_INFO DirInfo, const UNICODE_STRING* Name)
+{
+    ULONG hash = 0;
+
+    if (!NT_SUCCESS(RtlHashUnicodeString(Name, TRUE, HASH_STRING_ALGORITHM_DEFAULT, &hash)))
+    {
+        hash = 0;
+    }
+
+    const ULONG64 mixed = C_CAST(ULONG, hash * 0x9E3779B1u);
+    const ULONG chain = C_CAST(ULONG, (mixed * (C_CAST(ULONG64, DirInfo->IndexMask) + 1)) >> 32);
+
+    return C_CAST(PULONG, C_CAST(PUCHAR, DirInfo) + DirInfo->IndexOffset) + chain;
+}
+
+static PULONG HttpListingLinks(PDIRECTORY_INFO DirInfo)
+{
+    return C_CAST(PULONG, C_CAST(PUCHAR, DirInfo) + DirInfo->IndexOffset) + DirInfo->IndexMask + 1;
+}
+
+PDIRECTORY_INFO BlorgAllocateDirectoryInfo(SIZE_T FileCount, SIZE_T SubDirCount, SIZE_T NameBytes)
+{
+    SIZE_T entries = 0;
+
+    if (!HttpCheckedAddSizeT(FileCount, SubDirCount, &entries) || entries > (MAXULONG / 4))
+    {
+        return NULL;
+    }
+
+    ULONG chains = 1;
+
+    while (chains < entries)
+    {
+        chains <<= 1;
+    }
+
+    const SIZE_T filesOffset = sizeof(DIRECTORY_INFO);
+    const SIZE_T subDirsOffset = filesOffset + (FileCount * sizeof(DIRECTORY_FILE_METADATA));
+    const SIZE_T indexOffset = subDirsOffset + (SubDirCount * sizeof(DIRECTORY_SUBDIR_METADATA));
+    const SIZE_T namesOffset = indexOffset + ((chains + entries) * sizeof(ULONG));
+    SIZE_T bytes = 0;
+
+    if (!HttpCheckedAddSizeT(namesOffset, NameBytes, &bytes))
+    {
+        return NULL;
+    }
+
+    PDIRECTORY_INFO dirInfo = ExAllocatePoolZero(PagedPool, bytes, 'DBLR');
+
+    if (!dirInfo)
+    {
+        return NULL;
+    }
+
+    dirInfo->FilesOffset = filesOffset;
+    dirInfo->SubDirsOffset = subDirsOffset;
+    dirInfo->IndexOffset = indexOffset;
+    dirInfo->NamesOffset = namesOffset;
+    dirInfo->FileCount = FileCount;
+    dirInfo->SubDirCount = SubDirCount;
+    dirInfo->Bytes = bytes;
+    dirInfo->RefCount = 1;
+    dirInfo->IndexMask = chains - 1;
+
+    return dirInfo;
+}
+
+//
+// Entries are chained last first, so each chain runs in listing order and
+// a lookup meets the first of two names that differ only in case first,
+// files before subdirectories, as a scan of the listing would.
+//
+VOID BlorgIndexDirectoryInfo(PDIRECTORY_INFO DirInfo)
+{
+    PULONG links = HttpListingLinks(DirInfo);
+
+    for (SIZE_T entry = DirInfo->FileCount + DirInfo->SubDirCount; entry > 0; entry--)
+    {
+        UNICODE_STRING name;
+        HttpListingEntryName(DirInfo, entry - 1, &name);
+
+        PULONG chain = HttpListingChain(DirInfo, &name);
+
+        links[entry - 1] = *chain;
+        *chain = C_CAST(ULONG, entry);
+    }
+}
+
+BOOLEAN BlorgFindDirectoryEntry(PDIRECTORY_INFO DirInfo, const UNICODE_STRING* Name, PSIZE_T Entry)
+{
+    PULONG links = HttpListingLinks(DirInfo);
+
+    for (ULONG next = *HttpListingChain(DirInfo, Name); 0 != next; next = links[next - 1])
+    {
+        UNICODE_STRING entryName;
+        HttpListingEntryName(DirInfo, next - 1, &entryName);
+
+        if (RtlEqualUnicodeString(&entryName, Name, TRUE))
+        {
+            *Entry = next - 1;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+//
+// Converts one listed name into the names area of a listing being
+// decoded, at *Cursor, NUL-terminated, and moves *Cursor past it. The
+// area was sized for every name at two bytes per UTF-8 byte, which no
+// UTF-16 conversion exceeds. A name past MAX_NAME_LEN - 1 characters fails
+// the listing, as the fixed name field it replaced did.
+//
+static NTSTATUS HttpDecodeName(flatbuffers_string_t Utf8, PWCH* Cursor, PWCH* Name, PSIZE_T NameLength)
+{
+    ULONG nameBytes = 0;
+    NTSTATUS status = RtlUTF8ToUnicodeN(
+        *Cursor,
+        (MAX_NAME_LEN - 1) * sizeof(WCHAR),
+        &nameBytes,
+        Utf8,
+        C_CAST(ULONG, flatbuffers_string_len(Utf8)));
+
+    if (!NT_SUCCESS(status))
+    {
+        return status;
+    }
+
+    *Name = *Cursor;
+    *NameLength = nameBytes / sizeof(WCHAR);
+    *Cursor += *NameLength + 1;
+
+    return STATUS_SUCCESS;
+}
+
+//
 // Decodes one verified Directory table into a newly allocated
-// PDIRECTORY_INFO (header + inline file/subdir arrays): the listing a
-// response answers, or one a subtree answer carries beneath it. BodyLen is
-// the whole response body's, which bounds the entry counts. PASSIVE
-// only (RtlUTF8ToUnicodeN), per the stage-machine gating above. The
-// listing is PagedPool: every producer and consumer (this deserialize,
-// the create path's serve-from-listing, directory enumeration, and the
-// reap worker's free) runs at <= APC_LEVEL, and at 560 bytes per file
-// entry a large flat directory would otherwise pin megabytes of
-// non-paged pool for the DCB's whole lifetime.
+// PDIRECTORY_INFO (BlorgAllocateDirectoryInfo): the listing a response
+// answers, or one a subtree answer carries beneath it. BodyLen is the
+// whole response body's, which bounds the entry counts. PASSIVE only
+// (RtlUTF8ToUnicodeN), per the stage-machine gating above. The listing is
+// PagedPool: every producer and consumer (this deserialize, the create
+// path's serve-from-listing, directory enumeration, and the reap worker's
+// free) runs at <= APC_LEVEL, and a large flat directory would otherwise
+// pin megabytes of non-paged pool for the DCB's whole lifetime.
+//
+// Each name takes only its own length in the block, where every entry
+// used to carry a WCHAR[MAX_NAME_LEN] of its own: 560 bytes a file, so the
+// 32 MB listing budget held about 57,000 entries, and an open that missed
+// the path cache scanned a 20,000-entry listing 560 bytes at a time for
+// its name. The names are sized in a first pass over the table, converted
+// in the second, and chained into the listing's name index once all are in
+// place, so that open is one hash chain (BlorgFindDirectoryEntry).
+//
 // Server-supplied file and subdir names are untrusted: flatcc's verifier
-// validates buffer structure but not that a decoded name fits the fixed
-// Name[MAX_NAME_LEN] field, so each name is converted with
-// RtlUTF8ToUnicodeN straight into the entry's Name -- no per-name
-// intermediate allocation -- bounded to leave room for a NUL (the entry
-// block is zero-allocated, so a bounded conversion stays terminated, and
-// DirCtrlEnumerateDirectoryEntries reads Name as null-terminated). A name too
-// long for the field fails its conversion outright and rejects the
-// listing, the same policy the old explicit length check enforced.
+// validates buffer structure but not that a decoded name is usable, so an
+// empty name, or one longer than MAX_NAME_LEN - 1 characters, rejects the
+// listing. Each is converted with RtlUTF8ToUnicodeN straight into the
+// block -- no per-name intermediate allocation -- and stays NUL-terminated
+// because the block is zero-allocated with room for every terminator
+// (DirCtrlEnumerateDirectoryEntries reads Name as null-terminated).
 //
 static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZE_T BodyLen, BOOLEAN NoStore, PDIRECTORY_INFO* OutDirInfo)
 {
-    size_t headerSize = sizeof(DIRECTORY_INFO);
-
     BlorgMetaFlat_SubdirectoryMetadata_vec_t flatSubdirEntries = BlorgMetaFlat_Directory_subdirectories(Directory);
     SIZE_T subdirCount = (flatSubdirEntries) ? BlorgMetaFlat_SubdirectoryMetadata_vec_len(flatSubdirEntries) : 0;
 
@@ -1036,20 +1210,32 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         return STATUS_INVALID_PARAMETER;
     }
 
-    SIZE_T filesEntryArraySize = filesCount * sizeof(DIRECTORY_FILE_METADATA);
-    SIZE_T subDirArraySize = subdirCount * sizeof(DIRECTORY_SUBDIR_METADATA);
+    SIZE_T nameBytes = 0;
 
-    SIZE_T entriesSize = 0;
-    SIZE_T allocationSize = 0;
-
-    if (!HttpCheckedAddSizeT(filesEntryArraySize, subDirArraySize, &entriesSize) ||
-        !HttpCheckedAddSizeT(headerSize, entriesSize, &allocationSize))
+    for (SIZE_T i = 0; i < filesCount + subdirCount; ++i)
     {
-        BLORGFS_PRINT("HttpDecodeListing() - listing size overflowed\n");
-        return STATUS_INVALID_PARAMETER;
+        flatbuffers_string_t name = NULL;
+
+        if (i < filesCount)
+        {
+            BlorgMetaFlat_FileEntryMetadata_table_t flatFileEntry = BlorgMetaFlat_FileEntryMetadata_vec_at(flatFileEntries, i);
+            name = flatFileEntry ? BlorgMetaFlat_FileEntryMetadata_name(flatFileEntry) : NULL;
+        }
+        else
+        {
+            BlorgMetaFlat_SubdirectoryMetadata_table_t flatSubdirEntry = BlorgMetaFlat_SubdirectoryMetadata_vec_at(flatSubdirEntries, i - filesCount);
+            name = flatSubdirEntry ? BlorgMetaFlat_SubdirectoryMetadata_name(flatSubdirEntry) : NULL;
+        }
+
+        if (!name || 0 == flatbuffers_string_len(name) ||
+            !HttpCheckedAddSizeT(nameBytes, (flatbuffers_string_len(name) + 1) * sizeof(WCHAR), &nameBytes))
+        {
+            BLORGFS_PRINT("HttpDecodeListing() - failed\n");
+            return STATUS_INVALID_PARAMETER;
+        }
     }
 
-    PDIRECTORY_INFO dirInfo = ExAllocatePoolZero(PagedPool, allocationSize, 'DBLR');
+    PDIRECTORY_INFO dirInfo = BlorgAllocateDirectoryInfo(filesCount, subdirCount, nameBytes);
 
     if (!dirInfo)
     {
@@ -1057,41 +1243,14 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    dirInfo->FilesOffset = headerSize;
-    dirInfo->SubDirsOffset = headerSize + filesEntryArraySize;
-    dirInfo->FileCount = filesCount;
-    dirInfo->SubDirCount = subdirCount;
-    dirInfo->RefCount = 1;
+    PWCH cursor = C_CAST(PWCH, C_CAST(PUCHAR, dirInfo) + dirInfo->NamesOffset);
 
-    PDIRECTORY_FILE_METADATA fileEntries = BlorgGetFileEntry(dirInfo, 0);
-
-    for (size_t i = 0; i < filesCount; ++i)
+    for (SIZE_T i = 0; i < filesCount; ++i)
     {
         BlorgMetaFlat_FileEntryMetadata_table_t flatFileEntry = BlorgMetaFlat_FileEntryMetadata_vec_at(flatFileEntries, i);
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(dirInfo, i);
 
-        if (!flatFileEntry)
-        {
-            BLORGFS_PRINT("HttpDecodeListing() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        flatbuffers_string_t name = BlorgMetaFlat_FileEntryMetadata_name(flatFileEntry);
-
-        if (!name || flatbuffers_string_len(name) == 0)
-        {
-            BLORGFS_PRINT("HttpDecodeListing() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        ULONG nameBytes = 0;
-        NTSTATUS status = RtlUTF8ToUnicodeN(
-            fileEntries[i].Name,
-            (MAX_NAME_LEN - 1) * sizeof(WCHAR),
-            &nameBytes,
-            name,
-            C_CAST(ULONG, flatbuffers_string_len(name)));
+        NTSTATUS status = HttpDecodeName(BlorgMetaFlat_FileEntryMetadata_name(flatFileEntry), &cursor, &file->Name, &file->NameLength);
 
         if (!NT_SUCCESS(status))
         {
@@ -1100,43 +1259,18 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
             return status;
         }
 
-        fileEntries[i].NameLength = nameBytes / sizeof(WCHAR);
-
-        fileEntries[i].Size = BlorgMetaFlat_FileEntryMetadata_size(flatFileEntry);
-        fileEntries[i].CreationTime = BlorgMetaFlat_FileEntryMetadata_created(flatFileEntry);
-        fileEntries[i].LastAccessedTime = BlorgMetaFlat_FileEntryMetadata_accessed(flatFileEntry);
-        fileEntries[i].LastModifiedTime = BlorgMetaFlat_FileEntryMetadata_modified(flatFileEntry);
+        file->Size = BlorgMetaFlat_FileEntryMetadata_size(flatFileEntry);
+        file->CreationTime = BlorgMetaFlat_FileEntryMetadata_created(flatFileEntry);
+        file->LastAccessedTime = BlorgMetaFlat_FileEntryMetadata_accessed(flatFileEntry);
+        file->LastModifiedTime = BlorgMetaFlat_FileEntryMetadata_modified(flatFileEntry);
     }
 
-    PDIRECTORY_SUBDIR_METADATA subdirEntries = BlorgGetSubDirEntry(dirInfo, 0);
-
-    for (size_t i = 0; i < subdirCount; ++i)
+    for (SIZE_T i = 0; i < subdirCount; ++i)
     {
         BlorgMetaFlat_SubdirectoryMetadata_table_t flatSubdirEntry = BlorgMetaFlat_SubdirectoryMetadata_vec_at(flatSubdirEntries, i);
+        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(dirInfo, i);
 
-        if (!flatSubdirEntry)
-        {
-            BLORGFS_PRINT("HttpDecodeListing() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        flatbuffers_string_t name = BlorgMetaFlat_SubdirectoryMetadata_name(flatSubdirEntry);
-
-        if (!name || flatbuffers_string_len(name) == 0)
-        {
-            BLORGFS_PRINT("HttpDecodeListing() - failed\n");
-            ExFreePool(dirInfo);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        ULONG nameBytes = 0;
-        NTSTATUS status = RtlUTF8ToUnicodeN(
-            subdirEntries[i].Name,
-            (MAX_NAME_LEN - 1) * sizeof(WCHAR),
-            &nameBytes,
-            name,
-            C_CAST(ULONG, flatbuffers_string_len(name)));
+        NTSTATUS status = HttpDecodeName(BlorgMetaFlat_SubdirectoryMetadata_name(flatSubdirEntry), &cursor, &sub->Name, &sub->NameLength);
 
         if (!NT_SUCCESS(status))
         {
@@ -1145,12 +1279,12 @@ static NTSTATUS HttpDecodeListing(BlorgMetaFlat_Directory_table_t Directory, SIZ
             return status;
         }
 
-        subdirEntries[i].NameLength = nameBytes / sizeof(WCHAR);
-
-        subdirEntries[i].CreationTime = BlorgMetaFlat_SubdirectoryMetadata_created(flatSubdirEntry);
-        subdirEntries[i].LastAccessedTime = BlorgMetaFlat_SubdirectoryMetadata_accessed(flatSubdirEntry);
-        subdirEntries[i].LastModifiedTime = BlorgMetaFlat_SubdirectoryMetadata_modified(flatSubdirEntry);
+        sub->CreationTime = BlorgMetaFlat_SubdirectoryMetadata_created(flatSubdirEntry);
+        sub->LastAccessedTime = BlorgMetaFlat_SubdirectoryMetadata_accessed(flatSubdirEntry);
+        sub->LastModifiedTime = BlorgMetaFlat_SubdirectoryMetadata_modified(flatSubdirEntry);
     }
+
+    BlorgIndexDirectoryInfo(dirInfo);
 
     dirInfo->NoStore = NoStore;
 
@@ -1548,10 +1682,11 @@ static VOID HttpFreeContext(HTTP_CONTEXT* Ctx)
 //
 // Grows Ctx->Buffer in place (realloc) if RequiredCapacity exceeds the
 // current capacity; no-op otherwise. RequiredCapacity is rejected above
-// MAXULONG since Capacity is stored as ULONG. ReallocateBufferUninitialized
-// returns the original buffer (untouched) on allocation failure and always
-// yields a distinct pointer on success, so failure is detected by pointer
-// equality with the prior buffer.
+// MAXULONG since Capacity is stored as ULONG.
+// BlorgReallocateBufferUninitialized returns the original buffer
+// (untouched) on allocation failure and always yields a distinct pointer
+// on success, so failure is detected by pointer equality with the prior
+// buffer.
 //
 static NTSTATUS HttpGrowBufferIfNeeded(HTTP_CONTEXT* Ctx, SIZE_T RequiredCapacity)
 {
@@ -1565,7 +1700,7 @@ static NTSTATUS HttpGrowBufferIfNeeded(HTTP_CONTEXT* Ctx, SIZE_T RequiredCapacit
         return STATUS_INVALID_PARAMETER;
     }
 
-    PCHAR newBuffer = ReallocateBufferUninitialized(
+    PCHAR newBuffer = BlorgReallocateBufferUninitialized(
         Ctx->Buffer,
         Ctx->Length,
         NonPagedPoolNx,
@@ -1729,11 +1864,11 @@ static BOOLEAN HttpMustBounceToPassive(const HTTP_CONTEXT* Ctx)
 // handshake stage. So a file read on a plaintext connection needs no work
 // item up front, and skipping it takes one pool allocation and one free off
 // every chunk on the read hot path. The idle-close retry, which is rare,
-// allocates one itself when it has to (see HttpKick). global.TlsEnabled is sampled here, at the one point
-// where an allocation failure can still be reported to the caller, rather
-// than at handshake time; HttpKick re-checks for NULL so that flipping
-// the flag live (the debugger poke documented in Driver.h) degrades to a
-// failed request rather than a NULL dereference.
+// allocates one itself when it has to (see HttpKick). global.TlsEnabled is
+// sampled here, at the one point where an allocation failure can still be
+// reported to the caller, rather than at handshake time; HttpKick re-checks
+// for NULL so that flipping the flag live (the debugger poke documented in
+// Driver.h) degrades to a failed request rather than a NULL dereference.
 //
 static BOOLEAN HttpNeedsWorkItem(HTTP_OPERATION Operation)
 {
@@ -1981,13 +2116,12 @@ static VOID HttpFailOrRetryReusedConnection(HTTP_CONTEXT* Ctx, NTSTATUS Status)
 // disabled by default, so this is a no-op until explicitly turned on. When
 // enabled, a pooled socket that already completed a handshake (State ==
 // TlsHandshakeComplete) skips straight to sending the request; anything
-// else (always true for a fresh connection) runs the handshake first. That
-// includes a pooled socket that never had one: pre-warmed connections
-// (Socket.c) enter the pool straight from the connect, and a server that
-// drops a client which stays silent (the guest's TLS terminator does after
-// 15 s) has already closed one that waited there. A handshake failure on a
-// reused socket is therefore the idle-close case and is retried once on a
-// fresh connection, as a failed send or receive is.
+// else (always true for a fresh connection) runs the handshake first. A
+// pooled socket that never had one is the case a debugger flip of
+// TlsEnabled leaves behind; pre-warmed connections (Socket.c) handshake
+// before they enter the pool. A handshake failure on a reused socket is
+// the idle-close case and is retried once on a fresh connection, as a
+// failed send or receive is.
 // No separate pool-release guard is needed on a failure:
 // HttpComplete's failure path already closes rather than pools any socket
 // still held on failure, and the only success path that pools a socket
@@ -2064,8 +2198,8 @@ static VOID HttpAcquireSocketWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 
 //
 // Completion for BlorgTlsStartHandshakeAsync: advances to sending the request
-// on success; a failure on a reused (pre-warmed) socket is retried once on a
-// fresh connection, any other fails the request (see HttpOnSocket).
+// on success; a failure on a reused socket is retried once on a fresh
+// connection, any other fails the request (see HttpOnSocket).
 //
 static VOID HttpOnTlsHandshakeComplete(NTSTATUS Status, PVOID CallerContext)
 {
@@ -2201,9 +2335,12 @@ static VOID HttpIssueReceiveDispatch(HTTP_CONTEXT* Ctx)
 // already be freed. Two receive regimes are selected by whether headers
 // have been parsed yet (BodyOffset != 0): header phase posts the
 // remaining capacity and completes on whatever arrives (Flags = 0),
-// growing a page at a time if the headers alone overflow it -- and only
-// re-posting while HttpParseHeaders keeps answering STATUS_BUFFER_TOO_SMALL,
-// which it stops doing past HTTP_MAX_HEADER_BYTES; body phase
+// growing a page only once the headers have filled it (growing ahead of
+// that reallocated every zero-copy read's 2 KB header buffer before its
+// first receive, for room that only filled with body bytes to spill-copy),
+// and only re-posting while HttpParseHeaders keeps answering
+// STATUS_BUFFER_TOO_SMALL, which it stops doing past
+// HTTP_MAX_HEADER_BYTES; body phase
 // posts exactly the outstanding remainder with WSK_FLAG_WAITALL -- one
 // completion for the whole body rather than one per arriving segment,
 // into either the caller's locked MDL (TargetMdl set, body byte i at MDL
@@ -2248,12 +2385,15 @@ static VOID HttpIssueReceive(HTTP_CONTEXT* Ctx)
 
     if (0 == Ctx->BodyOffset)
     {
-        NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, C_CAST(SIZE_T, Ctx->Length) + PAGE_SIZE);
-
-        if (!NT_SUCCESS(growResult))
+        if (Ctx->Length == Ctx->Capacity)
         {
-            HttpComplete(Ctx, growResult);
-            return;
+            NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, C_CAST(SIZE_T, Ctx->Capacity) + PAGE_SIZE);
+
+            if (!NT_SUCCESS(growResult))
+            {
+                HttpComplete(Ctx, growResult);
+                return;
+            }
         }
 
         result = BlorgReceiveWskAsync(
@@ -2384,7 +2524,9 @@ static VOID HttpIssueTlsReceiveExpandedCallout(PVOID Parameter)
 //  - Outer type 0x14 (change_cipher_spec, an RFC 8446 Appendix D.4
 //    middlebox-compat no-op) is skipped without decryption -- it isn't
 //    AEAD-protected at all -- but must still be consumed from the byte
-//    stream. 0x15 (alert) is a hard failure; 0x17 (application_data) is
+//    stream. 0x15 (alert) ends the connection, and is handled as a
+//    framing failure (below): a pooled connection the peer closed with a
+//    plaintext alert is the idle-close race. 0x17 (application_data) is
 //    the only other legal outer type post-handshake.
 //
 //  - A 0x17 record is AEAD-decrypted (tag verified) straight from its
@@ -2480,7 +2622,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
 
         if (0x15 == recordType)
         {
-            HttpFail(Ctx, STATUS_CONNECTION_RESET);
+            HttpFailOrRetryReusedConnection(Ctx, STATUS_CONNECTION_RESET);
             return;
         }
 
@@ -2621,7 +2763,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         socket->TlsRecvOffset = 0;
     }
     else if (socket->TlsRecvOffset &&
-        (SocketTlsRecvCapacity - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
+        (BlorgSocketTlsRecvCapacity - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
     {
         RtlMoveMemory(
             socket->TlsRecvBuffer,
@@ -2638,7 +2780,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         socket,
         socket->TlsRecvMdl,
         socket->TlsRecvLength,
-        SocketTlsRecvCapacity - socket->TlsRecvLength,
+        BlorgSocketTlsRecvCapacity - socket->TlsRecvLength,
         0,
         HttpOnTlsReceive,
         Ctx);
@@ -2753,9 +2895,12 @@ static NTSTATUS HttpStatusToNtStatus(int StatusCode)
 // short body is handled. In buffer mode, Buffer is then pre-grown to fit
 // the full declared body now that ContentLength is known, so the
 // remaining receive loop (if any) doesn't repeatedly realloc a page at a
-// time for large files. Dispatch does not happen until the full declared
-// Content-Length has arrived, looping HttpStageReceive as many times as
-// the peer needs to deliver it.
+// time for large files, and one byte past it: over TLS the record that
+// ends the body decrypts its inner content-type byte after the body's last
+// byte before HttpIssueTlsReceive strips it, and a buffer ending at the
+// body was reallocated, and the whole body copied, for that byte. Dispatch
+// does not happen until the full declared Content-Length has arrived,
+// looping HttpStageReceive as many times as the peer needs to deliver it.
 //
 static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
 {
@@ -2845,7 +2990,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
                         return;
                     }
 
-                    NTSTATUS alignGrowResult = HttpGrowBufferIfNeeded(Ctx, alignedBodyEnd);
+                    NTSTATUS alignGrowResult = HttpGrowBufferIfNeeded(Ctx, alignedBodyEnd + 1);
 
                     if (!NT_SUCCESS(alignGrowResult))
                     {
@@ -2864,7 +3009,7 @@ static VOID HttpReadResponse(HTTP_CONTEXT* Ctx)
                 }
             }
 
-            NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, Ctx->BodyEndOffset);
+            NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, Ctx->BodyEndOffset + 1);
 
             if (!NT_SUCCESS(growResult))
             {
@@ -2983,13 +3128,14 @@ static NTSTATUS HttpParseHeaders(HTTP_CONTEXT* Ctx)
 // Deserializes the response body per Ctx->Operation and fires the caller's
 // completion callback on success, clearing Completion.*.Routine so
 // HttpComplete does not invoke it a second time (dirInfo ownership
-// transfers to the caller with one reference, dropped with BlorgReleaseDirectoryInfo). Must
-// run at PASSIVE (see HttpDispatch/HttpMustBounceToPassive) since flatcc
-// and the callbacks require it. For HttpOpFileRead in zero-copy mode, the
-// body is already in the caller's MDL, so there is nothing to hand over --
-// BodyBuffer/BaseAddress are NULL (BlorgFreeHttpFile on a NULL BaseAddress is a
-// no-op) and only the byte count is meaningful; in buffer mode, ownership
-// of Ctx->Buffer transfers to the caller via BaseAddress (see
+// transfers to the caller with one reference, dropped with
+// BlorgReleaseDirectoryInfo). Must run at PASSIVE (see
+// HttpDispatch/HttpMustBounceToPassive) since flatcc and the callbacks
+// require it. For HttpOpFileRead in zero-copy mode, the body is already in
+// the caller's MDL, so there is nothing to hand over --
+// BodyBuffer/BaseAddress are NULL (BlorgFreeHttpFile on a NULL BaseAddress
+// is a no-op) and only the byte count is meaningful; in buffer mode,
+// ownership of Ctx->Buffer transfers to the caller via BaseAddress (see
 // HttpFreeContext).
 //
 static VOID HttpDispatchInline(HTTP_CONTEXT* Ctx)
@@ -3406,7 +3552,7 @@ static NTSTATUS HttpBuildRequest(
 
     ULONG sendBufferSize = C_CAST(ULONG, formatStringLength) + 1 + Target->Length + C_CAST(ULONG, ExtraDigitsBudget) + C_CAST(ULONG, remoteHostLength);
 
-    Ctx->RequestBuffer = ExAllocatePoolZero(NonPagedPoolNx, sendBufferSize, 'BOOB');
+    Ctx->RequestBuffer = ExAllocatePoolZero(NonPagedPoolNx, sendBufferSize, HTTP_REQUEST_TAG);
 
     if (!Ctx->RequestBuffer)
     {
@@ -3756,10 +3902,11 @@ NTSTATUS BlorgHttpGetChanges(
 // already excluded by the 0 == Length check above, but kept explicit
 // rather than relying on that exclusion alone. Zero-copy requests never
 // put body bytes in Buffer, so headers-only sizing suffices; buffer mode
-// sizes for the headers and the whole body, and at least a read-ahead
-// chunk, so the body lands without a regrow. On
-// a HttpBuildRequest failure, see BlorgHttpGetDirectoryInfo for the
-// HttpFreeContext/FinalStatus cleanup rationale.
+// adds the body, whose length the 206 must match exactly, so it lands
+// without a regrow. It used to be floored at 256 KB as well, which held
+// 256 KB of NonPagedPoolNx per in-flight 4 KB fault. On a HttpBuildRequest
+// failure, see BlorgHttpGetDirectoryInfo for the HttpFreeContext/FinalStatus
+// cleanup rationale.
 //
 static NTSTATUS HttpGetFileCommon(
     const UNICODE_STRING* Path,
@@ -3787,11 +3934,6 @@ static NTSTATUS HttpGetFileCommon(
     if (!TargetMdl && !HttpCheckedAddSizeT(Length, HTTP_MDL_INITIAL_RECV_CAPACITY, &capacity))
     {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!TargetMdl && (capacity < HTTP_FILE_INITIAL_RECV_CAPACITY))
-    {
-        capacity = HTTP_FILE_INITIAL_RECV_CAPACITY;
     }
 
     HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpFileRead, 206, capacity);
@@ -3930,7 +4072,8 @@ VOID BlorgFreeHttpFile(PFILE_BUFFER FileBuffer)
     }
 }
 
-// Frees a batch BlorgHttpGetChanges delivered; one allocation, see HttpDeserializeChangeBatch.
+// Frees a batch BlorgHttpGetChanges delivered; one allocation, see
+// HttpDeserializeChangeBatch.
 VOID BlorgFreeChangeBatch(PCHANGE_BATCH Batch)
 {
     if (Batch)
@@ -3948,7 +4091,8 @@ NTSTATUS BlorgGetHttpAddrInfo(const UNICODE_STRING* NodeName, const UNICODE_STRI
     return BlorgGetWskAddrInfo(NodeName, ServiceName, Hints, RemoteAddrInfo);
 }
 
-// Thin wrapper over BlorgFreeWskAddrInfo; frees results from BlorgGetHttpAddrInfo.
+// Thin wrapper over BlorgFreeWskAddrInfo; frees results from
+// BlorgGetHttpAddrInfo.
 VOID BlorgFreeHttpAddrInfo(PADDRINFOEXW AddrInfo)
 {
     BlorgFreeWskAddrInfo(AddrInfo);

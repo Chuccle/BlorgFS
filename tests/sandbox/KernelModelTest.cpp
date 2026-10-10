@@ -317,6 +317,57 @@ TEST_F(KernelModelTest, RecycledLockIdWithManyPartnersStartsWithNoOrderEdges)
 }
 
 //
+// Re-initialising a lock keeps its id even with recycling off, and drops
+// the edges the id had. A fixture that re-initialises the path cache's 512
+// bucket locks per test otherwise mints 512 ids a test once an exploration
+// has switched recycling off, and runs the model out of ids in three.
+//
+TEST_F(KernelModelTest, ReinitialisingALockKeepsItsIdWithRecyclingOff)
+{
+    KmSetLockIdRecycling(0);
+
+    KM_LOCK spin = {};
+    EX_PUSH_LOCK a = {};
+    EX_PUSH_LOCK b = {};
+    ERESOURCE resource = {};
+
+    KmInitializeLock(&spin, "renew-spin");
+    ExInitializePushLock(&a);
+    ExInitializePushLock(&b);
+    ASSERT_EQ(STATUS_SUCCESS, ExInitializeResourceLite(&resource));
+
+    ExAcquirePushLockExclusive(&a);
+    ExAcquirePushLockExclusive(&b);
+    ExReleasePushLockExclusive(&b);
+    ExReleasePushLockExclusive(&a);
+
+    const int spinId = spin.Id;
+    const int bId = b.Id;
+    const int resourceId = resource.Id;
+
+    KmInitializeLock(&spin, "renew-spin2");
+    ExInitializePushLock(&b);
+    ASSERT_EQ(STATUS_SUCCESS, ExInitializeResourceLite(&resource));
+
+    EXPECT_EQ(spinId, spin.Id);
+    EXPECT_EQ(bId, b.Id);
+    EXPECT_EQ(resourceId, resource.Id);
+
+    ExAcquirePushLockExclusive(&b);
+
+    KmExpectViolation(KmViolationLockOrder);
+    ExAcquirePushLockExclusive(&a);
+
+    EXPECT_EQ(KmViolationNone, KmTakeViolation())
+        << "the re-initialised lock kept the edge its id had before";
+
+    ExReleasePushLockExclusive(&a);
+    ExReleasePushLockExclusive(&b);
+
+    ExDeleteResourceLite(&resource);
+}
+
+//
 // Holding a spin lock raises to DISPATCH and releasing restores. The
 // driver's IRQL reasoning depends on this, and so does the paged-pool
 // check above -- if the raise did not happen, an allocation under a lock
