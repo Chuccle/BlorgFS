@@ -114,32 +114,16 @@ inline VOID BlorgClearIrpContextFlag(PIRP Irp, ULONG_PTR Flag)
     Irp->Tail.Overlay.DriverContext[0] = C_CAST(PVOID, flags);
 }
 
+//
+// Completes Irp with Status, if there is one. On an error status for an
+// input operation Information is zeroed first, since IopCompleteRequest
+// would otherwise copy that many bytes to the caller's buffer.
+//
 inline VOID BlorgCompleteRequest(
     _In_opt_ PIRP Irp,
     NTSTATUS Status,
     CCHAR PriorityBoost
 )
-
-/*++
-
-Routine Description:
-
-    This routine completes a Irp. On an error status for an input
-    operation, Information is zeroed first, since IopCompleteRequest
-    would otherwise try to copy that many bytes to the user's buffer.
-
-Arguments:
-
-    Irp - Supplies the Irp being processed
-
-    Status - Supplies the status to complete the Irp with
-
-Return Value:
-
-    None.
-
---*/
-
 {
     if (Irp)
     {
@@ -155,30 +139,12 @@ Return Value:
     }
 }
 
-inline BOOLEAN BlorgIsIrpTopLevel(
-    PIRP Irp
-)
-
-/*++
-
-Routine Description:
-
-    This routine detects if an Irp is the Top level requestor, ie. if it os OK
-    to do a verify or pop-up now.  If TRUE is returned, then no file system
-    resources are held above us.
-
-Arguments:
-
-    Irp - Supplies the Irp being processed
-
-    Status - Supplies the status to complete the Irp with
-
-Return Value:
-
-    None.
-
---*/
-
+//
+// Makes Irp the top-level IRP if there is none and returns TRUE, which
+// means no file system resources are held above this request and a
+// verify or pop-up is safe; returns FALSE otherwise.
+//
+inline BOOLEAN BlorgIsIrpTopLevel(PIRP Irp)
 {
     if (!IoGetTopLevelIrp())
     {
