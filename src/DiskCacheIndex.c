@@ -217,17 +217,27 @@ ULONG BlorgDiskCacheIndexPinHeld(PDISK_CACHE_INDEX Index, const DISK_CACHE_KEY* 
     return pinned;
 }
 
-VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, ULONG Slot, BOOLEAN Served)
+VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, const ULONG* Slots, ULONG Count, BOOLEAN Served)
 {
     KIRQL oldIrql;
     KeAcquireSpinLock(&Index->Lock, &oldIrql);
 
-    NT_ASSERT(0 < Index->Slots[Slot].Pins);
-    Index->Slots[Slot].Pins--;
-
-    if (Served)
+    for (ULONG i = 0; i < Count; ++i)
     {
-        Index->Slots[Slot].Referenced = TRUE;
+        if (DISK_CACHE_NO_SLOT == Slots[i])
+        {
+            continue;
+        }
+
+        PDISK_CACHE_SLOT entry = &Index->Slots[Slots[i]];
+
+        NT_ASSERT(0 < entry->Pins);
+        entry->Pins--;
+
+        if (Served)
+        {
+            entry->Referenced = TRUE;
+        }
     }
 
     KeReleaseSpinLock(&Index->Lock, oldIrql);
@@ -272,12 +282,14 @@ ULONG BlorgDiskCacheIndexPlanRead(PDISK_CACHE_INDEX Index, PULONG Slots, ULONG C
             return Held;
         }
 
+        BlorgDiskCacheIndexUnpin(Index, &Slots[gapStart], gapLength, FALSE);
+
         for (ULONG i = gapStart; i < gapStart + gapLength; ++i)
         {
-            BlorgDiskCacheIndexUnpin(Index, Slots[i], FALSE);
             Slots[i] = DISK_CACHE_NO_SLOT;
-            Held--;
         }
+
+        Held -= gapLength;
     }
 }
 

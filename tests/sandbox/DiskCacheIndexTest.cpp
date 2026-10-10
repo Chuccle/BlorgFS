@@ -67,13 +67,7 @@ protected:
         const ULONG count = C_CAST(ULONG, last - Key.Block + 1);
         const BOOLEAN all = (count == BlorgDiskCacheIndexPinHeld(&index, &Key, last, slots));
 
-        for (ULONG i = 0; i < count; ++i)
-        {
-            if (DISK_CACHE_NO_SLOT != slots[i])
-            {
-                BlorgDiskCacheIndexUnpin(&index, slots[i], all);
-            }
-        }
+        BlorgDiskCacheIndexUnpin(&index, slots, count, all);
 
         return all;
     }
@@ -126,10 +120,7 @@ TEST_F(DiskCacheIndexTest, EveryBlockMissedOnceIsAdmittedOnItsNextMiss)
     const DISK_CACHE_KEY first = Key(1, 0);
     EXPECT_EQ(64u, BlorgDiskCacheIndexPinHeld(&wide, &first, 63, slots));
 
-    for (ULONG i = 0; i < 64; ++i)
-    {
-        BlorgDiskCacheIndexUnpin(&wide, slots[i], TRUE);
-    }
+    BlorgDiskCacheIndexUnpin(&wide, slots, 64, TRUE);
 
     BlorgDiskCacheIndexCleanup(&wide);
 }
@@ -193,7 +184,7 @@ TEST_F(DiskCacheIndexTest, OnlyTheHeldBlocksOfARangeArePinned)
 
     for (ULONG i : { 0u, 1u, 3u })
     {
-        BlorgDiskCacheIndexUnpin(&index, slots[i], FALSE);
+        BlorgDiskCacheIndexUnpin(&index, &slots[i], 1, FALSE);
     }
 
     //
@@ -221,7 +212,7 @@ TEST_F(DiskCacheIndexTest, ABlockPinnedButNotServedIsNotMarked)
     const DISK_CACHE_KEY key = Key(1, 0);
 
     ASSERT_EQ(1u, BlorgDiskCacheIndexPinHeld(&index, &key, 0, &slot));
-    BlorgDiskCacheIndexUnpin(&index, slot, FALSE);
+    BlorgDiskCacheIndexUnpin(&index, &slot, 1, FALSE);
 
     Fill(Key(2, 0));
 
@@ -269,7 +260,7 @@ TEST_F(DiskCacheIndexTest, AReadWithTooManyHolesJoinsTheClosest)
     //
     for (ULONG i : { 0u, 6u, 8u, 10u })
     {
-        BlorgDiskCacheIndexUnpin(&wide, slots[i], FALSE);
+        BlorgDiskCacheIndexUnpin(&wide, &slots[i], 1, FALSE);
     }
 
     for (ULONG i = 0; i < 16; ++i)
@@ -312,7 +303,55 @@ TEST_F(DiskCacheIndexTest, AReadAllowedOneFetchJoinsEveryHole)
         EXPECT_EQ(0 == i, DISK_CACHE_NO_SLOT != slots[i]) << "block " << i;
     }
 
-    BlorgDiskCacheIndexUnpin(&wide, slots[0], FALSE);
+    BlorgDiskCacheIndexUnpin(&wide, &slots[0], 1, FALSE);
+
+    for (ULONG i = 0; i < 16; ++i)
+    {
+        EXPECT_EQ(0, wide.Slots[i].Pins) << "slot " << i;
+    }
+
+    BlorgDiskCacheIndexCleanup(&wide);
+}
+
+//
+// A held gap given up is counted out whole: with two blocks held between
+// each of four holes, joining two holes gives up both blocks between them,
+// and the count left is the six still pinned.
+//
+TEST_F(DiskCacheIndexTest, AGivenUpGapIsCountedOutWhole)
+{
+    DISK_CACHE_INDEX wide;
+    ASSERT_EQ(STATUS_SUCCESS, BlorgDiskCacheIndexInitialize(&wide, 16));
+
+    ULONG slot = DISK_CACHE_NO_SLOT;
+
+    for (ULONG64 block = 0; block < 12; ++block)
+    {
+        if (2 == block % 3)
+        {
+            continue;
+        }
+
+        const DISK_CACHE_KEY key = Key(1, block);
+        ASSERT_EQ(DiskCacheFirstMiss, BlorgDiskCacheIndexReserve(&wide, &key, &slot));
+        ASSERT_EQ(DiskCacheReserved, BlorgDiskCacheIndexReserve(&wide, &key, &slot));
+        BlorgDiskCacheIndexCommit(&wide, slot, TRUE);
+    }
+
+    ULONG slots[12];
+    const DISK_CACHE_KEY first = Key(1, 0);
+    const ULONG held = BlorgDiskCacheIndexPinHeld(&wide, &first, 11, slots);
+    ASSERT_EQ(8u, held);
+
+    EXPECT_EQ(6u, BlorgDiskCacheIndexPlanRead(&wide, slots, 12, held, 3));
+
+    for (ULONG i = 0; i < 12; ++i)
+    {
+        const BOOLEAN served = (2 != i % 3) && (3 != i) && (4 != i);
+        EXPECT_EQ(served, DISK_CACHE_NO_SLOT != slots[i]) << "block " << i;
+    }
+
+    BlorgDiskCacheIndexUnpin(&wide, slots, 12, FALSE);
 
     for (ULONG i = 0; i < 16; ++i)
     {
@@ -383,7 +422,7 @@ TEST_F(DiskCacheIndexTest, APinnedBlockIsNeverTheVictim)
 
     EXPECT_TRUE(Held(pinned));
 
-    BlorgDiskCacheIndexUnpin(&index, slots[0], TRUE);
+    BlorgDiskCacheIndexUnpin(&index, &slots[0], 1, TRUE);
 }
 
 TEST_F(DiskCacheIndexTest, ABlockServedSinceTheHandPassedOutlivesOneThatWasNot)
@@ -419,13 +458,47 @@ TEST_F(DiskCacheIndexTest, WithEverySlotPinnedNothingIsAdmitted)
     EXPECT_EQ(DiskCacheFirstMiss, BlorgDiskCacheIndexReserve(&index, &other, &slot));
     EXPECT_EQ(DiskCacheNoVictim, BlorgDiskCacheIndexReserve(&index, &other, &slot));
 
-    for (ULONG i = 0; i < 4; ++i)
-    {
-        BlorgDiskCacheIndexUnpin(&index, slots[i], TRUE);
-    }
+    BlorgDiskCacheIndexUnpin(&index, slots, 4, TRUE);
 
     EXPECT_EQ(DiskCacheReserved, BlorgDiskCacheIndexReserve(&index, &other, &slot));
     BlorgDiskCacheIndexCommit(&index, slot, TRUE);
+}
+
+//
+// A read unpins every block it pinned in one call, under one acquisition of
+// the index lock, where one call per block took the lock seventeen times
+// for a 1 MB hit. The holes a read fetched instead are skipped, every pin
+// is dropped, and a read that was served marks each block for the clock.
+//
+TEST_F(DiskCacheIndexTest, ARangeIsUnpinnedWholeSkippingItsHoles)
+{
+    const ULONG s0 = Fill(Key(1, 0));
+    const ULONG s1 = Fill(Key(1, 1));
+    const ULONG s3 = Fill(Key(1, 3));
+
+    const BOOLEAN served[] = { FALSE, TRUE };
+
+    for (BOOLEAN serve : served)
+    {
+        ULONG slots[4];
+        const DISK_CACHE_KEY first = Key(1, 0);
+
+        ASSERT_EQ(3u, BlorgDiskCacheIndexPinHeld(&index, &first, 3, slots));
+        ASSERT_EQ(DISK_CACHE_NO_SLOT, slots[2]);
+
+        for (ULONG slot : { s0, s1, s3 })
+        {
+            index.Slots[slot].Referenced = FALSE;
+        }
+
+        BlorgDiskCacheIndexUnpin(&index, slots, 4, serve);
+
+        for (ULONG slot : { s0, s1, s3 })
+        {
+            EXPECT_EQ(0, index.Slots[slot].Pins) << "slot " << slot;
+            EXPECT_EQ(serve, index.Slots[slot].Referenced) << "slot " << slot;
+        }
+    }
 }
 
 }
