@@ -201,6 +201,15 @@
 #define BLORGFS_REG_DISK_CACHE_PATH_MAX_CHARS 260 // NT path of the disk cache file + NUL
 #define BLORGFS_REMOTE_HOST_ANSI_MAX_BYTES (BLORGFS_REG_HOST_MAX_CHARS + 8) // host plus ":65535" + NUL -- bounds global.RemoteHostAnsi (Client.c)
 
+//
+// Sector and cluster size the volume reports: the sector of the synthetic
+// disk geometry (IOCTL_DISK_GET_DRIVE_GEOMETRY in DevIoCtrl.c) and a page
+// per cluster in the size queries (VolumeInfo.c). The backend has no
+// allocation unit, but GetDiskFreeSpace callers divide by the product.
+//
+#define BLORGFS_DISK_BYTES_PER_SECTOR 512ULL
+#define BLORGFS_SECTORS_PER_ALLOCATION_UNIT (PAGE_SIZE / BLORGFS_DISK_BYTES_PER_SECTOR)
+
 #ifdef DBG
 
 //
