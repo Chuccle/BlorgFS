@@ -19,6 +19,12 @@ static ULONG NodeTableBucketIndexFor(const UNICODE_STRING* Path);
 static VOID NodeDeferReapIfIdleLocked(PCOMMON_CONTEXT Node);
 
 //
+// Defined with the child index below; BlorgFreeFileContext takes a node
+// out of it before freeing the path it is hashed by.
+//
+static VOID NodeChildUnlink(PCOMMON_CONTEXT Node);
+
+//
 //  Allocates and initializes an FCB (file node) from the volume's
 //  lookaside lists: non-paged header resources, paged node, copied name,
 //  and advanced header/oplock setup. Zeroes exactly
@@ -278,6 +284,7 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             FsRtlUninitializeFileLock(&fcb->FileLock);
             FsRtlUninitializeOplock(&fcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);
+            NodeChildUnlink(C_CAST(PCOMMON_CONTEXT, fcb));
             ExFreePool(fcb->FullPath.Buffer);
             RemoveEntryList(&(fcb->Links));
             ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->FcbLookasideList, fcb);
@@ -288,6 +295,7 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
             PDCB dcb = Context;
             FsRtlUninitializeOplock(&dcb->Header.Oplock);
             DEALLOCATE_COMMON_CONTEXT(Context);
+            NodeChildUnlink(C_CAST(PCOMMON_CONTEXT, dcb));
             ExFreePool(dcb->FullPath.Buffer);
             RemoveEntryList(&(dcb->Links));
             ExFreeToPagedLookasideList(&BlorgGetVolumeDeviceExtension(VolumeDeviceObject)->DcbLookasideList, dcb);
@@ -1005,20 +1013,58 @@ inline static BOOLEAN NodeArePathComponentsEqual(const UNICODE_STRING* Component
 }
 
 //
-// Linear scan of ParentDcb's immediate children for one whose last path
-// component matches Name.
+// The child index: every FCB and DCB below the root, chained through
+// ChildNext in the bucket its parent and last path component hash to.
+// Walking ParentDcb's ChildrenList instead scanned every resident child,
+// recomputing each one's last component, for every component of every
+// cold open, under the VCB resource exclusive: n opens of new files in one
+// directory cost O(n^2), serialised volume-wide. Linked by
+// BlorgInsertByPath and unlinked by BlorgFreeFileContext; the VCB resource
+// held exclusive guards every chain, as it guards the tree.
 //
-inline static PCOMMON_CONTEXT NodeSearchByName(const DCB* ParentDcb, const UNICODE_STRING* Name)
-{
-    PCOMMON_CONTEXT child = NULL;
-    UNICODE_STRING lastComponent;
+static PCOMMON_CONTEXT NodeChildren[NODE_CHILD_BUCKETS];
 
-    for (PLIST_ENTRY entry = ParentDcb->ChildrenList.Flink;
-        entry != &ParentDcb->ChildrenList;
-        entry = entry->Flink)
+static VOID NodeChildLink(PCOMMON_CONTEXT Node)
+{
+    UNICODE_STRING name = NodeGetLastComponent(&Node->FullPath);
+    PCOMMON_CONTEXT* bucket = &NodeChildren[BlorgNodeChildBucket(Node->ParentDcb, &name)];
+
+    Node->ChildNext = *bucket;
+    *bucket = Node;
+}
+
+//
+// A node that was never linked, such as one a test built by hand, is not
+// in its chain and is left alone.
+//
+static VOID NodeChildUnlink(PCOMMON_CONTEXT Node)
+{
+    UNICODE_STRING name = NodeGetLastComponent(&Node->FullPath);
+
+    for (PCOMMON_CONTEXT* link = &NodeChildren[BlorgNodeChildBucket(Node->ParentDcb, &name)]; *link; link = &(*link)->ChildNext)
     {
-        child = CONTAINING_RECORD(entry, COMMON_CONTEXT, Links);
-        lastComponent = NodeGetLastComponent(&child->FullPath);
+        if (Node == *link)
+        {
+            *link = Node->ChildNext;
+            Node->ChildNext = NULL;
+            return;
+        }
+    }
+}
+
+//
+// The child of ParentDcb whose last path component matches Name.
+//
+static PCOMMON_CONTEXT NodeSearchByName(const DCB* ParentDcb, const UNICODE_STRING* Name)
+{
+    for (PCOMMON_CONTEXT child = NodeChildren[BlorgNodeChildBucket(ParentDcb, Name)]; child; child = child->ChildNext)
+    {
+        if (C_CAST(const DCB*, child->ParentDcb) != ParentDcb)
+        {
+            continue;
+        }
+
+        UNICODE_STRING lastComponent = NodeGetLastComponent(&child->FullPath);
 
         if (NodeArePathComponentsEqual(Name, &lastComponent))
         {
@@ -1039,31 +1085,13 @@ PCOMMON_CONTEXT BlorgSearchByPath(const DCB* ParentDcb, const UNICODE_STRING* Pa
 {
     const DCB* currentDcb = ParentDcb;
     UNICODE_STRING remainingPath = *Path;
-    UNICODE_STRING component, nextRemainingPart, lastComponent;
-    PCOMMON_CONTEXT child = NULL;
-    PCOMMON_CONTEXT matchingChild = NULL;
+    UNICODE_STRING component, nextRemainingPart;
 
     while (0 < remainingPath.Length)
     {
         FsRtlDissectName(remainingPath, &component, &nextRemainingPart);
 
-        matchingChild = NULL;
-
-        for (PLIST_ENTRY entry = currentDcb->ChildrenList.Flink;
-            entry != &currentDcb->ChildrenList;
-            entry = entry->Flink)
-        {
-            ASSERT(entry);
-
-            child = CONTAINING_RECORD(entry, COMMON_CONTEXT, Links);
-            lastComponent = NodeGetLastComponent(&child->FullPath);
-
-            if (NodeArePathComponentsEqual(&component, &lastComponent))
-            {
-                matchingChild = child;
-                break;
-            }
-        }
+        PCOMMON_CONTEXT matchingChild = NodeSearchByName(currentDcb, &component);
 
         if (!matchingChild)
         {
@@ -1169,6 +1197,7 @@ NTSTATUS BlorgInsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIR
 
             newFcb->ParentDcb = currentDcb;
             InsertTailList(&currentDcb->ChildrenList, &newFcb->Links);
+            NodeChildLink(C_CAST(PCOMMON_CONTEXT, newFcb));
 
             lastCreated = C_CAST(PCOMMON_CONTEXT, newFcb);
             break;
@@ -1199,6 +1228,7 @@ NTSTATUS BlorgInsertByPath(PDCB ParentDcb, const UNICODE_STRING* Path, const DIR
 
 #pragma warning(suppress: 28182)
         InsertTailList(&currentDcb->ChildrenList, &newDcb->Links);
+        NodeChildLink(C_CAST(PCOMMON_CONTEXT, newDcb));
 
         lastCreated = C_CAST(PCOMMON_CONTEXT, newDcb);
 

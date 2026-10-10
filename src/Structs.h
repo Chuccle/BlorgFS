@@ -413,6 +413,8 @@ typedef struct _COMMON_CONTEXT
 
     struct _DCB* ParentDcb; // Parent directory, or NULL for the root
 
+    struct _COMMON_CONTEXT* ChildNext; // Next node in its child index chain (Structs.c), under the VCB resource exclusive
+
     SHARE_ACCESS ShareAccess; // Share access state for open handles
 
     //
@@ -449,7 +451,8 @@ CHECK_PADDING_BETWEEN(COMMON_CONTEXT, TableLink, ReapLink);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ReapLink, FullPath);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, FullPath, VolumeDeviceObject);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, VolumeDeviceObject, ParentDcb);
-CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ParentDcb, ShareAccess);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ParentDcb, ChildNext);
+CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ChildNext, ShareAccess);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, ShareAccess, PinCount);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, PinCount, CreationTime);
 CHECK_PADDING_BETWEEN(COMMON_CONTEXT, CreationTime, LastAccessedTime);
@@ -633,7 +636,8 @@ CHECK_PADDING_BETWEEN(FCB, TableLink, ReapLink);
 CHECK_PADDING_BETWEEN(FCB, ReapLink, FullPath);
 CHECK_PADDING_BETWEEN(FCB, FullPath, VolumeDeviceObject);
 CHECK_PADDING_BETWEEN(FCB, VolumeDeviceObject, ParentDcb);
-CHECK_PADDING_BETWEEN(FCB, ParentDcb, ShareAccess);
+CHECK_PADDING_BETWEEN(FCB, ParentDcb, ChildNext);
+CHECK_PADDING_BETWEEN(FCB, ChildNext, ShareAccess);
 CHECK_PADDING_BETWEEN(FCB, ShareAccess, PinCount);
 CHECK_PADDING_BETWEEN(FCB, PinCount, CreationTime);
 CHECK_PADDING_BETWEEN(FCB, CreationTime, LastAccessedTime);
@@ -675,7 +679,8 @@ CHECK_PADDING_BETWEEN(DCB, TableLink, ReapLink);
 CHECK_PADDING_BETWEEN(DCB, ReapLink, FullPath);
 CHECK_PADDING_BETWEEN(DCB, FullPath, VolumeDeviceObject);
 CHECK_PADDING_BETWEEN(DCB, VolumeDeviceObject, ParentDcb);
-CHECK_PADDING_BETWEEN(DCB, ParentDcb, ShareAccess);
+CHECK_PADDING_BETWEEN(DCB, ParentDcb, ChildNext);
+CHECK_PADDING_BETWEEN(DCB, ChildNext, ShareAccess);
 CHECK_PADDING_BETWEEN(DCB, ShareAccess, PinCount);
 CHECK_PADDING_BETWEEN(DCB, PinCount, CreationTime);
 CHECK_PADDING_BETWEEN(DCB, CreationTime, LastAccessedTime);
@@ -749,6 +754,24 @@ VOID BlorgFreeFileContext(PVOID Context, const DEVICE_OBJECT* VolumeDeviceObject
 VOID BlorgReapEmptyAncestorDcbs(PDCB Dcb, const DEVICE_OBJECT* VolumeDeviceObject);
 
 ULONG BlorgHashPath(const UNICODE_STRING* Path);
+
+//
+// The child index (Structs.c), which BlorgSearchByPath and BlorgInsertByPath
+// resolve each path component through: Name under Parent is chained in
+// bucket BlorgNodeChildBucket. BlorgHashPath folds case as the component
+// compare does, so a component equal to a child's last one lands in that
+// child's bucket.
+//
+#define NODE_CHILD_BUCKET_BITS 12u
+#define NODE_CHILD_BUCKETS     (1u << NODE_CHILD_BUCKET_BITS)
+
+inline ULONG BlorgNodeChildBucket(const DCB* Parent, const UNICODE_STRING* Name)
+{
+    const ULONG parent = C_CAST(ULONG, C_CAST(ULONG_PTR, Parent) >> 4);
+
+    return ((BlorgHashPath(Name) ^ parent) * 0x9E3779B1u) >> (32u - NODE_CHILD_BUCKET_BITS);
+}
+
 PCOMMON_CONTEXT BlorgSearchByPath(const DCB* RootDcb, const UNICODE_STRING* Path);
 NTSTATUS BlorgInsertByPath(PDCB RootDcb, const UNICODE_STRING* Path, const DIRECTORY_ENTRY_METADATA* DirEntryInfo, const DEVICE_OBJECT* VolumeDeviceObject, PCOMMON_CONTEXT* Out);
 
