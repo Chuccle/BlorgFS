@@ -511,7 +511,7 @@ static VOID TlsHandshakeIssueReceiveRecordHeader(PTLS_HANDSHAKE_CONTEXT Ctx)
         socket->TlsRecvOffset = 0;
     }
     else if (socket->TlsRecvOffset &&
-        (SocketTlsRecvCapacity - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
+        (BlorgSocketTlsRecvCapacity - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
     {
         RtlMoveMemory(
             socket->TlsRecvBuffer,
@@ -528,7 +528,7 @@ static VOID TlsHandshakeIssueReceiveRecordHeader(PTLS_HANDSHAKE_CONTEXT Ctx)
         socket,
         socket->TlsRecvMdl,
         socket->TlsRecvLength,
-        SocketTlsRecvCapacity - socket->TlsRecvLength,
+        BlorgSocketTlsRecvCapacity - socket->TlsRecvLength,
         0,
         TlsHandshakeOnBulkReceive,
         Ctx);

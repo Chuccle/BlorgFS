@@ -138,7 +138,7 @@ typedef struct _KSOCKET
 // (Client.c) -- so the sizing decision lives here, with the field it
 // sizes, rather than in one of the two consumers.
 //
-extern ULONG SocketTlsRecvCapacity;
+extern ULONG BlorgSocketTlsRecvCapacity;
 
 //
 // Lazily allocates a connection's TLS ciphertext accumulator (buffer,

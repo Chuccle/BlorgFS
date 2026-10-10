@@ -11,7 +11,7 @@
 
 #include "SandboxSocket.h"
 
-ULONG SocketTlsRecvCapacity = 16 * (5 + TLS_RECORD_CIPHERTEXT_MAX);
+ULONG BlorgSocketTlsRecvCapacity = 16 * (5 + TLS_RECORD_CIPHERTEXT_MAX);
 
 static const SANDBOX_STEP* ScriptSteps = NULL;
 static SIZE_T ScriptStepCount = 0;
@@ -296,7 +296,7 @@ NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket)
 
     if (!Socket->TlsRecvBuffer)
     {
-        Socket->TlsRecvBuffer = (PUCHAR)ExAllocatePoolUninitialized(NonPagedPoolNx, SocketTlsRecvCapacity, 'TSKS');
+        Socket->TlsRecvBuffer = (PUCHAR)ExAllocatePoolUninitialized(NonPagedPoolNx, BlorgSocketTlsRecvCapacity, 'TSKS');
 
         if (!Socket->TlsRecvBuffer)
         {
@@ -314,7 +314,7 @@ NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket)
         }
     }
 
-    Socket->TlsRecvMdl = ShimCreateMdl(Socket->TlsRecvBuffer, SocketTlsRecvCapacity);
+    Socket->TlsRecvMdl = ShimCreateMdl(Socket->TlsRecvBuffer, BlorgSocketTlsRecvCapacity);
 
     if (!Socket->TlsRecvMdl)
     {

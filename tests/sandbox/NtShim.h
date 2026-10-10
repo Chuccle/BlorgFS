@@ -198,7 +198,7 @@ PVOID ExAllocatePoolUninitialized(POOL_TYPE PoolType, SIZE_T NumberOfBytes, ULON
 VOID  ExFreePool(PVOID P);
 
 //
-// ReallocateBufferUninitialized is a real inline in Util.h and comes
+// BlorgReallocateBufferUninitialized is a real inline in Util.h and comes
 // from there; the sandbox does not reimplement it. Its exact contract
 // (returns the ORIGINAL pointer on failure, always a different one on
 // success) is what Client.c detects failure by, so a second

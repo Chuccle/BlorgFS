@@ -74,14 +74,14 @@ typedef struct _FSP_QUEUE_STATE
 static FSP_QUEUE_STATE FspQueue;
 
 // IO_CSQ insert callback: appends Irp to the tail of the pending-IRP queue.
-VOID BlorgFspCsqInsertIrp(IO_CSQ* Csq, PIRP Irp)
+static VOID FspCsqInsertIrp(IO_CSQ* Csq, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Csq);
     InsertTailList(&FspQueue.IrpQueue, &Irp->Tail.Overlay.ListEntry);
 }
 
 // IO_CSQ remove callback: unlinks Irp from the pending-IRP queue.
-VOID BlorgFspCsqRemoveIrp(IO_CSQ* Csq, PIRP Irp)
+static VOID FspCsqRemoveIrp(IO_CSQ* Csq, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Csq);
     RemoveEntryList(&Irp->Tail.Overlay.ListEntry);
@@ -92,7 +92,7 @@ VOID BlorgFspCsqRemoveIrp(IO_CSQ* Csq, PIRP Irp)
 // is NULL; NULL if the queue is exhausted. Used by IoCsqRemoveNextIrp and by
 // cancel processing to walk the queue under the CSQ lock.
 //
-PIRP BlorgFspCsqPeekNextIrp(IO_CSQ* Csq, PIRP Irp, PVOID PeekContext)
+static PIRP FspCsqPeekNextIrp(IO_CSQ* Csq, PIRP Irp, PVOID PeekContext)
 {
     UNREFERENCED_PARAMETER(Csq);
     UNREFERENCED_PARAMETER(PeekContext);
@@ -119,14 +119,14 @@ PIRP BlorgFspCsqPeekNextIrp(IO_CSQ* Csq, PIRP Irp, PVOID PeekContext)
 }
 
 _IRQL_raises_(DISPATCH_LEVEL)
-VOID BlorgFspCsqAcquireLock(IO_CSQ* Csq, _At_(*Irql, _IRQL_saves_) PKIRQL Irql)
+static VOID FspCsqAcquireLock(IO_CSQ* Csq, _At_(*Irql, _IRQL_saves_) PKIRQL Irql)
 {
     UNREFERENCED_PARAMETER(Csq);
     KeAcquireSpinLock(&FspQueue.IrpQueueSpinLock, Irql);
 }
 
 _IRQL_requires_(DISPATCH_LEVEL)
-VOID BlorgFspCsqReleaseLock(IO_CSQ* Csq, _IRQL_restores_ KIRQL Irql)
+static VOID FspCsqReleaseLock(IO_CSQ* Csq, _IRQL_restores_ KIRQL Irql)
 {
     UNREFERENCED_PARAMETER(Csq);
     KeReleaseSpinLock(&FspQueue.IrpQueueSpinLock, Irql);
@@ -183,7 +183,7 @@ static VOID FspCompleteRequest(PIRP Irp, NTSTATUS Status, CCHAR PriorityBoost)
 // IO_CSQ cancel callback: completes an IRP that was cancelled while still
 // queued (the CSQ has already removed it by the time this runs).
 //
-VOID BlorgFspCsqCompleteCanceledIrp(IO_CSQ* Csq, PIRP Irp)
+static VOID FspCsqCompleteCanceledIrp(IO_CSQ* Csq, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(Csq);
 
@@ -649,12 +649,12 @@ NTSTATUS BlorgCreateWorkQueue(VOID)
     KeInitializeEvent(&FspQueue.TerminationEvent, NotificationEvent, FALSE);
 
     NTSTATUS result = IoCsqInitialize(&FspQueue.Csq,
-        BlorgFspCsqInsertIrp,
-        BlorgFspCsqRemoveIrp,
-        BlorgFspCsqPeekNextIrp,
-        BlorgFspCsqAcquireLock,
-        BlorgFspCsqReleaseLock,
-        BlorgFspCsqCompleteCanceledIrp);
+        FspCsqInsertIrp,
+        FspCsqRemoveIrp,
+        FspCsqPeekNextIrp,
+        FspCsqAcquireLock,
+        FspCsqReleaseLock,
+        FspCsqCompleteCanceledIrp);
 
     if (!NT_SUCCESS(result))
     {

@@ -1808,7 +1808,7 @@ protected:
     {
         HttpClientTest::SetUp();
 
-        SavedRecvCapacity = SocketTlsRecvCapacity;
+        SavedRecvCapacity = BlorgSocketTlsRecvCapacity;
 
         ASSERT_EQ(STATUS_SUCCESS, BlorgTlsGlobalInit());
 
@@ -1821,7 +1821,7 @@ protected:
     {
         HttpClientTest::TearDown();
 
-        SocketTlsRecvCapacity = SavedRecvCapacity;
+        BlorgSocketTlsRecvCapacity = SavedRecvCapacity;
         SandboxResetHandshakes();
         global.TlsEnabled = FALSE;
 
@@ -2200,7 +2200,7 @@ TEST_F(HttpClientTlsTest, PartialRecordIsMovedToTheFrontWhenTheTailCannotTakeAWh
 {
     const ULONG maxRecord = 5 + TLS_RECORD_CIPHERTEXT_MAX;
 
-    SocketTlsRecvCapacity = maxRecord + 2000;
+    BlorgSocketTlsRecvCapacity = maxRecord + 2000;
 
     const std::string first(3000, 'a');
     const std::string second(16384, 'b');
