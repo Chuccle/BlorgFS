@@ -941,29 +941,43 @@ VOID BlorgPathCacheInvalidatePrefix(const UNICODE_STRING* Dir)
 }
 
 //
-//  Appends one listing entry's name to the directory path already in
-//  Scratch, inserts it with Meta, and trims Scratch back to the directory.
-//  Names the listing could not have produced -- empty, or longer than
-//  MAX_NAME_LEN allows -- and paths past the cache's own limit are
-//  skipped rather than truncated, since a truncated path would cache a
-//  result for a different file. So is a name holding a backslash, which a
-//  Linux host allows: it would cache an entry for a path a level deeper,
-//  through a directory that need not exist.
+//  Whether a listed name can stand as one path component: not empty, no
+//  longer than a listing admits (MAX_NAME_LEN - 1 characters), and free of
+//  backslashes. A Linux host allows a backslash in a name, and such a name
+//  would stand for a path a level deeper, through a directory that need
+//  not exist.
 //
-static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const WCHAR* Name, SIZE_T NameLength, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket)
+static BOOLEAN PathCacheIsComponent(const WCHAR* Name, SIZE_T NameLength)
 {
-    if (0 == NameLength || NameLength > MAX_NAME_LEN ||
-        DirLength + (NameLength * sizeof(WCHAR)) > Scratch->MaximumLength)
+    if (0 == NameLength || NameLength >= MAX_NAME_LEN)
     {
-        return;
+        return FALSE;
     }
 
-    for (SIZE_T i = 0; i < NameLength; i++)
+    for (SIZE_T i = 0; i < NameLength; ++i)
     {
         if (L'\\' == Name[i])
         {
-            return;
+            return FALSE;
         }
+    }
+
+    return TRUE;
+}
+
+//
+//  Appends one listing entry's name to the directory path already in
+//  Scratch, inserts it with Meta, and trims Scratch back to the directory.
+//  A name that cannot stand as a component (PathCacheIsComponent) and a
+//  path past the cache's own limit are skipped rather than truncated, since
+//  a truncated path would cache a result for a different file.
+//
+static VOID PathCacheSeedEntry(PUNICODE_STRING Scratch, USHORT DirLength, const WCHAR* Name, SIZE_T NameLength, const DIRECTORY_ENTRY_METADATA* Meta, _In_opt_ const PATH_CACHE_TICKET* Ticket)
+{
+    if (!PathCacheIsComponent(Name, NameLength) ||
+        DirLength + (NameLength * sizeof(WCHAR)) > Scratch->MaximumLength)
+    {
+        return;
     }
 
     RtlCopyMemory(C_CAST(PUCHAR, Scratch->Buffer) + DirLength, Name, NameLength * sizeof(WCHAR));
@@ -1364,28 +1378,6 @@ BOOLEAN BlorgPathCachePublishListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO 
     }
 
     return current;
-}
-
-//
-//  Whether a listed name can stand as one path component: not empty, no
-//  longer than a listing admits (MAX_NAME_LEN), and free of separators.
-//
-static BOOLEAN PathCacheIsComponent(const WCHAR* Name, SIZE_T NameLength)
-{
-    if (0 == NameLength || NameLength >= MAX_NAME_LEN)
-    {
-        return FALSE;
-    }
-
-    for (SIZE_T i = 0; i < NameLength; ++i)
-    {
-        if (L'\\' == Name[i])
-        {
-            return FALSE;
-        }
-    }
-
-    return TRUE;
 }
 
 //
