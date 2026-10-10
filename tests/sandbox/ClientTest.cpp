@@ -1609,6 +1609,53 @@ TEST_F(HttpClientTest, AZeroCopyReadGrowsItsHeaderBufferOnlyOnceHeadersFillIt)
         << "a read whose headers fit the buffer must not regrow it";
 }
 
+SIZE_T BufferedReadBlock;
+std::string BufferedReadBody;
+
+void OnBufferedFileRead(NTSTATUS Status, PFILE_BUFFER FileBuffer, PVOID CallerContext)
+{
+    OnFileRead(Status, FileBuffer, CallerContext);
+
+    if (NT_SUCCESS(Status) && FileBuffer->BaseAddress)
+    {
+        BufferedReadBlock = ShimPoolBlockSize(FileBuffer->BaseAddress);
+        BufferedReadBody.assign(FileBuffer->BodyBuffer, FileBuffer->BodyBufferSize);
+
+        BlorgFreeHttpFile(FileBuffer);
+    }
+}
+
+//
+// A buffered fetch lands in the client's own buffer, sized for its headers
+// and the body the 206 must match exactly. It was floored at 256 KB too, so
+// every small fetch the disk cache or a fair-share refetch issued held
+// 256 KB of nonpaged pool while it was in flight: 8 MB at the 32-fetch
+// limit for what needed a few hundred KB.
+//
+TEST_F(HttpClientTest, ABufferedFetchHoldsOnlyItsHeadersAndBody)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\n\r\nABCDEFGH")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    wchar_t path[] = L"/media/file.bin";
+    UNICODE_STRING pathString = MakePath(path);
+
+    BufferedReadBlock = 0;
+    BufferedReadBody.clear();
+
+    ASSERT_EQ(STATUS_PENDING, BlorgHttpGetFile(&pathString, 0, 8, OnBufferedFileRead, nullptr));
+
+    Drain();
+
+    EXPECT_EQ(STATUS_SUCCESS, LastRead.Status);
+    EXPECT_EQ("ABCDEFGH", BufferedReadBody);
+    EXPECT_GE(8u + 4096u, BufferedReadBlock) << "a buffered fetch is floored past its own headers and body";
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // The TLS record layer
 ///////////////////////////////////////////////////////////////////////////
