@@ -26,6 +26,7 @@
 #include <ntstrsafe.h>
 #include <wdmsec.h>
 #include <wsk.h>
+#include <usermode_accessors.h>
 #endif
 
 #include <limits.h>

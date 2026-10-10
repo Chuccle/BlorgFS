@@ -255,14 +255,24 @@ correct drift when you find it.
   Never inside a function body — naming carries the meaning there.
 - **Padding:** never widen a field's type to satisfy `CHECK_PADDING_END`; add an
   explicit named `Reserved[N]` instead.
-- **`ProbeForRead` for all user-buffer validation,** including output buffers.
-  `ProbeForWrite` is legacy and writes every page.
+- **User buffers are read and written only through the user-mode
+  accessors** (`usermode_accessors.h`, linked from `umaccess.lib`), never
+  through `ProbeForRead`/`ProbeForWrite` and a plain dereference. Build the
+  output in kernel memory and copy it out with `CopyToMode` (or
+  `WriteULongToMode` and friends) under the request's `RequestorMode`, or
+  `KernelMode` when the buffer is an MDL's system address, inside the
+  handler's `__try`. `DirCtrl.c`'s query path is the model: each entry is
+  filled in a pool scratch block and copied to the caller's buffer whole.
+  The sandbox shims the accessors in `NtShim.c` as plain copies that a test
+  can make fault (`ShimUserAccessFaultAt`).
 
-  Two places deliberately do not probe, both following fastfat: the cached
-  read path in `Read.c` hands `Irp->UserBuffer` to `CcCopyReadEx` under SEH,
-  and `Security.c` lets `SeQuerySecurityDescriptorInfo` write into
-  `Irp->UserBuffer` directly. In both the fault is caught rather than
-  prevented. Do not "fix" either without reading why fastfat does the same.
+  Two places deliberately hand `Irp->UserBuffer` to a kernel routine
+  instead, both following fastfat: the cached read path in `Read.c` passes
+  it to `CcCopyReadEx`, and `Security.c` lets
+  `SeQuerySecurityDescriptorInfo` write into it. Both run under SEH, so a
+  fault is caught rather than prevented, and neither has an accessor form:
+  the copy happens inside the routine. Do not "fix" either without reading
+  why fastfat does the same.
 - **Never `%wZ`/`%Z` in a `DbgPrint` that can run above `PASSIVE_LEVEL`** —
   the formatting touches paged code and bugchecks. In practice that means
   anywhere on a completion chain (`HttpFail`, `HttpComplete`,

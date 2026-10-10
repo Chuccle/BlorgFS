@@ -978,6 +978,7 @@ VOID ShimReset(VOID)
     InterlockedExchange(&MdlMappingFailPending, 0);
     InterlockedExchange(&ShimMdlAllocationFailPending, 0);
     InterlockedExchange(&WorkItemFailPending, 0);
+    ShimUserAccessFaultAt(-1);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -1237,6 +1238,51 @@ PMDL ShimCreateMdl(PVOID Base, SIZE_T Length)
 VOID ShimFreeMdl(PMDL Mdl)
 {
     free(Mdl);
+}
+
+///////////////////////////////////////////////////////////////////////////
+// User-mode accessors
+///////////////////////////////////////////////////////////////////////////
+
+static volatile LONG UserAccessFaultIndex = -1;
+static volatile LONG UserAccessCounter = 0;
+
+VOID ShimUserAccessFaultAt(LONG Index)
+{
+    InterlockedExchange(&UserAccessFaultIndex, Index);
+    InterlockedExchange(&UserAccessCounter, 0);
+}
+
+LONG ShimUserAccesses(VOID)
+{
+    return UserAccessCounter;
+}
+
+static VOID ShimUserAccess(KPROCESSOR_MODE Mode)
+{
+    if (KernelMode == Mode)
+    {
+        return;
+    }
+
+    LONG index = InterlockedIncrement(&UserAccessCounter) - 1;
+
+    if (index == UserAccessFaultIndex)
+    {
+        RaiseException((DWORD)STATUS_ACCESS_VIOLATION, 0, 0, NULL);
+    }
+}
+
+VOID CopyToMode(volatile VOID* Destination, const VOID* Source, SIZE_T Length, KPROCESSOR_MODE Mode)
+{
+    ShimUserAccess(Mode);
+    memcpy((VOID*)Destination, Source, Length);
+}
+
+VOID WriteULongToMode(volatile ULONG* Destination, ULONG Value, KPROCESSOR_MODE Mode)
+{
+    ShimUserAccess(Mode);
+    *Destination = Value;
 }
 
 static SIZE_T RemainingStack = 16 * 1024;

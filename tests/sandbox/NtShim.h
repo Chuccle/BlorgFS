@@ -597,6 +597,28 @@ PMDL ShimCreateMdl(PVOID Base, SIZE_T Length);
 VOID ShimFreeMdl(PMDL Mdl);
 
 ///////////////////////////////////////////////////////////////////////////
+// User-mode accessors (usermode_accessors.h)
+///////////////////////////////////////////////////////////////////////////
+
+//
+// The driver writes a caller's user-mode buffer only through these. Here
+// they are plain copies; what the sandbox adds is the fault. In the kernel
+// a user-mode access to a bad page raises STATUS_ACCESS_VIOLATION into the
+// caller's __except, so the shim can be told to raise exactly that, and a
+// KernelMode access never faults, as the kernel's would not for the
+// buffers the driver hands it.
+//
+VOID CopyToMode(volatile VOID* Destination, const VOID* Source, SIZE_T Length, KPROCESSOR_MODE Mode);
+VOID WriteULongToMode(volatile ULONG* Destination, ULONG Value, KPROCESSOR_MODE Mode);
+
+//
+// Raises STATUS_ACCESS_VIOLATION from the Nth user-mode access from now
+// (-1 disables), and counts the user-mode accesses made since.
+//
+VOID ShimUserAccessFaultAt(LONG Index);
+LONG ShimUserAccesses(VOID);
+
+///////////////////////////////////////////////////////////////////////////
 // Kernel stack budget
 ///////////////////////////////////////////////////////////////////////////
 
