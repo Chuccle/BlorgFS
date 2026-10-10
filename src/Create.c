@@ -612,62 +612,38 @@ static BOOLEAN CreateSplitPathLeaf(const UNICODE_STRING* Path, PUNICODE_STRING P
 
 //
 //  Looks up a single entry by name within a cached parent-directory
-//  listing, checking files then subdirectories, and fills Out with its
-//  metadata on a match.
+//  listing, through its name index (BlorgFindDirectoryEntry), and fills
+//  Out with its metadata on a match.
 //
 static BOOLEAN CreateFindEntryByName(PDIRECTORY_INFO Listing, const UNICODE_STRING* Name, PDIRECTORY_ENTRY_METADATA Out)
 {
-    for (SIZE_T i = 0; i < Listing->FileCount; i++)
+    SIZE_T entry;
+
+    if (!BlorgFindDirectoryEntry(Listing, Name, &entry))
     {
-        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(Listing, i);
-
-        if (!file)
-        {
-            break;
-        }
-
-        UNICODE_STRING entryName;
-        entryName.Buffer = file->Name;
-        entryName.Length = C_CAST(USHORT, file->NameLength * sizeof(WCHAR));
-        entryName.MaximumLength = entryName.Length;
-
-        if (RtlEqualUnicodeString(&entryName, Name, TRUE))
-        {
-            Out->Size = file->Size;
-            Out->CreationTime = file->CreationTime;
-            Out->LastAccessedTime = file->LastAccessedTime;
-            Out->LastModifiedTime = file->LastModifiedTime;
-            Out->IsDirectory = FALSE;
-            return TRUE;
-        }
+        return FALSE;
     }
 
-    for (SIZE_T i = 0; i < Listing->SubDirCount; i++)
+    if (entry < Listing->FileCount)
     {
-        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(Listing, i);
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(Listing, entry);
 
-        if (!sub)
-        {
-            break;
-        }
-
-        UNICODE_STRING entryName;
-        entryName.Buffer = sub->Name;
-        entryName.Length = C_CAST(USHORT, sub->NameLength * sizeof(WCHAR));
-        entryName.MaximumLength = entryName.Length;
-
-        if (RtlEqualUnicodeString(&entryName, Name, TRUE))
-        {
-            Out->Size = 0;
-            Out->CreationTime = sub->CreationTime;
-            Out->LastAccessedTime = sub->LastAccessedTime;
-            Out->LastModifiedTime = sub->LastModifiedTime;
-            Out->IsDirectory = TRUE;
-            return TRUE;
-        }
+        Out->Size = file->Size;
+        Out->CreationTime = file->CreationTime;
+        Out->LastAccessedTime = file->LastAccessedTime;
+        Out->LastModifiedTime = file->LastModifiedTime;
+        Out->IsDirectory = FALSE;
+        return TRUE;
     }
 
-    return FALSE;
+    PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(Listing, entry - Listing->FileCount);
+
+    Out->Size = 0;
+    Out->CreationTime = sub->CreationTime;
+    Out->LastAccessedTime = sub->LastAccessedTime;
+    Out->LastModifiedTime = sub->LastModifiedTime;
+    Out->IsDirectory = TRUE;
+    return TRUE;
 }
 
 //

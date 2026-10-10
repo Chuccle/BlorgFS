@@ -1503,6 +1503,73 @@ TEST_F(HttpClientSubtreeTest, APathWithNoRoomForTheSubtreeQueryIsRefused)
     EXPECT_EQ(0, LastDirInfo.Calls);
 }
 
+//
+// A decoded listing keeps each name once, after its entries and its name
+// index, NUL-terminated because DirCtrl enumerates it so, and finds every
+// one through the index whatever its case, files first. The root of
+// kSubtreeOutOfOrder lists the file r.bin and the subdirectories a and b.
+// Names laid over one another, a terminator left out, or an index that
+// misses or answers for the wrong entry each fail one of these.
+//
+TEST_F(HttpClientSubtreeTest, ADecodedListingsNamesStandApartAndAreFoundThroughItsIndex)
+{
+    PDIRECTORY_INFO root = List(0, kSubtreeOutOfOrder, sizeof(kSubtreeOutOfOrder) - 1);
+    ASSERT_NE(nullptr, root);
+    ASSERT_EQ(1u, root->FileCount);
+    ASSERT_EQ(2u, root->SubDirCount);
+
+    const PUCHAR names = (PUCHAR)root + root->NamesOffset;
+    const PUCHAR end = (PUCHAR)root + root->Bytes;
+
+    const struct
+    {
+        PWCH Name;
+        SIZE_T NameLength;
+        const wchar_t* Expected;
+    } entries[] = {
+        { BlorgGetFileEntry(root, 0)->Name, BlorgGetFileEntry(root, 0)->NameLength, L"r.bin" },
+        { BlorgGetSubDirEntry(root, 0)->Name, BlorgGetSubDirEntry(root, 0)->NameLength, L"a" },
+        { BlorgGetSubDirEntry(root, 1)->Name, BlorgGetSubDirEntry(root, 1)->NameLength, L"b" },
+    };
+
+    for (const auto& entry : entries)
+    {
+        EXPECT_EQ(std::wstring(entry.Expected), std::wstring(entry.Name));
+        EXPECT_EQ(wcslen(entry.Expected), entry.NameLength);
+        EXPECT_GE((PUCHAR)entry.Name, names);
+        EXPECT_LE((PUCHAR)(entry.Name + entry.NameLength + 1), end);
+    }
+
+    const struct
+    {
+        const wchar_t* Name;
+        BOOLEAN Found;
+        SIZE_T Entry;
+    } lookups[] = {
+        { L"r.bin", TRUE, 0 },
+        { L"R.BIN", TRUE, 0 },
+        { L"a", TRUE, 1 },
+        { L"B", TRUE, 2 },
+        { L"c", FALSE, 0 },
+        { L"r.bi", FALSE, 0 },
+    };
+
+    for (const auto& lookup : lookups)
+    {
+        wchar_t buffer[16];
+        wcscpy_s(buffer, lookup.Name);
+        UNICODE_STRING name = MakePath(buffer);
+        SIZE_T entry = ~SIZE_T(0);
+
+        EXPECT_EQ(lookup.Found, BlorgFindDirectoryEntry(root, &name, &entry)) << lookup.Name;
+
+        if (lookup.Found)
+        {
+            EXPECT_EQ(lookup.Entry, entry) << lookup.Name;
+        }
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Resource exhaustion
 ///////////////////////////////////////////////////////////////////////////

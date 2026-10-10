@@ -1517,6 +1517,84 @@ TEST_F(FcbReopenTest, ACreatePostedToTheFspIsCountedOnceByThePassThatFinishesIt)
 }
 
 ///////////////////////////////////////////////////////////////////////////
+// CreateFindEntryByName -- the listing's name index
+///////////////////////////////////////////////////////////////////////////
+
+//
+// An open that misses the path cache finds its name in the parent's cached
+// listing through the listing's name index (BlorgFindDirectoryEntry), as
+// the linear scan it replaced did: the first entry of that name in any
+// case, files before subdirectories. Two files and a subdirectory share
+// one name but for case here, so an index chained in the wrong order, or
+// one that let a later entry shadow an earlier, opens the other file or
+// the directory.
+//
+TEST_F(CreateDirectoryTest, AnOpenThroughAListingTakesTheFirstEntryOfItsNameFilesFirst)
+{
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media", TRUE));
+
+    PDIRECTORY_INFO listing = BuildListing({ L"Clip.bin", L"clip.BIN" }, { L"CLIP.BIN" });
+    ASSERT_NE(nullptr, listing);
+    UNICODE_STRING media = Path(L"\\media");
+    EXPECT_TRUE(BlorgPathCachePublishListing(&media, listing, nullptr));
+    BlorgReleaseDirectoryInfo(listing);
+
+    CreateOpener opener;
+    PrepareOpener(&opener, Path(L"\\media\\clip.bin"), FILE_READ_DATA, kShareAll, 0);
+    BlorgCreate(Volume, &opener.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, opener.CreateIrp.IoStatus.Status);
+    ASSERT_NE(nullptr, opener.FileObject.FsContext);
+    ASSERT_EQ(BLORGFS_FCB_SIGNATURE, GET_NODE_TYPE(opener.FileObject.FsContext));
+    EXPECT_EQ(1000, C_CAST(PFCB, opener.FileObject.FsContext)->Header.FileSize.QuadPart)
+        << "the open took Clip.bin's later namesake";
+
+    CloseOpener(&opener);
+}
+
+//
+// A large directory, where the index has thousands of chains: a file deep
+// in it, in another case, opens with its own entry's size; the first
+// subdirectory, the entry right after the last file, opens as a directory;
+// and a name one past the last file is not found, without a request.
+//
+TEST_F(CreateDirectoryTest, AnOpenInALargeListingFindsItsOwnEntry)
+{
+    ASSERT_NE(nullptr, MakePublishedNode(L"\\media", TRUE));
+
+    PDIRECTORY_INFO listing = BuildSyntheticListing(5000, 100);
+    ASSERT_NE(nullptr, listing);
+    UNICODE_STRING media = Path(L"\\media");
+    EXPECT_TRUE(BlorgPathCachePublishListing(&media, listing, nullptr));
+    BlorgReleaseDirectoryInfo(listing);
+
+    CreateOpener file;
+    PrepareOpener(&file, Path(L"\\media\\FILE4321.BIN"), FILE_READ_DATA, kShareAll, 0);
+    BlorgCreate(Volume, &file.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, file.CreateIrp.IoStatus.Status);
+    ASSERT_NE(nullptr, file.FileObject.FsContext);
+    ASSERT_EQ(BLORGFS_FCB_SIGNATURE, GET_NODE_TYPE(file.FileObject.FsContext));
+    EXPECT_EQ(5321, C_CAST(PFCB, file.FileObject.FsContext)->Header.FileSize.QuadPart);
+    CloseOpener(&file);
+
+    CreateOpener dir;
+    PrepareOpener(&dir, Path(L"\\media\\dir0"), FILE_LIST_DIRECTORY, kShareAll, 0);
+    BlorgCreate(Volume, &dir.CreateIrp);
+
+    ASSERT_EQ(STATUS_SUCCESS, dir.CreateIrp.IoStatus.Status);
+    ASSERT_NE(nullptr, dir.FileObject.FsContext);
+    EXPECT_EQ(BLORGFS_DCB_SIGNATURE, GET_NODE_TYPE(dir.FileObject.FsContext));
+    CloseOpener(&dir);
+
+    CreateOpener missing;
+    PrepareOpener(&missing, Path(L"\\media\\file5000.bin"), FILE_READ_DATA, kShareAll, 0);
+    BlorgCreate(Volume, &missing.CreateIrp);
+
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, missing.CreateIrp.IoStatus.Status);
+}
+
+///////////////////////////////////////////////////////////////////////////
 // The cold network open -- CreateComplete
 ///////////////////////////////////////////////////////////////////////////
 

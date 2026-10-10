@@ -7,64 +7,99 @@
 // DirCtrlTest.cpp's enumeration).
 //
 // Shared rather than copied per fixture because this encodes the listing's
-// wire layout -- the FilesOffset/SubDirsOffset arithmetic that must agree
-// with what Client.c's HttpDeserializeDirectoryInfo produces and what
-// BlorgGetFileEntry/BlorgGetSubDirEntry read back. Two hand-maintained copies of that
-// arithmetic is exactly the drift this avoids: a layout change would fix one
-// caller and quietly leave the other building a structure the driver reads
+// layout: the block comes from BlorgAllocateDirectoryInfo, the names are
+// laid out from NamesOffset on, and BlorgIndexDirectoryInfo chains them, as
+// Client.c's HttpDecodeListing does. Two hand-maintained copies of that is
+// exactly the drift this avoids: a layout change would fix one caller and
+// quietly leave the other building a structure the driver reads
 // differently. The entries themselves are filled through the real
 // BlorgGetFileEntry/BlorgGetSubDirEntry accessors for the same reason.
 //
 
 #include "..\..\src\Driver.h"
 
+#include <cwchar>
 #include <string>
+#include <vector>
 
 //
-// Counted entries named "file<N>.bin" and "dir<N>", sized 1000+N. The result
+// Files and SubDirs under the names given, files sized 1000+N. The result
 // carries one reference, as a deserialized listing does; the caller drops it
 // with BlorgReleaseDirectoryInfo once whatever it published into holds its own.
 //
-inline PDIRECTORY_INFO BuildSyntheticListing(int FileCount, int SubDirCount)
+inline PDIRECTORY_INFO BuildListing(const std::vector<std::wstring>& Files, const std::vector<std::wstring>& SubDirs)
 {
-    const SIZE_T size = sizeof(DIRECTORY_INFO) +
-        C_CAST(SIZE_T, FileCount) * sizeof(DIRECTORY_FILE_METADATA) +
-        C_CAST(SIZE_T, SubDirCount) * sizeof(DIRECTORY_SUBDIR_METADATA);
+    SIZE_T nameBytes = 0;
 
-    PDIRECTORY_INFO info = C_CAST(PDIRECTORY_INFO, ExAllocatePoolZero(PagedPool, size, 'TCRT'));
+    for (const auto& name : Files)
+    {
+        nameBytes += (name.size() + 1) * sizeof(WCHAR);
+    }
+
+    for (const auto& name : SubDirs)
+    {
+        nameBytes += (name.size() + 1) * sizeof(WCHAR);
+    }
+
+    PDIRECTORY_INFO info = BlorgAllocateDirectoryInfo(Files.size(), SubDirs.size(), nameBytes);
 
     if (!info)
     {
         return nullptr;
     }
 
-    info->RefCount = 1;
-    info->FilesOffset = sizeof(DIRECTORY_INFO);
-    info->SubDirsOffset = C_CAST(ULONG, sizeof(DIRECTORY_INFO) +
-        C_CAST(SIZE_T, FileCount) * sizeof(DIRECTORY_FILE_METADATA));
-    info->FileCount = FileCount;
-    info->SubDirCount = SubDirCount;
+    PWCH cursor = C_CAST(PWCH, C_CAST(PUCHAR, info) + info->NamesOffset);
+
+    for (SIZE_T i = 0; i < Files.size(); ++i)
+    {
+        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(info, i);
+
+        file->Size = 1000 + i;
+        file->Name = cursor;
+        file->NameLength = Files[i].size();
+        wmemcpy(cursor, Files[i].c_str(), Files[i].size() + 1);
+        cursor += Files[i].size() + 1;
+    }
+
+    for (SIZE_T i = 0; i < SubDirs.size(); ++i)
+    {
+        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(info, i);
+
+        sub->Name = cursor;
+        sub->NameLength = SubDirs[i].size();
+        wmemcpy(cursor, SubDirs[i].c_str(), SubDirs[i].size() + 1);
+        cursor += SubDirs[i].size() + 1;
+    }
+
+    BlorgIndexDirectoryInfo(info);
+
+    return info;
+}
+
+//
+// Counted entries named "file<N>.bin" and "dir<N>". Pad lengthens every
+// name to that many characters with leading 'x's, for the tests that need a
+// listing of a given size in bytes rather than in entries: at 250 an entry
+// takes about 570 bytes.
+//
+inline PDIRECTORY_INFO BuildSyntheticListing(int FileCount, int SubDirCount, size_t Pad = 0)
+{
+    std::vector<std::wstring> files;
+    std::vector<std::wstring> subDirs;
 
     for (int i = 0; i < FileCount; ++i)
     {
-        PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(info, i);
         std::wstring name = L"file" + std::to_wstring(i) + L".bin";
-
-        file->Size = 1000 + i;
-        file->NameLength = name.size();
-        wcscpy_s(file->Name, MAX_NAME_LEN, name.c_str());
+        files.push_back((name.size() < Pad) ? std::wstring(Pad - name.size(), L'x') + name : name);
     }
 
     for (int i = 0; i < SubDirCount; ++i)
     {
-        PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(info, i);
         std::wstring name = L"dir" + std::to_wstring(i);
-
-        sub->NameLength = name.size();
-        wcscpy_s(sub->Name, MAX_NAME_LEN, name.c_str());
+        subDirs.push_back((name.size() < Pad) ? std::wstring(Pad - name.size(), L'x') + name : name);
     }
 
-    return info;
+    return BuildListing(files, subDirs);
 }
 
 //
@@ -73,21 +108,14 @@ inline PDIRECTORY_INFO BuildSyntheticListing(int FileCount, int SubDirCount)
 //
 inline PDIRECTORY_INFO BuildSyntheticListingNamed(const wchar_t* FileName, const wchar_t* SubDirName)
 {
-    PDIRECTORY_INFO info = BuildSyntheticListing(1, 1);
+    PDIRECTORY_INFO info = BuildListing({ FileName }, { SubDirName });
 
     if (!info)
     {
         return nullptr;
     }
 
-    PDIRECTORY_FILE_METADATA file = BlorgGetFileEntry(info, 0);
-    file->Size = 2048;
-    file->NameLength = wcslen(FileName);
-    wcscpy_s(file->Name, MAX_NAME_LEN, FileName);
-
-    PDIRECTORY_SUBDIR_METADATA sub = BlorgGetSubDirEntry(info, 0);
-    sub->NameLength = wcslen(SubDirName);
-    wcscpy_s(sub->Name, MAX_NAME_LEN, SubDirName);
+    BlorgGetFileEntry(info, 0)->Size = 2048;
 
     return info;
 }
