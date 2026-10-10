@@ -67,7 +67,7 @@ static SOCKET_POOL_STATE SocketPool;
 // along with the ring. Peer idle-close of pooled connections is handled by
 // the reused-connection retry in the HTTP client.
 //
-ULONG SocketMaxPoolSize = 64;
+static ULONG SocketMaxPoolSize = 64;
 
 //
 // TLS ciphertext accumulator sizing (see Socket.h). Ciphertext is
@@ -90,7 +90,7 @@ ULONG SocketMaxPoolSize = 64;
 
 #define SOCKET_TLS_RECORD_MAX_BYTES (5 + TLS_RECORD_CIPHERTEXT_MAX)
 
-ULONG SocketTlsRecvCapacity = SOCKET_TLS_RECV_RECORDS_LARGE * SOCKET_TLS_RECORD_MAX_BYTES;
+ULONG BlorgSocketTlsRecvCapacity = SOCKET_TLS_RECV_RECORDS_LARGE * SOCKET_TLS_RECORD_MAX_BYTES;
 
 //
 // Every async send/receive needs a KSOCKET_ASYNC_CONTEXT; the TLS record
@@ -192,7 +192,7 @@ NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket)
 
     if (!Socket->TlsRecvBuffer)
     {
-        Socket->TlsRecvBuffer = ExAllocatePoolUninitialized(NonPagedPoolNx, SocketTlsRecvCapacity, SOCKET_TAG);
+        Socket->TlsRecvBuffer = ExAllocatePoolUninitialized(NonPagedPoolNx, BlorgSocketTlsRecvCapacity, SOCKET_TAG);
 
         if (!Socket->TlsRecvBuffer)
         {
@@ -210,7 +210,7 @@ NTSTATUS BlorgEnsureTlsRecvBuffer(PKSOCKET Socket)
         }
     }
 
-    Socket->TlsRecvMdl = IoAllocateMdl(Socket->TlsRecvBuffer, SocketTlsRecvCapacity, FALSE, FALSE, NULL);
+    Socket->TlsRecvMdl = IoAllocateMdl(Socket->TlsRecvBuffer, BlorgSocketTlsRecvCapacity, FALSE, FALSE, NULL);
 
     if (!Socket->TlsRecvMdl)
     {
@@ -325,7 +325,7 @@ static BOOLEAN SocketReleaseTimeoutRef(PSOCKET_OP_TIMEOUT Timeout)
     return 0 == InterlockedDecrement(&Timeout->RefCount);
 }
 
-const WSK_CLIENT_DISPATCH WskAppDispatch =
+static const WSK_CLIENT_DISPATCH WskAppDispatch =
 {
     MAKE_WSK_VERSION(1,0), // Use WSK version 1.0
     0,    // Reserved
@@ -600,7 +600,7 @@ NTSTATUS BlorgInitialiseWskClient(VOID)
         }
     }
 
-    SocketTlsRecvCapacity = tlsRecvRecords * SOCKET_TLS_RECORD_MAX_BYTES;
+    BlorgSocketTlsRecvCapacity = tlsRecvRecords * SOCKET_TLS_RECORD_MAX_BYTES;
 
     return STATUS_SUCCESS;
 }

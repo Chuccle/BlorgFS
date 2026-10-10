@@ -62,7 +62,7 @@
 
 //
 // The TLS bulk-receive accumulator this file drains lives on the KSOCKET
-// and is sized and allocated by Socket.c (SocketTlsRecvCapacity,
+// and is sized and allocated by Socket.c (BlorgSocketTlsRecvCapacity,
 // BlorgEnsureTlsRecvBuffer). It is shared with the handshake, which fills it
 // first: bytes the handshake's last bulk receive pulled in past the
 // server's Finished -- a NewSessionTicket, typically -- stay buffered on
@@ -1681,10 +1681,11 @@ static VOID HttpFreeContext(HTTP_CONTEXT* Ctx)
 //
 // Grows Ctx->Buffer in place (realloc) if RequiredCapacity exceeds the
 // current capacity; no-op otherwise. RequiredCapacity is rejected above
-// MAXULONG since Capacity is stored as ULONG. ReallocateBufferUninitialized
-// returns the original buffer (untouched) on allocation failure and always
-// yields a distinct pointer on success, so failure is detected by pointer
-// equality with the prior buffer.
+// MAXULONG since Capacity is stored as ULONG.
+// BlorgReallocateBufferUninitialized returns the original buffer
+// (untouched) on allocation failure and always yields a distinct pointer
+// on success, so failure is detected by pointer equality with the prior
+// buffer.
 //
 static NTSTATUS HttpGrowBufferIfNeeded(HTTP_CONTEXT* Ctx, SIZE_T RequiredCapacity)
 {
@@ -1698,7 +1699,7 @@ static NTSTATUS HttpGrowBufferIfNeeded(HTTP_CONTEXT* Ctx, SIZE_T RequiredCapacit
         return STATUS_INVALID_PARAMETER;
     }
 
-    PCHAR newBuffer = ReallocateBufferUninitialized(
+    PCHAR newBuffer = BlorgReallocateBufferUninitialized(
         Ctx->Buffer,
         Ctx->Length,
         NonPagedPoolNx,
@@ -2761,7 +2762,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         socket->TlsRecvOffset = 0;
     }
     else if (socket->TlsRecvOffset &&
-        (SocketTlsRecvCapacity - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
+        (BlorgSocketTlsRecvCapacity - socket->TlsRecvLength) < (5 + TLS_RECORD_CIPHERTEXT_MAX))
     {
         RtlMoveMemory(
             socket->TlsRecvBuffer,
@@ -2778,7 +2779,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
         socket,
         socket->TlsRecvMdl,
         socket->TlsRecvLength,
-        SocketTlsRecvCapacity - socket->TlsRecvLength,
+        BlorgSocketTlsRecvCapacity - socket->TlsRecvLength,
         0,
         HttpOnTlsReceive,
         Ctx);
