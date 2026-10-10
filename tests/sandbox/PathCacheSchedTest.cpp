@@ -136,9 +136,15 @@ void PathCacheProofTeardown(void* Parameter)
 class PathCacheSchedTest : public ::testing::Test
 {
 protected:
+    //
+    // Each schedule's teardown cleans the path cache up, so it is set up
+    // again for the tests after these, which rely on PathCacheTest.cpp's
+    // process-wide environment having left it ready.
+    //
     void TearDown() override
     {
         KmAssertQuiescent("PathCacheSchedTest teardown");
+        BlorgPathCacheInit();
     }
 };
 
