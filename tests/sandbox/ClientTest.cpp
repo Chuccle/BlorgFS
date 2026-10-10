@@ -1552,4 +1552,65 @@ INSTANTIATE_TEST_SUITE_P(
     HttpClientAllocationFailureTest,
     ::testing::Range<LONG>(0, 12));
 
+///////////////////////////////////////////////////////////////////////////
+// The TLS record layer
+///////////////////////////////////////////////////////////////////////////
+
+//
+// A plaintext alert record arriving where the reply should be ends the
+// connection, and on a pooled connection before any response byte that is
+// the idle-close race: a server closing a keep-alive connection it timed
+// out. Every other framing failure on a reused connection is retried once
+// on a fresh one; the alert failed the read outright. The first read is
+// plaintext and leaves its connection pooled with the alert still to come;
+// the second runs over TLS, the stub's handshake keying the record layer
+// so the request can be sent, and the fresh connection the retry opens
+// answers with an alert too, which pins the single retry.
+//
+TEST_F(HttpClientTest, AnAlertOnAPooledTlsConnectionIsRetriedOnceOnAFreshOne)
+{
+    ASSERT_EQ(STATUS_SUCCESS, BlorgTlsGlobalInit());
+
+    static const SANDBOX_STEP warmup[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWARM"),
+        DELIVER("\x15\x03\x03\x00\x02\x01\x00")
+    };
+
+    SandboxSetPeerScript(warmup, RTL_NUMBER_OF(warmup));
+
+    unsigned char first[4] = {};
+    Read(first, sizeof(first));
+    Drain();
+
+    ASSERT_EQ(STATUS_SUCCESS, LastRead.Status);
+    ASSERT_EQ(1u, SandboxSocketsPooled());
+    FreeMdl();
+
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("\x15\x03\x03\x00\x02\x01\x00")
+    };
+
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+    global.TlsEnabled = TRUE;
+
+    LastRead = {};
+    const ULONG createdBefore = SandboxSocketsCreated();
+    const ULONG64 retriesBefore = ShimStatistics.KeepAliveRetries;
+
+    unsigned char second[4] = {};
+    Read(second, sizeof(second));
+    Drain();
+
+    EXPECT_EQ(createdBefore + 1, SandboxSocketsCreated()) << "an alert on a pooled connection was not retried on a fresh one";
+    EXPECT_EQ(retriesBefore + 1, ShimStatistics.KeepAliveRetries);
+    EXPECT_EQ(1, LastRead.Calls);
+    EXPECT_EQ(STATUS_CONNECTION_RESET, LastRead.Status);
+
+    FreeMdl();
+    BlorgCleanupWskClient();
+    BlorgTlsGlobalCleanup();
+}
+
 } // namespace

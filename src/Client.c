@@ -2383,7 +2383,9 @@ static VOID HttpIssueTlsReceiveExpandedCallout(PVOID Parameter)
 //  - Outer type 0x14 (change_cipher_spec, an RFC 8446 Appendix D.4
 //    middlebox-compat no-op) is skipped without decryption -- it isn't
 //    AEAD-protected at all -- but must still be consumed from the byte
-//    stream. 0x15 (alert) is a hard failure; 0x17 (application_data) is
+//    stream. 0x15 (alert) ends the connection, and is handled as a
+//    framing failure (below): a pooled connection the peer closed with a
+//    plaintext alert is the idle-close race. 0x17 (application_data) is
 //    the only other legal outer type post-handshake.
 //
 //  - A 0x17 record is AEAD-decrypted (tag verified) straight from its
@@ -2479,7 +2481,7 @@ static VOID HttpIssueTlsReceive(HTTP_CONTEXT* Ctx)
 
         if (0x15 == recordType)
         {
-            HttpFail(Ctx, STATUS_CONNECTION_RESET);
+            HttpFailOrRetryReusedConnection(Ctx, STATUS_CONNECTION_RESET);
             return;
         }
 
