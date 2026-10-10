@@ -678,7 +678,7 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             PDCB dcb = IrpSp->FileObject->FsContext;
 
-            switch GET_NODE_TYPE(dcb)
+            switch (GET_NODE_TYPE(dcb))
             {
                 case BLORGFS_DCB_SIGNATURE:
                 {
