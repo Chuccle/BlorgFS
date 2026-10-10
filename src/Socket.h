@@ -160,21 +160,6 @@ VOID BlorgFreeWskAddrInfo(PADDRINFOEXW AddrInfo);
 NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket);
 
 //
-// Opens Count connections into the keep-alive pool ahead of demand, one at
-// a time, and returns immediately -- nothing waits on the result.
-//
-// The pool fills only from released sockets, so without this the first
-// burst of concurrent reads each pay a TCP connect while a reader is
-// blocked on it. Measured, those connects cost ~1.02 s apiece (a dropped
-// SYN and its retransmit, caused by the burst itself), and they are what
-// puts a 1438 ms worst case on a volume whose median read is 0.005 ms.
-//
-// Idempotent: a call made while a fill is already running is ignored, and
-// a call made after teardown has latched the pump (BlorgDrainWskSocketPrewarm)
-// is dropped whole -- teardown waits out any step already in flight, so no
-// connect can complete into a torn-down client.
-//
-//
 // Connections opened ahead of demand at driver start.
 //
 // Sized to cover PEAK concurrency, not average. Measured in-flight fetches
@@ -192,6 +177,21 @@ NTSTATUS BlorgReleaseReusableWskSocket(PKSOCKET Socket);
 //
 #define BLORGFS_SOCKET_PREWARM_COUNT 32
 
+//
+// Opens Count connections into the keep-alive pool ahead of demand, one at
+// a time, and returns immediately -- nothing waits on the result.
+//
+// The pool fills only from released sockets, so without this the first
+// burst of concurrent reads each pay a TCP connect while a reader is
+// blocked on it. Measured, those connects cost ~1.02 s apiece (a dropped
+// SYN and its retransmit, caused by the burst itself), and they are what
+// puts a 1438 ms worst case on a volume whose median read is 0.005 ms.
+//
+// Idempotent: a call made while a fill is already running is ignored, and
+// a call made after teardown has latched the pump (BlorgDrainWskSocketPrewarm)
+// is dropped whole -- teardown waits out any step already in flight, so no
+// connect can complete into a torn-down client.
+//
 VOID BlorgPrewarmSocketPool(const SOCKADDR* RemoteAddress, ULONG Count);
 
 VOID BlorgDrainWskSocketPrewarm(VOID);

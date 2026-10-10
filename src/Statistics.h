@@ -441,21 +441,6 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 TlsBulkReceives;             // wire receives feeding the accumulator
 
     //
-    // A file-read fetch split at the moment its response headers land:
-    // TTFB is issue-to-headers, body is headers-to-last-byte, and Samples
-    // counts the fetches that got far enough to contribute both.
-    //
-    // One issue-to-completion number cannot distinguish a server that is
-    // slow to answer from a driver that is slow to take delivery, and that
-    // ambiguity is currently the largest open question in this driver: a
-    // 512 KB range GET measures ~20 ms end to end from usermode inside the
-    // same guest, against ~98 ms here, with only two fetches in flight and
-    // no contention to explain it. These two counters say which half.
-    //
-    // Compare against the usermode probe's split for the same request:
-    // TTFB p50 5.4 ms, body p50 14 ms from the guest.
-    //
-    //
     // Issue-to-send-start: socket acquisition from the pool, any connect,
     // and any bounce to PASSIVE to build the request -- everything before
     // the request reaches the wire. A usermode client's TTFB does not
@@ -506,6 +491,21 @@ typedef struct _BLORGFS_STATISTICS
     ULONG64 FetchWaitSumUs;
     ULONG64 FetchWaitMaxUs;
 
+    //
+    // A file-read fetch split at the moment its response headers land:
+    // TTFB is issue-to-headers, body is headers-to-last-byte, and Samples
+    // counts the fetches that got far enough to contribute both.
+    //
+    // One issue-to-completion number cannot distinguish a server that is
+    // slow to answer from a driver that is slow to take delivery, and that
+    // ambiguity is currently the largest open question in this driver: a
+    // 512 KB range GET measures ~20 ms end to end from usermode inside the
+    // same guest, against ~98 ms here, with only two fetches in flight and
+    // no contention to explain it. These two counters say which half.
+    //
+    // Compare against the usermode probe's split for the same request:
+    // TTFB p50 5.4 ms, body p50 14 ms from the guest.
+    //
     ULONG64 FetchTtfbSumUs;
     ULONG64 FetchTtfbMaxUs;
     ULONG64 FetchBodySumUs;
@@ -526,13 +526,6 @@ typedef struct _BLORGFS_STATISTICS
 } BLORGFS_STATISTICS, * PBLORGFS_STATISTICS;
 
 //
-// Wire format for IOCTL_BLORGFS_QUERY_STATISTICS: the summed per-CPU
-// counters, the merged outlier records, and enough timebase to turn counts
-// into rates.
-// Version is checked by the driver so a stale harness fails loudly
-// instead of misreading a struct whose tail moved.
-//
-//
 // Set when the driver was built checked (DBG). A workload measured against
 // one of these is measuring the instrumentation: no optimisation, and
 // BLORGFS_PRINT compiled in as a live global.LogLevel test on the read
@@ -549,6 +542,13 @@ typedef struct _BLORGFS_STATISTICS
 
 #define BLORGFS_STATISTICS_VERSION 21
 
+//
+// Wire format for IOCTL_BLORGFS_QUERY_STATISTICS: the summed per-CPU
+// counters, the merged outlier records, and enough timebase to turn counts
+// into rates.
+// Version is checked by the driver so a stale harness fails loudly
+// instead of misreading a struct whose tail moved.
+//
 typedef struct _BLORGFS_STATISTICS_RESPONSE
 {
     ULONG Version;                       // BLORGFS_STATISTICS_VERSION
