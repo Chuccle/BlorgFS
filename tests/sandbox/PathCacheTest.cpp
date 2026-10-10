@@ -436,6 +436,22 @@ TEST_F(PathCacheSeedTest, ANameHoldingABackslashIsNotSeeded)
 }
 
 //
+// A listing admits names of up to MAX_NAME_LEN - 1 characters, and the
+// seed takes the same bound as a subtree answer's component check: the
+// longest name a listing can carry is seeded, one character more is not.
+//
+TEST_F(PathCacheSeedTest, ANameLongerThanAListingAdmitsIsNotSeeded)
+{
+    const std::wstring longest(MAX_NAME_LEN - 1, L'f');
+    const std::wstring tooLong(MAX_NAME_LEN, L'd');
+
+    Seed(L"\\seed\\long", BuildSyntheticListingNamed(longest.c_str(), tooLong.c_str()));
+
+    EXPECT_EQ(PathCacheExists, Lookup(L"\\seed\\long\\" + longest));
+    EXPECT_EQ(PathCacheMiss, Lookup(L"\\seed\\long\\" + tooLong));
+}
+
+//
 // The cache evicts FIFO per bucket, so seeding a huge directory in full
 // would flush every other entry for names that are mostly never opened.
 // Seeding stops at PATH_CACHE_SEED_MAX, keeping the first entries in
