@@ -347,13 +347,7 @@ static VOID DiskCacheReadSettle(PDISK_CACHE_READ Read)
         status = STATUS_UNEXPECTED_IO_ERROR;
     }
 
-    for (ULONG i = 0; i < Read->SlotCount; ++i)
-    {
-        if (DISK_CACHE_NO_SLOT != Read->Slots[i])
-        {
-            BlorgDiskCacheIndexUnpin(&DiskCache.Index, Read->Slots[i], NT_SUCCESS(status));
-        }
-    }
+    BlorgDiskCacheIndexUnpin(&DiskCache.Index, Read->Slots, Read->SlotCount, NT_SUCCESS(status));
 
     if (FlagOn(refetch, DISK_CACHE_READ_FAILED))
     {
@@ -1030,13 +1024,7 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, const UNICODE_ST
 
     if (0 == served)
     {
-        for (ULONG i = 0; i < blocks; ++i)
-        {
-            if (DISK_CACHE_NO_SLOT != read->Slots[i])
-            {
-                BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots[i], FALSE);
-            }
-        }
+        BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots, blocks, FALSE);
 
         ExFreePool(read);
         DiskCacheLeave();
@@ -1076,13 +1064,7 @@ BOOLEAN BlorgDiskCacheRead(PIRP Irp, const DISK_CACHE_KEY* Key, const UNICODE_ST
         {
             if (0 == issued)
             {
-                for (ULONG j = 0; j < blocks; ++j)
-                {
-                    if (DISK_CACHE_NO_SLOT != read->Slots[j])
-                    {
-                        BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots[j], FALSE);
-                    }
-                }
+                BlorgDiskCacheIndexUnpin(&DiskCache.Index, read->Slots, blocks, FALSE);
 
                 ExFreePool(read);
                 DiskCacheLeave();

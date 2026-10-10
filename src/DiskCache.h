@@ -157,12 +157,15 @@ VOID BlorgDiskCacheIndexCleanup(PDISK_CACHE_INDEX Index);
 // writing its slot into Slots in order and DISK_CACHE_NO_SLOT for each one
 // that is not, and returns how many it pinned. A pinned slot is not reused
 // until unpinned, so its bytes stay Key's while a read is in flight against
-// them. Unpin with Served marks the slot as used since the clock last passed
-// it; a block pinned but then fetched instead is unpinned unserved.
+// them. Unpin drops the pin of every slot in Slots, skipping
+// DISK_CACHE_NO_SLOT, under one acquisition of the lock: a read unpins all
+// it pinned at once, where one call per slot took the lock 17 times for a
+// 1 MB hit. With Served it marks each slot as used since the clock last
+// passed it; a block pinned but then fetched instead is unpinned unserved.
 // <= DISPATCH_LEVEL.
 //
 ULONG BlorgDiskCacheIndexPinHeld(PDISK_CACHE_INDEX Index, const DISK_CACHE_KEY* Key, ULONG64 LastBlock, PULONG Slots);
-VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, ULONG Slot, BOOLEAN Served);
+VOID BlorgDiskCacheIndexUnpin(PDISK_CACHE_INDEX Index, const ULONG* Slots, ULONG Count, BOOLEAN Served);
 
 //
 // Decides which blocks of a read pinned by PinHeld are fetched rather than
