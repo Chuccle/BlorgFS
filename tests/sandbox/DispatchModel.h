@@ -48,6 +48,14 @@ VOID ShimSetNextCcCopyReadInformation(ULONG Information);
 LONG ShimCachePurges(VOID);
 VOID ShimRefuseNextCachePurge(VOID);
 
+//
+// The read-ahead granule the driver last told Cc on a file object
+// (CcSetReadAheadGranularity), zero if it never did, and a reset that
+// forgets every file object a test read through.
+//
+ULONG ShimReadAheadGranularity(PFILE_OBJECT F);
+VOID ShimReadAheadGranularityReset(VOID);
+
 BOOLEAN ExIsResourceAcquiredExclusiveLite(PERESOURCE Resource);
 VOID ExConvertExclusiveToSharedLite(PERESOURCE Resource);
 

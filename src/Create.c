@@ -156,7 +156,9 @@ static inline NTSTATUS CreateBreakHandleOplockOnSharingViolation(POPLOCK Oplock,
 //  STATUS_PENDING; BlorgOplockComplete re-queues it to the FSP, which re-drives
 //  this create from the top, releasing the resource so the re-drive starts
 //  from a clean slate. On success wires FsContext/Vpb/SectionObjectPointer
-//  onto the file object.
+//  onto the file object, and the handle's CCB, which carries the read-ahead
+//  granule Cc is told on this file object (ReadAdaptGranularity, Read.c),
+//  allocated after the oplock check as CreateOpenExistingDcb does.
 //  Clears the FCB's read-ahead idle stamp on every open, which is not
 //  bookkeeping but a correctness fix. An FCB outlives its handles -- a
 //  closed file is parked on the delayed close list and revived on re-open
@@ -168,7 +170,7 @@ static inline NTSTATUS CreateBreakHandleOplockOnSharingViolation(POPLOCK Oplock,
 //  stamp risks a fabricated one, and the statistics block's standard is
 //  that a counter may be lossy and may never be invented.
 //
-static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PFCB Fcb)
+static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, const ACCESS_MASK* DesiredAccess, USHORT ShareAccess, PFCB Fcb, const DEVICE_OBJECT* VolumeDeviceObject)
 {
     if (!CreateCheckFileAccess(DesiredAccess))
     {
@@ -188,17 +190,28 @@ static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, 
         return oplockStatus;
     }
 
+    PCCB pCcb;
+
+    NTSTATUS result = BlorgCreateCCB(&pCcb, VolumeDeviceObject);
+
+    if (!NT_SUCCESS(result))
+    {
+        ExReleaseResourceLite(Fcb->Header.Resource);
+        return result;
+    }
+
     const BOOLEAN firstOpen = (1 == InterlockedIncrement64(&Fcb->RefCount));
 
     Fcb->ReadIdleLastEndQpc = 0;
 
-    NTSTATUS result = CreateApplyShareAccess(FileObject, DesiredAccess, ShareAccess, &Fcb->ShareAccess, firstOpen);
+    result = CreateApplyShareAccess(FileObject, DesiredAccess, ShareAccess, &Fcb->ShareAccess, firstOpen);
 
     if (!NT_SUCCESS(result))
     {
         InterlockedDecrement64(&Fcb->RefCount);
         result = CreateBreakHandleOplockOnSharingViolation(&Fcb->Header.Oplock, Irp, result);
         ExReleaseResourceLite(Fcb->Header.Resource);
+        BlorgFreeFileContext(pCcb, VolumeDeviceObject);
         return result;
     }
 
@@ -207,7 +220,7 @@ static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, 
 #pragma warning(suppress: 28175)
     FileObject->Vpb = global.DiskDeviceObject->Vpb;
     FileObject->FsContext = Fcb;
-    FileObject->FsContext2 = NULL;
+    FileObject->FsContext2 = pCcb;
     FileObject->SectionObjectPointer = &Fcb->NonPaged->SectionObjectPointers;
     Irp->IoStatus.Information = FILE_OPENED;
 
@@ -322,9 +335,9 @@ static VOID CreateFcbRefresh(PFCB Fcb, const DIRECTORY_ENTRY_METADATA* Meta, con
 
 //
 //  Opens a handle to an already-resident non-root DCB: same pattern as
-//  CreateOpenExistingFcb (access check, oplock break, RefCount bump, share
-//  access, all under the Dcb resource), but also allocates the CCB used
-//  for this directory handle's enumeration/notify state. The oplock break
+//  CreateOpenExistingFcb (access check, oplock break, CCB allocation,
+//  RefCount bump, share access, all under the Dcb resource); here the CCB
+//  holds this directory handle's enumeration/notify state. The oplock break
 //  happens before the CCB is allocated so a pending break leaks nothing;
 //  the resource is released on every early-out path.
 //
@@ -936,7 +949,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
                 }
                 else
                 {
-                    result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
+                    result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode), VolumeDeviceObject);
                 }
 
                 BlorgNodeUnpin(desiredNode);
@@ -1163,7 +1176,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
 
                 CreateFcbRefresh(C_CAST(PFCB, desiredNode), &dirEntInfo, &resolvedTicket, fileObject);
 
-                result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
+                result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode), VolumeDeviceObject);
 
                 if (STATUS_SUCCESS == result)
                 {
@@ -1232,7 +1245,7 @@ NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT Vo
             {
                 C_CAST(PFCB, desiredNode)->MetaTicket = resolvedTicket;
 
-                result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode));
+                result = CreateOpenExistingFcb(Irp, fileObject, desiredAccess, shareAccess, C_CAST(PFCB, desiredNode), VolumeDeviceObject);
 
                 if (STATUS_SUCCESS == result)
                 {

@@ -45,7 +45,49 @@ BOOLEAN CcUninitializeCacheMap(PFILE_OBJECT F, PLARGE_INTEGER T, PVOID E)
     return TRUE;
 }
 
-VOID CcSetReadAheadGranularity(PFILE_OBJECT F, ULONG G) { (void)F; (void)G; }
+//
+// Cc keeps the read-ahead granule in each file object's private cache map,
+// which the model does not have, so what the driver last told it is kept
+// here instead, for the first eight file objects a test reads through.
+//
+#define SHIM_READ_AHEAD_FILES 8
+
+static struct
+{
+    PFILE_OBJECT FileObject;
+    ULONG Granularity;
+} ShimReadAheadGranules[SHIM_READ_AHEAD_FILES];
+
+VOID CcSetReadAheadGranularity(PFILE_OBJECT F, ULONG G)
+{
+    for (ULONG i = 0; i < SHIM_READ_AHEAD_FILES; ++i)
+    {
+        if (F == ShimReadAheadGranules[i].FileObject || NULL == ShimReadAheadGranules[i].FileObject)
+        {
+            ShimReadAheadGranules[i].FileObject = F;
+            ShimReadAheadGranules[i].Granularity = G;
+            return;
+        }
+    }
+}
+
+ULONG ShimReadAheadGranularity(PFILE_OBJECT F)
+{
+    for (ULONG i = 0; i < SHIM_READ_AHEAD_FILES; ++i)
+    {
+        if (F == ShimReadAheadGranules[i].FileObject)
+        {
+            return ShimReadAheadGranules[i].Granularity;
+        }
+    }
+
+    return 0;
+}
+
+VOID ShimReadAheadGranularityReset(VOID)
+{
+    RtlZeroMemory(ShimReadAheadGranules, sizeof(ShimReadAheadGranules));
+}
 
 //
 // A purge fails in the kernel while a mapped view or an image section

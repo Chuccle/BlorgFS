@@ -142,13 +142,16 @@ protected:
     // unconditionally once past the IRP_PAGING_IO/IRP_NOCACHE flag checks,
     // and the fetch scheduler finds the file's nonpaged node through it
     // (ReadFairNode), so a stand-alone one would have it write past the
-    // end of something that is not a node.
+    // end of something that is not a node. Each request is its own handle,
+    // with the CCB Create.c gives every file open, which is where the
+    // cached path keeps the read-ahead granule Cc was told on it.
     //
     struct ReadRequest
     {
         FILE_OBJECT FileObject;
         IO_STACK_LOCATION Stack;
         IRP Irp;
+        CCB Ccb;
     };
 
     ReadRequest* PrepareRead(PFCB fcb, ULONG64 offset, ULONG length, ULONG irpFlags,
@@ -158,7 +161,11 @@ protected:
         ReadRequest* req = Requests.back().get();
         memset(req, 0, sizeof(*req));
 
+        req->Ccb.NodeTypeCode = BLORGFS_CCB_SIGNATURE;
+        req->Ccb.NodeByteSize = sizeof(CCB);
+
         req->FileObject.FsContext = fcb;
+        req->FileObject.FsContext2 = &req->Ccb;
         req->FileObject.DeviceObject = Volume;
         req->FileObject.SectionObjectPointer = &fcb->NonPaged->SectionObjectPointers;
 
@@ -1274,6 +1281,172 @@ TEST_F(ReadTest, FastIoReadCountsOnlyHandledReads)
     EXPECT_EQ(samples + 1, BlorgStatisticsForCurrentProcessor()->UserReadSamples);
     EXPECT_EQ(consumed + sizeof(buffer), Fcb->ReadAheadConsumedBytes);
     EXPECT_EQ(completed, Fcb->ReadIdleLastEndQpc);
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Adaptive read-ahead, one granule per handle
+///////////////////////////////////////////////////////////////////////////
+
+//
+// Cc keeps the read-ahead granule per file object, so two handles on one
+// file each have their own, and the policy must move only the one whose
+// read closed the window. It used to keep one granule per file: a second
+// handle's first read reset it to the starting value, and the first
+// handle's next vote then doubled or halved that rather than its own. A
+// copy grown to 2 MB was told 256 KB, and a player still at 128 KB that
+// voted shrink after a copy had grown was told 1 MB.
+//
+// The windows here are closed by fast reads that each consume a whole
+// window, with the evidence a window is judged on -- how much was fetched,
+// how far Cc honoured the granule, the stream's streak, the consumer's
+// idle share -- set on the FCB just before. What is checked is what Cc
+// was told on each file object, which is the only thing that reaches Cc.
+//
+class ReadAheadHandleTest : public ReadTest
+{
+protected:
+    void SetUp() override
+    {
+        ReadTest::SetUp();
+
+        SavedGranularity = global.ReadAheadGranularity;
+        SavedMaxGranularity = global.ReadAheadMaxGranularity;
+        SavedAdapt = global.ReadAheadAdapt;
+        SavedSlackGrowth = global.ReadAheadSlackGrowth;
+
+        global.ReadAheadGranularity = READ_AHEAD_GRANULARITY;
+        global.ReadAheadMaxGranularity = READ_AHEAD_MAX_GRANULARITY;
+        global.ReadAheadAdapt = TRUE;
+        global.ReadAheadSlackGrowth = TRUE;
+
+        ShimReadAheadGranularityReset();
+    }
+
+    void TearDown() override
+    {
+        global.ReadAheadGranularity = SavedGranularity;
+        global.ReadAheadMaxGranularity = SavedMaxGranularity;
+        global.ReadAheadAdapt = SavedAdapt;
+        global.ReadAheadSlackGrowth = SavedSlackGrowth;
+
+        ShimReadAheadGranularityReset();
+
+        ReadTest::TearDown();
+    }
+
+    //
+    // A handle's first cached read, which sets up its cache map and tells
+    // Cc the starting granule. The model's CcInitializeCacheMap leaves
+    // PrivateCacheMap alone, so it is set here the way the real one sets it.
+    //
+    ReadRequest* OpenHandle()
+    {
+        ReadRequest* req = PrepareRead(Fcb, 0, 4096, 0, 0, NewBuffer(4096));
+
+        EXPECT_EQ(STATUS_SUCCESS, BlorgRead(Volume, &req->Irp));
+
+        req->FileObject.PrivateCacheMap = &req->Ccb;
+
+        return req;
+    }
+
+    //
+    // One fast read that closes a window on File judged at Granule: a
+    // window is two granules, or 256 KB when that is larger.
+    //
+    void CloseWindow(PFILE_OBJECT File, ULONG Granule, ULONG64 Fetched)
+    {
+        const ULONG window = (2 * Granule > 256 * 1024) ? (2 * Granule) : (256 * 1024);
+        LARGE_INTEGER offset = {};
+        IO_STATUS_BLOCK status = {};
+        unsigned char buffer[16] = {};
+
+        Fcb->ReadAheadConsumedBytes = 0;
+        Fcb->ReadAheadFetchedBytes = Fetched;
+        Fcb->ReadIdleLastEndQpc = 0;
+
+        ShimSetNextCcCopyReadInformation(window);
+        EXPECT_TRUE(BlorgFastIoRead(File, &offset, window, TRUE, 0, buffer, &status, Volume));
+    }
+
+    //
+    // A window a copy closes: nothing fetched beyond what it consumed, Cc
+    // honouring the whole granule, the current stream sixteen reads long,
+    // and the consumer idle for one tick in a thousand.
+    //
+    void GrowWindow(PFILE_OBJECT File, ULONG Granule)
+    {
+        Fcb->ReadMaxPagingBytes = Granule;
+        Fcb->Streams[Fcb->ReadLastStreamIndex].Streak = 16;
+        Fcb->ReadIdleTicks = 1;
+        Fcb->ReadBusyTicks = 1000;
+
+        CloseWindow(File, Granule, 0);
+    }
+
+    //
+    // A window that fetched eight times what it consumed.
+    //
+    void ShrinkWindow(PFILE_OBJECT File, ULONG Granule)
+    {
+        const ULONG64 window = (2 * Granule > 256 * 1024) ? (2 * Granule) : (256 * 1024);
+
+        Fcb->ReadMaxPagingBytes = 0;
+        Fcb->ReadIdleTicks = 0;
+        Fcb->ReadBusyTicks = 0;
+
+        CloseWindow(File, Granule, window * 8);
+    }
+
+    void GrowToCeiling(PFILE_OBJECT File)
+    {
+        for (ULONG granule = READ_AHEAD_GRANULARITY; granule < READ_AHEAD_MAX_GRANULARITY; granule *= 2)
+        {
+            GrowWindow(File, granule);
+            GrowWindow(File, granule);
+            ASSERT_EQ(granule * 2, ShimReadAheadGranularity(File))
+                << "two agreeing grow votes double the granule";
+        }
+    }
+
+    ULONG SavedGranularity = 0;
+    ULONG SavedMaxGranularity = 0;
+    BOOLEAN SavedAdapt = FALSE;
+    BOOLEAN SavedSlackGrowth = FALSE;
+};
+
+TEST_F(ReadAheadHandleTest, ASecondHandleLeavesTheFirstHandlesGrownGranuleAlone)
+{
+    ReadRequest* copy = OpenHandle();
+    ASSERT_EQ(READ_AHEAD_GRANULARITY, ShimReadAheadGranularity(&copy->FileObject));
+
+    GrowToCeiling(&copy->FileObject);
+    ASSERT_EQ(READ_AHEAD_MAX_GRANULARITY, ShimReadAheadGranularity(&copy->FileObject));
+
+    ReadRequest* player = OpenHandle();
+    EXPECT_EQ(READ_AHEAD_GRANULARITY, ShimReadAheadGranularity(&player->FileObject));
+
+    GrowWindow(&copy->FileObject, READ_AHEAD_MAX_GRANULARITY);
+    GrowWindow(&copy->FileObject, READ_AHEAD_MAX_GRANULARITY);
+
+    EXPECT_EQ(READ_AHEAD_MAX_GRANULARITY, ShimReadAheadGranularity(&copy->FileObject))
+        << "the copy's grow vote doubled the granule the player's first read set, not its own";
+    EXPECT_EQ(READ_AHEAD_GRANULARITY, ShimReadAheadGranularity(&player->FileObject));
+}
+
+TEST_F(ReadAheadHandleTest, AShrinkVotedOnOneHandleHalvesThatHandlesOwnGranule)
+{
+    ReadRequest* copy = OpenHandle();
+    ReadRequest* player = OpenHandle();
+
+    GrowToCeiling(&copy->FileObject);
+
+    ShrinkWindow(&player->FileObject, READ_AHEAD_GRANULARITY);
+    ShrinkWindow(&player->FileObject, READ_AHEAD_GRANULARITY);
+
+    EXPECT_EQ(READ_AHEAD_GRANULARITY / 2, ShimReadAheadGranularity(&player->FileObject))
+        << "the player's shrink halved the copy's grown granule, raising its own";
+    EXPECT_EQ(READ_AHEAD_MAX_GRANULARITY, ShimReadAheadGranularity(&copy->FileObject));
 }
 
 } // namespace
