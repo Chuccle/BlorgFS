@@ -21,14 +21,14 @@
 // The volume is read-only, so both checks apply a single read-only mask;
 // the bit-by-bit tests below cover the file and the directory mask.
 //
-// CreateComplete (the async BlorgHttpGetFileInformation completion) is not
-// exercised here: it needs a real HTTP round trip through Client.c and the
-// SandboxSocket peer. FcbReopenTest drives the re-drive that consumes what
-// it stashes directly. Cold paths here resolve through a fresh listing of
-// the parent in the listing cache, which is exactly how a warm directory's
-// children resolve once DirCtrlComplete has published its listing. That
-// path exercises CreateSplitPathLeaf and both of CreateFindEntryByName's
-// loops for free.
+// CreateComplete (the async BlorgHttpGetFileInformation completion) is
+// exercised only by CreateNetworkTest, at the end, which scripts the HTTP
+// round trip through Client.c and the SandboxSocket peer. FcbReopenTest
+// drives the re-drive that consumes what it stashes directly. Other cold
+// paths here resolve through a fresh listing of the parent in the listing
+// cache, which is exactly how a warm directory's children resolve once
+// DirCtrlComplete has published its listing. That path exercises
+// CreateSplitPathLeaf and both of CreateFindEntryByName's loops for free.
 //
 // DispatchSandbox.vcxproj lists this TU BEFORE DispatchSchedTest.cpp, not
 // alphabetically or by habit: KmExploreInterleavings (Scheduler.c) turns
@@ -47,11 +47,18 @@
 
 #include <cstdio>
 #include <cwchar>
+#include <initializer_list>
+#include <string>
 
 extern "C" {
-#include "..\..\src\Driver.h"
+#include "SandboxSocket.h"
 
 NTSTATUS BlorgVolumeCreate(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT VolumeDeviceObject);
+
+// Not declared in any header -- FspWorkQueue.c's only other caller is
+// PsCreateSystemThread, which is a no-op in this sandbox. ReadTest.cpp runs
+// it the same way, on a thread of its own.
+VOID BlorgFspDispatch(PVOID StartContext);
 }
 
 #include "ListingBuilder.h"
@@ -1103,6 +1110,31 @@ protected:
         return BlorgVolumeCreate(&opener->CreateIrp, &opener->CreateStack, Volume);
     }
 
+    //
+    // Runs one FSP worker on a thread of its own until every opener's
+    // create has completed, then stops the queue and waits for it to exit.
+    // The queue must already be running.
+    //
+    static void RunFspWorkerUntilCompleted(std::initializer_list<CreateOpener*> openers)
+    {
+        HANDLE worker = CreateThread(NULL, 0, [](LPVOID) -> DWORD { BlorgFspDispatch(NULL); return 0; }, NULL, 0, NULL);
+        ASSERT_NE((HANDLE)NULL, worker);
+
+        const DWORD start = GetTickCount();
+
+        for (CreateOpener* opener : openers)
+        {
+            while (0 == ReadNoFence(&opener->CreateIrp.CompletionCount) && GetTickCount() - start < 30000)
+            {
+                SwitchToThread();
+            }
+        }
+
+        BlorgDestroyWorkQueue();
+        EXPECT_EQ(WAIT_OBJECT_0, WaitForSingleObject(worker, 30000));
+        CloseHandle(worker);
+    }
+
     PFCB File = nullptr;
     PBLORGFS_STATISTICS Stats = nullptr;
 };
@@ -1421,6 +1453,181 @@ TEST_F(FcbReopenTest, AnExclusiveOplockCountsHandlesNotYetCleanedUp)
 
     CloseOpener(&second);
     BlorgClose(Volume, &first.CloseIrp);
+}
+
+//
+// A create that misses outside the FSP posts itself, and the worker looks
+// the path up again. Both passes used to count the lookup, so a posted miss
+// counted two MetaDataReads and two PathCacheMisses, and neither pass
+// counted the create: BlorgCreate counted only what the FSD pass finished,
+// and the worker completed the rest uncounted. The parent's listing is
+// published between the post and the worker's pass, so the worker answers
+// both opens from it, one found and one not, and the FSD pass is the one
+// that posted them. A third open of the name the worker learned is gone is
+// a path-cache hit the FSD pass finishes itself.
+//
+TEST_F(FcbReopenTest, ACreatePostedToTheFspIsCountedOnceByThePassThatFinishesIt)
+{
+    ASSERT_EQ(STATUS_SUCCESS, BlorgCreateWorkQueue());
+
+    const ULONG64 successesBefore = Stats->SuccessfulCreates;
+    const ULONG64 failuresBefore = Stats->FailedCreates;
+    const ULONG64 lookupsBefore = Stats->MetaDataReads;
+    const ULONG64 missesBefore = Stats->PathCacheMisses;
+    const ULONG64 hitsBefore = Stats->PathCacheHits;
+
+    CreateOpener found;
+    PrepareOpener(&found, Path(L"\\media\\movie.bin"), FILE_READ_DATA, kShareAll, 0);
+    ASSERT_EQ(STATUS_PENDING, BlorgCreate(Volume, &found.CreateIrp));
+
+    CreateOpener ghost;
+    PrepareOpener(&ghost, Path(L"\\media\\ghost.bin"), FILE_READ_DATA, kShareAll, 0);
+    ASSERT_EQ(STATUS_PENDING, BlorgCreate(Volume, &ghost.CreateIrp));
+
+    EXPECT_EQ(lookupsBefore, Stats->MetaDataReads) << "the FSD pass counted a lookup it only posted";
+    EXPECT_EQ(missesBefore, Stats->PathCacheMisses);
+
+    PublishListing(L"\\media", L"movie.bin", L"movies");
+
+    RunFspWorkerUntilCompleted({ &found, &ghost });
+
+    ASSERT_EQ(1u, found.CreateIrp.CompletionCount);
+    ASSERT_EQ(1u, ghost.CreateIrp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, found.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, ghost.CreateIrp.IoStatus.Status);
+
+    EXPECT_EQ(successesBefore + 1, Stats->SuccessfulCreates) << "a create the worker finished was not counted";
+    EXPECT_EQ(failuresBefore + 1, Stats->FailedCreates);
+    EXPECT_EQ(lookupsBefore + 2, Stats->MetaDataReads) << "a posted miss was counted on both passes";
+    EXPECT_EQ(missesBefore + 2, Stats->PathCacheMisses);
+    EXPECT_EQ(hitsBefore, Stats->PathCacheHits);
+
+    CreateOpener again;
+    PrepareOpener(&again, Path(L"\\media\\ghost.bin"), FILE_READ_DATA, kShareAll, 0);
+    BlorgCreate(Volume, &again.CreateIrp);
+
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, again.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(failuresBefore + 2, Stats->FailedCreates);
+    EXPECT_EQ(lookupsBefore + 3, Stats->MetaDataReads);
+    EXPECT_EQ(hitsBefore + 1, Stats->PathCacheHits) << "a path-cache answer was not counted as a hit";
+    EXPECT_EQ(missesBefore + 2, Stats->PathCacheMisses);
+
+    CloseOpener(&found);
+}
+
+//
+// A DirectoryEntryMetadata for a 4096-byte file, the bytes ClientTest.cpp's
+// kFileInfo holds.
+//
+static const char kCreateFileInfo[] =
+    "\x14\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x24\x00\x1c\x00\x14\x00"
+    "\x0c\x00\x04\x00\x0c\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00"
+    "\x02\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00"
+    "\x00\x10\x00\x00\x00\x00\x00\x00";
+
+//
+// The pass that sends a create to the network, driven the way the worker
+// runs it, with the server's answer scripted through SandboxSocket.h. A
+// create the network lookup fails, or whose re-queue is refused, is
+// completed by CreateComplete, which neither BlorgCreate nor the worker
+// sees, so it counts the create itself.
+//
+class CreateNetworkTest : public FcbReopenTest
+{
+protected:
+    void SetUp() override
+    {
+        SandboxInitialize();
+        FcbReopenTest::SetUp();
+    }
+
+    void TearDown() override
+    {
+        Drain();
+        BlorgCleanupWskClient();
+
+        FcbReopenTest::TearDown();
+    }
+
+    //
+    // The script refers to the response until the test drains, so both
+    // live on the fixture.
+    //
+    void Respond(const char* statusAndHeaders, const char* body, SIZE_T length)
+    {
+        Response = std::string(statusAndHeaders) + "Content-Length: " + std::to_string(length) +
+            "\r\n\r\n" + std::string(body, length);
+
+        Step = { SandboxStepDeliver, C_CAST(const unsigned char*, Response.data()), Response.size(), STATUS_SUCCESS, FALSE };
+        SandboxSetPeerScript(&Step, 1);
+    }
+
+    //
+    // A work item can issue more I/O, so this runs until neither side has
+    // anything left, as ClientTest.cpp's does.
+    //
+    void Drain()
+    {
+        do
+        {
+            SandboxDrainCompletions();
+        } while (ShimDrainWorkItems() > 0);
+    }
+
+    NTSTATUS SendToTheNetwork(CreateOpener* opener, const wchar_t* path)
+    {
+        PrepareOpener(opener, Path(path), FILE_READ_DATA, kShareAll, 0);
+        opener->CreateIrp.Tail.Overlay.DriverContext[0] =
+            C_CAST(PVOID, C_CAST(ULONG_PTR, IRP_CONTEXT_FLAG_WAIT | IRP_CONTEXT_FLAG_IN_FSP));
+
+        return BlorgVolumeCreate(&opener->CreateIrp, &opener->CreateStack, Volume);
+    }
+
+    std::string Response;
+    SANDBOX_STEP Step = {};
+};
+
+TEST_F(CreateNetworkTest, ACreateTheNetworkLookupFailsIsCountedOnce)
+{
+    Respond("HTTP/1.1 404 Not Found\r\n", "", 0);
+
+    const ULONG64 failuresBefore = Stats->FailedCreates;
+    const ULONG64 lookupsBefore = Stats->MetaDataReads;
+    const ULONG64 missesBefore = Stats->PathCacheMisses;
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_PENDING, SendToTheNetwork(&opener, L"\\media\\gone.bin"));
+
+    Drain();
+
+    ASSERT_EQ(1u, opener.CreateIrp.CompletionCount);
+    EXPECT_EQ(STATUS_OBJECT_NAME_NOT_FOUND, opener.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(failuresBefore + 1, Stats->FailedCreates) << "a create the network lookup failed was not counted";
+    EXPECT_EQ(lookupsBefore + 1, Stats->MetaDataReads) << "the pass that went to the network did not count its miss";
+    EXPECT_EQ(missesBefore + 1, Stats->PathCacheMisses);
+}
+
+//
+// The FSP queue is not running in this harness, so CreateComplete's
+// re-queue of a found file is refused, which is what a volume tearing down
+// does to it.
+//
+TEST_F(CreateNetworkTest, ACreateWhoseRequeueIsRefusedIsCountedOnce)
+{
+    Respond("HTTP/1.1 200 OK\r\n", kCreateFileInfo, sizeof(kCreateFileInfo) - 1);
+
+    const ULONG64 successesBefore = Stats->SuccessfulCreates;
+    const ULONG64 failuresBefore = Stats->FailedCreates;
+
+    CreateOpener opener;
+    ASSERT_EQ(STATUS_PENDING, SendToTheNetwork(&opener, L"\\media\\fresh.bin"));
+
+    Drain();
+
+    ASSERT_EQ(1u, opener.CreateIrp.CompletionCount);
+    EXPECT_EQ(STATUS_DEVICE_REMOVED, opener.CreateIrp.IoStatus.Status);
+    EXPECT_EQ(failuresBefore + 1, Stats->FailedCreates) << "a create whose re-queue was refused was not counted";
+    EXPECT_EQ(successesBefore, Stats->SuccessfulCreates);
 }
 
 } // namespace
