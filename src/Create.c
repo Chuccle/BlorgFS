@@ -147,9 +147,9 @@ static inline NTSTATUS CreateBreakHandleOplockOnSharingViolation(POPLOCK Oplock,
 //  under the Fcb resource so the oplock break is atomic with the
 //  RefCount/share-access update (see CreateBreakHandleOplockOnSharingViolation).
 //  That atomicity is the point: OplockRequest grants under this same
-//  resource using RefCount as OpenCount, so without it a grant could slip
-//  into the gap between the break and the bump and hand out an oplock this
-//  open never broke. The oplock package is internally thread-safe, but that
+//  resource using UncleanCount as OpenCount, so without it a grant could
+//  slip into the gap between the break and the bump and hand out an oplock
+//  this open never broke. The oplock package is internally thread-safe, but that
 //  protects only the OPLOCK structure, not this open-count invariant.
 //  FsRtlCheckOplock is called unconditionally (it fast-returns SUCCESS with
 //  no oplock). On a pending break it posts the IRP and returns
@@ -214,6 +214,8 @@ static inline NTSTATUS CreateOpenExistingFcb(PIRP Irp, PFILE_OBJECT FileObject, 
         BlorgFreeFileContext(pCcb, VolumeDeviceObject);
         return result;
     }
+
+    Fcb->UncleanCount++;
 
     ExReleaseResourceLite(Fcb->Header.Resource);
 

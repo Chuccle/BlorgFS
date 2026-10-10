@@ -48,6 +48,7 @@ static NTSTATUS CleanupVolume(PIRP Irp, PIO_STACK_LOCATION IrpSp, PDEVICE_OBJECT
 
             if (BLORGFS_FCB_SIGNATURE == GET_NODE_TYPE(node))
             {
+                C_CAST(PFCB, node)->UncleanCount--;
                 FsRtlFastUnlockAll(&C_CAST(PFCB, node)->FileLock, fileObject, IoGetRequestorProcess(Irp), NULL);
             }
 

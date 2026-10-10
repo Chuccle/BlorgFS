@@ -610,10 +610,20 @@ typedef struct _FCB BLORGFS_COMMON_CONTEXT_BASE
     // current stream costs one ULONG, needs no decay, and reacts on the
     // first read of a new pattern.
     //
-    // It also closes the tail explicitly, which is what the field it
-    // replaced was doing.
-    //
     ULONG   ReadLastStreamIndex;
+
+    //
+    // Handles open on this file that have not been cleaned up: raised by a
+    // successful open and lowered by its cleanup, both under the FCB
+    // resource, which FsCtrlUser reads it under too. It is the open count
+    // an exclusive oplock grant is judged by, as fastfat's UncleanCount is.
+    // RefCount is not that count: it drops at close, and the file object
+    // Cc keeps for its cache map is cleaned up long before it is closed, so
+    // after one cached read RefCount stayed at one with no handle open and
+    // the next opener could not have a batch or RWH oplock.
+    //
+    ULONG   UncleanCount;
+    UCHAR   Reserved[4];             // Pad to 8-byte alignment
 } FCB, * PFCB;
 
 CHECK_PADDING_BETWEEN(FCB, Header, NonPaged);
@@ -642,7 +652,9 @@ CHECK_PADDING_BETWEEN(FCB, ReadIdleLastEndQpc, ReadIdleTicks);
 CHECK_PADDING_BETWEEN(FCB, ReadIdleTicks, ReadBusyTicks);
 CHECK_PADDING_BETWEEN(FCB, ReadBusyTicks, ReadMaxPagingBytes);
 CHECK_PADDING_BETWEEN(FCB, ReadMaxPagingBytes, ReadLastStreamIndex);
-CHECK_PADDING_END(FCB, ReadLastStreamIndex);
+CHECK_PADDING_BETWEEN(FCB, ReadLastStreamIndex, UncleanCount);
+CHECK_PADDING_BETWEEN(FCB, UncleanCount, Reserved);
+CHECK_PADDING_END(FCB, Reserved);
 
 //
 // Per-directory context node. Extends COMMON_CONTEXT with child linkage.

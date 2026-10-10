@@ -20,14 +20,14 @@
 //
 //  The handoff takes only the node resource exclusive: the handle behind
 //  this FSCTL keeps RefCount nonzero (so the node cannot be reaped), and
-//  opens mutate RefCount under this same node resource, so no concurrent
-//  open can slip the count upward during the grant. A concurrent close's
-//  lock-free decrement can only lower the count, making a stale read err
-//  toward denying an exclusive grant -- the safe direction. OpenCount only
+//  opens and cleanups move the FCB's UncleanCount under this same node
+//  resource, so the count cannot change during the grant. OpenCount only
 //  steers a grant -- FsRtl ignores it on an acknowledge: a shared (Read)
 //  grant is denied by a conflicting byte-range lock (files only), while an
-//  exclusive grant needs the sole opener, for which RefCount is our analog
-//  of fastfat's UncleanCount.
+//  exclusive grant, which only a file can ask for, needs the sole open
+//  handle, which UncleanCount counts as fastfat's does. RefCount would
+//  not do: it drops at close, and Cc keeps a cleaned-up file object open
+//  for its cache map long after the handle is gone.
 //
 //  Every oplock code tests the node for NULL before reading its type, and
 //  that check is load-bearing rather than defensive. BlorgFileSystemControl
@@ -145,7 +145,7 @@ static NTSTATUS FsCtrlUser(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
     ULONG oplockCount = sharedRequest
         ? C_CAST(ULONG, isFile && !FsRtlCheckLockForOplockRequest(&C_CAST(PFCB, node)->FileLock, &node->Header.AllocationSize))
-        : C_CAST(ULONG, ReadNoFence64(&node->RefCount));
+        : C_CAST(PFCB, node)->UncleanCount;
 
     C_CAST(VOID, FsRtlOplockFsctrl(&node->Header.Oplock, Irp, oplockCount));
 
