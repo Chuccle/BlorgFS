@@ -108,6 +108,16 @@ VOID ShimPoolFailAt(LONG Index)
     InterlockedExchange(&PoolAllocationCounter, 0);
 }
 
+LONG ShimPoolAllocations(VOID)
+{
+    return PoolAllocationCounter;
+}
+
+SIZE_T ShimPoolBlockSize(PVOID Block)
+{
+    return ((SHIM_POOL_HEADER*)Block - 1)->Size;
+}
+
 SIZE_T ShimPoolOutstanding(VOID)
 {
     return (SIZE_T)KmObjectsLive(KmObjectPool);

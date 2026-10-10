@@ -1552,6 +1552,63 @@ INSTANTIATE_TEST_SUITE_P(
     HttpClientAllocationFailureTest,
     ::testing::Range<LONG>(0, 12));
 
+//
+// A zero-copy read's header buffer is 2 KB, which holds any real 206's
+// headers. Growing it a page ahead of every header receive reallocated it
+// on every read before a byte had arrived, and only made room for body
+// bytes the read then copied out again. It grows once headers fill it.
+//
+// The reference is the same read with 3 KB of headers, which must grow
+// exactly once: a buffer grown ahead of its first receive takes those
+// headers without growing again, so both reads cost the same, and a buffer
+// that never grows could not parse them at all.
+//
+TEST_F(HttpClientTest, AZeroCopyReadGrowsItsHeaderBufferOnlyOnceHeadersFillIt)
+{
+    std::vector<unsigned char> body(64 * 1024);
+
+    for (SIZE_T i = 0; i < body.size(); ++i)
+    {
+        body[i] = C_CAST(unsigned char, i * 7);
+    }
+
+    std::string padded = "HTTP/1.1 206 Partial Content\r\nX-Pad: ";
+    padded.append(3000, 'p');
+    padded += "\r\nContent-Length: 65536\r\n\r\n";
+
+    const char* const headers[] =
+    {
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: 65536\r\n\r\n",
+        padded.c_str()
+    };
+
+    LONG allocations[RTL_NUMBER_OF(headers)] = {};
+
+    for (SIZE_T i = 0; i < RTL_NUMBER_OF(headers); ++i)
+    {
+        std::vector<unsigned char> target(body.size());
+
+        Respond(headers[i], body.data(), body.size());
+        LastRead = {};
+        ShimPoolFailAt(-1);
+
+        ASSERT_EQ(STATUS_PENDING, Read(target.data(), target.size()));
+
+        Drain();
+
+        allocations[i] = ShimPoolAllocations();
+
+        EXPECT_EQ(STATUS_SUCCESS, LastRead.Status) << "headers " << i;
+        EXPECT_EQ(body, target) << "headers " << i;
+
+        FreeMdl();
+        BlorgCleanupWskClient();
+    }
+
+    EXPECT_EQ(allocations[0] + 1, allocations[1])
+        << "a read whose headers fit the buffer must not regrow it";
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // The TLS record layer
 ///////////////////////////////////////////////////////////////////////////

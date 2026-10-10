@@ -215,6 +215,15 @@ SIZE_T ShimPoolOutstanding(VOID);
 VOID ShimPoolFailAt(LONG Index);
 
 //
+// Allocations made since the last ShimPoolFailAt, failed ones included, and
+// the size a live block was asked for. A test that pins what a path costs
+// in pool -- a regrow it should not make, a buffer larger than it needs --
+// asserts on these.
+//
+LONG ShimPoolAllocations(VOID);
+SIZE_T ShimPoolBlockSize(PVOID Block);
+
+//
 // Raises *Flag the moment Block is freed, whichever allocator frees it.
 // This is how a test observes "the node was freed" at the instant it
 // happens rather than inferring it afterwards -- which matters when the
