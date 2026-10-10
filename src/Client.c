@@ -2200,9 +2200,12 @@ static VOID HttpIssueReceiveDispatch(HTTP_CONTEXT* Ctx)
 // already be freed. Two receive regimes are selected by whether headers
 // have been parsed yet (BodyOffset != 0): header phase posts the
 // remaining capacity and completes on whatever arrives (Flags = 0),
-// growing a page at a time if the headers alone overflow it -- and only
-// re-posting while HttpParseHeaders keeps answering STATUS_BUFFER_TOO_SMALL,
-// which it stops doing past HTTP_MAX_HEADER_BYTES; body phase
+// growing a page only once the headers have filled it (growing ahead of
+// that reallocated every zero-copy read's 2 KB header buffer before its
+// first receive, for room that only filled with body bytes to spill-copy),
+// and only re-posting while HttpParseHeaders keeps answering
+// STATUS_BUFFER_TOO_SMALL, which it stops doing past
+// HTTP_MAX_HEADER_BYTES; body phase
 // posts exactly the outstanding remainder with WSK_FLAG_WAITALL -- one
 // completion for the whole body rather than one per arriving segment,
 // into either the caller's locked MDL (TargetMdl set, body byte i at MDL
@@ -2247,12 +2250,15 @@ static VOID HttpIssueReceive(HTTP_CONTEXT* Ctx)
 
     if (0 == Ctx->BodyOffset)
     {
-        NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, C_CAST(SIZE_T, Ctx->Length) + PAGE_SIZE);
-
-        if (!NT_SUCCESS(growResult))
+        if (Ctx->Length == Ctx->Capacity)
         {
-            HttpComplete(Ctx, growResult);
-            return;
+            NTSTATUS growResult = HttpGrowBufferIfNeeded(Ctx, C_CAST(SIZE_T, Ctx->Capacity) + PAGE_SIZE);
+
+            if (!NT_SUCCESS(growResult))
+            {
+                HttpComplete(Ctx, growResult);
+                return;
+            }
         }
 
         result = BlorgReceiveWskAsync(
