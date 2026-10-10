@@ -38,26 +38,22 @@ static void EnsurePushLockInitialized(PEX_PUSH_LOCK Lock)
     }
 }
 
+//
+// Re-initialising keeps the previous identity (KmRenewLockId). Node table
+// fixtures re-init all 256 buckets per test, and without this each run
+// mints 256 fresh ids until the model's lock table is full.
+//
 VOID ExInitializePushLock(PEX_PUSH_LOCK Lock)
 {
-    //
-    // Re-initialising returns the previous identity to the pool. Node
-    // table fixtures re-init all 256 buckets per test, and without this
-    // each run mints 256 fresh ids until the model's lock table is full.
-    //
     KmSchedNoteFootprint(Lock, 1, 1);
 
-    if (Lock->Initialized)
-    {
-        KmReleaseLockId(Lock->Id);
-    }
+    Lock->Id = KmRenewLockId(Lock->Initialized ? Lock->Id : 0);
 
     InitializeSRWLock(&Lock->Lock);
     Lock->Initialized = 1;
     Lock->SchedState = 0;
     Lock->SchedExclusiveWaiters = 0;
     Lock->ExclusiveOwner = 0;
-    Lock->Id = KmAllocateLockId();
     Lock->Name = "push-lock";
 }
 
@@ -264,17 +260,13 @@ NTSTATUS ExInitializeResourceLite(PERESOURCE Resource)
 {
     KmSchedNoteFootprint(Resource, 1, 1);
 
-    if (Resource->Initialized)
-    {
-        KmReleaseLockId(Resource->Id);
-    }
+    Resource->Id = KmRenewLockId(Resource->Initialized ? Resource->Id : 0);
 
     InitializeSRWLock(&Resource->Lock);
     Resource->Initialized = 1;
     Resource->ExclusiveOwner = 0;
     Resource->SchedState = 0;
     Resource->SchedExclusiveWaiters = 0;
-    Resource->Id = KmAllocateLockId();
 
     return STATUS_SUCCESS;
 }

@@ -23,16 +23,12 @@ namespace
 {
 
 //
-// BlorgPathCacheInit/Cleanup re-initialize all 256 bucket push locks, which is
-// only cheap under KmExploreInterleavings' explicit "recycle lock ids for
-// the duration of the exploration" allowance (Scheduler.h). Outside that,
-// recycling is off by default once any sched-test in this binary has run
-// (Scheduler.c leaves it off after KmExploreInterleavings returns, so a
-// later reuse doesn't mask a real double-init), so calling Init/Cleanup
-// once per test here would mint 256 fresh ids every time and exhaust the
-// model's fixed-size lock table. Bracketing the whole process with one
-// Initialize/Cleanup pair -- the same pattern StatisticsTest.cpp uses for
-// its own process-lifetime table -- keeps this to a one-time cost.
+// BlorgPathCacheInit/Cleanup re-initialize all 512 bucket push locks. A
+// re-initialised lock keeps its model id (KmRenewLockId), so that costs no
+// ids, but the tests here have no need to pay it per test. Bracketing the
+// whole process with one Initialize/Cleanup pair -- the same pattern
+// StatisticsTest.cpp uses for its own process-lifetime table -- keeps this
+// to a one-time cost.
 //
 class PathCacheEnvironment : public ::testing::Environment
 {

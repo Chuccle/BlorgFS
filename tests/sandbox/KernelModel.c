@@ -362,10 +362,7 @@ void KmInitializeLock(KM_LOCK* Lock, const char* Name)
 {
     KmSchedNoteFootprint(Lock, 1, 1);
 
-    if (Lock->Initialized)
-    {
-        KmReleaseLockId(Lock->Id);
-    }
+    const int previousId = Lock->Initialized ? Lock->Id : 0;
 
     memset(Lock, 0, sizeof(*Lock));
     InitializeCriticalSection(&Lock->Cs);
@@ -374,13 +371,13 @@ void KmInitializeLock(KM_LOCK* Lock, const char* Name)
     Lock->Name = Name ? Name : "unnamed";
 
     //
-    // Through KmAllocateLockId, never straight off the counter: ids are
+    // Through KmRenewLockId, never straight off the counter: ids are
     // recycled when a lock is destroyed, and a second source would hand
     // the same id to two live locks. They would then share a row in the
     // order graph, and the inversions reported against them would be
     // about a lock pairing that never existed.
     //
-    Lock->Id = KmAllocateLockId();
+    Lock->Id = KmRenewLockId(previousId);
 
     if (Lock->Id <= 0 || Lock->Id >= KM_MAX_LOCKS)
     {
@@ -572,6 +569,37 @@ void KmReleaseLockId(int Id)
     }
 
     LeaveCriticalSection(&OrderCs);
+}
+
+//
+// Re-initialising a lock keeps its id, with the edges and name the id had
+// cleared, whether or not ids are being recycled. The lock is the same
+// object, so no other lock can be using the identity, and this is what a
+// release followed by an allocation does while recycling is on. While it
+// is off, the release was dropped and every re-initialisation minted a
+// fresh id: DiskCacheTest re-initialises the path cache's 512 bucket
+// locks in each SetUp, and ran out of ids in the third test after its own
+// exploration had switched recycling off.
+//
+int KmRenewLockId(int Id)
+{
+    if (Id <= 0 || Id >= KM_MAX_LOCKS)
+    {
+        return KmAllocateLockId();
+    }
+
+    KmSchedNoteFootprint(&NextLockId, sizeof(NextLockId), 1);
+
+    KmEnsureOrderCs();
+    EnterCriticalSection(&OrderCs);
+
+    KmClearLockEdges(Id);
+
+    LockNames[Id] = NULL;
+
+    LeaveCriticalSection(&OrderCs);
+
+    return Id;
 }
 
 int KmAllocateLockId(void)
