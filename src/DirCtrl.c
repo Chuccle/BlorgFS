@@ -632,12 +632,19 @@ static VOID DirCtrlInstallSnapshot(PCCB Ccb, PDIRECTORY_INFO Snapshot)
 // "not fetched yet", never "empty" (an empty directory still produces a
 // real zero-count DIRECTORY_INFO). That second query may issue a second
 // fetch; whichever completes first becomes the handle's snapshot and the
-// other is released (DirCtrlComplete). It also skips the posts in the
-// pattern branches, so it is posted to the FSP here when not already
-// there: the fetch can complete the IRP before it returns, so it is only
-// issued once the IRP is pending. The NET_DONE pass looks again for the
-// same reason if a racing restart on the handle dropped the snapshot the
-// completion installed.
+// other is released (DirCtrlComplete). The NET_DONE pass looks again for
+// the same reason if a racing restart on the handle dropped the snapshot
+// the completion installed.
+//
+// A miss is the only query posted to the FSP, and it is posted when not
+// already there: the fetch can complete the IRP before it returns, so it
+// is only issued once the IRP is pending. An initial query or a restart
+// sets the handle's pattern and takes its snapshot in the FSD, where a
+// cached listing answers it at once; they used to be posted first, which
+// cost a cached tree walk a worker hop, a buffer lock and a system-PTE
+// map per directory. The FSP pass of one that missed finds the pattern
+// set, so it is no longer an initial query and takes the resource shared,
+// which is all a lookup needs.
 //
 // NOTIFY_CHANGE_DIRECTORY registers the watch with the FsRtl notify
 // package, which captures its own copy of the directory name and holds
@@ -751,13 +758,6 @@ NTSTATUS BlorgVolumeDirectoryControl(PIRP Irp, PIO_STACK_LOCATION IrpSp)
 
             if ((initialQuery || restartScan) && !netDone)
             {
-                if (!BooleanFlagOn(irpFlags, IRP_CONTEXT_FLAG_IN_FSP))
-                {
-                    BLORGFS_PRINT("BlorgVolumeDirectoryControl: Enqueue to Fsp\n");
-                    ExReleaseResourceLite(dcb->Header.Resource);
-                    return BlorgFsdPostRequest(Irp, IrpSp);
-                }
-
                 RtlZeroMemory(&ccb->Flags, sizeof(ULONGLONG));
 
                 if (ccb->SearchPattern.Buffer)
