@@ -9,14 +9,15 @@
 //
 //  Handles every user FSCTL -- in practice the oplock request/acknowledge
 //  family, adapted from fastfat's FatOplockRequest. A single switch on the
-//  control code routes and validates in one pass: each oplock code states the
-//  node types it is legal on (the legacy codes are file-only; a directory
-//  takes its Read/Read-Handle oplock solely through the unified, METHOD_BUFFERED
-//  FSCTL_REQUEST_OPLOCK), then falls through to the common handoff. Returns
-//  STATUS_PENDING once the IRP has been handed to the FsRtl oplock package
-//  (which then owns it -- held pending a break, or already completed), telling
-//  BlorgFileSystemControl to leave the IRP alone; validation failures return
-//  the error and let the dispatcher complete the IRP with it.
+//  control code routes and validates in one pass: each oplock code states
+//  the node types it is legal on (the legacy codes are file-only; a
+//  directory takes its Read/Read-Handle oplock solely through the unified,
+//  METHOD_BUFFERED FSCTL_REQUEST_OPLOCK), then falls through to the common
+//  handoff. Returns STATUS_PENDING once the IRP has been handed to the
+//  FsRtl oplock package (which then owns it -- held pending a break, or
+//  already completed), telling BlorgFileSystemControl to leave the IRP
+//  alone; validation failures return the error and let the dispatcher
+//  complete the IRP with it.
 //
 //  The handoff takes only the node resource exclusive: the handle behind
 //  this FSCTL keeps RefCount nonzero (so the node cannot be reaped), and
@@ -42,15 +43,15 @@
 //  request is not malformed, it is aimed at a device that has no such
 //  operation.
 //
-//  FSCTL_FILESYSTEM_GET_STATISTICS(_EX) is handled first and separately:
-//  it is a volume-wide query with no node to validate, so it must not
-//  fall through the FCB/DCB type checks the oplock codes need. Answering
-//  it in the documented FILESYSTEM_STATISTICS shape (Statistics.h) is
-//  what makes `fsutil fsinfo statistics B:` work against this volume
-//  rather than needing a bespoke tool. STATUS_BUFFER_OVERFLOW from the
-//  fill is a success outcome for these FSCTLs, not an error -- callers
-//  are expected to probe with a short buffer and resize -- so the status
-//  is returned as-is alongside the byte count. After FsRtlOplockFsctrl returns, the IRP
+//  FSCTL_FILESYSTEM_GET_STATISTICS(_EX) is handled first and separately: it
+//  is a volume-wide query with no node to validate, so it must not fall
+//  through the FCB/DCB type checks the oplock codes need. Answering it in
+//  the documented FILESYSTEM_STATISTICS shape (Statistics.h) is what makes
+//  `fsutil fsinfo statistics B:` work against this volume rather than
+//  needing a bespoke tool. STATUS_BUFFER_OVERFLOW from the fill is a
+//  success outcome for these FSCTLs, not an error -- callers are expected
+//  to probe with a short buffer and resize -- so the status is returned
+//  as-is alongside the byte count. After FsRtlOplockFsctrl returns, the IRP
 //  belongs to FsRtl (held pending a break, or already completed) and must
 //  not be touched or completed here; the check may have broken conflicting
 //  oplocks, so IsFastIoPossible is refreshed before releasing the lock.

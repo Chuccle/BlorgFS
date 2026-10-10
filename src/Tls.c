@@ -443,14 +443,15 @@ cleanup:
 // close-completion path) and the only one carrying a chaining mode.
 //
 // BCRYPT_PROV_DISPATCH is what makes keys derived from that provider usable
-// at DISPATCH_LEVEL (see BlorgTlsImportKeyHandle) -- required in the real driver,
-// where the record-layer hot path runs there, but usermode CNG rejects it
-// outright (STATUS_INVALID_PARAMETER). The AES-GCM open is retried without
-// the flag on that specific failure, so the usermode test harnesses this
-// file also compiles into (Tls.h) can still exercise BlorgTlsImportKeyHandle:
-// none of them run anything at a real DISPATCH_LEVEL, so a
-// non-DISPATCH-safe handle costs them nothing. In the real driver that
-// retry is never reached -- BCRYPT_PROV_DISPATCH always succeeds there.
+// at DISPATCH_LEVEL (see BlorgTlsImportKeyHandle) -- required in the real
+// driver, where the record-layer hot path runs there, but usermode CNG
+// rejects it outright (STATUS_INVALID_PARAMETER). The AES-GCM open is
+// retried without the flag on that specific failure, so the usermode test
+// harnesses this file also compiles into (Tls.h) can still exercise
+// BlorgTlsImportKeyHandle: none of them run anything at a real
+// DISPATCH_LEVEL, so a non-DISPATCH-safe handle costs them nothing. In the
+// real driver that retry is never reached -- BCRYPT_PROV_DISPATCH always
+// succeeds there.
 //
 NTSTATUS BlorgTlsGlobalInit(VOID)
 {
@@ -1324,13 +1325,13 @@ static BOOLEAN TlsDerSkipTlv(const UCHAR** Data, const UCHAR* End)
 
 //
 // Walks Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
-// signatureValue } and tbsCertificate ::= SEQUENCE { version?, serialNumber,
-// signature, issuer, validity, subject, subjectPublicKeyInfo, ... } to reach
-// subjectPublicKeyInfo, skipping every other field by length only (their
-// content is never interpreted). Returns the SPKI's full TLV span
-// (tag+length+value), not just its value, since
-// BlorgTlsDecodeP256SubjectPublicKeyInfo expects to see the leading SEQUENCE tag
-// itself.
+// signatureValue } and tbsCertificate ::= SEQUENCE { version?,
+// serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo,
+// ... } to reach subjectPublicKeyInfo, skipping every other field by length
+// only (their content is never interpreted). Returns the SPKI's full TLV
+// span (tag+length+value), not just its value, since
+// BlorgTlsDecodeP256SubjectPublicKeyInfo expects to see the leading
+// SEQUENCE tag itself.
 //
 NTSTATUS BlorgTlsExtractSpkiFromCertificate(
     const UCHAR* CertDer, ULONG CertDerLen,

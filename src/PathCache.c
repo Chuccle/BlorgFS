@@ -1101,15 +1101,16 @@ VOID BlorgPathCacheSeedListing(const UNICODE_STRING* Dir, PDIRECTORY_INFO Listin
 }
 
 //
-//  Returns a referenced snapshot of Dir's listing, or NULL. Fresh within the
-//  path cache's lifetime; with AllowStale, also LISTING_STALE_GRACE_100NS past it,
-//  reported through *Stale, and the first lookup to see a given snapshot
-//  stale is told through *RefreshOwed that it owes the one background
-//  refetch. That claim is an interlocked flag on the entry rather than an
-//  exclusive acquire, so stale lookups stay concurrent; the flag is never
-//  reset on the entry -- a successful refetch replaces the whole entry, and a
-//  failed one leaves this snapshot unrefreshed until it ages out and the
-//  next query fetches in the foreground.
+//  Returns a referenced snapshot of Dir's listing, or NULL. Fresh within
+//  the path cache's lifetime; with AllowStale, also
+//  LISTING_STALE_GRACE_100NS past it, reported through *Stale, and the
+//  first lookup to see a given snapshot stale is told through *RefreshOwed
+//  that it owes the one background refetch. That claim is an interlocked
+//  flag on the entry rather than an exclusive acquire, so stale lookups
+//  stay concurrent; the flag is never reset on the entry -- a successful
+//  refetch replaces the whole entry, and a failed one leaves this snapshot
+//  unrefreshed until it ages out and the next query fetches in the
+//  foreground.
 //
 //  Create.c passes AllowStale = FALSE: a listing it reads answers "not
 //  found" outright, and a snapshot older than the TTL must not hide a file
