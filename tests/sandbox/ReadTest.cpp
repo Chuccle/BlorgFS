@@ -469,16 +469,14 @@ TEST_F(ReadTest, FailedDirectFetchCompletesTheIrpWithAFailureStatus)
 ///////////////////////////////////////////////////////////////////////////
 
 //
-// The direct-fetch path is only reachable inline for a non-paging read
-// when the caller is already running on an FSP worker
-// (IRP_CONTEXT_FLAG_IN_FSP) -- otherwise BlorgVolumeRead posts to the FSP
-// queue instead. That flag is only ever set by FspWorkQueue.c's own
-// re-dispatch (its own coverage gap, not this file's), never by
+// A posted non-paging read reaches the direct-fetch path on an FSP worker
+// (IRP_CONTEXT_FLAG_IN_FSP), with its buffer locked by the post. That flag
+// is only ever set by FspWorkQueue.c's own re-dispatch, never by
 // BlorgRead's entry-point setup -- BlorgSetupIrpContext in fact asserts
 // DriverContext[0] is still 0 when it runs. So this calls BlorgVolumeRead
 // directly, the same layer FspWorkQueue.c itself calls into, rather than
-// through BlorgRead -- which is what lets a non-paging completion's extra
-// bookkeeping (CurrentByteOffset, FO_FILE_FAST_IO_READ) be observed
+// through BlorgRead -- which is what lets a posted non-paging completion's
+// extra bookkeeping (CurrentByteOffset, FO_FILE_FAST_IO_READ) be observed
 // without also standing up a real work-queue drive.
 //
 TEST_F(ReadTest, NonPagingDirectFetchAdvancesFileOffsetAndSetsFastIoOnCompletion)
@@ -1283,6 +1281,43 @@ TEST_F(ReadTest, FastIoReadCountsOnlyHandledReads)
     EXPECT_EQ(completed, Fcb->ReadIdleLastEndQpc);
 }
 
+//
+// A non-paging non-cached read (FILE_FLAG_NO_BUFFERING) arrives at
+// PASSIVE_LEVEL in the requester's own context, which is where its buffer
+// has to be locked, and nothing after the lock blocks. It used to be posted
+// to the FSP anyway, a worker hop and a context switch per read. The queue
+// is not running here, so a post is refused with STATUS_DEVICE_REMOVED; a
+// read issued inline without locking has no MDL for the body to land in.
+//
+TEST_F(ReadTest, ANonPagingUncachedReadLocksItsBufferAndIssuesInline)
+{
+    static const SANDBOX_STEP script[] =
+    {
+        DELIVER("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nWXYZ")
+    };
+    SandboxSetPeerScript(script, RTL_NUMBER_OF(script));
+
+    const ULONG length = 4;
+    unsigned char* buffer = NewBuffer(length);
+    ReadRequest* req = PrepareRead(Fcb, 0, length, IRP_NOCACHE);
+    req->Irp.UserBuffer = buffer;
+    req->FileObject.Flags = FO_SYNCHRONOUS_IO;
+
+    ASSERT_EQ(STATUS_PENDING, BlorgRead(Volume, &req->Irp));
+
+    Drain();
+
+    EXPECT_EQ(1, req->Irp.CompletionCount);
+    EXPECT_EQ(STATUS_SUCCESS, req->Irp.IoStatus.Status);
+    EXPECT_EQ(length, req->Irp.IoStatus.Information);
+    EXPECT_EQ(0, memcmp(buffer, "WXYZ", length)) << "the body must land in the caller's own buffer";
+    EXPECT_EQ((LONGLONG)length, req->FileObject.CurrentByteOffset.QuadPart);
+    ASSERT_NE(nullptr, req->Irp.MdlAddress) << "the user buffer was never locked";
+    EXPECT_TRUE(req->Irp.MdlAddress->Locked);
+
+    ShimReleaseIrpMdl(&req->Irp);
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Adaptive read-ahead, one granule per handle
 ///////////////////////////////////////////////////////////////////////////
@@ -1678,6 +1713,5 @@ TEST_F(ReadAdaptTest, AdaptOffPinsTheGranule)
     EXPECT_EQ(kGranule, ShimReadAheadGranularity(&Handle));
     EXPECT_EQ(0u, Stats->ReadAdaptWindows);
 }
-
 
 } // namespace

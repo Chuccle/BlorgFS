@@ -980,8 +980,9 @@ static VOID ReadSucceeded(PIRP Irp, LONG64 ArrivedQpc)
 //  Completion for an async non-cached read. Invoked from the WSK
 //  completion path at <= DISPATCH_LEVEL, so everything it touches must be
 //  legal there: the source body lives in the NonPagedPoolNx HTTP receive
-//  buffer, and the destination is the user buffer already locked into
-//  Irp->MdlAddress by BlorgPrePostIrp when the IRP was posted to the FSP queue.
+//  buffer, and the destination is the user buffer BlorgVolumeRead (or
+//  BlorgPrePostIrp, for a read posted from raised IRQL) locked into
+//  Irp->MdlAddress.
 //  CallerContext is the PIRP.
 //
 //  Usually a zero-copy read (BlorgHttpGetFileMdl): the body was received
@@ -1428,15 +1429,20 @@ static VOID ReadRefetchWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // independent of FSP_THREAD_COUNT. Issuing inline lets the WSK completion
 // (a DPC, not a worker) satisfy the paging read, so the blocked worker's
 // own read completes without needing a second worker; FSP_THREAD_COUNT
-// becomes a pure throughput knob. Non-paging non-cached reads (e.g.
-// FILE_FLAG_NO_BUFFERING) still post: their user buffer must be locked
-// (BlorgPrePostIrp) and they need a guaranteed PASSIVE_LEVEL worker context.
-// Inline issuance happens when either already on a worker (IN_FSP -- the
-// original post locked the buffer) or this is a paging read at
-// PASSIVE_LEVEL (MM already supplied the MDL, nothing to lock); a paging
-// read at raised IRQL -- rare, but possible -- falls through to the post
-// path, safe because BlorgLockUserBuffer no-ops when Irp->MdlAddress is already
-// set (always true for paging I/O).
+// becomes a pure throughput knob. A non-paging non-cached read (e.g.
+// FILE_FLAG_NO_BUFFERING) is issued inline too: it arrives at PASSIVE_LEVEL
+// in the requester's own context, which is where its user buffer has to be
+// locked, and nothing after that lock blocks -- the fetch, the disk cache
+// and the fair share all complete or hold asynchronously. Posting it bought
+// a worker hop, an event and a context switch per read for nothing.
+// Inline issuance happens when already on a worker (IN_FSP -- the original
+// post locked the buffer) or at PASSIVE_LEVEL (MM supplied a paging read's
+// MDL, and a non-paging read's buffer is locked here); a read at raised
+// IRQL -- rare, but possible -- posts, which locks it in this context and
+// is safe for paging I/O because BlorgLockUserBuffer no-ops when
+// Irp->MdlAddress is already set. Only a non-paging read is locked here: a
+// paging read's MDL is MM's, and building one over its UserBuffer would
+// hand the client a buffer MM never described.
 //
 // Paging reads advance this reader's stream tracker and then go straight
 // to a direct fetch. Lookahead is Cc's alone: it reads ahead of the
@@ -1463,8 +1469,8 @@ static VOID ReadRefetchWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 //
 // The direct async HTTP read returns STATUS_PENDING on success; the client
 // receives the body straight into the locked user MDL (zero-copy -- both
-// arrival paths have one: MM supplies it for paging I/O, BlorgPrePostIrp locked
-// one for posted non-paging reads) and ReadComplete completes the IRP
+// arrival paths have one: MM supplies it for paging I/O, BlorgLockUserBuffer
+// locks one for non-paging reads) and ReadComplete completes the IRP
 // from the WSK completion path, so this function neither blocks nor copies
 // nor completes the IRP itself. If issuing the request fails synchronously,
 // the callback never runs and the returned error completes the IRP
@@ -1495,9 +1501,8 @@ static VOID ReadRefetchWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
 // first pass through here, gated on IRP_CONTEXT_FLAG_IN_FSP. A read that
 // cannot issue inline is posted to the FSP, whose worker re-enters this
 // same function on the same IRP -- so counting unconditionally scored
-// every posted read twice, and since in practice essentially every
-// non-cached read takes the post path, both counters simply read 2x
-// reality. That matters beyond this driver's own telemetry:
+// every posted read twice, and when every non-paging non-cached read
+// posted, both counters read 2x reality for them. That matters beyond this driver's own telemetry:
 // NonCachedReads feeds the standard FAT_STATISTICS surface that
 // fsutil reports.
 //
@@ -1644,17 +1649,13 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
         BOOLEAN alreadyInFsp =
             BooleanFlagOn(C_CAST(ULONG_PTR, Irp->Tail.Overlay.DriverContext[0]), IRP_CONTEXT_FLAG_IN_FSP);
 
-        BOOLEAN canIssueInline =
-            alreadyInFsp ||
-            (BooleanFlagOn(Irp->Flags, IRP_PAGING_IO) && PASSIVE_LEVEL == KeGetCurrentIrql());
-
         if (!alreadyInFsp)
         {
             BLORGFS_STAT_INC(NonCachedReads);
             BLORGFS_STAT_ADD(NonCachedReadBytes, realLength);
         }
 
-        if (!canIssueInline)
+        if (!alreadyInFsp && PASSIVE_LEVEL != KeGetCurrentIrql())
         {
             BLORGFS_PRINT("BlorgVolumeRead: Enqueue to Fsp\n");
             BLORGFS_STAT_INC(ReadsPosted);
@@ -1690,6 +1691,15 @@ NTSTATUS BlorgVolumeRead(PIRP Irp, PIO_STACK_LOCATION IrpSp)
             if (realLength > fcb->ReadMaxPagingBytes)
             {
                 fcb->ReadMaxPagingBytes = realLength;
+            }
+        }
+        else
+        {
+            NTSTATUS lockStatus = BlorgLockUserBuffer(Irp, IoWriteAccess, bytesLength);
+
+            if (!NT_SUCCESS(lockStatus))
+            {
+                return lockStatus;
             }
         }
 
