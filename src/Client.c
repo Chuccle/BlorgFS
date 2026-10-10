@@ -44,7 +44,6 @@
 //
 #define HTTP_MAX_HEADERS 64
 #define HTTP_INITIAL_RECV_CAPACITY (PAGE_SIZE * 4)
-#define HTTP_FILE_INITIAL_RECV_CAPACITY (PAGE_SIZE * 64) // 256 KB initial capacity for file-read responses
 
 //
 // Initial receive capacity for a zero-copy (MDL) file read. Nothing but
@@ -3763,10 +3762,11 @@ NTSTATUS BlorgHttpGetChanges(
 // already excluded by the 0 == Length check above, but kept explicit
 // rather than relying on that exclusion alone. Zero-copy requests never
 // put body bytes in Buffer, so headers-only sizing suffices; buffer mode
-// sizes for the headers and the whole body, and at least a read-ahead
-// chunk, so the body lands without a regrow. On
-// a HttpBuildRequest failure, see BlorgHttpGetDirectoryInfo for the
-// HttpFreeContext/FinalStatus cleanup rationale.
+// adds the body, whose length the 206 must match exactly, so it lands
+// without a regrow. It used to be floored at 256 KB as well, which held
+// 256 KB of NonPagedPoolNx per in-flight 4 KB fault. On a HttpBuildRequest
+// failure, see BlorgHttpGetDirectoryInfo for the HttpFreeContext/FinalStatus
+// cleanup rationale.
 //
 static NTSTATUS HttpGetFileCommon(
     const UNICODE_STRING* Path,
@@ -3794,11 +3794,6 @@ static NTSTATUS HttpGetFileCommon(
     if (!TargetMdl && !HttpCheckedAddSizeT(Length, HTTP_MDL_INITIAL_RECV_CAPACITY, &capacity))
     {
         return STATUS_INVALID_PARAMETER;
-    }
-
-    if (!TargetMdl && (capacity < HTTP_FILE_INITIAL_RECV_CAPACITY))
-    {
-        capacity = HTTP_FILE_INITIAL_RECV_CAPACITY;
     }
 
     HTTP_CONTEXT* ctx = HttpAllocateContext(HttpOpFileRead, 206, capacity);
